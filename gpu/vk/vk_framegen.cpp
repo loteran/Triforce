@@ -509,6 +509,7 @@ fgengine::Choice framegen_choice(int framegen) {
     f.enabled = allow && !dev.offscreen && !fg.failed;
     f.dlssg_usable = ngxfg::wanted_for(framegen);
     f.amd_usable = framegen == 2 && ffxfg::usable();
+    f.amd_gpu = dev.props.vendorID == 0x1002;
     f.fsr3fi_usable = framegen == 2 && fsr3fi::capable() && (framegen != opts.framegen || fsr3fi::frames_wanted() != 0);
     return fgengine::choose(f);
 }

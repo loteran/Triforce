@@ -19,6 +19,7 @@ using V = fe::Vendor;
 fe::Facts facts(V vendor, int framegen, bool dlssg, bool amd, bool fsr3fi) {
     fe::Facts f;
     f.vendor = vendor, f.framegen = framegen, f.dlssg_usable = dlssg, f.amd_usable = amd, f.fsr3fi_usable = fsr3fi;
+    f.amd_gpu = true;   // (the order; the GPU rule has its own checks below)
     return f;
 }
 E pick(V vendor, int framegen, bool dlssg, bool amd, bool fsr3fi) { return fe::choose(facts(vendor, framegen, dlssg, amd, fsr3fi)).engine; }
@@ -43,6 +44,15 @@ int main() {
     check("auto 2x: Triforce's passes without the library", pick(V::Auto, 2, false, false, true) == E::Fsr3fi);
     check("auto 2x: the flow without either", pick(V::Auto, 2, false, false, false) == E::Flow);
     check("auto 3x: DLSS-G where it makes 3x", pick(V::Auto, 3, true, true, false) == E::DlssG);
+    {
+        fe::Facts f = facts(V::Auto, 2, false, true, true);
+        f.amd_gpu = false;
+        check("auto 2x, not an AMD GPU: Triforce's passes, not AMD's library", fe::choose(f).engine == E::Fsr3fi && std::strlen(fe::choose(f).why) > 0);
+        f.fsr3fi_usable = false;
+        check("auto 2x, not an AMD GPU, no passes: the flow", fe::choose(f).engine == E::Flow);
+        f.vendor = V::Amd;
+        check("amd chosen on purpose, not an AMD GPU: the library", fe::choose(f).engine == E::AmdLibrary);
+    }
     check("auto 3x: never AMD's library", pick(V::Auto, 3, false, true, true) == E::Flow);
     check("auto Auto-row: never AMD's library", pick(V::Auto, 1, false, true, true) == E::Flow);
     check("auto Auto-row: DLSS-G where it runs", pick(V::Auto, 1, true, true, true) == E::DlssG);

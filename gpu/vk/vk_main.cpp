@@ -797,7 +797,10 @@ bool create_swapchain(uint32_t width, uint32_t height, bool may_use_ffx) {
          mode == VK_PRESENT_MODE_MAILBOX_KHR ? "mailbox" : mode == VK_PRESENT_MODE_IMMEDIATE_KHR ? "immediate" : "fifo",
          made_ffx ? ", AMD's frame generation swapchain (presents a made frame between the game's)" : "");
     swap_views_make(ci.imageUsage, mutable_view ? view_formats[1] : fmt.format);
-    reflex_swapchain_created(sc);   // (NVIDIA Reflex: its sleep mode on the new swapchain)
+    // (NVIDIA Reflex: its sleep mode on the new swapchain. Never on AMD's: its handle is the library's own object, not a driver
+    // swapchain, and vkSetLatencySleepModeNV on it crashed the driver (libnvidia-glcore) at the first present. Reflex is off with frame generation)
+    if (made_ffx) reflex_swapchain_destroyed();
+    else reflex_swapchain_created(sc);
     return true;
 }
 

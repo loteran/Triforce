@@ -5,7 +5,8 @@
 //   1. NVIDIA DLSS Frame Generation (vk_ngxfg.h) where it can run: an RTX 40 or 50, its runtime there, the multiplier within what the
 //      GPU makes, SDR;
 //   2. AMD FSR 3.1 frame generation through AMD's own FidelityFX library (vk_ffx_fg.h) at 2x, when the library is beside the game and
-//      loads, the device has the queues its swapchain needs, and it has not failed in this run (it is vendor neutral: any GPU);
+//      loads, the device has the queues its swapchain needs, and it has not failed in this run (it runs on any GPU, but Auto takes it
+//      on an AMD GPU only: elsewhere it is the engine row AMD or RX_VK_FRAMEGEN_VENDOR=amd, until proven there);
 //   3. Triforce's own: AMD FSR 3.1's interpolation as Triforce's own passes (vk_fsr3fi.h) at 2x, the optical-flow interpolation of
 //      vk_framegen.cpp otherwise (Auto, 3x and up, and any frame the passes above cannot take).
 // `nvidia` makes DLSS-G the only engine (none at all where it cannot run); `amd` takes the library where it can run and Triforce's
@@ -75,6 +76,7 @@ struct Facts {
     bool enabled = true;         ///< the interpolation is not off for the run (RX_VK_FRAMEGEN=0, a failed setup, no window)
     bool dlssg_usable = false;   ///< ngxfg::wanted_for(framegen): it can run and makes this multiplier, in SDR
     bool amd_usable = false;     ///< the library is loaded, the device has the swapchain's queues, and it has not failed in this run
+    bool amd_gpu = false;        ///< the GPU is AMD's: Auto takes the library only there (elsewhere it runs when chosen: the row AMD or RX_VK_FRAMEGEN_VENDOR=amd)
     bool fsr3fi_usable = false;  ///< Triforce's own passes of FSR 3.1 can make the frame at this row
 };
 
@@ -120,6 +122,7 @@ inline Choice choose(const Facts& f) {
     if (f.dlssg_usable) return {Engine::DlssG, ""};
     if (!amd_multiplier(f.framegen)) return triforce_own(f, "(AMD's library makes 2x only)");
     if (!f.amd_usable) return triforce_own(f, "(AMD's library cannot run here)");
+    if (!f.amd_gpu) return triforce_own(f, "(AMD's library is Auto's on an AMD GPU only: choose AMD to run it here)");
     return {Engine::AmdLibrary, "(DLSS Frame Generation cannot run here)"};
 }
 

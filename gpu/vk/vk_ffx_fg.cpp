@@ -38,6 +38,7 @@
 #include <string>
 
 #include "vk_ffx3.h"
+#include "vk_paths.h"
 #include "vk_fg_reset.h"
 #include "vk_fsr3_inputs.h"
 #include "vk_hudless.h"
@@ -343,6 +344,47 @@ VkImage make_hudless(const FrameArgs& a) {
     return target;
 }
 
+// ---- the crash guard ----
+// A marker file beside the game is written when AMD's swapchain is first made, and removed after kGuardPresents presents through it. A
+// start that finds it left over knows the previous run died in AMD's swapchain: it is said in the log and the status line (why_not), and
+// Triforce's own frame generation takes the run (the marker is removed then, so an engine chosen on purpose can try again)
+constexpr uint64_t kGuardPresents = 120;
+
+std::string guard_path() {
+    char exe[MAX_PATH];
+    const DWORD n = game_module_path(exe, MAX_PATH);
+    if (!n || n >= MAX_PATH) return {};
+    std::string path(exe, n);
+    return path.substr(0, path.find_last_of("\\/") + 1) + "triforce_ffxfg_pending";
+}
+
+bool guard_marker_exists() {
+    const std::string p = guard_path();
+    if (p.empty()) return false;
+    FILE* f = std::fopen(p.c_str(), "rb");
+    if (!f) return false;
+    std::fclose(f);
+    return true;
+}
+
+void guard_write() {
+    static bool written = false;
+    if (written) return;
+    written = true;
+    const std::string p = guard_path();
+    if (p.empty()) return;
+    if (FILE* f = std::fopen(p.c_str(), "wb")) {
+        std::fputs("AMD's frame generation swapchain was made and has not yet presented enough frames\n", f);
+        std::fflush(f);
+        std::fclose(f);
+    }
+}
+
+void guard_clear() {
+    const std::string p = guard_path();
+    if (!p.empty()) std::remove(p.c_str());
+}
+
 }  // namespace
 
 // ---- the device ----
@@ -379,6 +421,13 @@ void surface_made(VkSurfaceKHR surface) {
 
 bool usable() {
     State& s = st();
+    static const bool crashed = [] {   // (once, at the first ask: before anything of AMD's is made)
+        if (!guard_marker_exists()) return false;
+        guard_clear();
+        note_failed("the previous run ended inside AMD's frame generation swapchain (its marker file was left)", 0);
+        return true;
+    }();
+    (void)crashed;
     if (s.failed.load(std::memory_order_relaxed) || !s.queues_ok) return false;
     return L() != nullptr;
 }
@@ -433,6 +482,7 @@ VkResult create_swapchain(const VkSwapchainCreateInfoKHR& ci_in, VkSwapchainKHR*
     ci.queueFamilyIndexCount = 0, ci.pQueueFamilyIndices = nullptr;
     if (s.sc) return s.fn.pOutCreateSwapchainFFXAPI(dev.device, &ci, nullptr, out, s.sc);
     if (!L() || !s.queues_ok || s.failed) return VK_ERROR_FEATURE_NOT_PRESENT;
+    guard_write();   // (the crash guard: left in place until presents through this swapchain have gone out)
     ffxCreateContextDescFrameGenerationSwapChainVK d{};
     d.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_FGSWAPCHAIN_VK;
     d.physicalDevice = dev.physical;
@@ -482,7 +532,10 @@ VkResult acquire(VkSwapchainKHR sc, uint64_t timeout, VkSemaphore semaphore, uin
 
 VkResult present(const VkPresentInfoKHR* info) {
     State& s = st();
-    return s.fn.pOutQueuePresentKHR(dev.queue, info);
+    static std::atomic<uint64_t> ok{0};
+    const VkResult r = s.fn.pOutQueuePresentKHR(dev.queue, info);
+    if (r >= 0 && ok.load(std::memory_order_relaxed) < kGuardPresents && ok.fetch_add(1) + 1 == kGuardPresents) guard_clear();
+    return r;
 }
 
 void quiesce() {
