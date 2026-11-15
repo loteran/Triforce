@@ -1255,6 +1255,23 @@ def fetch_ngx_sdk(a):
         fail("NVIDIA's DLSS SDK could not be downloaded (%s). Check the connection and build again, or untick NVIDIA DLSS." % e)
 
 
+def fetch_fsr4(a, game_dir):
+    """--fetch-fsr4 (linux; the builder's AMD FSR 4 tick): AMD FSR 4's Vulkan library built beside the game once AMD's license
+    was accepted (--accept-amd-license: the builder asked first). The game is built either way: a library that could not be
+    made leaves FSR 4 off, and the next build tries again (what is cached is not downloaded again)"""
+    if not LINUX:
+        print("--fetch-fsr4 is for the Linux game: on Windows AMD's own DLLs are used (see the readme)", flush=True)
+        return
+    if not a.accept_amd_license:
+        print("AMD FSR 4: AMD's license was not accepted (--accept-amd-license): not built", flush=True)
+        return
+    say("stage", "fsr4", "Building AMD FSR 4 for Linux")
+    r = subprocess.run(PY + [os.path.join(ROOT, "nx2", "fsr4_linux.py"), "--out", game_dir, "--accept-amd-license"])
+    if r.returncode:
+        print("AMD FSR 4 could not be built (the lines above say why): the game is built without it, and the next build "
+              "tries again", flush=True)
+
+
 def ngx_built():
     """This build has NVIDIA DLSS: HOOKSHOT_NGX_SDK holds this platform's library (what nx2/build.py takes)"""
     sdk = os.environ.get("HOOKSHOT_NGX_SDK", "")
@@ -1269,7 +1286,7 @@ def fsr_wanted(a, out):
     MIT headers are in third_party/fidelityfx and its DLLs are the player's (the readme)"""
     if getattr(a, "no_fsr", False):
         return False
-    return bool(getattr(a, "fsr", False)) or bool(a.update and os.path.isfile(os.path.join(out, FSR_MARK)))
+    return bool(getattr(a, "fsr", False)) or bool(getattr(a, "fetch_fsr4", False)) or bool(a.update and os.path.isfile(os.path.join(out, FSR_MARK)))
 
 
 RENODX_MARK = ".hookshot_renodx"   # (in a game folder built with RenoDX's HDR: --update builds it with RenoDX again)
@@ -1352,6 +1369,11 @@ def parse_args():
     # (AMD FSR 4, off unless asked: nothing is downloaded. gpu/vk/vk_fsr4.cpp)
     p.add_argument("--fsr", action="store_true", help="build with AMD FSR 4 (AMD's DLLs are not included: see the readme)")
     p.add_argument("--no-fsr", action="store_true", help="with --update: build without AMD FSR 4 even if the folder had it")
+    # (linux: AMD's FSR 4 has no Linux library; --fetch-fsr4 builds a Vulkan one on this PC from AMD's SDK DLL, under AMD's
+    # license, and puts it beside the game. nx2/fsr4_linux.py)
+    p.add_argument("--fetch-fsr4", action="store_true",
+                   help="(linux) build AMD FSR 4's Vulkan library on this PC from AMD's SDK DLL, beside the game; implies --fsr")
+    p.add_argument("--accept-amd-license", action="store_true", help="AMD's FSR SDK license, accepted (with --fetch-fsr4)")
     # (RenoDX's HDR, in every build since 11-13: its shaders and the Slang compiler are downloaded and compiled here.
     # scripts/renodx_shaders.py, gpu/vk/vk_renodx.cpp)
     p.add_argument("--renodx", action="store_true",
@@ -1427,7 +1449,8 @@ def main(a=None):
     if fsr_wanted(a, out):
         os.environ["HOOKSHOT_FSR"] = "1"
         open(os.path.join(out, FSR_MARK), "w").close()
-        if os.environ.get("HOOKSHOT_VK_PREBUILT"):   # (the AppImage's back end, built without FSR 4)
+        # (the AppImage's back end is built with FSR 4, HOOKSHOT_VK_PREBUILT_FSR; another prebuilt one may not be)
+        if os.environ.get("HOOKSHOT_VK_PREBUILT") and os.environ.get("HOOKSHOT_VK_PREBUILT_FSR") != "1":
             print("--fsr: this build uses the prebuilt Vulkan back end (HOOKSHOT_VK_PREBUILT), which has no AMD FSR 4: the "
                   "Upscaler row will not offer it", flush=True)
     else:
@@ -1771,6 +1794,8 @@ def main(a=None):
                                                     "" if previous is None else " (the last one %s)" % clock(previous)), flush=True)
     say("times", "%.0f" % total_seconds, "%.0f" % compile_seconds, "-1" if previous is None else "%.0f" % previous)
     # (after the times: they stay comparable from build to build, without a GPU's minutes that can be switched off)
+    if getattr(a, "fetch_fsr4", False):
+        fetch_fsr4(a, game_dir)
     skipped = prepare_skipped(a)
     if skipped:
         not_prepared(skipped)

@@ -20,9 +20,11 @@ export EMSDK=$DEPS/emsdk RX_CPM=$DEPS/cpm
 PY=$DEPS/python/bin/python3
 
 # ---- the Vulkan back end, built here once (it needs no game) ----
+# (with AMD FSR 4: only AMD's MIT API headers are compiled in, and nothing of it acts until a Vulkan FSR 4 library is
+# beside the game, gpu/vk/vk_fsr4.cpp fsr4_wants_descriptor_buffer; the game built from this image offers it then)
 VKW=$B/vk-work
 rm -rf "$VKW/sa/build/triforce_vk.so"
-OOT_WORK=$VKW RX_MARCH=x86-64-v3 RX_VK_ONLY=1 RX_RELEASE=1 "$PY" -I nx2/build.py --standalone --jobs "${JOBS:-$(nproc)}"
+OOT_WORK=$VKW RX_MARCH=x86-64-v3 RX_VK_ONLY=1 RX_RELEASE=1 HOOKSHOT_FSR=1 "$PY" -I nx2/build.py --standalone --jobs "${JOBS:-$(nproc)}"
 VK=$VKW/sa/build/triforce_vk.so
 [ -f "$VK" ] || { echo "triforce_vk.so was not built"; exit 1; }
 
@@ -76,6 +78,10 @@ cp -a "$DEPS/emsdk/upstream" "$L/emsdk/"
 cp -a "$DEPS/ffmpeg" "$L/ffmpeg"
 cp "$VK" "$L/hookshot_vk.so"
 cp "$DEPS/sdl2/libSDL2-2.0.so.0" "$L/libSDL2-2.0.so.0"
+# (AMD FSR 4's kit, scripts/linux/deps.sh: fsr4-vk's sources and host tools, for nx2/fsr4_linux.py on the player's PC)
+cp -a "$DEPS/fsr4" "$L/fsr4"
+mkdir -p "$T/licenses/fsr4"
+cp -a "$DEPS/fsr4/licenses/." "$T/licenses/fsr4/"
 for d in "$DEPS"/cpm/*/*; do
     mkdir -p "$T/cpm/${d#"$DEPS/cpm/"}"
     cp -a "$d/include" "$T/cpm/${d#"$DEPS/cpm/"}/"
@@ -102,6 +108,10 @@ for f in crt1.o crti.o crtn.o Scrt1.o rcrt1.o libc.so libc.so.6 libc_nonshared.a
     [ -e "$M/$f" ] && cp -aL "$M/$f" "$S/usr/lib/x86_64-linux-gnu/" || true
 done
 cp -aL /lib64/ld-linux-x86-64.so.2 "$S/lib64/"
+# (the Vulkan loader, to link AMD FSR 4's library against, nx2/fsr4_linux.py: the game never links it, and at run time the
+# library uses the loader the game already has. Its licence beside the others)
+cp -aL "$M/libvulkan.so.1" "$S/usr/lib/x86_64-linux-gnu/libvulkan.so"
+mkdir -p "$T/licenses/vulkan-loader" && cp /usr/share/doc/libvulkan1/copyright "$T/licenses/vulkan-loader/copyright"
 GCC=$(ls -d /usr/lib/gcc/x86_64-linux-gnu/*/ | sort -V | tail -1)
 GV=$(basename "$GCC")
 G=$S/usr/lib/gcc/x86_64-linux-gnu/$GV

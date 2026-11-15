@@ -33,7 +33,8 @@ def dry_run(tools, lib, work):
     """nx2/build.py as nx2/make_game.py runs it in the AppImage (AppRun's variables), with nothing else of this PC's"""
     env = {"PATH": "/usr/bin:/bin", "HOME": str(work / "home"), "LANG": "C.UTF-8", "HOOKSHOT_TOOLS": str(tools),
            "EMSDK": str(lib / "emsdk"), "HOOKSHOT_SYSROOT": str(lib / "sysroot"), "HOOKSHOT_FFMPEG": str(lib / "ffmpeg"),
-           "HOOKSHOT_VK_PREBUILT": str(lib / "hookshot_vk.so"), "OOT_WORK": str(work / "work"), "RX_RELEASE": "1",
+           "HOOKSHOT_VK_PREBUILT": str(lib / "hookshot_vk.so"), "HOOKSHOT_VK_PREBUILT_FSR": "1",
+           "HOOKSHOT_FSR4_KIT": str(lib / "fsr4"), "OOT_WORK": str(work / "work"), "RX_RELEASE": "1",
            "A64_HOT_CHUNK": "1", "RX_MARCH": "x86-64-v3"}
     return subprocess.run([sys.executable, "-I", "-B", "-u", "-X", "utf8", "nx2/build.py", "--standalone", "--jobs", "1",
                            "--dry-run"], cwd=tools, env=env, capture_output=True, text=True, timeout=300)

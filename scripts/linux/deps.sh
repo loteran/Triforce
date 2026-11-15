@@ -13,6 +13,10 @@
 #                     AV1 movies (VP8 / VP9 too) - linked into the game
 #   sdl2/             libSDL2-2.0.so.0: the window, sound and controllers, placed beside the game
 #   cpm/              Vulkan-Headers, SPIRV-Headers and VulkanMemoryAllocator, in the CPM cache layout nx2/build.py reads
+#   fsr4/             (linux, AMD FSR 4) what nx2/fsr4_linux.py builds AMD FSR 4's Vulkan library with on the player's PC,
+#                     so that it needs nothing installed there: fsr4-vk's sources (GPL-3.0) at a pinned commit, without the
+#                     host tools' own sources, and those tools built here with GCC (dxil-spirv, SPIRV-Tools, glslang), plus
+#                     CMake and Ninja in python/. Nothing of AMD's: its DLL is downloaded on the player's PC
 #   appimagetool      the AppImage packer
 #   runtime-x86_64    the AppImage runtime it puts in front of the image (pinned: appimagetool's own download of the
 #                     'continuous' one, at packing time, fails whenever GitHub answers 504)
@@ -36,6 +40,9 @@ VK_HEADERS=v1.4.345
 SPIRV_HEADERS=vulkan-sdk-1.4.341.0
 VMA=v3.3.0
 APPIMAGETOOL=1.9.1
+FSR4_VK_COMMIT=b0125ea9798633750f83ebabbc00279bcb49d8dd   # (fsr4-vk: the commit nx2/fsr4_linux.py's AMD DLL hash goes with)
+CMAKE_PY=4.4.4      # (CMake and Ninja from PyPI, into python/: fsr4/'s build on the player's PC)
+NINJA_PY=1.13.0
 APPIMAGE_RUNTIME=20251108
 APPIMAGE_RUNTIME_SHA256=2fca8b443c92510f1483a883f60061ad09b46b978b2631c807cd873a47ec260d
 # (the SHA-256 of each release download: a part whose download differs stops the script. Change them with the versions.
@@ -73,13 +80,14 @@ fetch() {   # url file [sha256: checked on every run, the download removed when 
 done_for() { [ -f "$DEPS/.$1" ] && [ "$(cat "$DEPS/.$1")" = "$2" ]; }
 mark() { echo "$2" > "$DEPS/.$1"; }
 
-# ---- LLVM: clang, lld and clang's own headers, nothing else ----
+# ---- LLVM: clang, lld, llvm-objdump and clang's own headers, nothing else ----
 if ! done_for llvm "$LLVM_VER"; then
     fetch "https://github.com/llvm/llvm-project/releases/download/llvmorg-$LLVM_VER/LLVM-$LLVM_VER-Linux-X64.tar.xz" llvm.tar.xz "$LLVM_SHA256"
     rm -rf "$DEPS/emsdk" "$DEPS/llvm-x"
     mkdir -p "$DEPS/llvm-x"
     tar -xJf "$DL/llvm.tar.xz" -C "$DEPS/llvm-x" --strip-components=1 --wildcards \
-        '*/bin/clang' '*/bin/clang++' '*/bin/clang-[0-9]*' '*/bin/lld' '*/bin/ld.lld' '*/bin/llvm-profdata' '*/lib/clang/*'
+        '*/bin/clang' '*/bin/clang++' '*/bin/clang-[0-9]*' '*/bin/lld' '*/bin/ld.lld' '*/bin/llvm-profdata' '*/lib/clang/*' \
+        '*/bin/llvm-objdump'   # (llvm-objdump: nx2/fsr4_linux.py reads AMD's DLL with it)
     U=$DEPS/emsdk/upstream
     mkdir -p "$U/bin" "$U/lib"
     mv "$DEPS/llvm-x/bin/"* "$U/bin/"
@@ -87,7 +95,7 @@ if ! done_for llvm "$LLVM_VER"; then
     rm -rf "$DEPS/llvm-x"
     # (the runtimes: only the profile and builtins libraries; no sanitizers)
     find "$U"/lib/clang/*/lib -type f ! -name 'libclang_rt.profile*.a' ! -name 'libclang_rt.builtins*.a' -delete
-    strip "$U/bin/clang-"[0-9]* "$U/bin/lld" "$U/bin/llvm-profdata" 2>/dev/null || true
+    strip "$U/bin/clang-"[0-9]* "$U/bin/lld" "$U/bin/llvm-profdata" "$U/bin/llvm-objdump" 2>/dev/null || true
     "$U/bin/clang" --version | head -1
     [ -f "$U/lib/clang/${LLVM_VER%%.*}/include/stddef.h" ] || { echo "clang's own headers are missing"; exit 1; }
     mark llvm "$LLVM_VER"
@@ -176,6 +184,70 @@ if ! done_for cpm "$VK_HEADERS-$SPIRV_HEADERS-$VMA"; then
     get_headers KhronosGroup/SPIRV-Headers "$SPIRV_HEADERS" spirv-headers
     get_headers GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator "$VMA" vulkanmemoryallocator
     mark cpm "$VK_HEADERS-$SPIRV_HEADERS-$VMA"
+fi
+
+# ---- AMD FSR 4's kit (nx2/fsr4_linux.py): fsr4-vk's sources and its host tools, built with GCC ----
+# GCC, not clang: fsr4-vk's setup checks every shader the translator converts against a SHA-256, and dxil-spirv numbers
+# its SPIR-V ids in the order the compiler evaluates function arguments, so a clang-built translator writes other ids and
+# the setup refuses them. Built here once, the player's PC needs no GCC: only the library itself is compiled there, with
+# the AppImage's clang. The tools carry their C++ runtime (-static-libstdc++) and find dxil-spirv's library beside them.
+if ! done_for fsr4 "$FSR4_VK_COMMIT-$CMAKE_PY-$NINJA_PY-$PY_MARK"; then
+    "$DEPS/python/bin/python3" -m pip install --no-cache-dir --only-binary :all: --disable-pip-version-check -q \
+        "cmake==$CMAKE_PY" "ninja==$NINJA_PY"
+    PB=$DEPS/python/bin
+    F4=$DEPS/fsr4-build
+    rm -rf "$F4" "$DEPS/fsr4"
+    git clone -q https://github.com/Astyyyyy/fsr4-vk.git "$F4/src"
+    git -C "$F4/src" -c advice.detachedHead=false checkout -q "$FSR4_VK_COMMIT"
+    git -C "$F4/src" submodule update -q --init --recursive
+    git -C "$F4/src/third_party/dxil-spirv" apply --ignore-space-change --whitespace=error-all \
+        "$F4/src/third_party/patches/dxil-spirv-portable-sort.patch"
+    GCC_CC=$(command -v gcc-13 || command -v gcc) GCC_CXX=$(command -v g++-13 || command -v g++)
+    TOOLS_FLAGS=(-G Ninja -DCMAKE_MAKE_PROGRAM="$PB/ninja" -DCMAKE_BUILD_TYPE=Release -DCMAKE_POLICY_VERSION_MINIMUM=3.5
+                 -DCMAKE_C_COMPILER="$GCC_CC" -DCMAKE_CXX_COMPILER="$GCC_CXX"
+                 -DCMAKE_EXE_LINKER_FLAGS="-static-libstdc++ -static-libgcc"
+                 -DCMAKE_SHARED_LINKER_FLAGS="-static-libstdc++ -static-libgcc" -DCMAKE_BUILD_RPATH='$ORIGIN')
+    T=$F4/src/third_party
+    "$PB/cmake" -S "$T/dxil-spirv" -B "$F4/dxil" "${TOOLS_FLAGS[@]}" -DDXIL_SPIRV_CLI=ON
+    "$PB/cmake" --build "$F4/dxil" --target dxil-spirv dxil-spirv-c-shared -j"$JOBS"
+    "$PB/cmake" -S "$T/SPIRV-Tools" -B "$F4/spvt" "${TOOLS_FLAGS[@]}" -DBUILD_SHARED_LIBS=OFF -DSPIRV_SKIP_TESTS=ON \
+        -DSPIRV_WERROR=OFF -DSPIRV_SKIP_EXECUTABLES=OFF -DSPIRV-Headers_SOURCE_DIR="$T/SPIRV-Headers" \
+        -DCMAKE_RUNTIME_OUTPUT_DIRECTORY="$F4/spvt/bin"
+    "$PB/cmake" --build "$F4/spvt" --target spirv-as spirv-dis spirv-opt spirv-val -j"$JOBS"
+    "$PB/cmake" -S "$T/glslang" -B "$F4/glslang" "${TOOLS_FLAGS[@]}" -DBUILD_SHARED_LIBS=OFF -DBUILD_EXTERNAL=OFF \
+        -DGLSLANG_TESTS=OFF -DGLSLANG_ENABLE_INSTALL=OFF -DENABLE_GLSLANG_BINARIES=ON -DENABLE_OPT=OFF -DENABLE_HLSL=OFF \
+        -DCMAKE_RUNTIME_OUTPUT_DIRECTORY="$F4/glslang/bin"
+    "$PB/cmake" --build "$F4/glslang" --target glslang-standalone -j"$JOBS"
+    K=$DEPS/fsr4
+    mkdir -p "$K/tools" "$K/src/third_party/Vulkan-Headers"
+    find "$F4/dxil" -maxdepth 2 -type f -name dxil-spirv -exec cp {} "$K/tools/" \;
+    lib=$(find "$F4/dxil" -maxdepth 2 -type f -name 'libdxil-spirv-c-shared.so.*' | head -1)
+    cp "$lib" "$K/tools/" && ln -s "$(basename "$lib")" "$K/tools/libdxil-spirv-c-shared.so.2"
+    cp "$F4/spvt/bin/spirv-as" "$F4/spvt/bin/spirv-dis" "$F4/spvt/bin/spirv-opt" "$F4/spvt/bin/spirv-val" \
+        "$F4/glslang/bin/glslang" "$K/tools/"
+    strip "$K/tools/"* 2>/dev/null || true
+    "$K/tools/dxil-spirv" --help >/dev/null 2>&1 || "$K/tools/dxil-spirv" 2>&1 | head -1   # (it starts: its library found)
+    # the sources the library's own build reads: fsr4-vk's tracked files but the host tools' submodules, of which the build
+    # names only the CMakeLists.txt (the overlay shader's dependencies), and Vulkan-Headers' headers
+    (cd "$F4/src" && git ls-files | grep -v '^third_party/' | tar -cf - -T -) | tar -xf - -C "$K/src"
+    cp -a "$T/fidelityfx-api" "$T/fonts" "$T/patches" "$K/src/third_party/"
+    (cd "$T/zstd" && git ls-files | tar -cf - -T -) | (mkdir -p "$K/src/third_party/zstd" && tar -xf - -C "$K/src/third_party/zstd")
+    cp -a "$T/Vulkan-Headers/include" "$K/src/third_party/Vulkan-Headers/"
+    for d in glslang SPIRV-Tools SPIRV-Headers; do
+        mkdir -p "$K/src/third_party/$d" && cp "$T/$d/CMakeLists.txt" "$K/src/third_party/$d/"
+    done
+    # their licences: fsr4-vk's (GPL-3.0) with its third-party notices, and the tools'
+    mkdir -p "$K/licenses"
+    cp "$F4/src/LICENSE" "$K/licenses/fsr4-vk-LICENSE"
+    [ -f "$F4/src/THIRD_PARTY_NOTICES.md" ] && cp "$F4/src/THIRD_PARTY_NOTICES.md" "$K/licenses/fsr4-vk-THIRD_PARTY_NOTICES.md"
+    [ -d "$F4/src/LICENSES" ] && cp -a "$F4/src/LICENSES" "$K/licenses/fsr4-vk-LICENSES"
+    cp "$T/dxil-spirv/LICENSE.MIT" "$K/licenses/dxil-spirv-LICENSE.MIT"
+    cp "$T/SPIRV-Tools/LICENSE" "$K/licenses/SPIRV-Tools-LICENSE"
+    cp "$T/glslang/LICENSE.txt" "$K/licenses/glslang-LICENSE.txt"
+    echo "$FSR4_VK_COMMIT" > "$K/src/FSR4_VK_COMMIT"
+    rm -rf "$F4"
+    echo "fsr4 kit: $(du -sh "$K" | cut -f1)"
+    mark fsr4 "$FSR4_VK_COMMIT-$CMAKE_PY-$NINJA_PY-$PY_MARK"
 fi
 
 # ---- the licenses of what the AppImage carries (Python's and its modules' are in python/) ----

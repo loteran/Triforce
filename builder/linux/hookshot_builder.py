@@ -31,7 +31,7 @@ import toolchain  # noqa: E402  (default_jobs: RX_JOBS)
 
 CONFIG = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), "triforce", "builder.ini")
 STAGES = {"read": "Reading your game files", "lift": "Translating the game to PC code", "compile": "Compiling",
-          "finish": "Putting the game folder together", "shaders": "Preparing shaders"}
+          "finish": "Putting the game folder together", "shaders": "Preparing shaders", "fsr4": "Building AMD FSR 4 for Linux"}
 DLSS_LICENSE = (
     "NVIDIA DLSS is NVIDIA's, not Triforce's. With it ticked, the build downloads NVIDIA's DLSS SDK (release v310.9.16) from "
     "github.com/NVIDIA/DLSS, under NVIDIA's own license, the NVIDIA RTX SDKs license:\n\n"
@@ -40,6 +40,29 @@ DLSS_LICENSE = (
     "Triforce never includes or shares them: never share a game folder built with them.\n\n"
     "Do you accept NVIDIA's license?"
 )
+
+
+FSR4_LICENSE = (
+    "AMD FSR 4 is AMD's, not Triforce's, and AMD makes it for Windows only. With it ticked, the build downloads AMD's "
+    "FidelityFX SDK 2.3.0 (about 120 MB) from github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK, under AMD's own license:\n\n"
+    "https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK/blob/v2.3.0/docs/license.md\n\n"
+    "From its upscaler it makes a Linux one on this PC (fsr4-vk, GPL-3.0; nothing to install), a few minutes after the "
+    "game, and puts amd_fidelityfx_upscaler_vk.so in the game folder. It runs on Radeon RX 6000, 7000 and 9000 cards. "
+    "Never share a game folder built with it.\n\n"
+    "Do you accept AMD's license?"
+)
+
+
+def fsr4_args(fsr4):
+    return ["--fetch-fsr4", "--accept-amd-license"] if fsr4 else []
+
+
+def folder_has_fsr4(folder):
+    """Whether a game folder has the AMD FSR 4 library made for it (nx2/fsr4_linux.py), in the game's own folder"""
+    if not folder:
+        return False
+    folder = os.path.expanduser(folder)
+    return any(os.path.isfile(os.path.join(folder, sub, "amd_fidelityfx_upscaler_vk.so")) for sub in ("", "bin"))
 
 
 def ngx_sdk_dir():
@@ -336,6 +359,7 @@ class Builder(tk.Tk):
         self.language = tk.StringVar(value=dict(make_game.LANGUAGES).get(code, names[0]))
         self.prepare = tk.BooleanVar(value=self.cfg.get("prepare", "1") != "0")   # (make_game.py's last step: off, at the first start)
         self.dlss = tk.BooleanVar(value=self.cfg.get("dlss", "0") == "1")
+        self.fsr4 = tk.BooleanVar(value=self.cfg.get("fsr4", "0") == "1")
         self.check_text = tk.StringVar()
         self.space_text = tk.StringVar()
         self.stage_text = tk.StringVar()
@@ -700,6 +724,10 @@ class Builder(tk.Tk):
                         command=self.on_dlss_changed, cursor="hand2").pack(anchor="w", pady=(px(12), 0))
         ttk.Label(options, text="For NVIDIA RTX graphics cards. NVIDIA's files stay on this PC: never share a game folder built with them.",
                   style="Small.TLabel", wraplength=px(660)).pack(anchor="w", padx=(px(26), 0), pady=(px(2), 0))
+        ttk.Checkbutton(options, text="AMD FSR 4 (made on this PC from AMD's SDK, under AMD's license)", variable=self.fsr4,
+                        command=self.on_fsr4_changed, cursor="hand2").pack(anchor="w", pady=(px(12), 0))
+        ttk.Label(options, text="For Radeon RX 6000, 7000 and 9000 graphics cards. A few minutes after the game; nothing to install.",
+                  style="Small.TLabel", wraplength=px(660)).pack(anchor="w", padx=(px(26), 0), pady=(px(2), 0))
 
         f.rowconfigure(10, weight=1, minsize=px(18))
         ttk.Label(f, textvariable=self.status, style="Status.TLabel", wraplength=px(800)).grid(
@@ -915,6 +943,12 @@ class Builder(tk.Tk):
 
         threading.Thread(target=run, daemon=True).start()
 
+    def on_fsr4_changed(self):
+        if self.fsr4.get() and not messagebox.askyesno("AMD FSR 4", FSR4_LICENSE):
+            self.fsr4.set(False)
+        self.cfg["fsr4"] = "1" if self.fsr4.get() else "0"
+        save_config(self.cfg)
+
     def start_make_update(self, folder):
         if not folder:
             self.show_form()
@@ -923,7 +957,8 @@ class Builder(tk.Tk):
             return
         dlss = bool(self.dlss.get()) if getattr(self, "dlss_toggled", False) else folder_has_dlss(folder)
         cmd = [sys.executable, "-I", os.path.join(ROOT, "nx2", "make_game.py"), "--update", folder] + \
-            ([] if self.prepare.get() else ["--no-prepare-shaders"]) + dlss_args(dlss)   # (as the last build chose)
+            ([] if self.prepare.get() else ["--no-prepare-shaders"]) + dlss_args(dlss) + \
+            fsr4_args(hasattr(self, "fsr4") and bool(self.fsr4.get()) and not folder_has_fsr4(folder))   # (as the last build chose; FSR 4 once)
         self.heading.configure(text="Updating your game")
         self.stage_text.set("Compiling what changed")
         self.started = time.time()
@@ -968,14 +1003,16 @@ class Builder(tk.Tk):
             return messagebox.showerror("Triforce", str(error))
         code = next((c for c, n in make_game.LANGUAGES if n == self.language.get()), "en-US")
         dlss = bool(self.dlss.get()) if hasattr(self, "dlss") else False
+        fsr4 = bool(self.fsr4.get()) if hasattr(self, "fsr4") else False
         self.cfg.update(kind=self.kind.get(), nup=self.nup.get(), romfs=self.romfs.get(), exefs=self.exefs.get(), out=out, language=code,
-                        prepare="1" if self.prepare.get() else "0", **({"dlss": "1" if dlss else "0"} if hasattr(self, "dlss") else {}))
+                        prepare="1" if self.prepare.get() else "0", **({"dlss": "1" if dlss else "0"} if hasattr(self, "dlss") else {}),
+                        **({"fsr4": "1" if fsr4 else "0"} if hasattr(self, "fsr4") else {}))
         save_config(self.cfg)
         # (issue 531) Without HOOKSHOT_JOBS or RX_JOBS, make_game chooses as on Windows, from the memory free now; this window chose
         # fewer, 80% of the total memory at 3.5 GB each, and the CPU sat at 29%
         cmd = [sys.executable, "-I", os.path.join(ROOT, "nx2", "make_game.py")] + src + ["--out", out, "--language", code] + \
             ([] if jobs is None else ["--jobs", str(jobs)]) + ([] if self.prepare.get() else ["--no-prepare-shaders"]) + \
-            (dlss_args(True) if dlss else [])
+            (dlss_args(True) if dlss else []) + (fsr4_args(True) if fsr4 else [])
         slow = slow_disk_warning(out)   # (a warning, not a stop: a hard drive still builds, only much slower)
         if slow is not None and not messagebox.askokcancel("Triforce", slow):
             return
