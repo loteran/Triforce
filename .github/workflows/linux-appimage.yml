@@ -176,7 +176,8 @@ jobs:
         run: |
           chmod +x dist/*.AppImage
           grep -h '^NAME=\|^VERSION=' /etc/os-release || true
-          ldd --version | head -1
+          # sed -n 1p reads to EOF: `| head -1` gives ldd SIGPIPE (141) under pipefail
+          ldd --version 2>&1 | sed -n 1p
           scripts/linux/check_player_build.sh dist/*.AppImage
 
   release:

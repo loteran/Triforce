@@ -15,7 +15,7 @@
 # Neither may write into the image's tree: on a player's PC it is read-only.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
-IMAGE=${1:-$(ls -t build-linux/Triforce-*-x86_64.AppImage 2>/dev/null | head -1 || true)}
+IMAGE=${1:-$(ls -t build-linux/Triforce-*-x86_64.AppImage 2>/dev/null | sed -n 1p || true)}
 [ -n "$IMAGE" ] && [ -f "$IMAGE" ] || { echo "no AppImage to check (scripts/linux/appimage.sh makes one)"; exit 1; }
 IMAGE=$(readlink -f "$IMAGE")
 TMP=$(mktemp -d)
@@ -46,10 +46,11 @@ K=$R/usr/lib/hookshot/fsr4
 for tool in dxil-spirv glslang spirv-as spirv-dis spirv-opt spirv-val; do
     [ -x "$K/tools/$tool" ] || { echo "the FSR 4 kit has no $tool"; exit 1; }
 done
+# (no `| head`/`grep -q` below: an early-closing reader SIGPIPEs the writer under pipefail)
 # (each runs here: the tools need nothing of this system but its C library; dxil-spirv finds its library beside it)
 in_image env LD_LIBRARY_PATH="$K/tools" "$K/tools/dxil-spirv" --help > /dev/null 2>&1 ||
-    in_image env LD_LIBRARY_PATH="$K/tools" "$K/tools/dxil-spirv" 2>&1 | grep -qi "usage" ||
-    { echo "dxil-spirv did not start:"; in_image env LD_LIBRARY_PATH="$K/tools" "$K/tools/dxil-spirv" --help 2>&1 | head -5; exit 1; }
+    in_image env LD_LIBRARY_PATH="$K/tools" "$K/tools/dxil-spirv" 2>&1 | grep -i "usage" > /dev/null ||
+    { echo "dxil-spirv did not start:"; in_image env LD_LIBRARY_PATH="$K/tools" "$K/tools/dxil-spirv" --help 2>&1 | sed -n 1,5p; exit 1; }
 in_image "$K/tools/glslang" --version > /dev/null
 in_image "$K/tools/spirv-val" --version > /dev/null
 for py_tool in cmake ninja; do in_image "$R/usr/python/bin/$py_tool" --version > /dev/null; done
@@ -72,7 +73,7 @@ echo "AMD FSR 4's kit runs here"
 written=$(find "$R" -type f -newer "$TMP/before" ! -path "*/__pycache__/*" -print)
 if [ -n "$written" ]; then
     echo "a player's build wrote into the AppImage's tree, which is read-only on a player's PC:"
-    echo "$written" | head -20
+    echo "$written" | sed -n 1,20p
     exit 1
 fi
 echo "a player's build starts from the AppImage's tree"
