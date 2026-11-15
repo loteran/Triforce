@@ -1,3 +1,8 @@
+<p align="center"><a href="https://ko-fi.com/W7W31VXIVC"><img src="https://ko-fi.com/img/githubbutton_sm.svg" alt="ko-fi"></a></p>
+
+> [!NOTE]
+> **Unofficial fork with Linux additions** (Linux AppImage, AMD FSR 4 on Linux, vendor frame generation). Upstream: [git.triforceproject.com/triforce/source](https://git.triforceproject.com/triforce/source). This is where the [NX2navi Linux AppImage](https://github.com/loteran/NX2navi) work continues.
+
 <p align="center">
   <img src="assets/triforce.png" alt="Triforce" width="230">
 </p>
