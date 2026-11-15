@@ -14,7 +14,23 @@ set(FFX_API "${FFX_ROOT}/ffx-api")
 set(FFX_VK_FISC "${FFX_SDK}/src/backends/vk/FrameInterpolationSwapchain")
 set(FFX_SC_LIBS "${FFX_SDK}/tools/ffx_shader_compiler/libs")
 find_package(Threads REQUIRED)
-find_package(Vulkan REQUIRED)
+# The Vulkan headers and loader: named by the caller (scripts/linux/deps.sh passes its pinned headers and the system's
+# libvulkan.so.1), else looked for on this machine. The library links the loader by its soname (libvulkan.so.1) only.
+set(FFX_VULKAN_INCLUDE "" CACHE PATH "the folder holding vulkan/vulkan.h")
+set(FFX_VULKAN_LIBRARY "" CACHE FILEPATH "the Vulkan loader, libvulkan.so.1 (or libvulkan.so)")
+if(FFX_VULKAN_INCLUDE AND FFX_VULKAN_LIBRARY)
+    if(NOT EXISTS "${FFX_VULKAN_INCLUDE}/vulkan/vulkan.h")
+        message(FATAL_ERROR "FFX_VULKAN_INCLUDE: no vulkan/vulkan.h in ${FFX_VULKAN_INCLUDE}")
+    endif()
+    if(NOT EXISTS "${FFX_VULKAN_LIBRARY}")
+        message(FATAL_ERROR "FFX_VULKAN_LIBRARY: ${FFX_VULKAN_LIBRARY} does not exist")
+    endif()
+    add_library(Vulkan::Vulkan SHARED IMPORTED)
+    set_target_properties(Vulkan::Vulkan PROPERTIES IMPORTED_LOCATION "${FFX_VULKAN_LIBRARY}"
+        INTERFACE_INCLUDE_DIRECTORIES "${FFX_VULKAN_INCLUDE}")
+else()
+    find_package(Vulkan REQUIRED)
+endif()
 find_program(GLSLANG_VALIDATOR glslangValidator REQUIRED)
 
 # The shader compiler runs during the build only. FFX_SC_EXECUTABLE names one built beforehand, for a cross build whose

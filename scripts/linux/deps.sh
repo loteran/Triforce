@@ -269,7 +269,11 @@ if ! done_for ffx "$FFX_SDK_VER-$GLSLANG_VER-$FFX_TREE"; then
     mkdir -p "$DEPS/ffx" "$DEPS/ffx-build/glslang"
     tar -xzf "$DL/glslang-release.tar.gz" -C "$DEPS/ffx-build/glslang"
     GCC_CC=$(command -v gcc-13 || command -v gcc) GCC_CXX=$(command -v g++-13 || command -v g++)
-    CC=$GCC_CC CXX=$GCC_CXX FFX_GLSLANG=$DEPS/ffx-build/glslang/bin/glslangValidator FFX_WORK=$DEPS/ffx-build/work \
+    # (the Vulkan headers the cpm step fetched above; the loader the system package libvulkan1 installs, as appimage.sh's sysroot takes it)
+    VK_LOADER=$(ldconfig -p | awk '$1 == "libvulkan.so.1" && /x86-64/ {print $NF; exit}')
+    [ -f "$VK_LOADER" ] || { echo "ffx: libvulkan.so.1 not found (apt: libvulkan1)" >&2; exit 1; }
+    CC=$GCC_CC CXX=$GCC_CXX FFX_VULKAN_INCLUDE=$DEPS/cpm/vulkanheaders/$VK_HEADERS/include FFX_VULKAN_LIBRARY=$VK_LOADER \
+        FFX_GLSLANG=$DEPS/ffx-build/glslang/bin/glslangValidator FFX_WORK=$DEPS/ffx-build/work \
         scripts/linux/ffx_linux/build.sh "$DEPS/ffx" "$DL"
     rm -rf "$DEPS/ffx-build"
     echo "ffx: $(du -sh "$DEPS/ffx" | cut -f1)"

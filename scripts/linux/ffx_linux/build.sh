@@ -11,6 +11,8 @@
 # Environment (all optional):
 #   FFX_LLVM=<folder with bin/clang, bin/clang++, bin/ld.lld>   build with that clang and lld instead of the system's compiler
 #                                                               (deps.sh: the pinned LLVM; the C++ runtime is linked statically)
+#   FFX_VULKAN_INCLUDE=<folder holding vulkan/vulkan.h>, FFX_VULKAN_LIBRARY=<libvulkan.so.1>   the Vulkan headers and loader
+#                                                               (default: what CMake's FindVulkan finds on this machine)
 #   FFX_GLSLANG=<glslangValidator or a glslang that takes its options>   the GLSL compiler the shader compiler runs
 #   FFX_WORK=<folder>   scratch folder (default: a new one under $TMPDIR); removed at the end
 # The library needs only glibc and libvulkan.so.1: its C++ runtime is inside. Its glibc floor is that of the system it is
@@ -19,6 +21,11 @@
 set -euo pipefail
 version=1.1.4
 sha256=0216556bfb0e243cec30004a2a98d38f4e3f7406cb7938e3c1b85c758e95d952
+for tool in curl unzip patch cmake ninja sha256sum objdump strip sed awk; do
+    command -v "$tool" >/dev/null || { echo "build.sh needs $tool" >&2; exit 1; }
+done
+if [ -n "${FFX_GLSLANG:-}" ]; then [ -x "$FFX_GLSLANG" ] || { echo "FFX_GLSLANG: $FFX_GLSLANG is not executable" >&2; exit 1; }
+else command -v glslangValidator >/dev/null || { echo "build.sh needs glslangValidator (or FFX_GLSLANG)" >&2; exit 1; }; fi
 here=$(cd "$(dirname "$0")" && pwd)
 out=$(mkdir -p "$1" && cd "$1" && pwd)
 cache=${2:-}
@@ -58,7 +65,10 @@ fi
 # (the same sources under another folder give the same library: no build path in the debug info or __FILE__)
 export CXXFLAGS="${CXXFLAGS:-} -ffile-prefix-map=$work=. -ffile-prefix-map=$here=ffx_linux"
 export CFLAGS="${CFLAGS:-} -ffile-prefix-map=$work=. -ffile-prefix-map=$here=ffx_linux"
-cmake -S "$here" -B "$work/build" -G Ninja -DCMAKE_BUILD_TYPE=Release -DFFX_ROOT="$work/sdk" "${tc[@]+"${tc[@]}"}" >/dev/null
+vk=()
+[ -z "${FFX_VULKAN_INCLUDE:-}" ] || vk+=(-DFFX_VULKAN_INCLUDE="$(cd "$FFX_VULKAN_INCLUDE" && pwd)")
+[ -z "${FFX_VULKAN_LIBRARY:-}" ] || vk+=(-DFFX_VULKAN_LIBRARY="$(readlink -f "$FFX_VULKAN_LIBRARY")")
+cmake -S "$here" -B "$work/build" -G Ninja -DCMAKE_BUILD_TYPE=Release -DFFX_ROOT="$work/sdk" "${vk[@]+"${vk[@]}"}" "${tc[@]+"${tc[@]}"}" >/dev/null
 cmake --build "$work/build"
 so=$work/build/libamd_fidelityfx_vk.so
 strip --strip-unneeded "$so" 2>/dev/null || true
