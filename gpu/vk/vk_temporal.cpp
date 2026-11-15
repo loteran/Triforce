@@ -1601,6 +1601,14 @@ bool chain(VkCommandBuffer cmd, int mode, Engine& engine, const Camera& cam, con
     } disturbed;
     uint32_t iw = rw, ih = rh;
     const char* why = nullptr;
+    {   // (each engine's first frame in the chain, said before its prepare: a prepare that never returns leaves no other line)
+        static std::atomic<unsigned> told{0};
+        const unsigned bit = 1u << engine_slot(mode);
+        if (!(told.fetch_or(bit) & bit))
+            logf("vk: upscaler: %s: its first frame in the chain, prepare next: render %ux%u, output %ux%u%s, %s colour (frame %llu)",
+                 engine.e->name, rw, rh, dw, dh, pre ? " (before the bloom)" : "", hdr ? "HDR" : "LDR",
+                 (unsigned long long)texture_frame_no());
+    }
     const int ready = engine.e->prepare(cmd, rw, rh, dw, dh, hdr, &iw, &ih, &why);
     if (ready < 0) {
         engine.failed = true;

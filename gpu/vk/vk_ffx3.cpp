@@ -211,12 +211,31 @@ std::vector<Dead>& dead() {
     static std::vector<Dead>& d = *new std::vector<Dead>;
     return d;
 }
+/// The timeline wait of the library's contexts, logged (the first few, not every frame): what it waited for and how long. A value
+/// at or past the recording being made now is signalled by this thread's own submit, which has not happened: waiting for it only
+/// ran to vk_timeline_wait's 250 ms, so it is not waited for (the context goes at a later reap)
+void timeline_wait(uint64_t fence, const char* why) {
+    if (fence >= draw_recording_value()) {
+        static std::atomic<int> told{0};
+        if (told++ < 8)
+            logf("vk: FSR 3.1: no wait for the GPU's timeline value %llu (%s): the recording being made (%llu) signals it, its submit is not "
+                 "made yet", (unsigned long long)fence, why, (unsigned long long)draw_recording_value());
+        return;
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+    vk_timeline_wait(fence);
+    static std::atomic<int> told{0};
+    if (told++ < 8)
+        logf("vk: FSR 3.1: waited for the GPU's timeline value %llu (%s): %.1f ms (done %llu)", (unsigned long long)fence, why,
+             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(),
+             (unsigned long long)vk_timeline_completed());
+}
 int reap(bool wait) {
     auto& d = dead();
     int n = 0;
     const uint64_t done = vk_timeline_completed();
     for (size_t i = 0; i < d.size();) {
-        if (!pol::gpu_past(d[i].fence, done) && wait) vk_timeline_wait(d[i].fence);
+        if (!pol::gpu_past(d[i].fence, done) && wait) timeline_wait(d[i].fence, "a context let go of");
         if (pol::gpu_past(d[i].fence, vk_timeline_completed())) {
             d[i] = std::move(d.back());
             d.pop_back();
@@ -268,15 +287,20 @@ std::shared_ptr<Context> make_context(const pol::Ask& a, uint32_t mw, uint32_t m
     d.maxRenderSize = {mw, mh};
     d.maxUpscaleSize = {a.ow, a.oh};
     d.fpMessage = &on_message;
+    logf("vk: FSR 3.1: creating AMD's upscale context (ffxCreateContext) for outputs of %ux%u, render sizes up to %ux%u, %s colour (frame "
+         "%llu, %zu let go of still in flight)", a.ow, a.oh, mw, mh, a.hdr ? "HDR" : "LDR", (unsigned long long)texture_frame_no(),
+         dead().size());
     const auto t0 = std::chrono::steady_clock::now();
     ffxReturnCode_t r = l.create(&c->context, &d.header, nullptr);
+    logf("vk: FSR 3.1: ffxCreateContext returned %d after %.1f ms", (int)r,
+         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
     if (r != FFX_API_RETURN_OK && !dead().empty()) {
         // Refused while contexts let go of are still in flight (most often their video memory): the GPU finishes with them,
         // they go, and the creation is tried once more, rather than the library failing for the run
         c->context = nullptr;
         const uint64_t w0 = (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(
                                 std::chrono::steady_clock::now().time_since_epoch()).count();
-        vk_timeline_wait(dead_fence());
+        timeline_wait(dead_fence(), "before the creation's second try");
         const int gone = reap(false);
         const uint64_t w1 = (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(
                                 std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -434,6 +458,8 @@ bool evaluate(VkCommandBuffer cmd, const TemporalFrame& f) {
     d.viewSpaceToMetersFactor = 1.0f;
     d.flags = hdr ? 0 : FFX_UPSCALE_FLAG_NON_LINEAR_COLOR_SRGB;   // (HDR: linear light as it is)
     ::mkwvk::rec::boundary(::mkwvk::rec::B_DIRECT);   // (ffxDispatch records into cmd itself: what this thread recorded through vk_work.h reaches cmd first)
+    if (!s.told_first) logf("vk: FSR 3.1: the first ffxDispatch (upscale) starts: %ux%u -> %ux%u (frame %llu)", f.render_w, f.render_h,
+                            f.output.width, f.output.height, (unsigned long long)texture_frame_no());
     const ffxReturnCode_t r = l.dispatch(&s.context[s.cur]->context, &d.header);
     note_work();   // (AMD's dispatches: full_barrier must not take the next barrier for a repeat of the one before them)
     s.slot[s.cur].fence = std::max(s.slot[s.cur].fence, draw_recording_value());   // (recorded into cmd, a refusal too, for all this side knows)

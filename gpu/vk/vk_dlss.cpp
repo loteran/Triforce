@@ -326,6 +326,7 @@ bool ngx_init() {
     // (NGX also writes its own log files into the data folder; with RX_VK_DLSS_LOG=1 its lines go to ours instead)
     info.LoggingInfo.DisableOtherLoggingSinks = verbose;
     // (a project id of Hookshot's own: NGX wants one with the custom engine type, any GUID)
+    logf("vk: NVIDIA DLSS: NGX starting (NVSDK_NGX_VULKAN_Init, frame %llu)", (unsigned long long)texture_frame_no());
     NVSDK_NGX_Result r = NVSDK_NGX_VULKAN_Init_with_ProjectID(kProjectId, NVSDK_NGX_ENGINE_TYPE_CUSTOM,
                                                               "1.0", wdata.c_str(), dev.instance, dev.physical, dev.device,
                                                               instance_proc(), vkGetDeviceProcAddr, &info);
@@ -470,6 +471,7 @@ int prepare(VkCommandBuffer cmd, uint32_t rw, uint32_t rh, uint32_t ow, uint32_t
     if (hdr) cp.InFeatureCreateFlags |= NVSDK_NGX_DLSS_Feature_Flags_IsHDR | NVSDK_NGX_DLSS_Feature_Flags_AutoExposure;
     const auto t0 = std::chrono::steady_clock::now();
     ::mkwvk::rec::boundary(::mkwvk::rec::B_DIRECT);   // (NGX records into cmd itself: what this thread recorded through vk_work.h reaches cmd first)
+    logf("vk: NVIDIA DLSS: making its feature (%s; frame %llu): %ux%u -> %ux%u", why, (unsigned long long)texture_frame_no(), max_w, max_h, ow, oh);
     const NVSDK_NGX_Result r = NGX_VULKAN_CREATE_DLSS_EXT(cmd, 1, 1, &s.feature, s.params, &cp);
     const double made_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     note_work();   // (NGX's own commands, which vk_work.h does not see: the next full_barrier is not left out)

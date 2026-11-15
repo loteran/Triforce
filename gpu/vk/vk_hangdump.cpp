@@ -141,7 +141,124 @@ void hang_watch_start() {
 
 }  // namespace mkwvk
 #else
+// (Linux: the same watchdog, with signals. When no frame has been presented for RX_VK_HANG_SEC seconds (default 20) after the
+// first, a line goes to the log, and every thread is sent SIGUSR2 in turn: its handler takes the thread's stack (backtrace) and
+// the watchdog writes it, with the thread's name, its state and the kernel function it sleeps in (/proc/self/task/<tid>/wchan), to
+// RX_VK_HANG_DUMP (default triforce_hang.txt beside the log). Off with RX_VK_HANG_DUMP=0)
+#include <dirent.h>
+#include <dlfcn.h>
+#include <execinfo.h>
+#include <signal.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <string>
+#include <thread>
+#include <vector>
+
 namespace mkwvk {
-void hang_watch_start() {}   // (linux: no hang dump)
+extern int64_t presents_now;
+void logf(const char* fmt, ...);
+
+namespace {
+constexpr int kFrames = 40;
+void* g_frames[kFrames];
+std::atomic<int> g_count{-1};   // (-1: not taken yet)
+
+void on_stack(int) {
+    g_count.store(backtrace(g_frames, kFrames), std::memory_order_release);
+}
+
+std::string read_file(const std::string& path) {
+    std::string out;
+    if (FILE* f = fopen(path.c_str(), "r")) {
+        char buf[512];
+        size_t n;
+        while ((n = fread(buf, 1, sizeof buf - 1, f)) > 0 && out.size() < 4096) out.append(buf, n);
+        fclose(f);
+    }
+    while (!out.empty() && (out.back() == '\n' || out.back() == ' ')) out.pop_back();
+    return out;
+}
+
+void dump(const char* path) {
+    const pid_t pid = getpid();
+    const pid_t self = (pid_t)syscall(SYS_gettid);
+    FILE* f = fopen(path, "w");
+    if (!f) return;
+    fprintf(f, "# hang dump: %lld presents\n", (long long)presents_now);
+    std::vector<pid_t> tids;
+    if (DIR* d = opendir("/proc/self/task")) {
+        while (dirent* e = readdir(d))
+            if (e->d_name[0] >= '0' && e->d_name[0] <= '9') tids.push_back((pid_t)atoi(e->d_name));
+        closedir(d);
+    }
+    for (pid_t tid : tids) {
+        const std::string base = "/proc/self/task/" + std::to_string(tid);
+        std::string stat = read_file(base + "/stat");
+        const size_t close = stat.rfind(')');
+        const char state = close != std::string::npos && close + 2 < stat.size() ? stat[close + 2] : '?';
+        fprintf(f, "\nthread %d \"%s\" state %c wchan %s\n", (int)tid, read_file(base + "/comm").c_str(), state,
+                read_file(base + "/wchan").c_str());
+        if (tid == self) continue;
+        g_count.store(-1, std::memory_order_release);
+        if (syscall(SYS_tgkill, pid, tid, SIGUSR2) != 0) continue;
+        for (int i = 0; i < 100 && g_count.load(std::memory_order_acquire) < 0; i++)
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        const int n = g_count.load(std::memory_order_acquire);
+        for (int k = 0; k < n; k++) {
+            Dl_info info{};
+            const char* mod = "?";
+            if (dladdr(g_frames[k], &info) && info.dli_fname) {
+                mod = strrchr(info.dli_fname, '/') ? strrchr(info.dli_fname, '/') + 1 : info.dli_fname;
+            }
+            fprintf(f, "  %2d %s+%#llx %s (%p)\n", k, mod,
+                    (unsigned long long)((char*)g_frames[k] - (char*)(info.dli_fbase ? info.dli_fbase : nullptr)),
+                    info.dli_sname ? info.dli_sname : "", g_frames[k]);
+        }
+    }
+    fclose(f);
+}
+}  // namespace
+
+void hang_watch_start() {
+    static std::atomic<bool> started{false};
+    const char* env = getenv("RX_VK_HANG_DUMP");
+    if (env && !strcmp(env, "0")) return;
+    if (started.exchange(true)) return;
+    const std::string path = env && *env ? env : "triforce_hang.txt";
+    const int sec = getenv("RX_VK_HANG_SEC") ? std::max(5, atoi(getenv("RX_VK_HANG_SEC"))) : 20;
+    struct sigaction sa{};
+    sa.sa_handler = on_stack;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = SA_RESTART;
+    sigaction(SIGUSR2, &sa, nullptr);
+    std::thread([path, sec] {
+        pthread_setname_np(pthread_self(), "mkw_vk hang");
+        void* warm[2];
+        backtrace(warm, 2);   // (loads libgcc's unwinder here, not inside a signal handler)
+        int64_t last = -1;
+        int still = 0;
+        bool dumped = false;
+        for (;;) {
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+            const int64_t now = presents_now;
+            if (now != last) last = now, still = 0, dumped = false;
+            else if (++still >= sec && !dumped) {
+                logf("vk: hang watch: no present for %d s (%lld presents so far): every thread's stack and wait go to %s", still,
+                     (long long)now, path.c_str());
+                dump(path.c_str());
+                dumped = true;
+            }
+        }
+    }).detach();
+}
 }  // namespace mkwvk
 #endif
