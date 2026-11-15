@@ -82,6 +82,9 @@ struct { void note(const int*) {} } restart_state;
 bool can_mic() { return false; }
 /* (the Upscaler row's choices, which set_row steps through: the game's own only, here) */
 unsigned upscalers_available() { return 1; }
+/* (the Frame generation engine row's choices, which set_row steps through: none here) */
+unsigned fg_engines_available() { return 1; }
+namespace fgengine { constexpr int kEngineRows = 4; int step_row(int v, int, unsigned) { return v; } }
 void mic_chosen() {}
 // (set_row steps the Output row through vk_menu.cpp's step_output_choice (#1144): not what this checks)
 int step_output_choice(int id, int dir) { return id + dir; }

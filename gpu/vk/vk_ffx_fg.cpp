@@ -351,7 +351,8 @@ bool queues_wanted() {
     static const bool wanted = [] {
         const char* e = getenv("RX_VK_FFX_FG");
         if (e && *e && atoi(e) == 0) return false;
-        if (ngxfg::vendor() != ngxfg::VENDOR_AUTO && ngxfg::vendor() != ngxfg::VENDOR_AMD) return false;
+        // (RX_VK_FRAMEGEN_VENDOR alone: the queues are made once, with the device, so the Frame generation engine row can still choose AMD's library later)
+        if (ngxfg::env_vendor() != ngxfg::VENDOR_AUTO && ngxfg::env_vendor() != ngxfg::VENDOR_AMD) return false;
         return ffx_library_present();
     }();
     return wanted;

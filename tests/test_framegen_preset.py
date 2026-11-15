@@ -52,6 +52,9 @@ void sync_preset_budgets(int) {}
 bool row_fixed(const int*) { return false; }
 int upscaler() { return 0; }
 unsigned upscalers_available() { return 1; }
+/* (the Frame generation engine row's choices, which set_row steps through: none here) */
+unsigned fg_engines_available() { return 1; }
+namespace fgengine { constexpr int kEngineRows = 4; int step_row(int v, int, unsigned) { return v; } }
 namespace ur {
 int snap(int, int value) { return value; }
 int step(int, int value, int dir) { return value + dir; }

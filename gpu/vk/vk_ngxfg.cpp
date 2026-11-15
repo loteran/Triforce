@@ -40,15 +40,40 @@
 
 namespace mkwvk::ngxfg {
 
-Vendor vendor() {
+Vendor env_vendor(bool* set) {
+    static bool is_set = false;
     static const Vendor v = [] {
         const char* e = getenv("RX_VK_FRAMEGEN_VENDOR");
         bool known = true;
         const Vendor parsed = fgengine::parse_vendor(e, &known);
-        if (!known) logf("vk: RX_VK_FRAMEGEN_VENDOR=%s is not auto, nvidia, amd or triforce: auto", e);
+        if (!known) logf("vk: RX_VK_FRAMEGEN_VENDOR=%s is not auto, nvidia, amd or triforce: the Frame generation engine row's choice", e);
+        is_set = e && *e && known;
         return parsed;
     }();
+    if (set) *set = is_set;
     return v;
+}
+
+bool vendor_env_set() {
+    bool set = false;
+    env_vendor(&set);
+    return set;
+}
+
+// (the row's NVIDIA is Auto where DLSS Frame Generation cannot run: dlss_fg_max says, from NGX's own answers, whichever vendor is
+// chosen. NGX's start reads the vendor through dlssg_env_allowed, never this)
+bool dlssg_capable() { return dlss_fg_max() > 0; }
+
+Vendor vendor() {
+    bool set = false;
+    const Vendor env = env_vendor(&set);
+    const int row = opts.fg_engine;
+    return fgengine::effective_vendor(set, env, row, row != 1 || set || dlssg_capable());
+}
+
+bool dlssg_env_allowed() {
+    const Vendor v = env_vendor();
+    return v == VENDOR_AUTO || v == VENDOR_NVIDIA;
 }
 
 bool dlssg_allowed() { return vendor() == VENDOR_AUTO || vendor() == VENDOR_NVIDIA; }

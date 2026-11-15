@@ -136,6 +136,12 @@ inline bool upscaler_fixed(bool dlss_ok) { return !dlss_ok; }
 /// The same, from the mask of what can run: fixed when only the game's own can
 inline bool upscaler_fixed(unsigned available) { return (available & ~bit(GAME)) == 0; }
 inline bool resolution_fixed(int upscaler) { return full_scale(upscaler); }
+/// The FSR sharpening row (opts.fsr_sharpness, fsr_sharpen.h): AMD's own RCAS inside AMD's library, which draws FSR 4 and its native AA, and
+/// FSR 3.1 where the library draws it (ffx3_library: ffx3_usable(); else Triforce's own passes of FSR 3.1, which have none). Shown in a build
+/// where either can run, and fixed (shown without arrows, the saved value kept) while another Upscaler is on
+inline bool fsr_sharpen_used(int upscaler, bool ffx3_library) { return is_fsr4(upscaler) || (upscaler == FSR3 && ffx3_library); }
+inline bool fsr_sharpen_fixed(int upscaler, bool ffx3_library) { return !fsr_sharpen_used(upscaler, ffx3_library); }
+inline bool fsr_sharpen_shown(bool fsr4_built, bool ffx3_library) { return fsr4_built || ffx3_library; }
 /// The DLSS model row: shown where the Upscaler is (a build with DLSS), with nothing to choose while the game's own upscales
 inline bool model_shown(bool built) { return built; }
 /// (env_set: RX_VK_DLSS_PRESET names a preset, which wins over the row for this run)

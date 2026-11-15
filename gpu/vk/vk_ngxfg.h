@@ -23,10 +23,19 @@ namespace ngxfg {
 
 using Vendor = fgengine::Vendor;
 constexpr Vendor VENDOR_AUTO = Vendor::Auto, VENDOR_NVIDIA = Vendor::Nvidia, VENDOR_AMD = Vendor::Amd, VENDOR_TRIFORCE = Vendor::Triforce;
-/// RX_VK_FRAMEGEN_VENDOR, read once
+/// RX_VK_FRAMEGEN_VENDOR, read once; *set: it names a vendor (the Frame generation engine row is then fixed). Unset, empty or unknown: Auto, not set
+Vendor env_vendor(bool* set = nullptr);
+bool vendor_env_set();
+/// Who may make the frames now: RX_VK_FRAMEGEN_VENDOR when it names one, else the Frame generation engine row (opts.fg_engine), live: a
+/// change of the row is taken at the next present (framegen_engine_tick)
 Vendor vendor();
-/// DLSS Frame Generation may be the engine at all: the vendor is auto or nvidia (amd and triforce never ask NGX for it)
+/// DLSS Frame Generation can run on this GPU, whatever the vendor says (NGX's answers: an RTX 40 or 50, its runtime). The row's NVIDIA asks it
+bool dlssg_capable();
+/// DLSS Frame Generation may be the engine at all now: the vendor is auto or nvidia (amd and triforce never ask NGX for it)
 bool dlssg_allowed();
+/// The same for RX_VK_FRAMEGEN_VENDOR alone: what NGX's start reads (the capabilities and extensions are asked once, whichever the row says
+/// then, so a row changed in play finds them)
+bool dlssg_env_allowed();
 
 /// Whether this build has DLSS-G in it (HOOKSHOT_NGX)
 bool built();

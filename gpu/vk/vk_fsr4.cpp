@@ -15,7 +15,9 @@
 #include <atomic>
 #include <cstdlib>
 
+#include "fsr_sharpen.h"
 #include "vk_internal.h"
+#include "vk_menu.h"
 #include "vk_temporal.h"
 
 #ifdef HOOKSHOT_FSR
@@ -411,8 +413,10 @@ bool evaluate(VkCommandBuffer cmd, const TemporalFrame& f) {
     d.motionVectorScale = {1.0f, 1.0f};             // (render pixels already, towards the frame before)
     d.renderSize = {f.render_w, f.render_h};
     d.upscaleSize = {f.output.width, f.output.height};
-    d.enableSharpening = false;   // (the Sharpness row sharpens at the window, after the HUD)
-    d.sharpness = 0.0f;
+    // (the FSR sharpening row: AMD's own RCAS, raised below a 75% render share; off at 0, the default. The Sharpness row sharpens at the window,
+    // after the HUD, whatever this says)
+    d.enableSharpening = fsr_sharpen::enabled(opts.fsr_sharpness);
+    d.sharpness = fsr_sharpen::strength(opts.fsr_sharpness, f.render_w, f.output.width);
     d.frameTimeDelta = frame_ms;
     d.preExposure = 1.0f;
     d.reset = f.reset;

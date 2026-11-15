@@ -757,7 +757,7 @@ void note_engine(const char* engine, const char* why) {
 const char* dlssg_why(char* buf, size_t n) {
     const int most = ngxfg::max_generated();
     if (!ngxfg::built()) return "(this build has no NVIDIA NGX SDK)";
-    if (ngxfg::vendor() == ngxfg::VENDOR_TRIFORCE) return "(RX_VK_FRAMEGEN_VENDOR=triforce)";
+    if (ngxfg::vendor() == ngxfg::VENDOR_TRIFORCE) return "(the Frame generation engine is Triforce)";
     if (dev.hdr || opts.hdr == 2) return "(HDR is on: DLSS Frame Generation is SDR here)";
     if (most <= 0) return snprintf(buf, n, "(DLSS Frame Generation: %s)", dlss_fg_why()), buf;
     if (opts.framegen > most + 1) return snprintf(buf, n, "(%dx is more than DLSS Frame Generation makes here: %dx)", opts.framegen, most + 1), buf;

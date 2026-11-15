@@ -252,6 +252,8 @@ def cpp_checks(tools, timeout):
     out.append((fgr, build_and_run(fgr, ["-Wall", "-Wextra", "-Werror"], [])))
     fge = "gpu/vk/tests/framegen_engine_test.cpp"   # (who makes the made frames: DLSS-G, AMD's library, Triforce's own: framegen_engine.h)
     out.append((fge, build_and_run(fge, ["-Wall", "-Wextra", "-Werror"], [])))
+    fsh = "gpu/vk/tests/fsr_sharpen_test.cpp"   # (the FSR sharpening row's strength for AMD's library: fsr_sharpen.h)
+    out.append((fsh, build_and_run(fsh, ["-Wall", "-Wextra", "-Werror"], [])))
     return out, ([] if cxx else ["a C++ compiler"])
 
 

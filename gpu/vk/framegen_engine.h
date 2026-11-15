@@ -1,7 +1,7 @@
 // Who makes the frames between the game's, as plain functions: no Vulkan, no library. gpu/vk/tests/framegen_engine_test.cpp checks it.
 //
-// The Frame generation row (opts.framegen: 0 off, 1 Auto, 2 to 8 times) and RX_VK_FRAMEGEN_VENDOR (auto, nvidia, amd, triforce) pick the
-// engine, in this order:
+// The Frame generation row (opts.framegen: 0 off, 1 Auto, 2 to 8 times) and the Frame generation engine row (opts.fg_engine: Auto, NVIDIA
+// DLSS-G, AMD, Triforce; RX_VK_FRAMEGEN_VENDOR=auto|nvidia|amd|triforce, when set, goes over it) pick the engine, in this order:
 //   1. NVIDIA DLSS Frame Generation (vk_ngxfg.h) where it can run: an RTX 40 or 50, its runtime there, the multiplier within what the
 //      GPU makes, SDR;
 //   2. AMD FSR 3.1 frame generation through AMD's own FidelityFX library (vk_ffx_fg.h) at 2x, when the library is beside the game and
@@ -34,6 +34,38 @@ inline Vendor parse_vendor(const char* text, bool* known = nullptr) {
     if (!std::strcmp(text, "triforce")) return Vendor::Triforce;
     if (known) *known = false;
     return Vendor::Auto;
+}
+
+/// The Frame generation engine row (opts.fg_engine, saved as frame_generation_engine): the vendors in the order above
+constexpr int kEngineRows = 4;
+inline Vendor vendor_from_row(int row) {
+    switch (row) {
+    case 1: return Vendor::Nvidia;
+    case 2: return Vendor::Amd;
+    case 3: return Vendor::Triforce;
+    default: return Vendor::Auto;
+    }
+}
+/// The vendor that rules: RX_VK_FRAMEGEN_VENDOR when it names one (env_set), else the row's. A row on NVIDIA where DLSS Frame Generation
+/// cannot run here (a saved choice from another PC) is Auto: the env var keeps its strict meaning (none made), the row never leaves a
+/// player with no made frames at all
+inline Vendor effective_vendor(bool env_set, Vendor env, int row, bool dlssg_capable) {
+    if (env_set) return env;
+    const Vendor v = vendor_from_row(row);
+    return v == Vendor::Nvidia && !dlssg_capable ? Vendor::Auto : v;
+}
+/// One bit per row value that can run here (1 << row): Auto and Triforce always, NVIDIA where DLSS Frame Generation can run, AMD where
+/// its library can
+inline unsigned rows_available(bool dlssg_capable, bool amd_usable) { return 1u | (dlssg_capable ? 2u : 0u) | (amd_usable ? 4u : 0u) | 8u; }
+/// The row's next value from v (dir +1 / -1), wrapping over those that can run here; a value that cannot run here steps as Auto does
+inline int step_row(int v, int dir, unsigned available) {
+    available |= 1u;
+    int at = v < 0 || v >= kEngineRows || !(available & (1u << v)) ? 0 : v;
+    for (int i = 0; i < kEngineRows; i++) {
+        at = (at + (dir > 0 ? 1 : kEngineRows - 1)) % kEngineRows;
+        if (available & (1u << at)) return at;
+    }
+    return 0;
 }
 
 /// What the choice depends on, all of it read by the caller
@@ -74,14 +106,14 @@ inline Choice choose(const Facts& f) {
     if (f.framegen < 1 || !f.enabled) return {Engine::None, f.framegen < 1 ? "the Frame generation row is off" : "frame generation is off for this run"};
     switch (f.vendor) {
     case Vendor::Nvidia:
-        if (f.dlssg_usable) return {Engine::DlssG, "(RX_VK_FRAMEGEN_VENDOR=nvidia)"};
-        return {Engine::None, "(RX_VK_FRAMEGEN_VENDOR=nvidia, and DLSS Frame Generation cannot run here)"};
+        if (f.dlssg_usable) return {Engine::DlssG, "(engine nvidia)"};
+        return {Engine::None, "(engine nvidia, and DLSS Frame Generation cannot run here)"};
     case Vendor::Triforce:
-        return triforce_own(f, "(RX_VK_FRAMEGEN_VENDOR=triforce)");
+        return triforce_own(f, "(engine triforce)");
     case Vendor::Amd:
-        if (!amd_multiplier(f.framegen)) return triforce_own(f, "(RX_VK_FRAMEGEN_VENDOR=amd, but AMD's library makes 2x only)");
-        if (!f.amd_usable) return triforce_own(f, "(RX_VK_FRAMEGEN_VENDOR=amd, but AMD's library cannot run here)");
-        return {Engine::AmdLibrary, "(RX_VK_FRAMEGEN_VENDOR=amd)"};
+        if (!amd_multiplier(f.framegen)) return triforce_own(f, "(engine amd, but AMD's library makes 2x only)");
+        if (!f.amd_usable) return triforce_own(f, "(engine amd, but AMD's library cannot run here)");
+        return {Engine::AmdLibrary, "(engine amd)"};
     case Vendor::Auto:
         break;
     }

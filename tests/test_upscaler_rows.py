@@ -116,6 +116,25 @@ def main():
         raise SystemExit("upscalers_available does not ask vk_fsr4.cpp whether FSR 4 runs here")
     if "upscalers_available()" not in function(menu, "void set_row(") or "upscalers_available()" not in function(menu, "bool row_fixed("):
         raise SystemExit("the Upscaler row does not step over (or fix on) what runs here")
+    # the FSR sharpening and Frame generation engine rows: beside the Upscaler and Frame generation, the player's (not the preset's), the engine
+    # row's choice taken through the engine switch and fixed by RX_VK_FRAMEGEN_VENDOR
+    for row, hint in (('"FSR sharpening", &opts.fsr_sharpness', "hn_fsr_sharpness"), ('"Frame generation engine", &opts.fg_engine', "hn_fg_engine")):
+        if row not in menu:
+            raise SystemExit("vk_menu.cpp: the %s row is missing" % row.split(",")[0])
+        entry = menu[menu.index(row):]
+        entry = entry[:entry.index("},")]
+        if hint not in entry or not entry.rstrip().endswith("false, true"):
+            raise SystemExit("vk_menu.cpp: %s has no %s, or takes a restart, or turns the Quality preset to Custom" % (row.split(",")[0], hint))
+    if menu.index('"Frame generation", &opts.framegen') > menu.index('"Frame generation engine", &opts.fg_engine') or \
+            menu.index('"Frame generation engine", &opts.fg_engine') > menu.index('"Frame pacing", &opts.pace'):
+        raise SystemExit("vk_menu.cpp: the Frame generation engine row is not between Frame generation and Frame pacing")
+    if "ngxfg::vendor_env_set()" not in function(menu, "bool row_fixed(") or "ur::fsr_sharpen_fixed(" not in function(menu, "bool row_fixed("):
+        raise SystemExit("row_fixed: the engine row is not fixed by RX_VK_FRAMEGEN_VENDOR, or FSR sharpening by the Upscaler")
+    if "fgengine::step_row(" not in function(menu, "void set_row("):
+        raise SystemExit("set_row: the engine row does not step over what cannot run here")
+    for name in ("vk_ffx3.cpp", "vk_fsr4.cpp"):
+        if "fsr_sharpen::strength(opts.fsr_sharpness" not in (ROOT / "gpu" / "vk" / name).read_text(encoding="utf-8"):
+            raise SystemExit("%s does not give AMD's library the FSR sharpening row's strength" % name)
     with tempfile.TemporaryDirectory(prefix="upscaler-rows-") as tmp:
         exe = Path(tmp) / "upscaler-rows"
         subprocess.run([args.cxx, "-std=c++20", "-Wall", "-Wextra", "-Werror",

@@ -9,7 +9,8 @@
 // The host side follows NX2navi's runtime/vk_ffx.cpp, which runs the same game on this library: a Vulkan backend description
 // chained to the upscale context description, inputs in SHADER_READ_ONLY_OPTIMAL, the output written in GENERAL.
 //
-// Sharpening is off here: Triforce sharpens at the window with its Sharpness row, after the HUD. (FSR's own RCAS comes later.)
+// Sharpening is off here unless the FSR sharpening row asks for AMD's own RCAS (fsr_sharpen.h): Triforce sharpens at the window with its
+// Sharpness row, after the HUD, independently.
 //
 // The library is loaded here once for the whole back end: vk_ffx_fg.cpp (frame generation through the same library, its own
 // swapchain) takes the handle and the five entry points from ffx_library() (vk_ffx3.h).
@@ -32,6 +33,7 @@
 #include <unistd.h>
 #endif
 
+#include "fsr_sharpen.h"
 #include "vk_draw.h"
 #include "vk_internal.h"
 #include "vk_menu.h"
@@ -418,8 +420,10 @@ bool evaluate(VkCommandBuffer cmd, const TemporalFrame& f) {
     d.motionVectorScale = {1.0f, 1.0f};             // (render pixels already, towards the frame before)
     d.renderSize = {f.render_w, f.render_h};
     d.upscaleSize = {f.output.width, f.output.height};
-    d.enableSharpening = false;   // (the Sharpness row sharpens at the window, after the HUD)
-    d.sharpness = 0.0f;
+    // (the FSR sharpening row: AMD's own RCAS, raised below a 75% render share; off at 0, the default. The Sharpness row sharpens at the window,
+    // after the HUD, whatever this says)
+    d.enableSharpening = fsr_sharpen::enabled(opts.fsr_sharpness);
+    d.sharpness = fsr_sharpen::strength(opts.fsr_sharpness, f.render_w, f.output.width);
     d.frameTimeDelta = frame_ms;
     d.preExposure = 1.0f;
     d.reset = f.reset || s.last_drawn != s.cur;

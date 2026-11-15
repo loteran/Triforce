@@ -131,11 +131,13 @@ apply at the next start; the game asks. They're saved in `triforce_options.ini` 
 |---|---|
 | Quality preset | Custom, Minimum (4 GB), Low (6 GB), Balanced (8 GB), High (12 GB), Ultra (16 GB+): one choice that sets resolution, upscaling, frame generation and VRAM limits for your card |
 | Fullscreen | Off, On |
-| Frame generation | Off, 2x up to 8x |
+| Frame generation | Off, Auto, 2x up to 8x |
+| Frame generation engine | Auto, NVIDIA DLSS-G, AMD (library), Triforce: who makes the made frames. Auto picks the best that runs on your PC; a choice that cannot run here is skipped |
 | Frame pacing | Off, On |
 | Resolution | Auto (the game's dynamic resolution), 100%, 75%, 67%, 50% |
 | Upscaling | Off, Catmull-Rom, Lanczos, AMD FSR 1 |
 | Sharpness | 0–100% |
+| FSR sharpening | Off, 5–100%: AMD's own sharpening inside FSR 4 and FSR 3.1 through AMD's library, apart from Sharpness |
 | Texture filtering | Game's, 2x, 4x, 8x, 16x anisotropic |
 | Game speed | Real time (keeps normal pace), Per frame (slows down below 60 fps) |
 | Handheld profile | Off, On |

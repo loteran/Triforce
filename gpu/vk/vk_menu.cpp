@@ -50,6 +50,7 @@
 #include "vk_fsr3fi.h"    // (the Frame generation row: whether FSR 3.1 makes the frame)
 #include "vk_fsr4.h"
 #include "vk_ngxfg.h"    // (the Frame generation row: whether DLSS Frame Generation makes the frames)
+#include "vk_ffx_fg.h"    // (the Frame generation engine row: whether AMD's library can make the frames)
 #include "vk_framegen.h"   // (the Frame generation row's hint: which engine makes the frames, framegen_choice)
 #include "vk_temporal.h"
 #include "vk_renodx.h"    // (renodx_built: the RenoDX rows only in a build with its shaders)
@@ -278,6 +279,66 @@ const char* hn_dlss_model(int v, int variant) {
     if (variant == 2) return env;
     return variant == 0 ? t[std::clamp(v, 0, ur::kModels - 1)] : nullptr;
 }
+/// The FSR sharpening row (opts.fsr_sharpness): AMD's own sharpening inside FSR 3.1 (through AMD's library) and FSR 4
+const char* tx_fsr_sharpness(int v) {
+    if (v <= 0) return "Off";
+    static char b[8];
+    snprintf(b, sizeof b, "%d%%", v);
+    return b;
+}
+/// The FSR sharpening: the value chosen; variant 1: the Upscaler is not one of AMD's library's; variant 2: FSR 3.1 is drawn by Triforce's own
+/// passes here (no library), which have no sharpening of their own
+const char* hn_fsr_sharpness(int v, int variant) {
+    const char* const t = v <= 0 ? "Off: FSR sharpens nothing itself. The Sharpness row below works as it always does."
+                                 : "AMD's own sharpening inside FSR, raised further when the 3D is smaller than three quarters of the output. "
+                                   "Apart from the Sharpness row, which sharpens the finished picture.";
+    static const char* const unused = "Used by AMD FSR 4 and by FSR 3.1 through AMD's library: choose one in the Upscaler row.";
+    static const char* const own = "FSR 3.1 is drawn by Triforce's own passes here (no AMD library), which have no sharpening of their own: use the Sharpness row.";
+    if (variant < 0) variant = upscaler() == ur::FSR3 && !ffx3_usable() ? 2 : ur::fsr_sharpen_used(upscaler(), ffx3_usable()) ? 0 : 1;
+    return variant == 0 ? t : variant == 1 ? unused : variant == 2 ? own : nullptr;
+}
+/// The Frame generation engine row (opts.fg_engine): who makes the made frames, RX_VK_FRAMEGEN_VENDOR going over it. A choice that cannot
+/// run on this machine is skipped by the arrows and says so (a saved one from another PC is kept, and Auto's or Triforce's own is used)
+unsigned fg_engines_available() { return fgengine::rows_available(ngxfg::dlssg_capable(), ffxfg::usable()); }
+const char* fg_engine_name(int v) {
+    static const char* const t[fgengine::kEngineRows] = {"Auto", "NVIDIA DLSS-G", "AMD (library)", "Triforce"};
+    return t[std::clamp(v, 0, fgengine::kEngineRows - 1)];
+}
+const char* tx_fg_engine(int v) {
+    static char b[48];
+    if (ngxfg::vendor_env_set()) {   // (the env var's vendor has the row's numbers: framegen_engine.h kEngineRows)
+        snprintf(b, sizeof b, "%s (RX_VK_FRAMEGEN_VENDOR)", fg_engine_name((int)ngxfg::env_vendor()));
+        return b;
+    }
+    v = std::clamp(v, 0, fgengine::kEngineRows - 1);
+    if (fg_engines_available() & (1u << v)) return fg_engine_name(v);
+    snprintf(b, sizeof b, "%s (not here)", fg_engine_name(v));
+    return b;
+}
+/// The Frame generation engine: the value chosen, then (NVIDIA and AMD) why it cannot run here, then that RX_VK_FRAMEGEN_VENDOR sets it.
+/// The variants run on without a gap: Auto and Triforce 0 and 1, NVIDIA and AMD 0 to 2, then nullptr
+const char* hn_fg_engine(int v, int variant) {
+    static const char* const t[fgengine::kEngineRows] = {
+        "DLSS Frame Generation where it runs, else AMD's library at 2x, else Triforce's own.",
+        "Only NVIDIA DLSS Frame Generation (RTX 40 and 50) makes frames: none where it cannot, such as at a multiplier it does not make or in HDR.",
+        "AMD FSR 3.1 frame generation through AMD's library at 2x, with its own swapchain. Triforce's own makes the other multipliers.",
+        "Triforce's own: AMD FSR 3.1's interpolation at 2x, the optical flow at any other multiplier. Never DLSS Frame Generation or AMD's library.",
+    };
+    static const char* const no[fgengine::kEngineRows] = {
+        nullptr,
+        "Not available here: needs an NVIDIA RTX 40 or 50 GPU with DLSS Frame Generation's runtime (see the readme). Auto is used instead.",
+        "Not available here: needs AMD's FidelityFX library beside the game and a device with the queues its swapchain needs (see the readme). "
+        "Triforce's own is used instead.",
+        nullptr,
+    };
+    static const char* const env = "Set for this run by RX_VK_FRAMEGEN_VENDOR.";
+    v = std::clamp(v, 0, fgengine::kEngineRows - 1);
+    if (variant < 0)
+        variant = ngxfg::vendor_env_set() ? (no[v] ? 2 : 1) : !(fg_engines_available() & (1u << v)) ? 1 : 0;
+    if (variant == 0) return t[v];
+    if (no[v]) return variant == 1 ? no[v] : variant == 2 ? env : nullptr;
+    return variant == 1 ? env : nullptr;
+}
 const char* tx_aniso(int v) {   // (Triforce: the Texture filtering row)
     static const char* t[] = {"Game's", "2x", "4x", "8x", "16x"};
     if ((unsigned)v >= sizeof t / sizeof t[0]) return t[0];
@@ -380,7 +441,9 @@ bool row_fixed(const int* value) {
     return (value == &opts.reflex && !reflex_available()) || (value == &opts.antilag && !antilag_available()) ||
            (value == &opts.dlss && ur::upscaler_fixed(upscalers_available())) ||
            (value == &opts.resolution && ur::resolution_fixed(upscaler())) || (value == &opts.upscale && !filter_needed()) ||
-           (value == &opts.dlss_model && ur::model_fixed(upscaler(), dlss_preset_env() != nullptr));
+           (value == &opts.dlss_model && ur::model_fixed(upscaler(), dlss_preset_env() != nullptr)) ||
+           (value == &opts.fsr_sharpness && ur::fsr_sharpen_fixed(upscaler(), ffx3_usable())) ||
+           (value == &opts.fg_engine && ngxfg::vendor_env_set());
 }
 const char* tx_output_res(int v) {
     static char b[32];
@@ -544,7 +607,7 @@ void apply_preset(int p) {
     default:
         break;
     }
-    // (the Upscaler and Frame generation are the player's: a preset never turns DLSS or made frames on or off. With DLSS
+    // (the Upscaler, Frame generation, its engine and FSR sharpening are the player's: a preset never turns DLSS or made frames on or off. With DLSS
     // its resolution is DLSS's nearest mode)
     if (p > 0) opts.resolution = ur::snap(upscaler(), opts.resolution);
     sync_preset_budgets(p);
@@ -723,6 +786,10 @@ Row rows[] = {
      hn_upscaler},
     {TAB_GRAPHICS, "DLSS model", &opts.dlss_model, 0, ur::kModels - 1, 1, tx_dlss_model,
      "Which of NVIDIA's DLSS networks draws the picture.", hn_dlss_model, false, true},
+    // (Triforce: AMD's own RCAS inside the library's FSR 3.1 and FSR 4, fsr_sharpen.h; off, as before, until asked)
+    {TAB_GRAPHICS, "FSR sharpening", &opts.fsr_sharpness, 0, 100, 5, tx_fsr_sharpness,
+     "AMD FSR 3.1 (through AMD's library) and FSR 4: how much of FSR's own sharpening is used. Off leaves the picture as it is.",
+     hn_fsr_sharpness, false, true},
     // (Triforce, 11-13: vk_temporal.cpp pre_wanted, off until asked)
     {TAB_GRAPHICS, "Upscale before bloom", &opts.upscale_pre, 0, 1, 1, tx_onoff,
      "With NVIDIA DLSS, DLAA or AMD FSR as the Upscaler: On, it works on the scene before the game's glow and tone mapping, "
@@ -741,6 +808,10 @@ Row rows[] = {
     {TAB_GRAPHICS, "Frame generation", &opts.framegen, 0, 8, 1, tx_framegen,
      "Makes frames between the game's own, for smoother motion, at a little input delay. Fast motion or camera cuts can "
      "show artifacts.", hn_framegen, false, true},
+    // (Triforce: the engine that makes the made frames; RX_VK_FRAMEGEN_VENDOR over it. A change is taken at the next present, through the
+    // engine switch (framegen_engine_tick: the swapchain made again where AMD's library comes or goes))
+    {TAB_GRAPHICS, "Frame generation engine", &opts.fg_engine, 0, fgengine::kEngineRows - 1, 1, tx_fg_engine,
+     "Which engine makes the made frames: Auto picks the best that runs on this PC.", hn_fg_engine, false, true},
     {TAB_GRAPHICS, "Frame pacing", &opts.pace, 0, 1, 1, tx_onoff, "When each frame is shown.", hn_pace},
     {TAB_GRAPHICS, "NVIDIA Reflex", &opts.reflex, 0, 2, 1, tx_reflex,
      "NVIDIA GPUs: each frame starts as late as it can, for less input delay. Not used with frame generation.", hn_reflex},
@@ -1107,6 +1178,7 @@ bool row_shown(int i) {
     return (rows[i].cheat < 0 || cheats_on()) &&
            (rows[i].value != &opts.dlss || ur::upscaler_shown(dlss_built() || fsr4_built(), fsr3::supported() || ffx3_usable())) &&
            (rows[i].value != &opts.dlss_model || ur::model_shown(dlss_built())) &&
+           (rows[i].value != &opts.fsr_sharpness || ur::fsr_sharpen_shown(fsr4_built(), ffx3_usable())) &&
            // (local, RenoDX port: its rows with HDR Native, in a build with its shaders; Triforce: and its own row on)
            (!rdx_row(rows[i].value) || (opts.hdr == 2 && renodx_built() && opts.renodx)) &&
            (rows[i].value != &opts.renodx || renodx_built()) &&
@@ -1298,6 +1370,7 @@ void set_row(Row& r, int v, int dir, bool keep = true) {
     // (the scaling rows: only what can run here; the Render resolution row through the Upscaler's own steps)
     if (r.value == &opts.dlss) v = ur::step_upscaler(upscaler(), dir, upscalers_available());
     if (r.value == &opts.resolution) v = ur::step(upscaler(), *r.value, dir);
+    if (r.value == &opts.fg_engine) v = fgengine::step_row(*r.value, dir, fg_engines_available());   // (what runs here)
     if (r.value == &opts.output_res) {   // (smallest to largest: kOutputOrder)
         v = step_output_choice(*r.value, dir);
         if (v == *r.value) return;

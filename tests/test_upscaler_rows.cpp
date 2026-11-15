@@ -133,5 +133,12 @@ int main() {
     CHECK("model row shown with DLSS built", ur::model_shown(true) && !ur::model_shown(false));
     CHECK("model row fixed with the game's own or the switch", ur::model_fixed(GAME, false) && !ur::model_fixed(DLSS, false) &&
                                                                !ur::model_fixed(DLAA, false) && ur::model_fixed(DLSS, true));
+    // the FSR sharpening row: AMD's library's FSR 4 (both) and FSR 3.1 only where the library draws it
+    CHECK("FSR sharpening used by FSR 4 and its native AA", ur::fsr_sharpen_used(ur::FSR4, false) && ur::fsr_sharpen_used(ur::FSR4_AA, false));
+    CHECK("FSR sharpening used by FSR 3.1 through the library only", ur::fsr_sharpen_used(ur::FSR3, true) && !ur::fsr_sharpen_used(ur::FSR3, false));
+    CHECK("FSR sharpening waits with the game's own, DLSS and DLAA", ur::fsr_sharpen_fixed(GAME, true) && ur::fsr_sharpen_fixed(DLSS, true) &&
+                                                                       ur::fsr_sharpen_fixed(DLAA, true));
+    CHECK("FSR sharpening row shown where AMD's library can run", ur::fsr_sharpen_shown(true, false) && ur::fsr_sharpen_shown(false, true) &&
+                                                                    !ur::fsr_sharpen_shown(false, false));
     std::puts("upscaler rows: all checks passed");
 }

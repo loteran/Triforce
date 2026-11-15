@@ -76,5 +76,29 @@ int main() {
                                      std::strlen(fe::name(E::Fsr3fi)) && std::strlen(fe::name(E::Flow)) && std::strlen(fe::name(E::None)));
     if (failures) return 1;
     std::puts("framegen_engine_test: all passed");
+    // the Frame generation engine row: the vendors in order, the env var over it, NVIDIA without DLSS-G is Auto, and stepping skips what cannot run
+    {
+        check("row 0 is auto", fe::vendor_from_row(0) == V::Auto);
+        check("row 1 is nvidia", fe::vendor_from_row(1) == V::Nvidia);
+        check("row 2 is amd", fe::vendor_from_row(2) == V::Amd);
+        check("row 3 is triforce", fe::vendor_from_row(3) == V::Triforce);
+        check("a row past the end is auto", fe::vendor_from_row(9) == V::Auto && fe::vendor_from_row(-1) == V::Auto);
+        check("the row rules without the env var", fe::effective_vendor(false, V::Auto, 3, true) == V::Triforce);
+        check("the env var goes over the row", fe::effective_vendor(true, V::Amd, 3, true) == V::Amd);
+        check("the env var 'auto' goes over the row too", fe::effective_vendor(true, V::Auto, 3, true) == V::Auto);
+        check("a row on NVIDIA without DLSS-G is auto", fe::effective_vendor(false, V::Auto, 1, false) == V::Auto);
+        check("the env var on nvidia without DLSS-G stays strict", fe::effective_vendor(true, V::Nvidia, 0, false) == V::Nvidia);
+        check("a row on AMD stays AMD (the choice falls to Triforce's own by itself)", fe::effective_vendor(false, V::Auto, 2, false) == V::Amd);
+        check("all four run with DLSS-G and the library", fe::rows_available(true, true) == 15u);
+        check("auto and triforce always run", fe::rows_available(false, false) == 9u);
+        check("step over what cannot run", fe::step_row(0, 1, fe::rows_available(false, false)) == 3 && fe::step_row(3, 1, fe::rows_available(false, false)) == 0);
+        check("step down wraps", fe::step_row(0, -1, fe::rows_available(true, true)) == 3 && fe::step_row(3, -1, fe::rows_available(true, true)) == 2);
+        check("step with only the library", fe::step_row(0, 1, fe::rows_available(false, true)) == 2);
+        check("a value that cannot run steps as auto does", fe::step_row(1, 1, fe::rows_available(false, false)) == 3 && fe::step_row(1, -1, fe::rows_available(false, false)) == 3);
+        check("a saved value past the row steps as auto does", fe::step_row(7, 1, fe::rows_available(true, true)) == 1);
+        // the row's choice, through the order
+        check("row triforce makes it Triforce's own", pick(fe::effective_vendor(false, V::Auto, 3, true), 2, true, true, true) == E::Fsr3fi);
+        check("row nvidia without DLSS-G falls to the order", pick(fe::effective_vendor(false, V::Auto, 1, false), 2, false, true, true) == E::AmdLibrary);
+    }
     return 0;
 }

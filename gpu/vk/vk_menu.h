@@ -8,6 +8,7 @@ namespace mkwvk {
 // (out of the box every feature is off: what the game does on its own. The ini beside the executable keeps a player's choices)
 struct Options {
     int framegen = 0;     // made frames: 0 off, 1 Auto (to the display's refresh), or 2 to 8 times the game's frames
+    int fg_engine = 0; // who makes the made frames: 0 Auto, 1 NVIDIA DLSS-G, 2 AMD (library), 3 Triforce (framegen_engine.h; RX_VK_FRAMEGEN_VENDOR over it; saved as frame_generation_engine)
     int pace = 0;         // frames shown on an even line (vk_framegen.cpp)
     int hdr = 0;          // (hookshot) HDR10 out (vk_framegen.cpp framegen_hdr): 0 off, 1 the SDR picture expanded, 2 the game's own (native) HDR; when the display has it (the swapchain made again at once)
     int hdr_white = 200;  // HDR paper white, nits (the picture's white)
@@ -37,6 +38,7 @@ struct Options {
     int dlss_model = 0;   // DLSS's network, by its preset: 0 K (transformer), 1 M, 2 L (second-generation transformer), 3 NVIDIA's
                           // default (upscaler_rows.h model_preset; vk_dlss.cpp). RX_VK_DLSS_PRESET over it
     int sharpness = 0;    // 0 to 100
+    int fsr_sharpness = 0; // FSR sharpening, 0 (off) to 100: AMD's own RCAS in the library's FSR 3.1 and FSR 4 (fsr_sharpen.h), apart from sharpness
     int aniso = 0;        // texture filtering: 0 the game's, 1 2x, 2 4x, 3 8x, 4 16x anisotropic at least (vk_draw.cpp sampler_for)
     int realtime = 1;     // game time follows the clock (host/nn_vi.c); 0: per frame (slower frames, slower game)
     int handheld = 0;     // the game's handheld profile: ~4 fps, softer; read once, at the start (host/nn_applet.c)
