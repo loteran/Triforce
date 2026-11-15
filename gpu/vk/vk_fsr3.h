@@ -57,8 +57,12 @@ struct Inputs {
 } // namespace fsr3
 
 /// FSR 3.1 upscales: the Insert menu's Upscaler row says FSR 3.1 (upscaler_rows.h FSR3) and neither RX_VK_DLSS nor
-/// RX_VK_FSR4 is set over it (vk_temporal.h temporal_env_chosen), or RX_VK_FSR=1; and it runs here
+/// RX_VK_FSR4 is set over it (vk_temporal.h temporal_env_chosen), or RX_VK_FSR=1; and Triforce's own passes run here, with AMD's
+/// library (vk_ffx3.h) not drawing it in their place
 bool fsr3_wanted();
+/// FSR 3.1 is asked for (the row's, or RX_VK_FSR=1), whichever draws it: AMD's own library through the temporal chain (vk_ffx3.cpp,
+/// when it loads: vk_temporal.cpp's temporal_mode then says FSR3) or Triforce's own passes here (fsr3_wanted)
+bool fsr3_requested();
 
 /// A gameplay upscale's dispatch, as vk_temporal.h's temporal_upscale takes it (vk_draw.cpp's fsr3_stand_in finds them the same
 /// way). With FSR 3.1's frame interpolation on, the dispatch's input and this frame's camera become its inputs here

@@ -56,6 +56,9 @@ struct DrawArgs {
 
 /// A recording starts (its slot's descriptor pool and upload stream are reset); value: the timeline value it signals
 void draw_begin_recording(int slot, VkCommandBuffer cmd, uint64_t value);
+/// The timeline value the recording this thread is making signals (0: none begun): what an upscaler's context was last used by,
+/// so that it is destroyed only once the GPU is past it (vk_ffx3.cpp)
+uint64_t draw_recording_value();
 /// Publish CPU writes from this slot's used streams before its commands reach the GPU (also for worker slots).
 void draw_flush_recording(int slot);
 /// The recording's stream still holds [at, at + n) in the mapping at base (a reset starts used over)

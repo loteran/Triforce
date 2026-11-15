@@ -246,6 +246,8 @@ def cpp_checks(tools, timeout):
     out.append((regmap, build_and_run(regmap, ["-O1", "-Wno-everything", "-I" + eden, "-I" + compat], [])))
     dlssg = "gpu/vk/tests/dlssg_math_test.cpp"   # (NVIDIA DLSS Frame Generation's camera: dlssg_math.h)
     out.append((dlssg, build_and_run(dlssg, ["-Wall", "-Wextra", "-Werror"], [])))
+    ffx3 = "gpu/vk/tests/ffx3_policy_test.cpp"   # (FSR 3.1 through AMD's library: its context policy, ffx3_policy.h)
+    out.append((ffx3, build_and_run(ffx3, ["-Wall", "-Wextra", "-Werror"], [])))
     return out, ([] if cxx else ["a C++ compiler"])
 
 

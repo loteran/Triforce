@@ -930,6 +930,11 @@ def main():
         fsr_flags = ["-DHOOKSHOT_FSR", "-I" + os.path.join(kit.HERE, "..", "third_party", "fidelityfx")] if FSR else []
         if FSR:
             print("the Vulkan back end: with AMD FSR 4 (AMD's FSR API headers, third_party/fidelityfx)", flush=True)
+        # (AMD FSR 3.1 through AMD's own library, loaded at run time (gpu/vk/vk_ffx3.cpp): in every build, from the FidelityFX SDK
+        # 1.1.4's MIT API headers (third_party/ffx_api_114). Only vk_ffx3.cpp sees them: FSR 4's SDK 2.4 headers above name the same
+        # types with other layouts, so the two sets never meet in one translation unit)
+        ffx3_flags = ["-I" + os.path.normpath(os.path.join(kit.HERE, "..", "third_party", "ffx_api_114"))]
+        ffx3_deps = tree_headers(os.path.normpath(os.path.join(kit.HERE, "..", "third_party", "ffx_api_114")))
         # (RenoDX's HDR, a build's option too: only vk_renodx.cpp sees its compiled shaders; without them it is the stubs
         # that replace nothing)
         renodx_flags = ["-DHOOKSHOT_RENODX", "-I" + RENODX] if RENODX else []
@@ -976,10 +981,12 @@ def main():
                             (ngx_flags if os.path.basename(src) in ("vk_dlss.cpp", "vk_ngxfg.cpp") else []) +
                             (imgui_flags if os.path.basename(src) in imgui_users else []) +
                             (fsr_flags if os.path.basename(src) == "vk_fsr4.cpp" else []) +
+                            (ffx3_flags if os.path.basename(src) == "vk_ffx3.cpp" else []) +
                             (renodx_flags if os.path.basename(src) == "vk_renodx.cpp" else []),
                             vk_lib_deps if lib else vdeps + (logo_text if os.path.basename(src) == "vk_imgui.cpp" else b"") +
                             (renodx_deps if os.path.basename(src) == "vk_renodx.cpp" else b"") +
                             (ngx_deps if os.path.basename(src) in ("vk_dlss.cpp", "vk_ngxfg.cpp") else b"") +
+                            (ffx3_deps if os.path.basename(src) == "vk_ffx3.cpp" else b"") +
                             (imgui_deps if os.path.basename(src) in imgui_users else b"")))
         if NGX_SDK and not LINUX and toolchain.mingw():
             # (llvm-mingw: NVIDIA's static library was built with Microsoft's compiler for its static runtime (/MT). What it asks

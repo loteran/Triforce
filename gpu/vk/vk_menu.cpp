@@ -46,6 +46,7 @@
 #include "vk_menu_keys.h"   // (which gamepad buttons confirm and go back: those A and B are bound to)         // (how it looks: Dear ImGui, vk_imgui.h)
 #include "vk_dlss.h"
 #include "vk_fsr3.h"      // (the Upscaler row: whether AMD FSR 3.1 runs on this GPU)
+#include "vk_ffx3.h"      // (...or AMD's own library draws it)
 #include "vk_fsr3fi.h"    // (the Frame generation row: whether FSR 3.1 makes the frame)
 #include "vk_fsr4.h"
 #include "vk_ngxfg.h"    // (the Frame generation row: whether DLSS Frame Generation makes the frames)
@@ -182,7 +183,7 @@ const char* hn_antilag(int v, int variant) {
 namespace ur = upscaler_rows;
 /// One bit per upscaler that runs here (upscaler_rows.h bit). Each backend caches its own answer, so this costs nothing
 unsigned upscalers_available() {
-    return ur::bit(ur::GAME) | ur::dlss_bits(dlss_why() == DLSS_OK) | (fsr3::supported() ? ur::bit(ur::FSR3) : 0u) |
+    return ur::bit(ur::GAME) | ur::dlss_bits(dlss_why() == DLSS_OK) | (fsr3::supported() || ffx3_usable() ? ur::bit(ur::FSR3) : 0u) |
            ur::fsr4_bits(fsr4_why() == FSR_OK);
 }
 /// (FSR 3.1 has inputs of its own; DLSS and FSR 4 run on the frame chain they share, temporal_mode)
@@ -1089,7 +1090,7 @@ bool rdx_row(const int* v) {   // (local, RenoDX port)
 }
 bool row_shown(int i) {
     return (rows[i].cheat < 0 || cheats_on()) &&
-           (rows[i].value != &opts.dlss || ur::upscaler_shown(dlss_built() || fsr4_built(), fsr3::supported())) &&
+           (rows[i].value != &opts.dlss || ur::upscaler_shown(dlss_built() || fsr4_built(), fsr3::supported() || ffx3_usable())) &&
            (rows[i].value != &opts.dlss_model || ur::model_shown(dlss_built())) &&
            // (local, RenoDX port: its rows with HDR Native, in a build with its shaders; Triforce: and its own row on)
            (!rdx_row(rows[i].value) || (opts.hdr == 2 && renodx_built() && opts.renodx)) &&

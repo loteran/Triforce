@@ -61,6 +61,8 @@
 #include "vk_ngxfg.h"
 #include "vk_draw.h"
 #include "vk_fsr3.h"   // (fsr3_wanted: AMD FSR 3.1 upscales with inputs of its own)
+#include "vk_fsr3fi.h"   // (frames_wanted: not before the bloom with frame interpolation on)
+#include "vk_ffx3.h"   // (AMD's own library as the engine of the row's FSR 3.1)
 #include "vk_fsr4.h"
 #include "vk_menu.h"
 #include "vk_renodx.h"   // (renodx_built: temporal_scene_format)
@@ -103,9 +105,11 @@ int temporal_mode() {
     int v = opts.dlss;
     if (dlss > 0) v = dlss >= 2 ? ur::DLAA : ur::DLSS;   // (2 and up: DLAA, as RX_VK_DLSS was clamped before)
     else if (fsr4 > 0) v = fsr4 >= 2 ? ur::FSR4_AA : ur::FSR4;
-    // (FSR 3.1, the row's 3, is not an engine of this chain: the game's own as far as it is concerned. Nor anything while
-    // FSR 3.1 upscales: one upscaler at a time, and one camera jitter. A switch above goes over the row's FSR 3.1 too
-    // (fsr3_wanted asks temporal_env_chosen); RX_VK_FSR=1 goes over them)
+    // (FSR 3.1 asked for (the row's 3, RX_VK_FSR=1) and AMD's own library there and working (vk_ffx3.cpp): an engine of this
+    // chain, as FSR 4 is, with the chain's inputs. Otherwise it is the game's own as far as the chain is concerned, and
+    // Triforce's own passes upscale (vk_fsr3.cpp): one upscaler at a time, and one camera jitter. A switch above goes over the
+    // row's FSR 3.1 too (fsr3_requested asks temporal_env_chosen); RX_VK_FSR=1 goes over them)
+    if (fsr3_requested() && ffx3_usable()) return ur::FSR3;
     if (!ur::is_dlss(v) && !ur::is_fsr4(v)) return ur::GAME;
     if (fsr3_wanted()) return ur::GAME;
     if (ur::is_dlss(v) && dlss_why() != DLSS_OK) return ur::GAME;
@@ -152,7 +156,7 @@ struct Engine {
 
 struct State {
     std::mutex mu;
-    Engine engines[2];               // (DLSS, FSR: engine_of)
+    Engine engines[3];               // (DLSS, FSR 4, FSR 3.1 through AMD's library: engine_of)
     const TemporalEngine* drawing = nullptr;   // (the engine that drew last: another one starts a new history)
     Image color, depth, motion, output;
     // (the engine before the bloom, scaling up: the scene's colour target as its pass left it, in the scene's format; and
@@ -327,17 +331,19 @@ void note_output(const Texture* out, uint32_t level) {
     s.out_h.store(std::max(1u, out->height >> level), std::memory_order_relaxed);
 }
 
-/// The chain's slot for the engine of an Upscaler value (DLSS and DLAA: DLSS's; FSR 4 and its native AA: FSR's)
+/// The chain's slot for the engine of an Upscaler value (DLSS and DLAA: DLSS's; FSR 4 and its native AA: FSR 4's; FSR 3.1: AMD's library's)
+int engine_slot(int mode) { return ur::is_fsr4(mode) ? 1 : mode == ur::FSR3 ? 2 : 0; }
 Engine& engine_of(int mode) {
     State& s = st();
-    Engine& k = s.engines[ur::is_fsr4(mode) ? 1 : 0];
-    if (!k.e) k.e = ur::is_fsr4(mode) ? fsr4_engine() : dlss_engine();
+    Engine& k = s.engines[engine_slot(mode)];
+    if (!k.e) k.e = ur::is_fsr4(mode) ? fsr4_engine() : mode == ur::FSR3 ? ffx3_engine() : dlss_engine();
     return k;
 }
 const char* name_of(int mode) {
     switch (mode) {
     case ur::DLSS: return "NVIDIA DLSS";
     case ur::DLAA: return "NVIDIA DLAA";
+    case ur::FSR3: return "AMD FSR 3.1";
     case ur::FSR4: return "AMD FSR 4";
     case ur::FSR4_AA: return "AMD FSR 4 Native AA";
     default: return "the game's own";
@@ -1152,7 +1158,7 @@ uint32_t temporal_jitter_size(int axis) {
     const int mode = temporal_mode();
     if (off || mode == ur::GAME) return 0;
     const uint64_t last = s.last_frame.load(std::memory_order_relaxed);
-    if (s.engines[ur::is_fsr4(mode) ? 1 : 0].failed.load(std::memory_order_relaxed) || !last || texture_frame_no() - last > 30)
+    if (s.engines[engine_slot(mode)].failed.load(std::memory_order_relaxed) || !last || texture_frame_no() - last > 30)
         return 0;
     if (axis == 2) return s.jitter_phases.load(std::memory_order_relaxed);
     return axis ? s.jitter_h.load(std::memory_order_relaxed) : s.jitter_w.load(std::memory_order_relaxed);
@@ -1375,7 +1381,8 @@ bool pre_wanted(int mode) {
         const int e = env_switch("RX_VK_DLSS_PRE");
         return e >= 0 ? e != 0 : upscale_pre_at_start != 0;
     }();
-    return on && (ur::is_dlss(mode) || ur::is_fsr4(mode) || fsr3_pre_wanted());
+    // (AMD's library's FSR 3.1: not with FSR's frame interpolation on, whose inputs are made at the upscale's dispatch, as for Triforce's own)
+    return on && (ur::is_dlss(mode) || ur::is_fsr4(mode) || (mode == ur::FSR3 && fsr3fi::frames_wanted() == 0) || fsr3_pre_wanted());
 }
 
 /// The upscale's dispatch in a frame the engine drew before the bloom: the tone mapped picture into its output, nothing
@@ -1434,7 +1441,7 @@ bool pre_dispatch(VkCommandBuffer cmd, int mode, Texture* in, VkImageView in_vie
     if (learn && pre_wanted(mode)) {   // (it did not: what the first draw after the scene was, for the next frame)
         if (s.pre_candidate.program && !(s.pre_candidate == s.pre_key)) {
             logf("vk: %s: before the game's bloom and tone mapping from the next frame: the first draw after the scene is "
-                 "program %016llx into %ux%u, format %d (frame %llu)", ur::is_dlss(mode) || ur::is_fsr4(mode) ? name_of(mode) : "AMD FSR 3.1",
+                 "program %016llx into %ux%u, format %d (frame %llu)", ur::is_dlss(mode) || ur::is_fsr4(mode) || mode == ur::FSR3 ? name_of(mode) : "AMD FSR 3.1",
                  (unsigned long long)s.pre_candidate.program, s.pre_candidate.width, s.pre_candidate.height,
                  (int)s.pre_candidate.format, (unsigned long long)texture_frame_no());
             s.pre_key = s.pre_candidate;
@@ -1788,8 +1795,8 @@ Texture* temporal_pre_tonemap(VkCommandBuffer cmd) {
     std::lock_guard lk(s.mu);
     const Camera cam = s.cam;
     Texture* scene = const_cast<Texture*>(cam.color);
-    // (AMD FSR 3.1: not one of the chain's engines, its own inputs and passes: pre_fsr3)
-    const bool f3 = !ur::is_dlss(mode) && !ur::is_fsr4(mode);
+    // (Triforce's own AMD FSR 3.1: not one of the chain's engines, its own inputs and passes: pre_fsr3. Through AMD's library it is)
+    const bool f3 = !ur::is_dlss(mode) && !ur::is_fsr4(mode) && mode != ur::FSR3;
     Engine* const engine = f3 ? nullptr : &engine_of(mode);
     // (anything unexpected: nothing here, and the upscale's dispatch draws as before, on the tone mapped picture)
     if (!cam.valid || !scene || (engine && (!engine->e || engine->failed)) || cam.depth_gen != texture_destroy_generation())

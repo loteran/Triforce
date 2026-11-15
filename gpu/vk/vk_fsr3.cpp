@@ -18,6 +18,7 @@
 
 #include "vk_fsr3.h"
 #include "vk_fsr3_inputs.h"
+#include "vk_ffx3.h"      // (ffx3_usable: AMD's library draws FSR 3.1 in place of these passes)
 #include "vk_fsr3fi.h"   // (frames_wanted: not before the bloom with frame interpolation on)
 #include "vk_draw.h"      // (descriptors_disturbed)
 #include "vk_gprof.h"     // (RX_VK_PASS_TIMING: a span per pass, so the report names them)
@@ -755,12 +756,18 @@ bool fail(const char* why) {   // (the network runs: why, when it changes and ev
 
 } // namespace
 
-bool fsr3_wanted() {
+bool fsr3_requested() {
     static const int env = env_switch("RX_VK_FSR");
     if (env == 0) return false;
     // (the Upscaler row's FSR 3.1, upscaler_rows.h, read each time: the row changes it while the game runs. RX_VK_DLSS=1 / 2
     // or RX_VK_FSR4=1 / 2 goes over the row, its FSR 3.1 too: vk_temporal.cpp's chain draws then)
-    return (env > 0 || (opts.dlss == upscaler_rows::FSR3 && !temporal_env_chosen())) && fsr3::supported();
+    return env > 0 || (opts.dlss == upscaler_rows::FSR3 && !temporal_env_chosen());
+}
+
+bool fsr3_wanted() {
+    // (AMD's own library draws FSR 3.1 through the temporal chain when it is there and works (vk_ffx3.cpp); these passes are the
+    // fallback, and what runs without it)
+    return fsr3_requested() && !ffx3_usable() && fsr3::supported();
 }
 
 bool fsr3_pre_wanted() { return fsr3_wanted() && fsr3fi::frames_wanted() == 0; }

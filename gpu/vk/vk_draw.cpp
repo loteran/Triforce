@@ -4367,6 +4367,8 @@ void draw_flush_recording(int slot) {
     }
 }
 
+uint64_t draw_recording_value() { return rec_value; }
+
 void draw_begin_recording(int slot, VkCommandBuffer cmd, uint64_t value) {
     rec_cmd = cmd;
     rec_value = value;
