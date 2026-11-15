@@ -74,13 +74,57 @@ FFX=$R/usr/lib/hookshot/ffx
 [ -f "$FFX/libamd_fidelityfx_vk.so" ] && [ -s "$FFX/libamd_fidelityfx_vk-LICENSE.txt" ] ||
     { echo "the image has no libamd_fidelityfx_vk.so with its licence"; exit 1; }
 [ -s "$T/licenses/fidelityfx/libamd_fidelityfx_vk-LICENSE.txt" ] || { echo "the image has no FidelityFX licence under licenses/"; exit 1; }
-# (loaded with the image's Python and no GPU: the library needs only libc and libvulkan.so.1, which dlopen finds on any PC with
-# a Vulkan loader: CI's runner has libvulkan1, which appimage.sh needs to build)
-in_image "$R/usr/python/bin/python3" -I -B -c '
-import ctypes, sys
-lib = ctypes.CDLL(sys.argv[1])
-missing = [n for n in ("ffxCreateContext", "ffxDestroyContext", "ffxConfigure", "ffxQuery", "ffxDispatch") if not hasattr(lib, n)]
-sys.exit("libamd_fidelityfx_vk.so lacks " + ", ".join(missing) if missing else 0)' "$FFX/libamd_fidelityfx_vk.so"
+# (loaded with the image's Python and no GPU. The library needs only libc and libvulkan.so.1, which a player's PC always has
+# (its GPU driver needs it) but a clean container does not. So the sysroot's loader (appimage.sh copies the real
+# libvulkan.so.1 there, for the FSR 4 kit's linking; the AppImage never ships it at run time) is put on LD_LIBRARY_PATH for
+# this one load. If it cannot be loaded either, the ELF is read instead: the 5 symbols exported, and nothing NEEDED but
+# libvulkan.so.1, libm, libc and ld-linux.)
+cat > "$TMP/ffx_check.py" <<'PY'
+import ctypes, struct, sys
+path, mode = sys.argv[1], sys.argv[2]
+SYMS = ("ffxCreateContext", "ffxDestroyContext", "ffxConfigure", "ffxQuery", "ffxDispatch")
+if mode == "load":
+    lib = ctypes.CDLL(path)
+    missing = [n for n in SYMS if not hasattr(lib, n)]
+else:
+    d = open(path, "rb").read()
+    if d[:4] != b"\x7fELF" or d[4] != 2 or d[5] != 1:
+        sys.exit("not a 64-bit little-endian ELF")
+    shoff = struct.unpack_from("<Q", d, 0x28)[0]
+    shentsize, shnum = struct.unpack_from("<HH", d, 0x3A)
+    sh = [struct.unpack_from("<IIQQQQIIQQ", d, shoff + i * shentsize) for i in range(shnum)]
+    dynsym = next(s for s in sh if s[1] == 11)   # SHT_DYNSYM
+    dynstr = sh[dynsym[6]]
+    def name(tab, off):
+        o = tab[4] + off
+        return d[o:d.index(b"\0", o)].decode()
+    exported = set()
+    for i in range(dynsym[5] // 24):
+        st_name, st_info, _o, st_shndx = struct.unpack_from("<IBBH", d, dynsym[4] + i * 24)
+        if st_shndx != 0 and st_name:
+            exported.add(name(dynstr, st_name))
+    missing = [n for n in SYMS if n not in exported]
+    dyn = next(s for s in sh if s[1] == 6)       # SHT_DYNAMIC
+    strtab = sh[dyn[6]]
+    needed = []
+    for i in range(dyn[5] // 16):
+        tag, val = struct.unpack_from("<qQ", d, dyn[4] + i * 16)
+        if tag == 1:
+            needed.append(name(strtab, val))
+    allowed = ("libvulkan.so.1", "libm.so", "libc.so", "ld-linux")
+    extra = [n for n in needed if not n.startswith(allowed)]
+    if extra:
+        sys.exit("libamd_fidelityfx_vk.so needs " + ", ".join(extra) + " besides libvulkan.so.1, libm, libc, ld-linux")
+sys.exit("libamd_fidelityfx_vk.so lacks " + ", ".join(missing) if missing else 0)
+PY
+mkdir -p "$TMP/vkloader"
+ln -sf "$S/usr/lib/x86_64-linux-gnu/libvulkan.so" "$TMP/vkloader/libvulkan.so.1"
+if in_image env LD_LIBRARY_PATH="$TMP/vkloader" "$R/usr/python/bin/python3" -I -B "$TMP/ffx_check.py" "$FFX/libamd_fidelityfx_vk.so" load; then
+    :
+else
+    echo "(the sysroot's libvulkan is not loadable here: reading the ELF instead)"
+    in_image "$R/usr/python/bin/python3" -I -B "$TMP/ffx_check.py" "$FFX/libamd_fidelityfx_vk.so" elf
+fi
 echo "libamd_fidelityfx_vk.so loads"
 
 # (Python's own __pycache__ aside: AppRun runs Python with -I, which writes it where it can, and does without where it cannot)
