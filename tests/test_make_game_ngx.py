@@ -29,7 +29,7 @@ class NgxRuntimeTests(unittest.TestCase):
         (self.out / "bin").mkdir(parents=True)
         self.ngx = make_game.ngx_script()
 
-    def sdk_files(self, platform, runtime=True):
+    def sdk_files(self, platform, runtime=True, dlssg=True):
         lib = Path(self.ngx.library(str(self.sdk), platform))
         lib.parent.mkdir(parents=True, exist_ok=True)
         lib.write_bytes(b"lib")
@@ -37,6 +37,9 @@ class NgxRuntimeTests(unittest.TestCase):
             rt = Path(self.ngx.runtime(str(self.sdk), platform))
             rt.parent.mkdir(parents=True, exist_ok=True)
             rt.write_bytes(b"runtime")
+            if dlssg:   # (an older kit has only Super Resolution's runtime)
+                fg = Path(self.ngx.dlssg_runtime(str(self.sdk), platform))
+                fg.write_bytes(b"framegen")
 
     def place(self, platform, sdk=None):
         env = {"HOOKSHOT_NGX_SDK": str(self.sdk) if sdk is None else sdk}
@@ -84,6 +87,20 @@ class NgxRuntimeTests(unittest.TestCase):
     def test_linux_runtime(self):
         self.sdk_files("linux")
         self.assertEqual(Path(self.place("linux")), self.out / "ngx" / "libnvidia-ngx-dlss.so.310.9.16")
+
+    def test_frame_generation_runtime_is_placed_beside_it(self):
+        for platform, name in (("linux", "libnvidia-ngx-dlssg.so.310.9.16"), ("windows", "nvngx_dlssg.dll")):
+            self.sdk_files(platform)
+            self.place(platform)
+            self.assertEqual((self.out / "ngx" / name).read_bytes(), b"framegen")
+            self.assertIsNone(self.place(platform, sdk=""))
+            self.assertFalse((self.out / "ngx").exists())   # (both removed with the folder)
+
+    def test_older_kit_without_frame_generation(self):
+        self.sdk_files("linux", dlssg=False)
+        dst = self.place("linux")
+        self.assertEqual(Path(dst), self.out / "ngx" / "libnvidia-ngx-dlss.so.310.9.16")
+        self.assertEqual(sorted(p.name for p in (self.out / "ngx").iterdir()), ["libnvidia-ngx-dlss.so.310.9.16"])
 
     def test_rebuilding_without_dlss_removes_stale_runtime(self):
         self.sdk_files("linux")

@@ -1325,21 +1325,27 @@ def prepare_renodx(work):
 
 def place_ngx_runtime(out):
     """(NVIDIA DLSS) a game built with NVIDIA's SDK (HOOKSHOT_NGX_SDK, as nx2/build.py takes it) gets DLSS's runtime in its ngx
-    folder, where gpu/vk/vk_dlss.cpp looks first: nvngx_dlss.dll on Windows, libnvidia-ngx-dlss.so.<version> on Linux. Never
+    folder, where gpu/vk/vk_dlss.cpp looks first: nvngx_dlss.dll on Windows, libnvidia-ngx-dlss.so.<version> on Linux, and
+    DLSS Frame Generation's beside it (nvngx_dlssg.dll, libnvidia-ngx-dlssg.so.<version>; not in an older kit). Never
     NGX's core (_nvngx.dll is the driver's) and nothing beside the exe. Returns the file placed, or None"""
     ngx = ngx_script()
     platform = ngx_platform()
     sdk = os.environ.get("HOOKSHOT_NGX_SDK", "")
     if not sdk or not (os.path.isfile(ngx.library(sdk, platform)) and os.path.isfile(ngx.runtime(sdk, platform))):
         # (a folder built with DLSS before and rebuilt without it loses NVIDIA's runtime too)
-        stale = os.path.join(out, "ngx", ngx.runtime_name(platform))
-        if os.path.isfile(stale):
-            with contextlib.suppress(OSError):
-                os.remove(stale)
-                os.rmdir(os.path.dirname(stale))
+        for name in (ngx.runtime_name(platform), ngx.dlssg_name(platform)):
+            stale = os.path.join(out, "ngx", name)
+            if os.path.isfile(stale):
+                with contextlib.suppress(OSError):
+                    os.remove(stale)
+        with contextlib.suppress(OSError):
+            os.rmdir(os.path.join(out, "ngx"))
         return None
     dst = ngx.install_runtime(sdk, platform, os.path.join(out, "ngx"))
     print("NVIDIA DLSS: %s (NVIDIA's, under NVIDIA's license: never share this game folder)" % dst, flush=True)
+    frame_gen = os.path.join(os.path.dirname(dst), ngx.dlssg_name(platform))
+    if os.path.isfile(frame_gen):
+        print("NVIDIA DLSS Frame Generation: %s (NVIDIA's, same license)" % frame_gen, flush=True)
     return dst
 
 

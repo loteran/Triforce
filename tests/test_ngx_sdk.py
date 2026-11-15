@@ -64,11 +64,19 @@ class TableTests(unittest.TestCase):
         self.assertEqual(table["runtime/libnvidia-ngx-dlss.so.310.9.16"], "lib/Linux_x86_64/rel/libnvidia-ngx-dlss.so.310.9.16")
         self.assertFalse([p for p in table.values() if "Windows" in p])
 
+    def test_frame_generation_runtime_is_pinned_per_platform(self):
+        self.assertEqual(ngx_sdk.PLATFORMS["linux"]["dlssg"][0], "lib/Linux_x86_64/rel/libnvidia-ngx-dlssg.so.310.9.16")
+        self.assertEqual(ngx_sdk.PLATFORMS["windows"]["dlssg"][0], "lib/Windows_x86_64/rel/nvngx_dlssg.dll")
+        for platform in ngx_sdk.PLATFORMS:
+            table = {rel: sha for _, sha, rel in ngx_sdk.files(platform)}
+            self.assertRegex(table["runtime/" + ngx_sdk.dlssg_name(platform)], r"^[0-9a-f]{64}$")
+
     def test_build_only_leaves_out_the_runtime(self):
         for platform in ngx_sdk.PLATFORMS:
             full = {rel for _, _, rel in ngx_sdk.files(platform)}
             build = {rel for _, _, rel in ngx_sdk.files(platform, runtime=False)}
-            self.assertEqual(full - build, {"runtime/" + ngx_sdk.runtime_name(platform)})
+            self.assertEqual(full - build, {"runtime/" + ngx_sdk.runtime_name(platform),
+                                            "runtime/" + ngx_sdk.dlssg_name(platform)})
 
     def test_platforms_share_the_headers_and_one_folder(self):
         linux = {rel for _, _, rel in ngx_sdk.files("linux")}
@@ -137,6 +145,21 @@ class FetchTests(unittest.TestCase):
         self.assertEqual(dst, os.path.join(game, "ngx", "nvngx_dlss.dll"))
         self.assertEqual(Path(dst).read_bytes(), b"runtime")
         self.assertEqual(os.listdir(game), ["ngx"])   # (nothing beside the exe)
+
+
+class FrameGenerationInstallTests(unittest.TestCase):
+    def test_both_runtimes_installed_and_old_kit_tolerated(self):
+        with tempfile.TemporaryDirectory(prefix="hookshot-ngx-sdk-") as t:
+            sdk, ngx = os.path.join(t, "sdk"), os.path.join(t, "game", "ngx")
+            sr = ngx_sdk.runtime(sdk, "linux")
+            os.makedirs(os.path.dirname(sr))
+            Path(sr).write_bytes(b"sr")
+            dst = ngx_sdk.install_runtime(sdk, "linux", ngx)   # (no dlssg in the kit: only SR)
+            self.assertEqual(os.listdir(ngx), [os.path.basename(dst)])
+            Path(ngx_sdk.dlssg_runtime(sdk, "linux")).write_bytes(b"fg")
+            self.assertEqual(ngx_sdk.install_runtime(sdk, "linux", ngx), dst)
+            self.assertEqual(sorted(os.listdir(ngx)), ["libnvidia-ngx-dlss.so.310.9.16", "libnvidia-ngx-dlssg.so.310.9.16"])
+            self.assertEqual(Path(ngx, "libnvidia-ngx-dlssg.so.310.9.16").read_bytes(), b"fg")
 
 
 class LicenseTests(unittest.TestCase):
