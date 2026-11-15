@@ -437,6 +437,9 @@ class Builder(tk.Tk):
                     darkcolor=PAGE, troughcolor=TRACK, focuscolor=BRAND, selectbackground=BRAND, selectforeground=WHITE,
                     fieldbackground=GLASS, insertcolor=INK, arrowcolor=INK_SOFT, borderwidth=0)
         s.map(".", foreground=[("disabled", INK_FAINT)], background=[("disabled", PAGE)])
+        # (Tk's own file chooser draws its file list with the Treeview colours, which clam leaves white: light text on white)
+        s.configure("Treeview", background=RAISED, fieldbackground=RAISED, foreground=INK)
+        s.map("Treeview", background=[("selected", BRAND)], foreground=[("selected", WHITE)])
         for name, options in (("TFrame", {}), ("Card.TFrame", {"background": GLASS}),
                               ("TLabel", {}), ("Title.TLabel", {"font": "HsTitle"}), ("Display.TLabel", {"font": "HsDisplay"}),
                               ("Sub.TLabel", {"foreground": INK_SOFT}), ("Note.TLabel", {"foreground": INK_SOFT, "font": "HsNote"}),
@@ -764,8 +767,47 @@ class Builder(tk.Tk):
         ttk.Entry(f, textvariable=var, font="HsMono").grid(row=row, column=1, sticky="we", pady=self.px(3))
         ttk.Button(f, text=button, command=browse, cursor="hand2").grid(row=row, column=2, padx=(self.px(10), 0), pady=self.px(3))
 
+    def native_chooser(self, directory, title, start, patterns=None, label=""):
+        """The desktop's own file chooser (kdialog on KDE, else zenity), run with the system's environment, not the AppImage's.
+        Returns (handled, path): handled is False when there is none (the Tk dialog is used), path is "" when cancelled."""
+        kde = "KDE" in os.environ.get("XDG_CURRENT_DESKTOP", "").upper().split(":")
+        if kde and shutil.which("kdialog"):
+            cmd = ["kdialog", "--title", title, "--getexistingdirectory" if directory else "--getopenfilename", start]
+            if patterns:
+                cmd.append("%s|%s" % (patterns, label))
+        elif shutil.which("zenity"):
+            cmd = ["zenity", "--file-selection", "--title=" + title, "--filename=" + start]
+            if directory:
+                cmd.append("--directory")
+            elif patterns:
+                cmd.append("--file-filter=%s | %s" % (label, patterns))
+        else:
+            return False, ""
+        try:
+            proc = subprocess.Popen(cmd, env=make_game.game_env(), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+        except OSError:
+            return False, ""
+        done = tk.BooleanVar(self, False)
+
+        def poll():
+            if proc.poll() is None:
+                self.after(80, poll)
+            else:
+                done.set(True)
+        poll()
+        self.wait_variable(done)   # (the window keeps redrawing while the chooser is open)
+        out = proc.stdout.read().strip()
+        proc.stdout.close()
+        if proc.returncode not in (0, 1):   # (1 is Cancel; anything else is a chooser that did not work: the Tk one)
+            return False, ""
+        return True, out.splitlines()[0] if out else ""
+
     def pick_file(self, var):
-        p = filedialog.askopenfilename(title="Your game's .nup", filetypes=[("Switch 2 game package", "*.nup"), ("All files", "*")])
+        cur = os.path.dirname(os.path.expanduser(var.get())) if var.get() else ""
+        start = (cur if os.path.isdir(cur) else os.path.expanduser("~")).rstrip("/") + "/"
+        handled, p = self.native_chooser(False, "Your game's .nup", start, "*.nup", "Switch 2 game package")
+        if not handled:
+            p = filedialog.askopenfilename(title="Your game's .nup", filetypes=[("Switch 2 game package", "*.nup"), ("All files", "*")])
         if p:
             var.set(p)
             self.source_picked = True
@@ -773,7 +815,11 @@ class Builder(tk.Tk):
             self.check_version()
 
     def pick_dir(self, var):
-        p = filedialog.askdirectory(title="Choose a folder", initialdir=var.get() or os.path.expanduser("~"))
+        cur = os.path.expanduser(var.get()) if var.get() else ""
+        start = (cur if os.path.isdir(cur) else os.path.expanduser("~")).rstrip("/") + "/"
+        handled, p = self.native_chooser(True, "Choose a folder", start)
+        if not handled:
+            p = filedialog.askdirectory(title="Choose a folder", initialdir=var.get() or os.path.expanduser("~"))
         if p:
             var.set(p)
             if var is self.exefs:
