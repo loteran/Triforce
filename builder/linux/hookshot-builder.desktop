@@ -1,9 +1,9 @@
 [Desktop Entry]
 Type=Application
-Name=Triforce Builder
-Comment=Builds Ocarina of Time for PC from your own copy of the game
+Name=Triforce (Linux)
+Comment=Triforce for Linux (unofficial): builds Ocarina of Time for PC from your own copy of the game
 Exec=AppRun
-Icon=hookshot
+Icon=triforce
 Categories=Game;
 Terminal=false
 Actions=Play;
@@ -11,4 +11,4 @@ Actions=Play;
 [Desktop Action Play]
 Name=Play
 Exec=AppRun --play
-Icon=hookshot
+Icon=triforce

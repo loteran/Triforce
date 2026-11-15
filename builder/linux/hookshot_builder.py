@@ -36,7 +36,7 @@ DLSS_LICENSE = (
     "NVIDIA DLSS is NVIDIA's, not Triforce's. With it ticked, the build downloads NVIDIA's DLSS SDK (release v310.9.16) from "
     "github.com/NVIDIA/DLSS, under NVIDIA's own license, the NVIDIA RTX SDKs license:\n\n"
     "https://github.com/NVIDIA/DLSS/blob/9981c6350dc58c0ce21f024fd65e31e851c31689/LICENSE.txt\n\n"
-    "Its files stay on this PC (in the builder's ngx-sdk folder, and libnvidia-ngx-dlss.so in the game folder's ngx folder). "
+    "Its files stay on this PC (in the builder's ngx-sdk folder, and libnvidia-ngx-dlss.so and libnvidia-ngx-dlssg.so (Frame Generation) in the game folder's ngx folder). "
     "Triforce never includes or shares them: never share a game folder built with them.\n\n"
     "Do you accept NVIDIA's license?"
 )
@@ -151,6 +151,9 @@ def desktop_exec(path):
         escaped = escaped.replace(char, "\\\\" + char)
     return '"%s"' % escaped.replace("%", "%%")
 
+
+ABOUT = ("Unofficial Linux build of Triforce. Fork: github.com/loteran/Triforce. "
+         "Upstream: git.triforceproject.com/triforce/source")
 
 APP_ID = "io.github.NotRexed.Hookshot"   # (the game's window names itself so: host/posix/display_sdl.c's HOS_APP_ID)
 
@@ -331,7 +334,7 @@ def _arg(name):
 class Builder(tk.Tk):
     def __init__(self, launch=None, update=None, fetched=False, tag=None):
         super().__init__()
-        self.title("Triforce Builder")
+        self.title("Triforce Builder for Linux")
         self.apply_scale()
         self.apply_theme()
         self.minsize(self.px(760), self.px(520))
@@ -543,7 +546,10 @@ class Builder(tk.Tk):
         # Play's triangle, and the hookshot of the window's head
         self.photo("play", px(11) + px(10), px(14), GO,
                    [(GO_INK, triangle([(px(0.5), px(0.5)), (px(11), px(7)), (px(0.5), px(13.5))]))])
-        self.load_logo(px(28))
+        self.load_logo(px(46))
+        bw = int(self.tk.call("font", "measure", "HsLabel", "Linux")) + px(22)
+        self.photo("linux-badge", bw, px(24), PAGE,
+                   [(lambda y: mix("#3557d6", "#4b70f0", min(1, max(0, y / px(24)))), box(0, 0, bw, px(24), px(12)))])
 
     def photo(self, name, w, h, under, layers):
         image = tk.PhotoImage(master=self, width=int(w), height=int(h))
@@ -603,7 +609,11 @@ class Builder(tk.Tk):
             canvas.create_image(x, px(32), image=self.images["logo"], anchor="w")
             x += self.images["logo"].width() + px(10)
         canvas.create_text(x, px(32), text="Triforce", font="HsBrand", fill=INK, anchor="w")
-        x += int(self.tk.call("font", "measure", "HsBrand", "Triforce"))
+        x += int(self.tk.call("font", "measure", "HsBrand", "Triforce")) + px(10)
+        badge = self.images["linux-badge"]
+        canvas.create_image(x, px(32), image=badge, anchor="w")
+        canvas.create_text(x + badge.width() // 2, px(32), text="Linux", font="HsLabel", fill=WHITE)
+        x += badge.width()
         if chip:
             canvas.create_text(x + px(12), px(32), text=chip, font="HsSmall", fill=INK_SOFT, anchor="w")
         self.header_canvas = canvas
@@ -668,7 +678,7 @@ class Builder(tk.Tk):
 
     # ---- the form ----
     def show_form(self):
-        self.title("Triforce Builder")
+        self.title("Triforce Builder for Linux")
         if self.page:
             self.page.destroy()
         px = self.px
@@ -735,6 +745,8 @@ class Builder(tk.Tk):
         foot = ttk.Frame(f)
         foot.grid(row=12, column=0, columnspan=3, sticky="we")
         foot.columnconfigure(1, weight=1)
+        ttk.Label(f, text=ABOUT, style="Faint.TLabel", wraplength=px(800)).grid(
+            row=13, column=0, columnspan=3, sticky="w", pady=(px(10), 0))
         self.space_bar = ttk.Progressbar(foot, maximum=1.0, length=px(160), style="Go.Horizontal.TProgressbar")
         self.space_bar.grid(row=0, column=0)
         ttk.Label(foot, textvariable=self.space_text, style="Small.TLabel").grid(row=0, column=1, sticky="w", padx=(px(10), 0))
