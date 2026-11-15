@@ -17,6 +17,8 @@
 #                     so that it needs nothing installed there: fsr4-vk's sources (GPL-3.0) at a pinned commit, without the
 #                     host tools' own sources, and those tools built here with GCC (dxil-spirv, SPIRV-Tools, glslang), plus
 #                     CMake and Ninja in python/. Nothing of AMD's: its DLL is downloaded on the player's PC
+#   ffx/              libamd_fidelityfx_vk.so (AMD FidelityFX SDK 1.1.4, MIT: FSR 3.1 upscaler and frame generation), built from
+#                     scripts/linux/ffx_linux, with its licence file: placed beside every game the AppImage builds
 #   appimagetool      the AppImage packer
 #   runtime-x86_64    the AppImage runtime it puts in front of the image (pinned: appimagetool's own download of the
 #                     'continuous' one, at packing time, fails whenever GitHub answers 504)
@@ -41,6 +43,9 @@ SPIRV_HEADERS=vulkan-sdk-1.4.341.0
 VMA=v3.3.0
 APPIMAGETOOL=1.9.1
 FSR4_VK_COMMIT=b0125ea9798633750f83ebabbc00279bcb49d8dd   # (fsr4-vk: the commit nx2/fsr4_linux.py's AMD DLL hash goes with)
+FFX_SDK_VER=1.1.4   # (scripts/linux/ffx_linux/build.sh pins that zip's SHA-256 itself)
+GLSLANG_VER=16.6.0  # (the release .github/workflows/source-regressions.yml generates the checked-in shaders with)
+GLSLANG_SHA256=2c34071f56ecf39d16233294d3739cf43f981fd39080f2fd9dccb782101191ce
 CMAKE_PY=4.4.4      # (CMake and Ninja from PyPI, into python/: fsr4/'s build on the player's PC)
 NINJA_PY=1.13.0
 APPIMAGE_RUNTIME=20251108
@@ -248,6 +253,27 @@ if ! done_for fsr4 "$FSR4_VK_COMMIT-$CMAKE_PY-$NINJA_PY-$PY_MARK"; then
     rm -rf "$F4"
     echo "fsr4 kit: $(du -sh "$K" | cut -f1)"
     mark fsr4 "$FSR4_VK_COMMIT-$CMAKE_PY-$NINJA_PY-$PY_MARK"
+fi
+
+# ---- AMD FidelityFX (FSR 3.1 upscaler and frame generation): libamd_fidelityfx_vk.so, scripts/linux/ffx_linux ----
+# AMD ships this library for Windows only. Built here from the SDK's release zip (MIT, SHA-256 pinned in build.sh) with the
+# GCC the fsr4 kit uses, not with the LLVM above: the library links the host's C library, so what matters is that this
+# runs on the oldest system (CI: Ubuntu 22.04, glibc 2.35), whose own GCC's static libstdc++ asks for nothing newer; the
+# AppImage's sysroot clang would need the shader compiler built apart (its C++ library is too old) for no gain. build.sh
+# checks the result: only the 5 ffx entry points exported, no GLIBC symbol newer than 2.35, no dynamic libstdc++.
+# glslang: the pinned release binary (with the optimiser the shader compiler's -Os needs; the fsr4 kit's own is built without).
+FFX_TREE=$(cd scripts/linux/ffx_linux && find . -type f | LC_ALL=C sort | xargs sha256sum | sha256sum | cut -c1-12)
+if ! done_for ffx "$FFX_SDK_VER-$GLSLANG_VER-$FFX_TREE"; then
+    fetch "https://github.com/KhronosGroup/glslang/releases/download/$GLSLANG_VER/glslang-$GLSLANG_VER-linux-x86_64-release.tar.gz" glslang-release.tar.gz "$GLSLANG_SHA256"
+    rm -rf "$DEPS/ffx" "$DEPS/ffx-build"
+    mkdir -p "$DEPS/ffx" "$DEPS/ffx-build/glslang"
+    tar -xzf "$DL/glslang-release.tar.gz" -C "$DEPS/ffx-build/glslang"
+    GCC_CC=$(command -v gcc-13 || command -v gcc) GCC_CXX=$(command -v g++-13 || command -v g++)
+    CC=$GCC_CC CXX=$GCC_CXX FFX_GLSLANG=$DEPS/ffx-build/glslang/bin/glslangValidator FFX_WORK=$DEPS/ffx-build/work \
+        scripts/linux/ffx_linux/build.sh "$DEPS/ffx" "$DL"
+    rm -rf "$DEPS/ffx-build"
+    echo "ffx: $(du -sh "$DEPS/ffx" | cut -f1)"
+    mark ffx "$FFX_SDK_VER-$GLSLANG_VER-$FFX_TREE"
 fi
 
 # ---- the licenses of what the AppImage carries (Python's and its modules' are in python/) ----

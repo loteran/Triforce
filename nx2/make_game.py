@@ -1323,6 +1323,28 @@ def prepare_renodx(work):
     return folder
 
 
+def place_ffx_library(game_dir):
+    """(linux) AMD's FidelityFX library for FSR 3.1 (libamd_fidelityfx_vk.so, MIT, built by scripts/linux/deps.sh and carried by the
+    AppImage, HOOKSHOT_FFX) beside the game's executable, with its license: where gpu/vk/vk_fsr4.cpp looks for it. On every
+    build and update, no license gate. Not set (a build outside the AppImage): nothing is placed, a copy already there stays"""
+    lib = os.environ.get("HOOKSHOT_FFX", "")
+    if not LINUX or not lib or not os.path.isfile(lib):
+        return None
+    notice = os.path.join(os.path.dirname(lib), "libamd_fidelityfx_vk-LICENSE.txt")
+    for src in (lib, notice):
+        if not os.path.isfile(src):
+            continue
+        dst = os.path.join(game_dir, os.path.basename(src))
+        try:
+            shutil.copy2(src, dst + ".new")
+            os.replace(dst + ".new", dst)   # (a running game keeps its own file)
+        except OSError as e:
+            print("could not place %s: %s" % (os.path.basename(src), e), flush=True)
+            return None
+    print("AMD FidelityFX (FSR 3.1 upscaler and frame generation): %s" % os.path.join(game_dir, os.path.basename(lib)), flush=True)
+    return os.path.join(game_dir, os.path.basename(lib))
+
+
 def place_ngx_runtime(out):
     """(NVIDIA DLSS) a game built with NVIDIA's SDK (HOOKSHOT_NGX_SDK, as nx2/build.py takes it) gets DLSS's runtime in its ngx
     folder, where gpu/vk/vk_dlss.cpp looks first: nvngx_dlss.dll on Windows, libnvidia-ngx-dlss.so.<version> on Linux, and
@@ -1737,6 +1759,7 @@ def main(a=None):
             except OSError:
                 pass
     drop_old_program(out)
+    place_ffx_library(game_dir)
     place_ngx_runtime(out)
     # every shader of the game, for its first start to translate (gpu/vk/vk_shader.cpp seed_open). Without it the game still runs, compiling them
     # as it meets them: not worth stopping a finished build for

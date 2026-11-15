@@ -69,6 +69,20 @@ in_image "$R/usr/lib/hookshot/emsdk/upstream/bin/clang++" --sysroot="$S" -fuse-l
     "$S/usr/lib/x86_64-linux-gnu/libvulkan.so"
 echo "AMD FSR 4's kit runs here"
 
+echo "== AMD FidelityFX (FSR 3.1): libamd_fidelityfx_vk.so is in the image and loads, with its 5 entry points"
+FFX=$R/usr/lib/hookshot/ffx
+[ -f "$FFX/libamd_fidelityfx_vk.so" ] && [ -s "$FFX/libamd_fidelityfx_vk-LICENSE.txt" ] ||
+    { echo "the image has no libamd_fidelityfx_vk.so with its licence"; exit 1; }
+[ -s "$T/licenses/fidelityfx/libamd_fidelityfx_vk-LICENSE.txt" ] || { echo "the image has no FidelityFX licence under licenses/"; exit 1; }
+# (loaded with the image's Python and no GPU: the library needs only libc and libvulkan.so.1, which dlopen finds on any PC with
+# a Vulkan loader: CI's runner has libvulkan1, which appimage.sh needs to build)
+in_image "$R/usr/python/bin/python3" -I -B -c '
+import ctypes, sys
+lib = ctypes.CDLL(sys.argv[1])
+missing = [n for n in ("ffxCreateContext", "ffxDestroyContext", "ffxConfigure", "ffxQuery", "ffxDispatch") if not hasattr(lib, n)]
+sys.exit("libamd_fidelityfx_vk.so lacks " + ", ".join(missing) if missing else 0)' "$FFX/libamd_fidelityfx_vk.so"
+echo "libamd_fidelityfx_vk.so loads"
+
 # (Python's own __pycache__ aside: AppRun runs Python with -I, which writes it where it can, and does without where it cannot)
 written=$(find "$R" -type f -newer "$TMP/before" ! -path "*/__pycache__/*" -print)
 if [ -n "$written" ]; then

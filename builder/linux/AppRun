@@ -17,6 +17,7 @@ export HOOKSHOT_FFMPEG="$LIB/ffmpeg"
 export HOOKSHOT_VK_PREBUILT="$LIB/hookshot_vk.so"
 export HOOKSHOT_VK_PREBUILT_FSR=1   # (it was built with AMD FSR 4: scripts/linux/appimage.sh)
 export HOOKSHOT_SDL2="$LIB/libSDL2-2.0.so.0"
+export HOOKSHOT_FFX="$LIB/ffx/libamd_fidelityfx_vk.so"   # (AMD FidelityFX, FSR 3.1: nx2/make_game.py puts it beside the game)
 export HOOKSHOT_FSR4_KIT="$LIB/fsr4"   # (AMD FSR 4 built on this PC: nx2/fsr4_linux.py)
 # (written into the game folder's hookshot_version.txt, so its launcher finds this builder)
 if [ -n "${APPIMAGE:-}" ]; then

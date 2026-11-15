@@ -93,6 +93,10 @@ cp "$DEPS/sdl2/libSDL2-2.0.so.0" "$L/libSDL2-2.0.so.0"
 cp -a "$DEPS/fsr4" "$L/fsr4"
 mkdir -p "$T/licenses/fsr4"
 cp -a "$DEPS/fsr4/licenses/." "$T/licenses/fsr4/"
+# (AMD FidelityFX, scripts/linux/deps.sh: FSR 3.1 upscaler and frame generation, MIT. make_game.py puts it beside every game)
+mkdir -p "$L/ffx"
+cp "$DEPS/ffx/libamd_fidelityfx_vk.so" "$DEPS/ffx/libamd_fidelityfx_vk-LICENSE.txt" "$L/ffx/"
+mkdir -p "$T/licenses/fidelityfx" && cp "$DEPS/ffx/libamd_fidelityfx_vk-LICENSE.txt" "$T/licenses/fidelityfx/"
 for d in "$DEPS"/cpm/*/*; do
     mkdir -p "$T/cpm/${d#"$DEPS/cpm/"}"
     cp -a "$d/include" "$T/cpm/${d#"$DEPS/cpm/"}/"

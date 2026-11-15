@@ -94,7 +94,7 @@ class TheChecksAreWired(unittest.TestCase):
         exported = set(re.findall(r"^export (HOOKSHOT_\w+|EMSDK)=", apprun, re.MULTILINE))
         source = Path(__file__).read_text(encoding="utf-8")
         used = set(re.findall(r'"(HOOKSHOT_\w+|EMSDK)":', source))
-        self.assertEqual(exported - used - {"HOOKSHOT_SDL2", "HOOKSHOT_BUILDER_EXE"}, set())   # (those two: the game's, after the build)
+        self.assertEqual(exported - used - {"HOOKSHOT_SDL2", "HOOKSHOT_FFX", "HOOKSHOT_BUILDER_EXE"}, set())   # (those three: the game's, after the build)
 
 
 if __name__ == "__main__":
