@@ -1390,6 +1390,9 @@ def parse_args():
     p.add_argument("--update", help="a game folder built before: built again from the game files it keeps (the game's update offer)")
     p.add_argument("--no-prepare-shaders", action="store_true",
                    help="leave the shaders' preparation to the game's first start (the builder's \"Prepare shaders now\" unticked)")
+    p.add_argument("--clean", action="store_true",
+                   help="start from scratch: the translation and the compiled objects of earlier builds are removed first, so the "
+                        "whole game is translated and compiled again (the builder's \"Start the next build from scratch\")")
     p.add_argument("--log", metavar="FILE", help="also save build output to a UTF-8 file (replaces the file if it exists)")
     # (NVIDIA DLSS, off unless asked: NVIDIA's SDK into HOOKSHOT_NGX_SDK first, under NVIDIA's license. scripts/ngx_sdk.py)
     p.add_argument("--fetch-ngx-sdk", action="store_true", help="download NVIDIA's DLSS SDK into HOOKSHOT_NGX_SDK before the build")
@@ -1423,6 +1426,38 @@ def parse_args():
             fail("Your copy of the game was not found: %s" % a.game)
     a.default_work = p.get_default("work")   # (main: the builder's own work folder, stop_stray_compilers)
     return a
+
+
+def clean_work(work):
+    """--clean: the lift key and both object caches go, so the next lift and compile start from nothing. The lifted C stays: without
+    its key it is made again, and the game's files are cleared before that (the lift's own pass)."""
+    for path in (os.path.join(work, "sa", "gen", LIFT_KEY),):
+        if os.path.exists(path):
+            os.remove(path)
+    for sub in (os.path.join(work, "objcache"), os.path.join(work, "sa", "build", "obj")):
+        shutil.rmtree(sub, ignore_errors=True)
+
+
+def failure_needs_wipe(lines):
+    """From build.py's output after a failed build: (True, why) when the lift and the object caches must go, (False, why) when
+    only files outside the lifted game failed to compile (the Vulkan back end, host, runtime, third_party) and the link was
+    never reached: the translation and the objects that compiled are still good. Anything else, or a failure that cannot be
+    told, wipes (the safe side: issues 1176 and 1197)."""
+    failed, other = [], False
+    for line in lines:
+        m = re.match(r"FAILED (\S+) \(", line)
+        if m:
+            failed.append(m.group(1))
+        elif re.match(r"(link FAILED|\S+ link FAILED)", line) or "undefined symbol" in line or line.startswith("linked "):
+            other = True
+    if other:
+        return True, "the link was reached"
+    if not failed:
+        return True, "the failure is not a compile error of one file"
+    game = [f for f in failed if re.match(r"code_", f)]
+    if game:
+        return True, "a translated game file failed to compile (%s)" % game[0]
+    return False, "only %s failed to compile" % ", ".join(failed[:6])
 
 
 def spinning_disk(folder):
@@ -1599,6 +1634,9 @@ def main(a=None):
     if os.path.exists(os.path.join(work, "hookshot_pieces.prof")) and profile_readable(os.path.join(work, "hookshot_pieces.prof")):
         env["RX_PGO"] = os.path.join(work, "hookshot_pieces.prof")
 
+    if a.clean:
+        clean_work(work)
+        print("starting from scratch: the earlier translation and compiled objects are removed", flush=True)
     say("stage", "lift", "Translating the game to PC code")
     # (the same game, tools and settings as the lift before: its C is what this lift would write, and nothing recompiles from it. A
     # rebuild after a change to host/ alone skips the minutes of the lift)
@@ -1691,9 +1729,19 @@ def main(a=None):
             parts = line.split(" ")
             if len(parts) == 3 and parts[1].isdigit() and parts[2].isdigit():
                 plan[:] = [int(parts[1]), int(parts[2])]
+    build_lines = []
+
+    def watched(line):
+        build_lines.append(line)
+        compiled(line)
     try:
-        run(PY + ["nx2/build.py", "--standalone", "--jobs", str(a.jobs)], env, compiled)
+        run(PY + ["nx2/build.py", "--standalone", "--jobs", str(a.jobs)], env, watched)
     except SystemExit:
+        wipe, why = failure_needs_wipe(build_lines)
+        if not wipe:
+            print("the build failed (%s): the next one reuses the translation and the compiled objects, and compiles only what "
+                  "failed" % why, flush=True)
+            raise
         # (hookshot) a compile or link that failed forgets the lift: the next build translates the game again. A lifted file cut short
         # (an antivirus, a full disk, a stopped run: "g_module_b" for g_module_base, issue 1197) or lifted C another builder left (20
         # undefined game functions at the link, issue 1176) otherwise failed the same way at every try, the key still matching
@@ -1704,7 +1752,8 @@ def main(a=None):
         # and a64_dirty, a64_icall, a64_lookup, recomp_cntpct undefined, at every try (issue 1197, Linux, v2.0.10))
         for sub in (os.path.join(work, "objcache"), os.path.join(work, "sa", "build", "obj")):
             shutil.rmtree(sub, ignore_errors=True)
-        print("the build failed: the next one translates and compiles the game again (nothing of this one is reused)", flush=True)
+        print("the build failed (%s): the next one translates and compiles the game again (nothing of this one is reused)" % why,
+              flush=True)
         raise
     compile_seconds = time.time() - compile_started
 

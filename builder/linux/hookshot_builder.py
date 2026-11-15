@@ -363,6 +363,8 @@ class Builder(tk.Tk):
         self.prepare = tk.BooleanVar(value=self.cfg.get("prepare", "1") != "0")   # (make_game.py's last step: off, at the first start)
         self.dlss = tk.BooleanVar(value=self.cfg.get("dlss", "0") == "1")
         self.fsr4 = tk.BooleanVar(value=self.cfg.get("fsr4", "0") == "1")
+        self.clean = tk.BooleanVar(value=self.cfg.get("clean", "0") == "1")   # (one build: unticked once a build succeeds with it)
+        self.cleaned = False
         self.check_text = tk.StringVar()
         self.space_text = tk.StringVar()
         self.stage_text = tk.StringVar()
@@ -742,6 +744,12 @@ class Builder(tk.Tk):
         ttk.Label(options, text="For Radeon RX 6000, 7000 and 9000 graphics cards. A few minutes after the game; nothing to install.",
                   style="Small.TLabel", wraplength=px(660)).pack(anchor="w", padx=(px(26), 0), pady=(px(2), 0))
 
+        ttk.Checkbutton(options, text="Start the next build from scratch", variable=self.clean, cursor="hand2").pack(
+            anchor="w", pady=(px(12), 0))
+        ttk.Label(options, text="Translates and compiles the whole game again: use it if a build keeps failing the same way. "
+                  "Unticks itself after a successful build.", style="Small.TLabel", wraplength=px(660)).pack(
+            anchor="w", padx=(px(26), 0), pady=(px(2), 0))
+
         f.rowconfigure(10, weight=1, minsize=px(18))
         ttk.Label(f, textvariable=self.status, style="Status.TLabel", wraplength=px(800)).grid(
             row=11, column=0, columnspan=3, sticky="w", pady=(0, px(12)))
@@ -1062,15 +1070,18 @@ class Builder(tk.Tk):
         code = next((c for c, n in make_game.LANGUAGES if n == self.language.get()), "en-US")
         dlss = bool(self.dlss.get()) if hasattr(self, "dlss") else False
         fsr4 = bool(self.fsr4.get()) if hasattr(self, "fsr4") else False
+        clean = bool(self.clean.get()) if hasattr(self, "clean") else False
         self.cfg.update(kind=self.kind.get(), nup=self.nup.get(), romfs=self.romfs.get(), exefs=self.exefs.get(), out=out, language=code,
                         prepare="1" if self.prepare.get() else "0", **({"dlss": "1" if dlss else "0"} if hasattr(self, "dlss") else {}),
-                        **({"fsr4": "1" if fsr4 else "0"} if hasattr(self, "fsr4") else {}))
+                        **({"fsr4": "1" if fsr4 else "0"} if hasattr(self, "fsr4") else {}),
+                        **({"clean": "1" if clean else "0"} if hasattr(self, "clean") else {}))
         save_config(self.cfg)
         # (issue 531) Without HOOKSHOT_JOBS or RX_JOBS, make_game chooses as on Windows, from the memory free now; this window chose
         # fewer, 80% of the total memory at 3.5 GB each, and the CPU sat at 29%
         cmd = [sys.executable, "-I", os.path.join(ROOT, "nx2", "make_game.py")] + src + ["--out", out, "--language", code] + \
             ([] if jobs is None else ["--jobs", str(jobs)]) + ([] if self.prepare.get() else ["--no-prepare-shaders"]) + \
-            (dlss_args(True) if dlss else []) + (fsr4_args(True) if fsr4 else [])
+            (dlss_args(True) if dlss else []) + (fsr4_args(True) if fsr4 else []) + (["--clean"] if clean else [])
+        self.cleaned = clean
         slow = slow_disk_warning(out)   # (a warning, not a stop: a hard drive still builds, only much slower)
         if slow is not None and not messagebox.askokcancel("Triforce", slow):
             return
@@ -1249,6 +1260,11 @@ class Builder(tk.Tk):
                 text += " · the shaders are prepared at its first start"
             self.stage_text.set(text)
             self.bar.configure(value=1.0)
+            if self.cleaned:   # (one build: the next one reuses what this one made)
+                self.cleaned = False
+                self.clean.set(False)
+                self.cfg["clean"] = "0"
+                save_config(self.cfg)
             try:
                 add_to_menu(folder)
             except (OSError, ValueError):   # (no menu entry; the game is built)
