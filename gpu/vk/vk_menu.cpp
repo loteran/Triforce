@@ -48,6 +48,7 @@
 #include "vk_fsr3.h"      // (the Upscaler row: whether AMD FSR 3.1 runs on this GPU)
 #include "vk_fsr3fi.h"    // (the Frame generation row: whether FSR 3.1 makes the frame)
 #include "vk_fsr4.h"
+#include "vk_ngxfg.h"    // (the Frame generation row: whether DLSS Frame Generation makes the frames)
 #include "vk_temporal.h"
 #include "vk_renodx.h"    // (renodx_built: the RenoDX rows only in a build with its shaders)
 #include "vk_reflex.h"
@@ -556,6 +557,18 @@ MENU_HINTS(hn_preset, 0, "Each row as you set it. Changing most rows yourself co
 MENU_HINTS(hn_gpu, 0, "The best dedicated GPU.")
 /// Frame generation: how many frames are made for each of the game's
 const char* hn_framegen(int v, int variant) {
+    // (where NVIDIA DLSS Frame Generation runs (RTX 40 and 50, vk_ngxfg.h) it makes the frames, up to what the GPU allows: Auto and
+    // 2x and up. Its text is variant 1, or 2 at 2x, after the AMD one there (the variants run on without a gap, up to the
+    // first nullptr: line 1476); it replaces the AMD one when it is the one in use)
+    if (v >= 1 && (variant < 0 ? ngxfg::wanted_for(v) : variant == (v == 2 ? 2 : 1))) {
+        if (v == 1)
+            return "A frame for each of the display's refreshes, made by NVIDIA DLSS Frame Generation: none made when the game keeps up. Frame pacing does not apply.";
+        static char d[9][128];
+        snprintf(d[v], sizeof d[v], "%s between each two of the game's, by NVIDIA DLSS Frame Generation from the scene's depth, motion and camera.",
+                 v == 2 ? "One made frame" : v == 3 ? "Two made frames" : v == 4 ? "Three made frames" : v == 5 ? "Four made frames"
+                 : v == 6 ? "Five made frames" : v == 7 ? "Six made frames" : "Seven made frames");
+        return d[std::clamp(v, 2, 8)];
+    }
     // (2x: by AMD FSR 3.1 where it runs, from the scene's depth and motion: vk_framegen.cpp. Variant 1 is that text)
     if (v == 2 && (variant < 0 ? fsr3fi::frames_wanted() != 0 : variant == 1))
         return "One made frame between each two of the game's, by AMD FSR 3.1 from the scene's depth and motion.";

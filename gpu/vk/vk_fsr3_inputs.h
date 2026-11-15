@@ -16,6 +16,7 @@
 
 #include <cstdint>
 
+#include "dlssg_math.h"
 #include "fsr3_math.h"
 #include "vk_internal.h"
 
@@ -30,16 +31,23 @@ struct Frame {
     VkImageView color = VK_NULL_HANDLE;    ///< RGBA16F: the network's input as it samples it, 0..1
     VkImageView depth = VK_NULL_HANDLE;    ///< R32F, reversed (fsr3_math.h Camera::flip_depth)
     VkImageView motion = VK_NULL_HANDLE;   ///< RG16F, render pixels toward the frame before, x right and y down, no jitter
+    VkImage depth_image = VK_NULL_HANDLE;   ///< the images behind the two views, for NVIDIA DLSS Frame Generation (NGX takes both)
+    VkImage motion_image = VK_NULL_HANDLE;
     uint32_t width = 0, height = 0;
     float jitter[2]{};                      ///< this frame's, in render pixels as FSR takes it (x right, y down)
     fsr3_math::Camera camera;
+    /// The whole camera for NVIDIA DLSS Frame Generation (dlssg_math.h: matrices without the jitter, position and basis), made
+    /// only while it is wanted (vk_ngxfg.h inputs_wanted); `dlssg_ok` when the scene's view and projection made one
+    dlssg_math::Camera dlssg;
+    bool dlssg_ok = false;
+    bool cut = false;                       ///< the camera jumped (a teleport, a cut scene's shot, an area): reset DLSS-G's history
     bool reset = false;                     ///< no history: the first frame, a new size, or a gap of more than two frames
     float frame_ms = 16.667f;               ///< since the frame before's
     uint64_t frame = 0;                     ///< texture_frame_no() when prepared
 };
 
-/// FSR 3.1 is asked for at all: its upscaler (the Upscaler row) or its frame interpolation (the Frame generation row). The
-/// scene's camera is kept only then
+/// FSR 3.1 is asked for at all: its upscaler (the Upscaler row) or its frame interpolation (the Frame generation row), or NVIDIA
+/// DLSS Frame Generation (vk_ngxfg.h) is given the scene's inputs. The scene's camera is kept only then
 bool wanted();
 
 /// A draw into a scene-sized target with the vertex stage's uniform buffer 3 at `camera`: what vk_temporal.cpp's

@@ -23,14 +23,17 @@
 #include <cstring>
 #include <filesystem>
 #include <mutex>
+#include <deque>
 #include <string>
 #ifndef _WIN32
+#include <dlfcn.h>   // (the driver's NGX core, asked for before NGX's frame generation's extensions)
 #include <fcntl.h>   // (wide: a folder's descriptor for NGX)
 #endif
 
 #include "dlss_checks.h"
 #include "upscaler_rows.h"
 #include "vk_menu.h"
+#include "vk_ngxfg.h"
 #include "vk_paths.h"
 #include "vk_temporal.h"
 #include "vk_texture.h"
@@ -39,6 +42,7 @@
 #include "nvsdk_ngx_vk.h"
 #include "nvsdk_ngx_helpers.h"
 #include "nvsdk_ngx_helpers_vk.h"
+#include "nvsdk_ngx_helpers_dlssg_vk.h"   // (DLSS Frame Generation's capability: vk_ngxfg.cpp makes the frames)
 #endif
 #include "vk_work.h"   // (after the others: counts the commands that do GPU work, for full_barrier)
 
@@ -83,6 +87,10 @@ struct State {
     // up for the run. Each try stalls as a creation does, so they are 600 frames apart)
     uint64_t retry_frame = 0;
     int retries = 0;
+    // DLSS Frame Generation (vk_ngxfg.cpp), as NGX answered at its start: how many frames it makes between two of the game's
+    // (0: none here), and the reason when it is none, for the log
+    int fg_max = 0;
+    const char* fg_why = "NGX was not started";
 };
 State& st() {
     static State s;
@@ -172,6 +180,126 @@ constexpr const fs::path::value_type* kRuntimeName = L"nvngx_dlss.dll";
 constexpr const char* kRuntime = "libnvidia-ngx-dlss.so";
 constexpr const fs::path::value_type* kRuntimeName = "libnvidia-ngx-dlss.so";
 #endif
+// (DLSS Frame Generation's runtime, beside DLSS's: scripts/ngx_sdk.py fetches both)
+#ifdef _WIN32
+constexpr const char* kFgRuntime = "nvngx_dlssg.dll";
+constexpr const fs::path::value_type* kFgRuntimeName = L"nvngx_dlssg.dll";
+#else
+constexpr const char* kFgRuntime = "libnvidia-ngx-dlssg.so";
+constexpr const fs::path::value_type* kFgRuntimeName = "libnvidia-ngx-dlssg.so";
+#endif
+
+/// Where NGX looks for its runtimes (DLSS's, Frame Generation's), and its own files go: built once (wide() keeps a folder's
+/// descriptor open for the process's life, so each folder is turned into NGX's path once)
+struct SearchPaths {
+    bool ok = false;
+    std::vector<fs::path> dirs;           // (RX_VK_DLSS_DIR, the game folder's ngx, the user's data folder's: NGX takes the newest runtime)
+    std::vector<std::wstring> wdirs;
+    std::vector<const wchar_t*> ptrs;
+    std::wstring wdata;                   // (NGX's logs and its own files: the game folder's ngx)
+};
+const SearchPaths& search_paths() {
+    static const SearchPaths sp = [] {
+        SearchPaths r;
+        // (the game folder or nothing: an empty one made "ngx" relative, and NGX looked for its runtime in the current folder)
+        const fs::path game = game_dir();
+        if (game.empty() || game.is_relative()) return r;
+        // where DLSS's runtime (kRuntime) is looked for (NGX takes the newest it finds), and its own files go
+        std::vector<fs::path>& dirs = r.dirs;
+#ifdef _WIN32
+        if (fs::path e = env_path(L"RX_VK_DLSS_DIR"); !e.empty()) dirs.push_back(e);
+        dirs.push_back(game / L"ngx");
+        if (fs::path l = env_path(L"LOCALAPPDATA"); !l.empty()) dirs.push_back(l / L"Hookshot" / L"ngx");
+#else
+        if (fs::path e = env_path("RX_VK_DLSS_DIR"); !e.empty()) dirs.push_back(e);
+        dirs.push_back(game / "ngx");
+        if (fs::path x = env_path("XDG_DATA_HOME"); !x.empty()) dirs.push_back(x / "hookshot" / "ngx");
+        else if (fs::path h = env_path("HOME"); !h.empty()) dirs.push_back(h / ".local" / "share" / "hookshot" / "ngx");
+#endif
+        for (const auto& d : dirs) r.wdirs.push_back(wide(d));
+        for (const auto& d : r.wdirs) r.ptrs.push_back(d.c_str());
+        const fs::path data = game / "ngx";
+        std::error_code made;   // (not the throwing overload: a folder that cannot be made, read-only or so, must not end the game)
+        fs::create_directories(data, made);   // (NGX's logs and its own files: the game folder's, not /usr/share)
+        r.wdata = wide(data);
+        r.ok = true;
+        return r;
+    }();
+    return sp;
+}
+
+/// NGX's Frame Generation requirements: the instance's extensions (device false) or the device's, as NGX lists them for the
+/// feature. NGX's own start is not needed for either. An NGX that does not implement them ("not implemented", seen with some
+/// drivers' cores) or has no core to ask (no NVIDIA driver) gives none: the caller goes on with what it has
+const char* const kProjectId = "7b2f5d0c-6a1e-4c39-9f84-3d5e2a1b0c96";
+std::vector<std::string> fg_requirements(bool device) {
+    std::vector<std::string> names;
+    const SearchPaths& sp = search_paths();
+    if (!sp.ok) return names;
+#ifndef _WIN32
+    // (NGX's core is the driver's: without it nothing here is an NVIDIA GPU, and the SDK's loader has nothing to ask)
+    static void* const core = dlopen("libnvidia-ngx.so.1", RTLD_LAZY);
+    if (!core) return names;
+#endif
+    NVSDK_NGX_FeatureCommonInfo info{};
+    info.PathListInfo.Path = sp.ptrs.data();
+    info.PathListInfo.Length = (unsigned)sp.ptrs.size();
+    NVSDK_NGX_FeatureDiscoveryInfo fd{};
+    fd.SDKVersion = NVSDK_NGX_Version_API;
+    fd.FeatureID = NVSDK_NGX_Feature_FrameGeneration;
+    fd.Identifier.IdentifierType = NVSDK_NGX_Application_Identifier_Type_Project_Id;
+    fd.Identifier.v.ProjectDesc = {kProjectId, NVSDK_NGX_ENGINE_TYPE_CUSTOM, "1.0"};
+    fd.ApplicationDataPath = sp.wdata.c_str();
+    fd.FeatureInfo = &info;
+    uint32_t n = 0;
+    VkExtensionProperties* props = nullptr;
+    const NVSDK_NGX_Result r = device ? NVSDK_NGX_VULKAN_GetFeatureDeviceExtensionRequirements(dev.instance, dev.physical, &fd, &n, &props)
+                                      : NVSDK_NGX_VULKAN_GetFeatureInstanceExtensionRequirements(&fd, &n, &props);
+    if (NVSDK_NGX_FAILED(r) || !props) {
+        logf("vk: NVIDIA DLSS Frame Generation: NGX gave no %s extensions (%#x): the ones DLSS has", device ? "device" : "instance",
+             (unsigned)r);
+        return names;
+    }
+    for (uint32_t i = 0; i < n; i++) names.emplace_back(props[i].extensionName);
+    return names;
+}
+
+/// DLSS Frame Generation's capability from NGX's answers (vk_ngxfg.cpp makes the frames): whether it is available and how many
+/// frames it makes between two of the game's. DLSSG.MultiFrameCountMax said 3 (4x) with the 310.9.16 library on an RTX 5090, yet
+/// that library evaluated 5 made frames without an error and NVIDIA ships up to 6x on RTX 50 cards (NX2navi's runtime found the
+/// same on this game): a GPU with multi-frame generation gets up to 5 (6x); one without it (RTX 40: 1, or not set) gets 1 (2x)
+void read_frame_generation(State& s, const std::vector<fs::path>& dirs) {
+    s.fg_max = 0;
+    if (ngxfg::vendor() == ngxfg::VENDOR_TRIFORCE) {
+        s.fg_why = "RX_VK_FRAMEGEN_VENDOR=triforce";
+        return;
+    }
+    int available = 0;
+    unsigned most = 0;
+    NVSDK_NGX_Parameter_GetI(s.caps, NVSDK_NGX_Parameter_FrameGeneration_Available, &available);
+    if (NVSDK_NGX_FAILED(NVSDK_NGX_Parameter_GetUI(s.caps, NVSDK_NGX_DLSSG_Parameter_MultiFrameCountMax, &most))) most = 1;
+    if (!available) {
+        bool runtime = false;
+        std::error_code ec;
+        for (const auto& d : dirs)
+            for (const auto& f : fs::directory_iterator(d, ec))
+                if (f.path().filename().native().rfind(kFgRuntimeName, 0) == 0) runtime = true;
+        std::string where;
+        for (const auto& d : dirs) where += (where.empty() ? "" : ", ") + shown(d);
+        if (!runtime) {
+            logf("vk: NVIDIA DLSS Frame Generation: not available: no %s in %s (scripts/ngx_sdk.py fetches it): the renderer's own "
+                 "frames", kFgRuntime, where.c_str());
+            s.fg_why = "its runtime is missing";
+        } else {
+            logf("vk: NVIDIA DLSS Frame Generation: not available on this GPU (it needs an RTX 40 or 50): the renderer's own frames");
+            s.fg_why = "needs an RTX 40 or 50";
+        }
+        return;
+    }
+    s.fg_max = most >= 3 ? 5 : most < 1 ? 1 : (int)most;
+    s.fg_why = "";
+    logf("vk: NVIDIA DLSS Frame Generation: available, up to %dx (NGX's DLSSG.MultiFrameCountMax %u)", s.fg_max + 1, most);
+}
 
 /// NGX on this device, once: false when DLSS cannot run here (the reason logged)
 bool ngx_init() {
@@ -179,33 +307,16 @@ bool ngx_init() {
     std::lock_guard lk(s.mu);
     if (s.ngx_tried) return s.ngx_ok;
     s.ngx_tried = true;
-    // (the game folder or nothing: an empty one made "ngx" relative, and NGX looked for its runtime in the current folder)
-    const fs::path game = game_dir();
-    if (game.empty() || game.is_relative()) {
+    const SearchPaths& sp = search_paths();
+    if (!sp.ok) {
         logf("vk: NVIDIA DLSS: the game's folder could not be found: no DLSS");
         g_why = DLSS_NO_RUNTIME;
+        s.fg_why = "the game's folder could not be found";
         return false;
     }
-    // where DLSS's runtime (kRuntime) is looked for (NGX takes the newest it finds), and its own files go
-    std::vector<fs::path> dirs;
-#ifdef _WIN32
-    if (fs::path e = env_path(L"RX_VK_DLSS_DIR"); !e.empty()) dirs.push_back(e);
-    dirs.push_back(game / L"ngx");
-    if (fs::path l = env_path(L"LOCALAPPDATA"); !l.empty()) dirs.push_back(l / L"Hookshot" / L"ngx");
-#else
-    if (fs::path e = env_path("RX_VK_DLSS_DIR"); !e.empty()) dirs.push_back(e);
-    dirs.push_back(game / "ngx");
-    if (fs::path x = env_path("XDG_DATA_HOME"); !x.empty()) dirs.push_back(x / "hookshot" / "ngx");
-    else if (fs::path h = env_path("HOME"); !h.empty()) dirs.push_back(h / ".local" / "share" / "hookshot" / "ngx");
-#endif
-    std::vector<std::wstring> wdirs;
-    for (const auto& d : dirs) wdirs.push_back(wide(d));
-    std::vector<const wchar_t*> paths;
-    for (const auto& d : wdirs) paths.push_back(d.c_str());
-    const fs::path data = game / "ngx";
-    std::error_code made;   // (not the throwing overload: a folder that cannot be made, read-only or so, must not end the game)
-    fs::create_directories(data, made);   // (NGX's logs and its own files: the game folder's, not /usr/share)
-    const std::wstring wdata = wide(data);
+    const std::vector<fs::path>& dirs = sp.dirs;
+    const std::vector<const wchar_t*>& paths = sp.ptrs;
+    const std::wstring& wdata = sp.wdata;
     NVSDK_NGX_FeatureCommonInfo info{};
     info.PathListInfo.Path = paths.data();
     info.PathListInfo.Length = (unsigned)paths.size();
@@ -215,7 +326,7 @@ bool ngx_init() {
     // (NGX also writes its own log files into the data folder; with RX_VK_DLSS_LOG=1 its lines go to ours instead)
     info.LoggingInfo.DisableOtherLoggingSinks = verbose;
     // (a project id of Hookshot's own: NGX wants one with the custom engine type, any GUID)
-    NVSDK_NGX_Result r = NVSDK_NGX_VULKAN_Init_with_ProjectID("7b2f5d0c-6a1e-4c39-9f84-3d5e2a1b0c96", NVSDK_NGX_ENGINE_TYPE_CUSTOM,
+    NVSDK_NGX_Result r = NVSDK_NGX_VULKAN_Init_with_ProjectID(kProjectId, NVSDK_NGX_ENGINE_TYPE_CUSTOM,
                                                               "1.0", wdata.c_str(), dev.instance, dev.physical, dev.device,
                                                               instance_proc(), vkGetDeviceProcAddr, &info);
     if (NVSDK_NGX_FAILED(r)) {
@@ -228,6 +339,8 @@ bool ngx_init() {
         g_why = DLSS_NEEDS_RTX;
         return false;
     }
+    // (the frame generation's capability first: it does not depend on DLSS's runtime being there)
+    read_frame_generation(s, dirs);
     // (NGX's C functions, not NVSDK_NGX_Parameter's virtual ones: its object comes from NVIDIA's MSVC-built library, whose
     // vtable order is not the Itanium ABI's that llvm-mingw calls with. The overloads only lined up by luck)
     int available = 0, needs_driver = 0;
@@ -432,13 +545,48 @@ const TemporalEngine kEngine{"NVIDIA DLSS", "DLSS", start, prepare, evaluate, re
 bool dlss_built() { return true; }
 const TemporalEngine* dlss_engine() { return &kEngine; }
 
+namespace {
+/// A name kept for the process's life, for the extension lists' const char*
+const char* kept_name(const std::string& n) {
+    static std::deque<std::string> names;
+    static std::mutex mu;
+    std::lock_guard lk(mu);
+    for (const auto& k : names)
+        if (k == n) return k.c_str();
+    names.push_back(n);
+    return names.back().c_str();
+}
+bool listed(const std::vector<const char*>& want, const char* name) {
+    for (const char* w : want)
+        if (!strcmp(w, name)) return true;
+    return false;
+}
+/// What NGX asks for DLSS Frame Generation (fg_requirements), added to `want` when the loader or device has it (all)
+void add_fg_extensions(bool device, std::vector<const char*>& want, const std::vector<VkExtensionProperties>& all) {
+    if (ngxfg::vendor() == ngxfg::VENDOR_TRIFORCE) return;
+    for (const std::string& n : fg_requirements(device)) {
+        bool have = false;
+        for (const auto& e : all) have |= n == e.extensionName;
+        if (!have) {
+            logf("vk: NVIDIA DLSS Frame Generation: the %s lacks %s, which NGX asks for it", device ? "device" : "loader", n.c_str());
+            continue;
+        }
+        if (!listed(want, n.c_str())) want.push_back(kept_name(n)), logf("vk: NVIDIA DLSS Frame Generation: %s extension %s", device ? "device" : "instance", n.c_str());
+    }
+}
+}  // namespace
+
 void dlss_instance_extensions(std::vector<const char*>& want, const std::vector<VkExtensionProperties>& all) {
     if (env_switch("RX_VK_DLSS") == 0) return;
     for (const auto& e : all)
         if (!strcmp(e.extensionName, VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME)) {
-            want.push_back(VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME);
-            return;
+            if (!listed(want, VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME))
+                want.push_back(VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME);
+            break;
         }
+    // (DLSS Frame Generation's own: not DLSS's list, which is only this one. Not before the menu's settings are read, so
+    // whenever NGX lists them; NGX not answering ("not implemented") leaves the list as it is)
+    add_fg_extensions(false, want, all);
 }
 
 void dlss_device_extensions(std::vector<const char*>& want, const std::vector<VkExtensionProperties>& all) {
@@ -457,6 +605,8 @@ void dlss_device_extensions(std::vector<const char*>& want, const std::vector<Vk
     // (NVIDIA's own extensions: without them this is not an NVIDIA GPU, or not one NGX runs on. With them, NGX says, in
     // dlss_probe or at the first upscale: a GTX has them too)
     if (!both) g_why = DLSS_NEEDS_RTX;
+    // (DLSS Frame Generation's, from NGX, on an NVIDIA device only: NGX's list for it, when NGX answers)
+    else add_fg_extensions(true, want, all);
 }
 
 void dlss_probe() {
@@ -464,11 +614,31 @@ void dlss_probe() {
     ngx_init();
 }
 
+int dlss_fg_max() {
+    if (env_switch("RX_VK_DLSS") == 0 || !dev.device) return 0;
+    State& s = st();
+    {
+        std::lock_guard lk(s.mu);
+        if (!s.ngx_tried && g_why.load(std::memory_order_relaxed) == DLSS_NEEDS_RTX) return 0;   // (no NVIDIA extensions: not an NVIDIA GPU)
+    }
+    ngx_init();   // (once)
+    std::lock_guard lk(s.mu);
+    return s.fg_max;
+}
+
+const char* dlss_fg_why() {
+    State& s = st();
+    std::lock_guard lk(s.mu);
+    return s.fg_max ? "" : s.fg_why;
+}
+
 #else  // (no NGX SDK in this build: DLSS is not there)
 
 bool dlss_built() { return false; }
 const TemporalEngine* dlss_engine() { return nullptr; }
 void dlss_probe() {}
+int dlss_fg_max() { return 0; }
+const char* dlss_fg_why() { return "this build has no NVIDIA NGX SDK"; }
 void dlss_instance_extensions(std::vector<const char*>&, const std::vector<VkExtensionProperties>&) {}
 void dlss_device_extensions(std::vector<const char*>&, const std::vector<VkExtensionProperties>&) {}
 

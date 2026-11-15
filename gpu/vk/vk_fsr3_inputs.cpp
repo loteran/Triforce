@@ -22,6 +22,7 @@
 #include "vk_draw.h"   // (descriptors_disturbed)
 #include "vk_fsr3.h"
 #include "vk_fsr3fi.h"
+#include "vk_ngxfg.h"
 #include "vk_texture.h"
 
 #include "shaders/fsr3_prep_comp_spv.h"
@@ -44,6 +45,7 @@ struct Image {
 };
 
 struct Camera {
+    float view[12]{};         // (its view, 3 x 4: the buffer's first 0x30 bytes; the camera's position and basis for frame generation)
     float current[16]{};      // (its view-projection, jittered)
     float projection[16]{};   // (its projection, jittered: the near plane and the field of view come from it)
     float jitter[2]{};        // (the projection's offset of the picture's centre, in clip space: nx2/oot_jitter.py)
@@ -67,6 +69,8 @@ struct State {
     uint64_t depth_views_gen = 0;
     float last_vp[16]{};      // (the frame before's view-projection, and its jitter)
     float last_jitter[2]{};
+    float last_pos[3]{}, last_fwd[3]{};   // (the frame before's camera position and direction: dlssg_math::is_cut)
+    bool last_cam_ok = false;
     uint64_t last_frame = 0;  // (the frame prepare last ran, 0: none)
     std::chrono::steady_clock::time_point last_time{};
     Frame frame;              // (the last one prepared: take())
@@ -207,7 +211,7 @@ VkImageView depth_view(Texture* t) {
 
 } // namespace
 
-bool wanted() { return fsr3_wanted() || fsr3fi::frames_wanted() != 0; }
+bool wanted() { return fsr3_wanted() || fsr3fi::frames_wanted() != 0 || ngxfg::inputs_wanted(); }
 
 void note_scene_draw(const Texture* color0, uint32_t width, uint32_t height, Texture* depth, uint64_t camera,
                      uint64_t camera_size) {
@@ -225,6 +229,7 @@ void note_scene_draw(const Texture* color0, uint32_t width, uint32_t height, Tex
         c[0xa8 / 4] != -1.0f || c[0xac / 4] != 0.0f)
         return;
     Camera& k = s.cam;
+    std::memcpy(k.view, c, sizeof k.view);
     std::memcpy(k.current, c + 0x30 / 4, sizeof k.current);
     std::memcpy(k.projection, c + 0x70 / 4, sizeof k.projection);
     // (the offset sead's projection gave the frustum, in its third column: 2 * offset, which moves the picture by -that)
@@ -316,6 +321,26 @@ bool prepare(VkCommandBuffer cmd, Texture* in, VkImageView in_view, Frame& out, 
     dlss_math::jitter_to_pixels(cam.jitter, rw, rh, f.jitter);   // (in render pixels, x right and y down: FSR's, as DLSS's)
     f.camera = camera;
     f.reset = reset;
+    f.depth_image = s.depth.image, f.motion_image = s.motion.image;
+    if (ngxfg::inputs_wanted()) {
+        // (NVIDIA DLSS Frame Generation's camera: its matrices carry no jitter, which it is given on its own: both frames'
+        // view-projections unjittered, where the motion above takes this frame's jittered, as the depth it was drawn with is)
+        float current[16], before[16];
+        std::memcpy(current, cam.current, sizeof current), std::memcpy(before, s.last_vp, sizeof before);
+        dlss_math::unjitter(current, cam.jitter), dlss_math::unjitter(before, s.last_jitter);
+        f.dlssg_ok = dlssg_math::camera(cam.view, projection, current, before, !reset, f.dlssg);
+        if (f.dlssg_ok && s.last_cam_ok && !reset) {
+            const float frames = s.last_time.time_since_epoch().count()
+                                     ? (float)(std::chrono::duration<double, std::milli>(t - s.last_time).count() / 16.667)
+                                     : 1.0f;
+            f.cut = dlssg_math::is_cut(s.last_pos, s.last_fwd, f.dlssg.pos, f.dlssg.fwd, frames);
+        }
+        s.last_cam_ok = f.dlssg_ok;
+        if (f.dlssg_ok)
+            std::memcpy(s.last_pos, f.dlssg.pos, sizeof s.last_pos), std::memcpy(s.last_fwd, f.dlssg.fwd, sizeof s.last_fwd);
+    } else {
+        s.last_cam_ok = false;
+    }
     f.frame_ms = s.last_time.time_since_epoch().count() && !reset
                      ? (float)std::min(250.0, std::chrono::duration<double, std::milli>(t - s.last_time).count())
                      : 16.667f;

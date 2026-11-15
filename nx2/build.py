@@ -919,8 +919,8 @@ def main():
             "-I" + os.path.join(spirv_headers, "include"), "-I" + os.path.join(spirv_headers, "include", "spirv", "unified1"),
             "-I" + os.path.join(vk_headers, "include"), "-I" + os.path.join(vma_headers, "include"),
             "-I" + vk, "-I" + gen_dir]
-        # (NVIDIA DLSS, a local build's option: scripts/ngx_sdk.py. Only vk_dlss.cpp sees NVIDIA's headers; without them
-        # it is the stubs that say DLSS is not there)
+        # (NVIDIA DLSS, a local build's option: scripts/ngx_sdk.py. Only these files see NVIDIA's headers (vk_dlss.cpp: the
+        # upscaler; vk_ngxfg.cpp: DLSS Frame Generation); without them it is the stubs that say it is not there)
         ngx_flags = ["-DHOOKSHOT_NGX", "-I" + os.path.join(NGX_SDK, "include")] if NGX_SDK else []
         ngx_deps = tree_headers(os.path.join(NGX_SDK, "include")) if NGX_SDK else b""
         if NGX_SDK:
@@ -973,13 +973,13 @@ def main():
             vk_jobs.append((cxx, src, os.path.join(obj_dir, "vk_" + name + ".o"),
                             vflags + ([shader_stamp] if os.path.basename(src) == "vk_shader.cpp" else []) +
                             ([stamp_def] if os.path.basename(src) == "vk_menu.cpp" else []) +
-                            (ngx_flags if os.path.basename(src) == "vk_dlss.cpp" else []) +
+                            (ngx_flags if os.path.basename(src) in ("vk_dlss.cpp", "vk_ngxfg.cpp") else []) +
                             (imgui_flags if os.path.basename(src) in imgui_users else []) +
                             (fsr_flags if os.path.basename(src) == "vk_fsr4.cpp" else []) +
                             (renodx_flags if os.path.basename(src) == "vk_renodx.cpp" else []),
                             vk_lib_deps if lib else vdeps + (logo_text if os.path.basename(src) == "vk_imgui.cpp" else b"") +
                             (renodx_deps if os.path.basename(src) == "vk_renodx.cpp" else b"") +
-                            (ngx_deps if os.path.basename(src) == "vk_dlss.cpp" else b"") +
+                            (ngx_deps if os.path.basename(src) in ("vk_dlss.cpp", "vk_ngxfg.cpp") else b"") +
                             (imgui_deps if os.path.basename(src) in imgui_users else b"")))
         if NGX_SDK and not LINUX and toolchain.mingw():
             # (llvm-mingw: NVIDIA's static library was built with Microsoft's compiler for its static runtime (/MT). What it asks

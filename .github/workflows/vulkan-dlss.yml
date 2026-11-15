@@ -12,6 +12,10 @@ on:
     branches: [main, dev]
     paths:
       - 'gpu/vk/vk_dlss*'
+      - 'gpu/vk/vk_ngxfg*'
+      - 'gpu/vk/vk_framegen*'
+      - 'gpu/vk/vk_fsr3_inputs*'
+      - 'gpu/vk/dlssg_math.h'
       - 'gpu/vk/vk_temporal*'
       - 'gpu/vk/vk_fsr4*'
       - 'third_party/fidelityfx/**'
@@ -30,6 +34,10 @@ on:
   pull_request:
     paths:
       - 'gpu/vk/vk_dlss*'
+      - 'gpu/vk/vk_ngxfg*'
+      - 'gpu/vk/vk_framegen*'
+      - 'gpu/vk/vk_fsr3_inputs*'
+      - 'gpu/vk/dlssg_math.h'
       - 'gpu/vk/vk_temporal*'
       - 'gpu/vk/vk_fsr4*'
       - 'third_party/fidelityfx/**'

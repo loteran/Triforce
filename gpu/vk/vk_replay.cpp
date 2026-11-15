@@ -39,6 +39,7 @@
 #include "vk_paths.h"   // (game_module_path: the frame trace beside the game)
 #include "vk_gprof.h"
 #include "vk_framegen.h"
+#include "vk_ngxfg.h"   // (DLSS Frame Generation: idle)
 #include "vk_menu.h"
 #include "vk_jobs.h"
 #include "vk_shader.h"
@@ -3041,6 +3042,7 @@ void do_present(const nvn_tex* t, const int crop[4]) {
     // next frame's input stage
     renodx_present();   // (local, RenoDX port) its settings as the menu has them now
     temporal_idle();   // (DLSS, FSR: their video memory let go once not used for a while)
+    ngxfg::idle();   // (DLSS Frame Generation's too)
     status_tick();   // (the status line, and the video-memory warning)
     reflex_present_begins();
     struct ReflexSleep { ~ReflexSleep() { reflex_sleep(); antilag_input(); } } reflex_sleep_after;

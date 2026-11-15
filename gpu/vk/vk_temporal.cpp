@@ -58,6 +58,7 @@
 #include "dlss_math.h"
 #include "upscaler_rows.h"
 #include "vk_dlss.h"
+#include "vk_ngxfg.h"
 #include "vk_draw.h"
 #include "vk_fsr3.h"   // (fsr3_wanted: AMD FSR 3.1 upscales with inputs of its own)
 #include "vk_fsr4.h"
@@ -1539,7 +1540,11 @@ bool temporal_upscale(VkCommandBuffer cmd, uint64_t key, bool known, Texture* in
         return fail("unexpected scene depth");
     if (!temporal_scene_format(out->format) || out->format != in->format || !dlss_checks::scene_size_fits(rw, rh, ow, oh))
         return fail("unexpected output");
-    return chain(cmd, mode, engine, cam, captures, in_view, rw, rh, ow, oh, out_view, nullptr, in->format, out->format);
+    const bool drew = chain(cmd, mode, engine, cam, captures, in_view, rw, rh, ow, oh, out_view, nullptr, in->format, out->format);
+    // (the engine's picture is in `out` now and the HUD is drawn into it next: NVIDIA DLSS Frame Generation keeps a copy of it, the
+    // picture without the HUD. Not before the bloom (pre), where the picture is not in `out` yet: that path returns above)
+    if (drew) ngxfg::hudless_note(cmd, out, out_level);
+    return drew;
 }
 
 namespace {

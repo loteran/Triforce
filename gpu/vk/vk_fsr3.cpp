@@ -22,6 +22,7 @@
 #include "vk_draw.h"      // (descriptors_disturbed)
 #include "vk_gprof.h"     // (RX_VK_PASS_TIMING: a span per pass, so the report names them)
 #include "vk_menu.h"
+#include "vk_ngxfg.h"
 #include "vk_temporal.h"   // (temporal_env_chosen: RX_VK_DLSS / RX_VK_FSR4 over the row's FSR 3.1)
 #include "vk_texture.h"
 #include "upscaler_rows.h"
@@ -854,6 +855,7 @@ bool fsr3_upscale(VkCommandBuffer cmd, uint64_t key, bool known, Texture* in, Vk
     }
     full_barrier(cmd);
     fsr3_inputs::upscaled(f.width, f.height, ow, oh);
+    ngxfg::hudless_note(cmd, out, out_level);   // (the picture without the HUD, for NVIDIA DLSS Frame Generation: vk_ngxfg.h)
     // (every 600 frames: that it still draws, and the jitter it was given, which says the host's jitter is on)
     if (++o.drawn % 600 == 0)
         logf("vk: fsr3: %llu frames drawn, %ux%u -> %ux%u, this one's jitter %+.3f %+.3f px of %u phases", (unsigned long long)o.drawn,

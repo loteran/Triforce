@@ -244,6 +244,8 @@ def cpp_checks(tools, timeout):
     out.append((lower, build_and_run(lower, ["-O1", "-Wno-everything", "-I" + eden, "-I" + compat], ["{tmp}"])))
     regmap = "gpu/vk/tests/regmap_marker_test.cpp"   # (the lowering's renamed-register markers: no number mapped twice)
     out.append((regmap, build_and_run(regmap, ["-O1", "-Wno-everything", "-I" + eden, "-I" + compat], [])))
+    dlssg = "gpu/vk/tests/dlssg_math_test.cpp"   # (NVIDIA DLSS Frame Generation's camera: dlssg_math.h)
+    out.append((dlssg, build_and_run(dlssg, ["-Wall", "-Wextra", "-Werror"], [])))
     return out, ([] if cxx else ["a C++ compiler"])
 
 

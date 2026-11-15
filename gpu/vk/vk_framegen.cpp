@@ -5,6 +5,9 @@
 //   2. block matching: a vector per 16x16 pixels within +-32 pixels (RX_VK_FRAMEGEN_RADIUS quarter texels, default
 //      8), then a 3x3 median of them;
 //   3. each in-between frame at time t blends the last frame moved back along t and the new one forward along 1 - t.
+// Where NVIDIA DLSS Frame Generation can run (an RTX 40 or 50, its runtime beside the game's: vk_ngxfg.h) it makes those frames
+// instead of steps 2 and 3, from the scene's depth, motion and camera, at 2x up to what the GPU allows (RX_VK_FRAMEGEN_VENDOR=
+// auto|nvidia|triforce chooses); the multipliers above that, and every present it cannot take, stay with the steps above.
 // Recorded into the present's own recording, after the game's work; the display thread shows the made frames and
 // then the game's, evenly over the game's recent frame time, about one frame behind the game. Loading hitches
 // (frames over 100 ms apart) are not interpolated.
@@ -22,7 +25,9 @@
 #include "vk_framegen.h"
 #include "vk_fsr3_inputs.h"   // (AMD FSR 3.1 frame interpolation's depth and motion)
 #include "vk_fsr3fi.h"
+#include "vk_dlss.h"   // (dlss_fg_why: why DLSS Frame Generation is not the one making the frames)
 #include "vk_menu.h"
+#include "vk_ngxfg.h"   // (NVIDIA DLSS Frame Generation)
 #include "vk_present_rect.h"
 #include "vk_texture.h"
 
@@ -332,6 +337,7 @@ void drop_size() {
     fg.mult = 0;
     fg.have_prev = false;
     fg.recorded = nullptr;
+    ngxfg::reset();   // (DLSS Frame Generation's history was of the pictures that are gone)
 }
 
 bool ensure_size(VkCommandBuffer cmd, uint32_t w, uint32_t h) {
@@ -718,6 +724,61 @@ int fsr3fi_frame(VkCommandBuffer cmd, OutSet& set, int cur, uint32_t uw, uint32_
     return 1;
 }
 
+namespace {
+
+/// Who makes the frames, said in the log whenever it changes (twenty times at most): engine and the reason it is not the other one
+void note_engine(const char* engine, const char* why) {
+    static const char* last_engine = nullptr;
+    static char last_why[160];
+    static int told = 0;
+    if (last_engine == engine && !strcmp(last_why, why)) return;
+    last_engine = engine, snprintf(last_why, sizeof last_why, "%s", why);
+    if (told++ < 20) logf("vk: frame generation: the made frames are from %s%s%s", engine, *why ? " " : "", why);
+}
+/// Why DLSS Frame Generation is not making this row's frames, for note_engine
+const char* dlssg_why(char* buf, size_t n) {
+    const int most = ngxfg::max_generated();
+    if (!ngxfg::built()) return "(this build has no NVIDIA NGX SDK)";
+    if (ngxfg::vendor() == ngxfg::VENDOR_TRIFORCE) return "(RX_VK_FRAMEGEN_VENDOR=triforce)";
+    if (dev.hdr || opts.hdr == 2) return "(HDR is on: DLSS Frame Generation is SDR here)";
+    if (most <= 0) return snprintf(buf, n, "(DLSS Frame Generation: %s)", dlss_fg_why()), buf;
+    if (opts.framegen > most + 1) return snprintf(buf, n, "(%dx is more than DLSS Frame Generation makes here: %dx)", opts.framegen, most + 1), buf;
+    return "(DLSS Frame Generation did not take this frame)";
+}
+
+/// The made frames of a set by NVIDIA DLSS Frame Generation (vk_ngxfg.h): the picture of this frame (fg.frames[cur]), the scene's
+/// depth, motion and camera (vk_fsr3_inputs.h) and, when an upscaler drew, the picture without the HUD, into
+/// set.frame[slots[0..count)] in that order. True when they are made. False when they are not (no inputs this present, no
+/// camera, an NGX error): the caller makes them itself, and DLSS-G starts a new history at its next frame
+bool dlssg_frames(VkCommandBuffer cmd, OutSet& set, const int* slots, int count, int cur, uint32_t uw, uint32_t uh) {
+    // (every 600 presents asked: how many DLSS-G made, and how many it left to the renderer's own and why)
+    static uint64_t asked = 0, made = 0, no_inputs = 0, failed = 0;
+    if (++asked % 600 == 0)
+        logf("vk: ngxfg: %llu of the last 600 presents' frames by DLSS Frame Generation, %llu without its inputs, %llu it did not make",
+             (unsigned long long)made, (unsigned long long)no_inputs, (unsigned long long)failed),
+            made = no_inputs = failed = 0;
+    fsr3_inputs::Frame f;
+    if (!fsr3_inputs::take(f) || !f.dlssg_ok) {
+        ngxfg::reset();   // (this present is not one DLSS-G saw: its next one has no clean frame before)
+        return no_inputs++, false;
+    }
+    ngxfg::Inputs in;
+    in.color = fg.frames[cur].view, in.color_image = fg.frames[cur].image;
+    in.width = uw, in.height = uh;
+    in.depth = f.depth, in.depth_image = f.depth_image, in.motion = f.motion, in.motion_image = f.motion_image;
+    in.render_width = f.width, in.render_height = f.height;
+    in.jitter[0] = f.jitter[0], in.jitter[1] = f.jitter[1];
+    in.camera = f.dlssg;
+    in.reset = f.reset || f.cut;   // (no history: the first frame, a new size, a gap, or the camera jumped)
+    ngxfg::Output out[kMaxMult];
+    for (int i = 0; i < count; i++) out[i] = {set.frame[slots[i]].image, set.frame[slots[i]].view};
+    if (!ngxfg::evaluate(cmd, in, out, count)) return failed++, false;
+    made++;
+    return true;
+}
+
+}  // namespace
+
 bool framegen_record(VkCommandBuffer cmd, VkImageView src, uint32_t sw, uint32_t sh, const int crop[4]) {
     const PresentSourceRect source = present_source_rect(sw, sh, crop);
     const int x0 = (int)source.x, y0 = (int)source.y, w = (int)source.w, h = (int)source.h;
@@ -763,10 +824,34 @@ bool framegen_record(VkCommandBuffer cmd, VkImageView src, uint32_t sw, uint32_t
             n = 1, t[0] = 1.0f, at[0] = now, fg.slot_next = now + period;
         }
         bool flow = false;
+        // (NVIDIA DLSS Frame Generation makes the slots that are not the game's, in time order, when it can: it takes evenly
+        // spaced frames only, so a refresh's own time is its index of the count's: the display's refreshes are that even already
+        // at the game's steady rate, and the pacer shows each at its own time as before)
+        bool made_by[kMaxMult] = {};
+        const bool dlssg_row = ngxfg::wanted_for(opts.framegen);
+        const bool only_nvidia = ngxfg::vendor() == ngxfg::VENDOR_NVIDIA;
+        for (int k = 0; k < n; k++) set->game[k] = t[k] > 0.999f;
+        if (blend && dlssg_row) {
+            int slots[kMaxMult], count = 0;
+            for (int k = 0; k < n; k++)
+                if (!set->game[k]) slots[count++] = k;
+            if (count > 0 && count <= ngxfg::max_generated() && dlssg_frames(cmd, *set, slots, count, cur, uw, uh)) {
+                for (int i = 0; i < count; i++) made_by[slots[i]] = true;
+                note_engine("NVIDIA DLSS Frame Generation", "");
+            }
+        } else if (dlssg_row) {
+            ngxfg::reset();   // (nothing to make from: the first frame, a loading hitch)
+        }
+        if (n > 0 && !set->game[n - 1] && !made_by[n - 1] && !only_nvidia) {
+            char b[160];
+            note_engine("the renderer's own optical flow", dlssg_row ? "(DLSS Frame Generation did not take this frame)" : dlssg_why(b, sizeof b));
+        }
         for (int k = 0; k < n; k++) {
             set->game[k] = t[k] > 0.999f;
             set->due[k] = at[k] + fg.game_ns;
-            if (set->game[k]) {
+            // (nothing but DLSS Frame Generation makes frames under RX_VK_FRAMEGEN_VENDOR=nvidia: a slot it did not make shows the game's)
+            if (made_by[k]) continue;
+            if (set->game[k] || only_nvidia) {
                 const VkImageCopy c{{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
                                     {0, 0, 0}, {uw, uh, 1}};
                 vkCmdCopyImage(cmd, fg.frames[cur].image, VK_IMAGE_LAYOUT_GENERAL, set->frame[k].image,
@@ -792,10 +877,28 @@ bool framegen_record(VkCommandBuffer cmd, VkImageView src, uint32_t sw, uint32_t
         fg.recorded_at = now;
         return true;
     }
+    // (NVIDIA DLSS Frame Generation first, where it runs and makes this many: 2x up to its most, any GPU's own limit; the frames
+    // it did not make, and the multipliers it does not, are the ones below. RX_VK_FRAMEGEN_VENDOR=nvidia: nothing else makes any)
+    const bool dlssg_row = ngxfg::wanted_for(opts.framegen);
+    const bool only_nvidia = ngxfg::vendor() == ngxfg::VENDOR_NVIDIA;
+    if (blend && m > 1 && dlssg_row && m - 1 <= ngxfg::max_generated()) {
+        int slots[kMaxMult];
+        for (int k = 0; k < m - 1; k++) slots[k] = k;
+        if (dlssg_frames(cmd, *set, slots, m - 1, cur, uw, uh)) {
+            set->made = m - 1;
+            note_engine("NVIDIA DLSS Frame Generation", "");
+        }
+    } else if (dlssg_row) {
+        ngxfg::reset();   // (nothing to make from, or more than it makes: its next present has no clean frame before)
+    }
+    if (set->made == 0 && blend && m > 1 && !only_nvidia) {
+        char b[160];
+        note_engine("the renderer's own optical flow", dlssg_row ? "(DLSS Frame Generation did not take this frame)" : dlssg_why(b, sizeof b));
+    }
     // (hookshot) At 2x, AMD FSR 3.1's frame interpolation where it runs; it makes the midpoint only, so 3x and more (and Auto,
     // above) stay with the interpolation below, as does any present it does not take
-    if (blend && m == 2 && fsr3fi::frames_wanted()) set->made = fsr3fi_frame(cmd, *set, cur, uw, uh, sequence);
-    if (set->made == 0 && blend && m > 1) {
+    if (set->made == 0 && !only_nvidia && blend && m == 2 && fsr3fi::frames_wanted()) set->made = fsr3fi_frame(cmd, *set, cur, uw, uh, sequence);
+    if (set->made == 0 && !only_nvidia && blend && m > 1) {
         pass(cmd, fg.flow, {{fg.lumas[prev].view, fg.nearest}, {fg.lumas[cur].view, fg.nearest},
                             {fg.flows[0].view, VK_NULL_HANDLE}}, cw, ch);
         pass(cmd, fg.median, {{fg.flows[0].view, fg.nearest}, {fg.flows[1].view, VK_NULL_HANDLE}}, cw, ch);
