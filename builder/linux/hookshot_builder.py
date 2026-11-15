@@ -27,6 +27,7 @@ sys.path.insert(0, os.path.join(ROOT, "nx2"))
 sys.path.insert(0, os.path.join(ROOT, "third_party", "a64-kit", "tools"))
 import linux_update  # noqa: E402  (the release check and the part download)
 import make_game  # noqa: E402  (LANGUAGES, BUILD_ID)
+import saves  # noqa: E402  (import saves from an emulator or NX2navi)
 import toolchain  # noqa: E402  (default_jobs: RX_JOBS)
 
 CONFIG = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), "triforce", "builder.ini")
@@ -699,8 +700,11 @@ class Builder(tk.Tk):
         ttk.Label(f, text="Pick your game files and where the game goes. Triforce does the rest, once.", style="Sub.TLabel",
                   wraplength=px(800)).grid(row=1, column=0, columnspan=3, sticky="w", pady=(px(6), 0))
         if game_ready(self.cfg.get("out")):
-            ttk.Button(f, text="Play the game built in %s" % self.cfg["out"], command=lambda: self.play_and_close(self.cfg["out"])).grid(
-                row=2, column=0, columnspan=3, sticky="w", pady=(px(16), 0))
+            ready = ttk.Frame(f)
+            ready.grid(row=2, column=0, columnspan=3, sticky="we", pady=(px(16), 0))
+            ttk.Button(ready, text="Play the game built in %s" % self.cfg["out"], command=lambda: self.play_and_close(self.cfg["out"])).pack(side="left")
+            ttk.Button(ready, text="Import saves\u2026", style="Link.TButton", cursor="hand2",
+                       command=lambda: self.import_saves_dialog(self.cfg["out"])).pack(side="left", padx=(px(18), 0))
         self.section(f, "Game files", 3, columnspan=3)
         kinds = ttk.Frame(f, style="Card.TFrame", padding=px(5))
         kinds.grid(row=4, column=0, columnspan=3, sticky="we")
@@ -970,7 +974,113 @@ class Builder(tk.Tk):
                    command=lambda: self.play_and_close(folder)).pack(side="right", padx=px(4))
         ttk.Button(f, text="Open the game folder", style="Link.TButton", cursor="hand2",
                    command=lambda: subprocess.Popen(["xdg-open", folder])).pack(pady=(px(22), 0))
+        ttk.Button(f, text="Import saves\u2026", style="Link.TButton", cursor="hand2",
+                   command=lambda: self.import_saves_dialog(folder)).pack(pady=(px(8), 0))
         self.lookup_latest()
+
+    def import_saves_dialog(self, game):
+        """Import saves: the sets found (NX2navi, emulators) in a list, Other folder\u2026, then Import after a confirmation that
+        names what gets replaced and where the backup goes (saves.py does the copy)."""
+        px = self.px
+        out = self.cfg.get("out") or ""
+        extra = [out, os.path.dirname(out.rstrip("/")) if out else "", game, os.path.dirname(game.rstrip("/"))]
+        for key in ("out", "last_navi"):
+            if self.cfg.get(key):
+                extra.append(self.cfg[key])
+        found = saves.find_saves([d for d in extra if d], game)
+        dest = saves.triforce_folder(game)
+        top = tk.Toplevel(self)
+        top.title("Import saves")
+        top.configure(background=PAGE)
+        top.transient(self)
+        top.minsize(px(640), px(380))
+        f = ttk.Frame(top, padding=(px(28), px(22), px(28), px(22)))
+        f.pack(fill="both", expand=True)
+        f.columnconfigure(0, weight=1)
+        f.rowconfigure(2, weight=1)
+        ttk.Label(f, text="Import saves", style="Title.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Label(f, text="Bring your saves of Ocarina of Time in from NX2navi or an emulator. Pick where to take them from.",
+                  style="Sub.TLabel", wraplength=px(600)).grid(row=1, column=0, sticky="w", pady=(px(6), px(12)))
+        box = tk.Frame(f, background=GLASS)
+        box.grid(row=2, column=0, sticky="nsew")
+        box.columnconfigure(0, weight=1)
+        box.rowconfigure(0, weight=1)
+        lst = tk.Listbox(box, height=7, activestyle="none", exportselection=False, font="HsNote", background=GLASS, foreground=INK,
+                         selectbackground=BRAND, selectforeground=WHITE, borderwidth=0, highlightthickness=0, relief="flat")
+        lst.grid(row=0, column=0, sticky="nsew", padx=px(8), pady=px(8))
+        items = list(found)
+
+        def fill():
+            lst.delete(0, "end")
+            for item in items:
+                lst.insert("end", "  %s \u2014 %d slot%s \u2014 %s" % (item.name, item.slots, "" if item.slots == 1 else "s", saves.when(item.last)))
+            if items:
+                lst.selection_set(0)
+            status.set("" if items else "No saves of this game were found. Use Other folder\u2026 to point at them.")
+            refresh()
+        status, where = tk.StringVar(), tk.StringVar()
+        ttk.Label(f, textvariable=where, style="Small.TLabel", wraplength=px(600)).grid(row=3, column=0, sticky="w", pady=(px(10), 0))
+        ttk.Label(f, textvariable=status, style="Status.TLabel", wraplength=px(600)).grid(row=4, column=0, sticky="w", pady=(px(4), 0))
+        buttons = ttk.Frame(f)
+        buttons.grid(row=5, column=0, sticky="we", pady=(px(16), 0))
+        go = ttk.Button(buttons, text="Import", style="Primary.TButton", cursor="hand2")
+
+        def refresh():
+            sel = lst.curselection()
+            go.state(["!disabled"] if sel else ["disabled"])
+            where.set(items[sel[0]].folder if sel else "")
+
+        def other():
+            cur = (self.cfg.get("last_navi") or os.path.expanduser("~")).rstrip("/") + "/"
+            handled, p = self.native_chooser(True, "Choose the folder with the saves", cur)
+            if not handled:
+                p = filedialog.askdirectory(parent=top, title="Choose the folder with the saves", initialdir=cur)
+            if not p:
+                return
+            hit = saves.find_in(p)
+            if not hit:
+                status.set("No saves of this game in %s. Choose a folder with option.sav and slot_00 to slot_05, or an NX2navi game folder." % p)
+                return
+            self.cfg["last_navi"] = p
+            save_config(self.cfg)
+            item = saves.describe(os.path.basename(p.rstrip("/")) + " (chosen)", hit)
+            items.insert(0, item)
+            fill()
+
+        def do_import():
+            sel = lst.curselection()
+            if not sel:
+                return
+            item = items[sel[0]]
+            have = saves.describe("", dest)
+            backup = saves.backup_root(dest)
+            msg = "Triforce's saves become the ones from %s (%d slots, %s)." % (item.name, item.slots, saves.when(item.last))
+            if saves.save_files(dest):
+                msg += ("\n\nThe saves Triforce has now (%d slots, last played %s) in\n%s\nare replaced. They are copied to\n%s/<date and time>\nfirst."
+                        % (have.slots, saves.when(have.last), dest, backup))
+            else:
+                msg += "\n\nThey go to\n%s" % dest
+            if not messagebox.askyesno("Import saves", msg + "\n\nImport them?", parent=top):
+                return
+            try:
+                kept = saves.import_saves(item.folder, dest, game=game)
+            except (RuntimeError, OSError) as e:
+                status.set(str(e))
+                return
+            top.destroy()
+            messagebox.showinfo("Import saves", "Done: %d slots imported into Triforce.%s" % (
+                item.slots, "\nThe saves that were there are kept in\n" + kept if kept else ""), parent=self)
+        go.configure(command=do_import)
+        go.pack(side="right")
+        ttk.Button(buttons, text="Cancel", cursor="hand2", command=top.destroy).pack(side="right", padx=(0, px(10)))
+        ttk.Button(buttons, text="Other folder\u2026", cursor="hand2", command=other).pack(side="left")
+        lst.bind("<<ListboxSelect>>", lambda e: refresh())
+        lst.bind("<Double-Button-1>", lambda e: do_import())
+        top.bind("<Escape>", lambda e: top.destroy())
+        fill()
+        top.update_idletasks()
+        top.geometry("+%d+%d" % (self.winfo_rootx() + px(60), self.winfo_rooty() + px(60)))
+        top.grab_set()
 
     def begin_update(self, folder=None):
         if folder is not None:

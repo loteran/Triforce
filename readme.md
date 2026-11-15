@@ -173,6 +173,14 @@ your NX2navi saves into Triforce, and moves saves of this game between Triforce 
 Every slot comes across as it is. Whatever gets replaced is backed up first, in the `save-backups` folder beside Setup.
 Close the game and the emulator before converting.
 
+**On Linux**, Triforce keeps its saves in `~/.local/share/hookshot/save/5a3c9e1f0b7d24680000000000000001` (under
+`$XDG_DATA_HOME`). The builder's **Import saves…** link (beside Play, and on the launcher) lists what it finds: Eden,
+yuzu, suyu, Sudachi, Citron and torzu (also their flatpak data), Ryujinx (also flatpak), and NX2navi game folders
+(under `~/Games`, your install folder and its parent; a finished commit in `profile/save-tx` counts when newer).
+**Other folder…** points at any other place, such as an NX2navi game folder. Importing is one way, into Triforce: the
+saves it replaces are copied to `~/.local/share/hookshot/save-backup/<date and time>` first, and it refuses to run
+while the game or an emulator is open.
+
 <p align="center"><img src="assets/readme/divider.svg" alt="" width="100%"></p>
 
 ## <img src="assets/readme/gold.svg" alt="" width="26"> If something goes wrong
