@@ -73,6 +73,17 @@ find "$T" -name __pycache__ -prune -exec rm -rf {} +
 # ---- what it builds with ----
 cp -a "$DEPS/python" "$APPDIR/usr/python"
 cp "$DEPS/tk/libtcl9tk9.0.so" "$DEPS/tk/libXft.so.2" "$DEPS/tk/libXrender.so.1" "$APPDIR/usr/python/lib/"
+# pip writes its console scripts (cmake, ninja, pip...) with this machine's absolute interpreter path as the shebang,
+# which does not exist once the AppImage is mounted elsewhere. Swap it for pip's own relocatable launcher: a sh line
+# that runs the python3 beside the script, and that Python then reads the rest as a plain string and the script.
+for f in "$APPDIR/usr/python/bin/"*; do
+    [ -f "$f" ] && [ ! -L "$f" ] || continue
+    IFS= read -r first < "$f" 2>/dev/null || continue
+    [ "$first" = "#!$DEPS/python/bin/python3" ] || [ "$first" = "#!$DEPS/python/bin/python3.12" ] || continue
+    { printf '#!/bin/sh\n'"'''"'exec'"'"' "$(dirname -- "$(realpath -- "$0")")/python3" "$0" "$@"\n'"' '''"'\n'
+      tail -n +2 "$f"; } > "$f.tmp" && chmod --reference="$f" "$f.tmp" && mv "$f.tmp" "$f"
+done
+if grep -l "^#!$DEPS/" "$APPDIR/usr/python/bin/"* 2>/dev/null; then echo "a script above still points at the build tree"; exit 1; fi
 mkdir -p "$L/emsdk"
 cp -a "$DEPS/emsdk/upstream" "$L/emsdk/"
 cp -a "$DEPS/ffmpeg" "$L/ffmpeg"
