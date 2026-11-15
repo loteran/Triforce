@@ -23,14 +23,17 @@ import zipfile
 from part_links import SYSROOT_PART, is_absolute_link, relative_sysroot_link
 
 LIST_NAME = "triforce-linux.txt"
-# (11-13: Triforce's own home. Releases are in triforce/downloads on its Forgejo: the list is asked on the main domain,
-# which passes /api/v1 on; a release's files are the Forgejo's own links. Up to v0.3.5: github.com/ruckus7382sfgsgdf/CBeta0.2)
-HOME_API = "https://triforceproject.com/api/v1/repos/triforce/downloads"
-DOWNLOADS = "https://git.triforceproject.com/triforce/downloads"
+# (This fork's own releases, never upstream's: an update from the upstream Forgejo would replace the Linux build with
+# one that lacks this fork's additions. Upstream: git.triforceproject.com/triforce/downloads. The same repository is
+# host/hos_update.c's UPDATE_REPO. make_parts.py's --base and scripts/linux/publish_parts.sh use it for the parts.)
+REPO = "loteran/Triforce"
+HOME_API = "https://api.github.com/repos/%s" % REPO
+DOWNLOADS = "https://github.com/%s" % REPO
 LATEST_LIST = "%s/releases/latest/download/%s" % (DOWNLOADS, LIST_NAME)
-# (Triforce: the newest release, pre-releases too, as the Windows side asks: /releases/latest skips pre-releases, and
-# every Triforce release so far is one. The answer is a list of one release)
-LATEST_API = HOME_API + "/releases?limit=1"
+# (the newest releases, pre-releases too: /releases/latest skips them. The answer is a list: pick_release takes the first
+# that is a version, not the linux-parts / builder-parts release that holds the parts, nor a draft)
+NOT_VERSIONS = ("linux-parts", "builder-parts")
+LATEST_API = HOME_API + "/releases?per_page=10"
 # (the game folder's names, nx2/make_game.py's; Hookshot's after them, for a folder that still has those)
 GAME_NAMES = ("triforce", "hookshot")
 VERSION_FILES = ("triforce_version.txt", "hookshot_version.txt")
@@ -111,8 +114,14 @@ def release_key(tag):
                  (tag or "").strip())
     if not m:
         return None
+    # (this fork's releases are vX.Y.Z-linux.N: a release, after upstream's vX.Y.Z, N ordering them. Any other suffix,
+    # -rc.1 included, is a prerelease)
+    suffix = m.group(2)
+    linux = re.match(r"^linux\.(\d+)$", suffix or "")
+    final = suffix is None or linux is not None
     # (a prerelease before its release; commits after a tag, or changes to it, after that tag and before the next)
-    return tuple(int(n) for n in m.group(1).split(".")), m.group(2) is None, bool(m.group(3) or m.group(4))
+    return (tuple(int(n) for n in m.group(1).split(".")), final, int(linux.group(1)) if linux else 0,
+            bool(m.group(3) or m.group(4)))
 
 
 def update_target(latest, tools):
@@ -284,6 +293,18 @@ def fetch_bytes(url, timeout=60):
     raise RuntimeError(last)
 
 
+def pick_release(body):
+    """The newest release of GitHub's answer (a list, newest first, or one release): not a draft, and not the release
+    that only holds parts. Its tag, or None."""
+    if isinstance(body, dict):
+        body = [body]
+    for release in body if isinstance(body, list) else ():
+        tag = release.get("tag_name") if isinstance(release, dict) else None
+        if tag and tag not in NOT_VERSIONS and not release.get("draft"):
+            return tag
+    return None
+
+
 def latest_tag(get=None):
     """The latest release's tag, or None when GitHub did not answer. The API first (60 an hour); the setup list's tag
     otherwise, which is a file download and not that limit. Same fallback as the Windows builder."""
@@ -291,9 +312,7 @@ def latest_tag(get=None):
     try:
         import json
         body = json.loads(get(LATEST_API).decode("utf-8"))
-        if isinstance(body, list):   # (releases?per_page=1: the newest first)
-            body = body[0] if body else {}
-        tag = body.get("tag_name")
+        tag = pick_release(body)
         if tag:
             return tag
     except Exception:
@@ -551,9 +570,7 @@ def fetch_manifest(get=None):
     try:
         import json
         body = json.loads(get(LATEST_API).decode("utf-8"))
-        if isinstance(body, list):
-            body = body[0] if body else {}
-        tag = body.get("tag_name") or ""
+        tag = pick_release(body) or ""
         if tag and all(ch.isalnum() or ch in "._-" for ch in tag):
             url = "%s/releases/download/%s/%s" % (DOWNLOADS, tag, LIST_NAME)
             return parse_list(get(url).decode("utf-8"), local=False)

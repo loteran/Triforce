@@ -845,5 +845,112 @@ class UpdateTests(unittest.TestCase):
             self.assertEqual(real.read_bytes(), b"private library bytes")
 
 
+class ForkReleaseTests(unittest.TestCase):
+    """The fork's own releases (loteran/Triforce, tags vX.Y.Z-linux.N), never upstream's."""
+
+    def test_every_update_url_is_this_forks_github(self):
+        for url in (linux_update.HOME_API, linux_update.DOWNLOADS, linux_update.LATEST_LIST, linux_update.LATEST_API):
+            self.assertNotIn("triforceproject.com", url)
+        self.assertEqual(linux_update.LATEST_API, "https://api.github.com/repos/loteran/Triforce/releases?per_page=10")
+        self.assertTrue(linux_update.LATEST_LIST.startswith("https://github.com/loteran/Triforce/releases/latest/download/"))
+        self.assertIn("loteran/Triforce", make_parts.argparse_default_base() if hasattr(make_parts, "argparse_default_base") else
+                      (ROOT / "scripts" / "linux" / "make_parts.py").read_text(encoding="utf-8"))
+        update_c = (ROOT / "host" / "hos_update.c").read_text(encoding="utf-8")
+        self.assertIn('#define UPDATE_REPO "loteran/Triforce"', update_c)
+        linux_part = update_c[update_c.index("static int latest_tag(char *tag, size_t cap) {\n    return"):]
+        self.assertNotIn("triforceproject.com", linux_part)
+
+    def test_manifest_comes_from_the_forks_release_download(self):
+        asked = []
+
+        def get(url):
+            asked.append(url)
+            if url == linux_update.LATEST_API:
+                return b'[{"tag_name": "v0.3.7-linux.2"}]'
+            return ("tag v0.3.7-linux.2\npart %s 10 usr/lib/x https://github.com/loteran/Triforce/releases/download/linux-parts/a.zip\ntree\n" % ("a" * 64)).encode()
+        self.assertEqual(linux_update.fetch_manifest(get).tag, "v0.3.7-linux.2")
+        self.assertEqual(asked[1], "https://github.com/loteran/Triforce/releases/download/v0.3.7-linux.2/triforce-linux.txt")
+        self.assertEqual(linux_update.latest_tag(get), "v0.3.7-linux.2")
+
+    def test_the_parts_release_and_drafts_are_not_versions(self):
+        body = [{"tag_name": "linux-parts"}, {"tag_name": "v0.3.9-linux.1", "draft": True},
+                {"tag_name": "builder-parts"}, {"tag_name": "v0.3.7-linux.2", "prerelease": True}, {"tag_name": "v0.3.7-linux.1"}]
+        self.assertEqual(linux_update.pick_release(body), "v0.3.7-linux.2")
+        self.assertIsNone(linux_update.pick_release([{"tag_name": "linux-parts"}]))
+        self.assertIsNone(linux_update.pick_release([]))
+        import json
+        get = lambda url: json.dumps(body).encode()
+        self.assertEqual(linux_update.latest_tag(get), "v0.3.7-linux.2")
+
+    def test_the_game_skips_the_parts_release(self):
+        src = (ROOT / "host" / "hos_update.c").read_text(encoding="utf-8")
+        self.assertIn("releases?per_page=10", src)
+        a = src.rindex("static int is_parts_tag")
+        body = src[a:src.index("\n}\n", src.index("static int pipe_tag", a)) + 3]
+        safe = src[src.index("static int safe_tag"):]
+        safe = safe[:safe.index("\n}\n") + 3]
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            (tmp / "t.c").write_text('#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n#include <ctype.h>\n' + safe + body +
+                                     '\nint main(int n, char **a){char t[128]; if(!pipe_tag(a[1], t, sizeof t)) return 1; puts(t); return 0;}\n')
+            if subprocess.run(["cc", "-o", str(tmp / "t"), str(tmp / "t.c")], capture_output=True).returncode != 0:
+                self.skipTest("no C compiler")
+            json_text = ('[{"id":1,"tag_name":"linux-parts","assets":[{"name":"a"}]},{"id":2,"tag_name":"v0.3.7-linux.2"},'
+                         '{"id":3,"tag_name":"v0.3.7-linux.1"}]')
+            out = subprocess.run([str(tmp / "t"), "printf '%s' '" + json_text + "'"], capture_output=True, text=True)
+            self.assertEqual(out.stdout.strip(), "v0.3.7-linux.2")
+            out = subprocess.run([str(tmp / "t"), "printf '%s' '[{\"tag_name\":\"linux-parts\"}]'"], capture_output=True, text=True)
+            self.assertNotEqual(out.returncode, 0)
+
+    def test_linux_tags_order(self):
+        key = linux_update.release_key
+        self.assertGreater(key("v0.3.7-linux.2"), key("v0.3.7-linux.1"))
+        self.assertGreater(key("v0.3.7-linux.10"), key("v0.3.7-linux.9"))
+        self.assertGreater(key("v0.3.8-linux.1"), key("v0.3.7-linux.2"))
+        self.assertGreater(key("v0.3.7-linux.1"), key("v0.3.7"))
+        self.assertGreater(key("v0.3.8"), key("v0.3.7-linux.5"))
+        self.assertGreater(key("v0.3.7-linux.1-3-gabc1234"), key("v0.3.7-linux.1"))
+        self.assertGreater(key("v0.3.7-linux.2"), key("v0.3.7-linux.1-3-gabc1234"))
+        self.assertGreater(key("v0.3.7-linux.1-dirty"), key("v0.3.7-linux.1"))
+        # (-rc stays a prerelease, -linux does not)
+        self.assertGreater(key("v0.3.7-linux.1"), key("v0.3.7-rc.1"))
+        self.assertTrue(key("v0.3.7-linux.1")[1])
+        self.assertFalse(key("v0.3.7-rc.1")[1])
+
+    def test_modes_with_linux_tags(self):
+        latest = "v0.3.7-linux.2"
+        self.assertEqual(linux_update.choose_mode(None, "v0.3.7-linux.1", latest, False, False), "update-builder")
+        self.assertEqual(linux_update.choose_mode(None, "v0.3.7-linux.2", latest, False, False), "build")
+        self.assertEqual(linux_update.choose_mode(None, "v0.3.7-linux.2-4-gabc1234", latest, False, False), "build")
+        self.assertEqual(linux_update.choose_mode("v0.3.7-linux.1", "v0.3.7-linux.2", latest, False, True), "update-game")
+        self.assertEqual(linux_update.choose_mode("v0.3.7-linux.2", "v0.3.7-linux.2", latest, False, True), "up-to-date")
+
+    def test_release_upload_prerelease_only_for_rc(self):
+        script = (ROOT / "scripts" / "release_upload.sh").read_text(encoding="utf-8")
+        self.assertIn("[[ $tag == *-rc* ]]", script)
+        for tag, pre in (("v0.3.7-linux.1", False), ("v0.3.7-rc.1", True), ("v0.3.8-rc.2-linux.1", True)):
+            out = subprocess.run(["bash", "-c", 'tag=$1; [[ $tag == *-rc* ]] && echo pre || echo rel', "x", tag],
+                                 capture_output=True, text=True).stdout.strip()
+            self.assertEqual(out == "pre", pre, tag)
+
+    def test_dev_build_is_not_an_update_in_the_game(self):
+        # (host/hos_update.c's is_dev_of, compiled alone)
+        src = (ROOT / "host" / "hos_update.c").read_text(encoding="utf-8")
+        body = src[src.index("static int is_dev_of"):]
+        body = body[:body.index("\n}\n") + 3]
+        with tempfile.TemporaryDirectory() as tmp:
+            c = Path(tmp) / "t.c"
+            c.write_text('#include <stdio.h>\n#include <string.h>\n' + body + '\nint main(int n, char **a){return !is_dev_of(a[1], a[2]);}\n')
+            exe = Path(tmp) / "t"
+            if subprocess.run(["cc", "-o", str(exe), str(c)], capture_output=True).returncode != 0:
+                self.skipTest("no C compiler")
+            run = lambda have, tag: subprocess.run([str(exe), have, tag]).returncode == 0
+            self.assertTrue(run("v0.3.7-linux.1-3-gabc1234", "v0.3.7-linux.1"))
+            self.assertTrue(run("v0.3.7-linux.1-dirty", "v0.3.7-linux.1"))
+            self.assertFalse(run("v0.3.7-linux.1", "v0.3.7-linux.1"))
+            self.assertFalse(run("v0.3.7-linux.1", "v0.3.7-linux.2"))
+            self.assertFalse(run("v0.3.7-linux.1-3-gabc1234", "v0.3.7-linux.2"))
+
+
 if __name__ == "__main__":
     unittest.main()

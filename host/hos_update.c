@@ -202,20 +202,48 @@ static int read_value(const char *path, const char *name, char *out, size_t cap)
 }
 
 
+/* This fork's own releases (never upstream's: its Update would replace this build by one without the fork's additions).
+   builder/linux/linux_update.py's REPO is the same repository. The answer is a list of releases, newest first: a JSON
+   array, whose first "tag_name" pipe_tag reads. */
+#define UPDATE_REPO "loteran/Triforce"
+#define UPDATE_API "https://api.github.com/repos/" UPDATE_REPO "/releases?per_page=10"
+#define UPDATE_PAGE "https://github.com/" UPDATE_REPO "/releases/latest"
+
+/* A version that is the release's tag plus commits (git describe: v0.3.7-linux.1-3-gabc1234[-dirty]) is not older than it. */
+static int is_dev_of(const char *have, const char *tag) {
+    const size_t n = strlen(tag);
+    if (strncmp(have, tag, n) || have[n] != '-') return 0;
+    const char *p = have + n + 1;
+    if (!strcmp(p, "dirty")) return 1;
+    if (*p < '0' || *p > '9') return 0;
+    while (*p >= '0' && *p <= '9') p++;
+    return p[0] == '-' && p[1] == 'g';
+}
+
+/* a release that only holds parts is not a version of the game */
+static int is_parts_tag(const char *t, size_t n) {
+    return (n == 11 && !strncmp(t, "linux-parts", n)) || (n == 13 && !strncmp(t, "builder-parts", n));
+}
+
 static int pipe_tag(const char *cmd, char *tag, size_t cap) {
     FILE *p = popen(cmd, "r");
     if (!p) return 0;
-    char buf[8192];
-    size_t n = fread(buf, 1, sizeof buf - 1, p);
+    const size_t max = 1 << 20;   /* (ten releases with their assets) */
+    char *buf = (char *)malloc(max);
+    if (!buf) { pclose(p); return 0; }
+    size_t n = 0, got;
+    while (n < max - 1 && (got = fread(buf + n, 1, max - 1 - n, p)) > 0) n += got;
     pclose(p);
     buf[n] = 0;
-    const char *k = strstr(buf, "\"tag_name\"");
-    if (k && (k = strchr(k + 10, '"'))) {
-        const char *e = strchr(++k, '"');
-        if (e && e > k && (size_t)(e - k) < cap) {
-            memcpy(tag, k, (size_t)(e - k));
-            tag[e - k] = 0;
-            return safe_tag(tag);
+    /* (the releases are newest first: the first "tag_name" that is a version) */
+    for (const char *k = strstr(buf, "\"tag_name\""); k; k = strstr(k + 10, "\"tag_name\"")) {
+        const char *q = strchr(k + 10, '"');
+        if (!q) break;
+        const char *e = strchr(++q, '"');
+        if (e && e > q && (size_t)(e - q) < cap && !is_parts_tag(q, (size_t)(e - q))) {
+            memcpy(tag, q, (size_t)(e - q));
+            tag[e - q] = 0;
+            if (safe_tag(tag)) { free(buf); return 1; }
         }
     }
     if (!strncmp(buf, "tag ", 4)) {
@@ -224,22 +252,18 @@ static int pipe_tag(const char *cmd, char *tag, size_t cap) {
         if (len && len < cap) {
             memcpy(tag, s, len);
             tag[len] = 0;
-            return safe_tag(tag);
+            n = (size_t)safe_tag(tag);
+            free(buf);
+            return (int)n;
         }
     }
+    free(buf);
     return 0;
 }
 
 static int latest_tag(char *tag, size_t cap) {
-    /* (11-13: Triforce's own home, as on Windows above: the newest release of triforce/downloads, pre-releases too. The list
-       of one release starts {"id":..,"tag_name":"..": pipe_tag finds the tag in its first bytes. The second address is the
-       same list asked of the Forgejo itself, should the main domain not pass it on. Up to v0.3.5 this asked GitHub's
-       /releases/latest, which skips pre-releases, and every Triforce release is one: no Linux game was ever told of an update) */
-    if (pipe_tag("curl -fsSL --max-time 4 --retry 2 -A Triforce-update-check -H \"Accept: application/json\" "
-                 "\"https://triforceproject.com/api/v1/repos/triforce/downloads/releases?limit=1\" 2>/dev/null", tag, cap))
-        return 1;
-    return pipe_tag("curl -fsSL --max-time 8 --retry 2 -A Triforce-update-check -H \"Accept: application/json\" "
-                    "\"https://git.triforceproject.com/api/v1/repos/triforce/downloads/releases?limit=1\" 2>/dev/null", tag, cap);
+    return pipe_tag("curl -fsSL --max-time 8 --retry 2 -A Triforce-update-check -H \"Accept: application/vnd.github+json\" "
+                    "\"" UPDATE_API "\" 2>/dev/null", tag, cap);
 }
 
 /* the builder an update installed (builder/linux/linux_update.py): <data>/triforce/builder/versions/<current>/AppRun. The
@@ -284,7 +308,7 @@ void hos_update_check(void) {
         return;
     }
     fprintf(stderr, "update: this folder is %s, the latest release is %s\n", have, tag);
-    if (!strcmp(tag, have) || !strcmp(tag, skipped)) return;
+    if (!strcmp(tag, have) || !strcmp(tag, skipped) || is_dev_of(have, tag)) return;
     snprintf(path, sizeof path, "%striforce_version.txt", dir);
     const int has_builder = installed_builder(builder, sizeof builder) ||
                             (read_value(path, "builder", builder, sizeof builder) && access(builder, X_OK) == 0);
@@ -311,7 +335,7 @@ void hos_update_check(void) {
     if (strncmp(answer, "Update", 6)) return;
     if (!has_builder) {
         if (fork() == 0) {
-            execlp("xdg-open", "xdg-open", "https://triforceproject.com", (char *)0);
+            execlp("xdg-open", "xdg-open", UPDATE_PAGE, (char *)0);
             _exit(127);
         }
         return;
