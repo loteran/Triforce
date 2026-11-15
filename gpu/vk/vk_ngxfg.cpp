@@ -7,7 +7,7 @@
 //  - the depth (1 at the near plane) and the motion vectors (render pixels toward the frame before) of the scene, which has the
 //    render size, and the camera: projection and its inverse, this frame's clip space to the last's and back, the position and
 //    basis, the planes, the field of view and the aspect (dlssg_math.h; the jitter taken off them and given on its own);
-//  - the picture without the HUD (hudless_note), when an upscaler drew this frame: DLSS-G tells the HUD apart from the scene by
+//  - the picture without the HUD (vk_hudless.h), when an upscaler drew this frame: DLSS-G tells the HUD apart from the scene by
 //    comparing the two, and keeps the HUD still while the scene's pixels move. The upscaler's output is encoded as the game's
 //    last pass encodes its picture (linear light to sRGB, which a blit into an sRGB image does), so a pixel of it is the
 //    backbuffer's pixel. Without an upscaler there is none: the HUD is then DLSS-G's own to find (it is optional).
@@ -26,6 +26,7 @@
 
 #include "vk_dlss.h"
 #include "vk_framegen.h"
+#include "vk_hudless.h"
 #include "vk_menu.h"
 #include "vk_texture.h"
 
@@ -42,14 +43,15 @@ namespace mkwvk::ngxfg {
 Vendor vendor() {
     static const Vendor v = [] {
         const char* e = getenv("RX_VK_FRAMEGEN_VENDOR");
-        if (!e || !*e || !strcmp(e, "auto")) return VENDOR_AUTO;
-        if (!strcmp(e, "nvidia")) return VENDOR_NVIDIA;
-        if (!strcmp(e, "triforce")) return VENDOR_TRIFORCE;
-        logf("vk: RX_VK_FRAMEGEN_VENDOR=%s is not auto, nvidia or triforce: auto", e);
-        return VENDOR_AUTO;
+        bool known = true;
+        const Vendor parsed = fgengine::parse_vendor(e, &known);
+        if (!known) logf("vk: RX_VK_FRAMEGEN_VENDOR=%s is not auto, nvidia, amd or triforce: auto", e);
+        return parsed;
     }();
     return v;
 }
+
+bool dlssg_allowed() { return vendor() == VENDOR_AUTO || vendor() == VENDOR_NVIDIA; }
 
 #ifdef HOOKSHOT_NGX
 
@@ -70,11 +72,8 @@ struct State {
     std::atomic<bool> failed{false};   // (its creation or an evaluation failed for good: the renderer's own frames; read by wanted_for without the lock)
     bool reset_next = true;       // (the next evaluation starts a new history)
     uint64_t evals = 0, last_eval = 0, made_total = 0;
-    // the picture without the HUD: the upscaler's output at its own size, as the game's last pass encodes it (hudless_note), and
-    // that picture scaled to the backbuffer's when the two sizes differ (prepare_hudless)
-    Img srgb, snap, scaled;
-    uint64_t snap_frame = 0;      // (texture_frame_no when taken; 0: none)
-    bool blit_checked = false, blit_ok = false;
+    // the picture without the HUD (vk_hudless.h) scaled to the backbuffer's when the two sizes differ
+    Img scaled;
     struct Dead { uint64_t frame; std::function<void()> free; };
     std::vector<Dead> dead;       // (what the GPU may still use: let go a few frames on)
 };
@@ -159,12 +158,12 @@ void release_feature(State& s) {
 bool built() { return true; }
 
 int max_generated() {
-    if (vendor() == VENDOR_TRIFORCE) return 0;
+    if (!dlssg_allowed()) return 0;
     return dlss_fg_max();
 }
 
 bool wanted_for(int framegen) {
-    if (framegen < 1 || vendor() == VENDOR_TRIFORCE || dev.hdr || opts.hdr == 2) return false;
+    if (framegen < 1 || !dlssg_allowed() || dev.hdr || opts.hdr == 2) return false;
     // (a feature that failed is not tried again for the run: asked of every scene draw, so no lock: a stale read costs a frame)
     if (st().failed.load(std::memory_order_relaxed)) return false;
     const int most = max_generated();
@@ -216,19 +215,19 @@ bool evaluate(VkCommandBuffer cmd, const Inputs& in, const Output* out, int coun
     // differ in size only; otherwise none, which DLSS-G allows)
     NVSDK_NGX_Resource_VK rh{};
     bool hudless = false;
-    if (s.snap.image && s.snap_frame && texture_frame_no() - s.snap_frame <= 1) {
-        if (s.snap.w == in.width && s.snap.h == in.height) {
-            rh = resource(s.snap.view, s.snap.image, VK_FORMAT_R8G8B8A8_UNORM, in.width, in.height, false), hudless = true;
-        } else if (std::fabs((double)s.snap.w / s.snap.h - (double)in.width / in.height) < 0.02 &&
+    if (const hudless::Picture snap = hudless::current(); snap.valid()) {
+        if (snap.width == in.width && snap.height == in.height) {
+            rh = resource(snap.view, snap.image, VK_FORMAT_R8G8B8A8_UNORM, in.width, in.height, false), hudless = true;
+        } else if (std::fabs((double)snap.width / snap.height - (double)in.width / in.height) < 0.02 &&
                    make(cmd, s.scaled, in.width, in.height, VK_FORMAT_R8G8B8A8_UNORM,
                         VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT)) {
             // (the upscaler's picture can be smaller than the presented one, as at the handheld profile: the same picture, scaled)
             full_barrier(cmd);
             VkImageBlit b{};
             b.srcSubresource = b.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-            b.srcOffsets[1] = {(int)s.snap.w, (int)s.snap.h, 1};
+            b.srcOffsets[1] = {(int)snap.width, (int)snap.height, 1};
             b.dstOffsets[1] = {(int)in.width, (int)in.height, 1};
-            vkCmdBlitImage(cmd, s.snap.image, VK_IMAGE_LAYOUT_GENERAL, s.scaled.image, VK_IMAGE_LAYOUT_GENERAL, 1, &b, VK_FILTER_LINEAR);
+            vkCmdBlitImage(cmd, snap.image, VK_IMAGE_LAYOUT_GENERAL, s.scaled.image, VK_IMAGE_LAYOUT_GENERAL, 1, &b, VK_FILTER_LINEAR);
             full_barrier(cmd);
             rh = resource(s.scaled.view, s.scaled.image, VK_FORMAT_R8G8B8A8_UNORM, in.width, in.height, false), hudless = true;
         }
@@ -331,8 +330,8 @@ void release() {
     State& s = st();
     std::lock_guard lk(s.mu);
     release_feature(s);
-    drop(s.srgb), drop(s.snap), drop(s.scaled);
-    s.snap_frame = 0, s.reset_next = true;
+    drop(s.scaled);
+    s.reset_next = true;
     free_dead(true);   // (the caller has the device idle: nothing is in use)
     if (s.params) NVSDK_NGX_VULKAN_DestroyParameters(s.params), s.params = nullptr;
 }
@@ -340,53 +339,14 @@ void release() {
 void idle() {
     State& s = st();
     std::unique_lock lk(s.mu, std::try_to_lock);
-    if (!lk.owns_lock() || (!s.feature && !s.snap.image)) return;
+    if (!lk.owns_lock() || (!s.feature && !s.scaled.image)) return;
     const uint64_t now = texture_frame_no();
-    if (now - std::max(s.last_eval, s.snap_frame) < 300) return;   // (used within the last five seconds' frames)
+    if (now - s.last_eval < 300) return;   // (used within the last five seconds' frames)
     // (not used for a while: its video memory goes back, made again when the row asks for it)
     release_feature(s);
-    drop(s.srgb), drop(s.snap), drop(s.scaled);
-    s.snap_frame = 0, s.reset_next = true;
+    drop(s.scaled);
+    s.reset_next = true;
     free_dead();
-}
-
-void hudless_note(VkCommandBuffer cmd, Texture* picture, uint32_t level) {
-    if (!picture || !picture->image || !inputs_wanted()) return;
-    State& s = st();
-    std::lock_guard lk(s.mu);
-    free_dead();
-    if (s.failed) return;
-    if (!s.blit_checked) {
-        // (the picture's format is blitted from and the sRGB image blitted to, or there is no picture without the HUD)
-        s.blit_checked = true;
-        VkFormatProperties from{}, to{};
-        vkGetPhysicalDeviceFormatProperties(dev.physical, picture->format, &from);
-        vkGetPhysicalDeviceFormatProperties(dev.physical, VK_FORMAT_R8G8B8A8_SRGB, &to);
-        s.blit_ok = (from.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_SRC_BIT) && (to.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_DST_BIT);
-        if (!s.blit_ok) logf("vk: ngxfg: no blit from the upscaler's picture (format %d) into sRGB here: no picture without the HUD", (int)picture->format);
-    }
-    if (!s.blit_ok || !(picture->usage & VK_IMAGE_USAGE_TRANSFER_SRC_BIT) || level >= picture->levels) return;
-    const uint32_t w = std::max(1u, picture->width >> level), h = std::max(1u, picture->height >> level);
-    const VkImageUsageFlags u = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
-    if (!make(cmd, s.srgb, w, h, VK_FORMAT_R8G8B8A8_SRGB, u) ||
-        !make(cmd, s.snap, w, h, VK_FORMAT_R8G8B8A8_UNORM, u | VK_IMAGE_USAGE_STORAGE_BIT)) {
-        s.snap_frame = 0;
-        return;
-    }
-    full_barrier(cmd);   // (the upscaler's picture, written before)
-    VkImageBlit b{};
-    b.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level, 0, 1};
-    b.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-    b.srcOffsets[1] = {(int)w, (int)h, 1};
-    b.dstOffsets[1] = {(int)w, (int)h, 1};
-    // (the blit encodes linear light as sRGB, as the game's last pass encodes its picture; the bytes are then copied as they
-    // are into the UNORM image the present's copy has the same layout of)
-    vkCmdBlitImage(cmd, picture->image, VK_IMAGE_LAYOUT_GENERAL, s.srgb.image, VK_IMAGE_LAYOUT_GENERAL, 1, &b, VK_FILTER_NEAREST);
-    full_barrier(cmd);
-    const VkImageCopy cp{{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {w, h, 1}};
-    vkCmdCopyImage(cmd, s.srgb.image, VK_IMAGE_LAYOUT_GENERAL, s.snap.image, VK_IMAGE_LAYOUT_GENERAL, 1, &cp);
-    full_barrier(cmd);
-    s.snap_frame = texture_frame_no();
 }
 
 #else  // (no NGX SDK in this build: DLSS Frame Generation is not there)
@@ -399,7 +359,6 @@ bool evaluate(VkCommandBuffer, const Inputs&, const Output*, int) { return false
 void reset() {}
 void release() {}
 void idle() {}
-void hudless_note(VkCommandBuffer, Texture*, uint32_t) {}
 
 #endif
 

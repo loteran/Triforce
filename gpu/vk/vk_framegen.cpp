@@ -7,7 +7,10 @@
 //   3. each in-between frame at time t blends the last frame moved back along t and the new one forward along 1 - t.
 // Where NVIDIA DLSS Frame Generation can run (an RTX 40 or 50, its runtime beside the game's: vk_ngxfg.h) it makes those frames
 // instead of steps 2 and 3, from the scene's depth, motion and camera, at 2x up to what the GPU allows (RX_VK_FRAMEGEN_VENDOR=
-// auto|nvidia|triforce chooses); the multipliers above that, and every present it cannot take, stay with the steps above.
+// auto|nvidia|amd|triforce chooses); the multipliers above that, and every present it cannot take, stay with the steps above.
+// Where it cannot run, at 2x AMD FSR 3.1 frame generation through AMD's own FidelityFX library makes them (vk_ffx_fg.h, framegen_engine.h):
+// its swapchain presents the made frame itself, so none of the steps above run for it and the display thread shows nothing;
+// framegen_engine_tick switches the swapchain, with the display thread drained, when the choice changes.
 // Recorded into the present's own recording, after the game's work; the display thread shows the made frames and
 // then the game's, evenly over the game's recent frame time, about one frame behind the game. Loading hitches
 // (frames over 100 ms apart) are not interpolated.
@@ -23,6 +26,7 @@
 #include <cmath>
 
 #include "vk_framegen.h"
+#include "vk_ffx_fg.h"   // (AMD FSR 3.1 frame generation through AMD's library, and its swapchain)
 #include "vk_fsr3_inputs.h"   // (AMD FSR 3.1 frame interpolation's depth and motion)
 #include "vk_fsr3fi.h"
 #include "vk_dlss.h"   // (dlss_fg_why: why DLSS Frame Generation is not the one making the frames)
@@ -495,6 +499,20 @@ bool framegen_on() {
     return framegen_wanted(opts.framegen, allow) && !dev.offscreen && !fg.failed;
 }
 
+/// The engine that makes the made frames for a Frame generation row value, from what is live now (framegen_engine.h's order); no side
+/// effects. The menu's hint asks it for the value it describes, framegen_engine_tick for the row
+fgengine::Choice framegen_choice(int framegen) {
+    static const int allow = !getenv("RX_VK_FRAMEGEN") || atoi(getenv("RX_VK_FRAMEGEN")) != 0;
+    fgengine::Facts f;
+    f.vendor = ngxfg::vendor();
+    f.framegen = framegen;
+    f.enabled = allow && !dev.offscreen && !fg.failed;
+    f.dlssg_usable = ngxfg::wanted_for(framegen);
+    f.amd_usable = framegen == 2 && ffxfg::usable();
+    f.fsr3fi_usable = framegen == 2 && fsr3fi::capable() && (framegen != opts.framegen || fsr3fi::frames_wanted() != 0);
+    return fgengine::choose(f);
+}
+
 // Ultrawide's menus (the Insert menu's Ultrawide menus): which of nx2/oot_wide.py's keep-list screens keep the whole picture, told
 // to the game's side each present, and, while a menu shows, the sides of the middle 16:9 to show out of focus (1)
 // or black (2), as fractions of the width. A menu's layout is set up once, when it is first opened: what tells one is
@@ -932,5 +950,49 @@ void framegen_queue(uint64_t value) {
 
 /// Each present (vk_replay.cpp): ultrawide's menu setting to the game's side, and the sides to treat now
 void wide_sides_tick() { wide_now = wide_sides(); }
+
+namespace {
+/// The display thread has nothing in flight: no job queued, no set being shown or made (the next present is the replay thread's own)
+void framegen_drain() {
+    if (!fg.thread_started) return;
+    std::unique_lock lk(fg.mu);
+    fg.cv.wait(lk, [] { return fg.jobs.empty() && !fg.sets[0].busy && !fg.sets[1].busy && !fg.sets[2].busy; });
+}
+}  // namespace
+
+/// Each present, first thing in do_present (the replay's thread): who makes the made frames now, said in the log when it changes (and
+/// why it is not the one before it in the order), and AMD's library's swapchain, which only it presents through, switched here:
+/// the display thread drained first, so no present of the old kind is in flight when present_image makes the other kind of swapchain
+void framegen_engine_tick() {
+    if (opts.framegen < 1 && !ffxfg::active() && !ffxfg::target()) return;   // (the row is off: nothing to choose, nothing to say)
+    const fgengine::Choice c = framegen_choice(opts.framegen);
+    {
+        static fgengine::Engine last = fgengine::Engine::None;
+        static int last_row = -1, told = 0;
+        if ((c.engine != last || last_row != opts.framegen) && told < 20) {
+            last = c.engine, last_row = opts.framegen, told++;
+            char why[300];
+            int n = snprintf(why, sizeof why, "%s", c.why);
+            const ngxfg::Vendor v = ngxfg::vendor();
+            char b[160];
+            if (c.engine != fgengine::Engine::DlssG && opts.framegen >= 1 && (v == ngxfg::VENDOR_AUTO || v == ngxfg::VENDOR_NVIDIA) &&
+                n < (int)sizeof why - 1)
+                n += snprintf(why + n, sizeof why - n, "%sno DLSS Frame Generation %s", n ? "; " : "", dlssg_why(b, sizeof b));
+            if (c.engine != fgengine::Engine::AmdLibrary && opts.framegen >= 1 && (v == ngxfg::VENDOR_AUTO || v == ngxfg::VENDOR_AMD) &&
+                n < (int)sizeof why - 1) {
+                if (!fgengine::amd_multiplier(opts.framegen))
+                    snprintf(why + n, sizeof why - n, "%sno AMD library: it makes 2x only", n ? "; " : "");
+                else if (!ffxfg::usable())
+                    snprintf(why + n, sizeof why - n, "%sno AMD library: %s", n ? "; " : "", ffxfg::why_not());
+            }
+            logf("vk: frame generation: row %d, engine: %s%s%s", opts.framegen, fgengine::name(c.engine), *why ? " " : "", why);
+        }
+    }
+    const bool want = c.engine == fgengine::Engine::AmdLibrary;
+    if (want != ffxfg::target()) {
+        framegen_drain();
+        ffxfg::set_target(want);
+    }
+}
 
 } // namespace mkwvk

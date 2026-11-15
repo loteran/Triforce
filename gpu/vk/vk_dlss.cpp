@@ -270,8 +270,8 @@ std::vector<std::string> fg_requirements(bool device) {
 /// same on this game): a GPU with multi-frame generation gets up to 5 (6x); one without it (RTX 40: 1, or not set) gets 1 (2x)
 void read_frame_generation(State& s, const std::vector<fs::path>& dirs) {
     s.fg_max = 0;
-    if (ngxfg::vendor() == ngxfg::VENDOR_TRIFORCE) {
-        s.fg_why = "RX_VK_FRAMEGEN_VENDOR=triforce";
+    if (!ngxfg::dlssg_allowed()) {
+        s.fg_why = ngxfg::vendor() == ngxfg::VENDOR_AMD ? "RX_VK_FRAMEGEN_VENDOR=amd" : "RX_VK_FRAMEGEN_VENDOR=triforce";
         return;
     }
     int available = 0;
@@ -563,7 +563,7 @@ bool listed(const std::vector<const char*>& want, const char* name) {
 }
 /// What NGX asks for DLSS Frame Generation (fg_requirements), added to `want` when the loader or device has it (all)
 void add_fg_extensions(bool device, std::vector<const char*>& want, const std::vector<VkExtensionProperties>& all) {
-    if (ngxfg::vendor() == ngxfg::VENDOR_TRIFORCE) return;
+    if (!ngxfg::dlssg_allowed()) return;
     for (const std::string& n : fg_requirements(device)) {
         bool have = false;
         for (const auto& e : all) have |= n == e.extensionName;

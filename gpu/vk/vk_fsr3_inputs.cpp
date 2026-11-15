@@ -23,6 +23,7 @@
 #include "vk_fsr3.h"
 #include "vk_fsr3fi.h"
 #include "vk_ngxfg.h"
+#include "vk_ffx_fg.h"   // (AMD's frame generation keeps the scene's inputs too)
 #include "vk_texture.h"
 
 #include "shaders/fsr3_prep_comp_spv.h"
@@ -211,7 +212,7 @@ VkImageView depth_view(Texture* t) {
 
 } // namespace
 
-bool wanted() { return fsr3_wanted() || fsr3fi::frames_wanted() != 0 || ngxfg::inputs_wanted(); }
+bool wanted() { return fsr3_wanted() || fsr3fi::frames_wanted() != 0 || ngxfg::inputs_wanted() || ffxfg::inputs_wanted(); }
 
 void note_scene_draw(const Texture* color0, uint32_t width, uint32_t height, Texture* depth, uint64_t camera,
                      uint64_t camera_size) {
@@ -322,7 +323,7 @@ bool prepare(VkCommandBuffer cmd, Texture* in, VkImageView in_view, Frame& out, 
     f.camera = camera;
     f.reset = reset;
     f.depth_image = s.depth.image, f.motion_image = s.motion.image;
-    if (ngxfg::inputs_wanted()) {
+    if (ngxfg::inputs_wanted() || ffxfg::inputs_wanted()) {   // (and AMD's frame generation takes the camera's basis as well)
         // (NVIDIA DLSS Frame Generation's camera: its matrices carry no jitter, which it is given on its own: both frames'
         // view-projections unjittered, where the motion above takes this frame's jittered, as the depth it was drawn with is)
         float current[16], before[16];

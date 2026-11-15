@@ -248,6 +248,10 @@ def cpp_checks(tools, timeout):
     out.append((dlssg, build_and_run(dlssg, ["-Wall", "-Wextra", "-Werror"], [])))
     ffx3 = "gpu/vk/tests/ffx3_policy_test.cpp"   # (FSR 3.1 through AMD's library: its context policy, ffx3_policy.h)
     out.append((ffx3, build_and_run(ffx3, ["-Wall", "-Wextra", "-Werror"], [])))
+    fgr = "gpu/vk/tests/fg_reset_test.cpp"   # (AMD FSR 3.1 frame generation's camera-cut ring: vk_fg_reset.h)
+    out.append((fgr, build_and_run(fgr, ["-Wall", "-Wextra", "-Werror"], [])))
+    fge = "gpu/vk/tests/framegen_engine_test.cpp"   # (who makes the made frames: DLSS-G, AMD's library, Triforce's own: framegen_engine.h)
+    out.append((fge, build_and_run(fge, ["-Wall", "-Wextra", "-Werror"], [])))
     return out, ([] if cxx else ["a C++ compiler"])
 
 

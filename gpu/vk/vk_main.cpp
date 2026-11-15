@@ -21,6 +21,7 @@
 #include "gpu_choice.h"
 #include "vk_menu.h"
 #include "vk_dlss.h"
+#include "vk_ffx_fg.h"
 #include "vk_fsr4.h"
 #include "vk_reflex.h"
 #include "vk_antilag.h"
@@ -303,10 +304,55 @@ bool create_device() {
             if ((families[i].queueFlags & VK_QUEUE_COMPUTE_BIT) && !(families[i].queueFlags & VK_QUEUE_GRAPHICS_BIT))
                 compute_family = i;
     }
-    VkDeviceQueueCreateInfo qs[2] = {q, {VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO}};
-    qs[1].queueFamilyIndex = compute_family;
-    qs[1].queueCount = 1;
-    qs[1].pQueuePriorities = &priority;
+    // (hookshot) AMD FSR 3.1 frame generation through AMD's library (vk_ffx_fg.h) has a swapchain of its own with four queues, each a
+    // different one: the game's (the queue above), a present queue and an image acquire queue, and an async compute one (none). Only
+    // asked for when the library is beside the game and the vendor setting leaves it a chance: the game's family gives the two
+    // others where it has three queues, else queues of other families (its present queue must be able to present to the window,
+    // which is not known before the surface: ffxfg::surface_made). Where the device has no three distinct queues, AMD's engine is
+    // not one here
+    struct QueueSlot { uint32_t family = UINT32_MAX, index = 0; } ffx_present, ffx_acquire;
+    std::vector<uint32_t> queue_counts(families.size(), 0);
+    queue_counts[dev.queue_family] = 1;
+    if (compute_family != UINT32_MAX) queue_counts[compute_family] = 1;
+    if (ffxfg::queues_wanted()) {
+        const auto take = [&](uint32_t f, QueueSlot& out) {
+            if (f >= families.size() || queue_counts[f] >= families[f].queueCount) return false;
+            out = {f, queue_counts[f]++};
+            return true;
+        };
+        const auto usable_family = [&](uint32_t f) {
+            return (families[f].queueFlags & (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT | VK_QUEUE_TRANSFER_BIT)) != 0;
+        };
+        // (the present queue: the game's family, which presents to the window; else another family, compute ones first)
+        bool got = take(dev.queue_family, ffx_present);
+        for (int pass = 0; pass < 2 && !got; pass++)
+            for (uint32_t f = 0; f < families.size() && !got; f++) {
+                if (f == dev.queue_family || !usable_family(f) || !(pass ? true : (families[f].queueFlags & VK_QUEUE_COMPUTE_BIT) != 0)) continue;
+                got = take(f, ffx_present);
+            }
+        // (the acquire queue needs no capability: any queue left, the game's family first)
+        bool got_acquire = got && take(dev.queue_family, ffx_acquire);
+        for (uint32_t f = 0; got && !got_acquire && f < families.size(); f++) got_acquire = take(f, ffx_acquire);
+        if (!got || !got_acquire) {
+            logf("vk: ffxfg: no three distinct queues for AMD's frame generation swapchain (the game's family %u has %u queue%s): AMD's "
+                 "frame generation is not an engine here", dev.queue_family, families[dev.queue_family].queueCount,
+                 families[dev.queue_family].queueCount == 1 ? "" : "s");
+            ffx_present = ffx_acquire = QueueSlot{};
+            queue_counts.assign(families.size(), 0);
+            queue_counts[dev.queue_family] = 1;
+            if (compute_family != UINT32_MAX) queue_counts[compute_family] = 1;
+        }
+    }
+    const std::vector<float> queue_priorities(8, 1.0f);
+    std::vector<VkDeviceQueueCreateInfo> qs;
+    for (uint32_t f = 0; f < queue_counts.size(); f++) {
+        if (!queue_counts[f]) continue;
+        VkDeviceQueueCreateInfo qi{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
+        qi.queueFamilyIndex = f;
+        qi.queueCount = std::min<uint32_t>(queue_counts[f], 8);
+        qi.pQueuePriorities = queue_priorities.data();
+        qs.push_back(qi);
+    }
 
     // features: what the hardware has of what the replay uses (all of them on the GPUs MKW-class hardware maps to)
     VkPhysicalDeviceMeshShaderFeaturesEXT mesh{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT};
@@ -466,8 +512,8 @@ bool create_device() {
     dev.sparse_buffers = (families[dev.queue_family].queueFlags & VK_QUEUE_SPARSE_BINDING_BIT) && f.features.sparseBinding;
     VkDeviceCreateInfo ci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
     ci.pNext = &f;
-    ci.queueCreateInfoCount = compute_family != UINT32_MAX ? 2 : 1;
-    ci.pQueueCreateInfos = qs;
+    ci.queueCreateInfoCount = (uint32_t)qs.size();
+    ci.pQueueCreateInfos = qs.data();
     ci.enabledExtensionCount = (uint32_t)want.size();
     ci.ppEnabledExtensionNames = want.data();
     if (vkCreateDevice(dev.physical, &ci, nullptr, &dev.device) != VK_SUCCESS) {
@@ -481,6 +527,15 @@ bool create_device() {
     dev.present_queue = VK_NULL_HANDLE;
     dev.present_family = dev.queue_family;
     if (compute_family != UINT32_MAX) vkGetDeviceQueue(dev.device, compute_family, 0, &dev.present_queue), dev.present_family = compute_family;
+    if (ffx_present.family != UINT32_MAX) {
+        VkQueue present = VK_NULL_HANDLE, acquire = VK_NULL_HANDLE;
+        vkGetDeviceQueue(dev.device, ffx_present.family, ffx_present.index, &present);
+        vkGetDeviceQueue(dev.device, ffx_acquire.family, ffx_acquire.index, &acquire);
+        ffxfg::set_queues(present, ffx_present.family, acquire, ffx_acquire.family);
+        logf("vk: ffxfg: queues for AMD's frame generation swapchain: presents on family %u queue %u, image acquires on family %u queue "
+             "%u (the game's: family %u queue 0)", ffx_present.family, ffx_present.index, ffx_acquire.family, ffx_acquire.index,
+             dev.queue_family);
+    }
     if (dev.buffer_marker) buffer_markers_init();
     coopmat_init();
     reflex_device_created();
@@ -529,7 +584,7 @@ void swap_views_make(VkImageUsageFlags usage, VkFormat format) {
     }
 }
 
-bool create_swapchain(uint32_t width, uint32_t height) {
+bool create_swapchain(uint32_t width, uint32_t height, bool may_use_ffx) {
     VkSurfaceCapabilitiesKHR caps;
     VkResult result = vkGetPhysicalDeviceSurfaceCapabilitiesKHR(dev.physical, dev.surface, &caps);
     if (result != VK_SUCCESS) {
@@ -610,7 +665,14 @@ bool create_swapchain(uint32_t width, uint32_t height) {
     }
     VkSwapchainCreateInfoKHR ci{VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR};
     ci.surface = dev.surface;
+    // (hookshot) AMD's frame generation swapchain (vk_ffx_fg.h), where the engine choice wants it and it can run: made through its
+    // functions, of at most 6 images (its limit, FFX_FRAME_INTERPOLATION_SWAP_CHAIN_MAX_BUFFER_COUNT), the sharing mode exclusive and
+    // no mutable format (it keeps nothing of the chain below past its call). The first creation at start-up is always the plain one:
+    // the engine choice asks NVIDIA's runtime, which only the device's threads may (the first present makes this one)
+    const bool want_ffx = may_use_ffx && ffxfg::target() && ffxfg::usable();
+    const bool was_ffx = ffxfg::active();
     ci.minImageCount = std::max(caps.minImageCount, 4u);   // (hookshot: mailbox with frame interpolation: an image always free)
+    if (want_ffx) ci.minImageCount = std::min(ci.minImageCount, 6u);
     if (caps.maxImageCount) ci.minImageCount = std::min(ci.minImageCount, caps.maxImageCount);
     ci.imageFormat = fmt.format;
     ci.imageColorSpace = fmt.colorSpace;
@@ -644,7 +706,7 @@ bool create_swapchain(uint32_t width, uint32_t height) {
     // through UNORM views, their colours as they are, as on a UNORM swapchain. Without it, vk_imgui.cpp makes them linear
     const VkFormat view_formats[2] = {fmt.format, unorm_of(fmt.format)};
     VkImageFormatListCreateInfo format_list{VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO};
-    const bool mutable_view = dev.swap_mutable && view_formats[1] != fmt.format && (ci.imageUsage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
+    const bool mutable_view = dev.swap_mutable && view_formats[1] != fmt.format && (ci.imageUsage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) && !want_ffx;
     if (mutable_view) {
         ci.flags |= VK_SWAPCHAIN_CREATE_MUTABLE_FORMAT_BIT_KHR;
         format_list.viewFormatCount = 2;
@@ -652,32 +714,67 @@ bool create_swapchain(uint32_t width, uint32_t height) {
         format_list.pNext = ci.pNext;
         ci.pNext = &format_list;
     }
-    reflex_swapchain_info(ci);   // (NVIDIA Reflex: latency mode on)
-    VkSwapchainKHR sc;
-    result = vkCreateSwapchainKHR(dev.device, &ci, nullptr, &sc);
-    // Passing oldSwapchain retires it even when creation fails. Nothing may acquire from it again.
-    if (dev.swapchain) {
+    // (a swapchain of one kind never stands in for the other's: the old one goes first, the device idle, through the functions of the
+    // kind it is of. AMD's context stays across a resize, and goes with a switch to the plain swapchain, after its swapchain)
+    const auto drop_old = [&] {
+        if (!dev.swapchain) return;
         device_wait_idle_locked();   // (the present queue's presents of the old swapchain done too)
         reflex_swapchain_destroyed();   // (no latency sleep or markers may use the destroyed chain)
         swap_views_drop();   // (hookshot: the overlays' views of its images, before it)
         for (auto semaphore : dev.swap_rendered) vkDestroySemaphore(dev.device, semaphore, nullptr);
-        vkDestroySwapchainKHR(dev.device, dev.swapchain, nullptr);
+        if (was_ffx) ffxfg::destroy_swapchain(dev.swapchain);
+        else vkDestroySwapchainKHR(dev.device, dev.swapchain, nullptr);
         dev.swapchain = VK_NULL_HANDLE;
         dev.swap_rendered.clear();
         dev.swap_images.clear();
+    };
+    VkSwapchainKHR sc = VK_NULL_HANDLE;
+    result = VK_ERROR_FEATURE_NOT_PRESENT;
+    bool made_ffx = false;
+    if (want_ffx || was_ffx) {
+        drop_old();
+        ci.oldSwapchain = VK_NULL_HANDLE;
+    }
+    if (want_ffx) {
+        {   // (Reflex is off with frame generation: it is told so, on a copy, for the swapchain it is told of below: made without its latency mode)
+            auto scratch = ci;
+            reflex_swapchain_info(scratch);
+        }
+        result = ffxfg::create_swapchain(ci, &sc);
+        made_ffx = result == VK_SUCCESS;
+        if (!made_ffx) {
+            logf("vk: ffxfg: AMD's frame generation swapchain failed (VkResult %d): a plain swapchain, and Triforce's own frame generation "
+                 "for the run", (int)result);
+            ffxfg::note_failed("AMD's frame generation swapchain was not made", (int)result);
+        }
+    }
+    if (!made_ffx) {
+        if (was_ffx || want_ffx) ffxfg::release();   // (its contexts go, the swapchain is gone or was never made)
+        ci.oldSwapchain = dev.swapchain;
+        reflex_swapchain_info(ci);   // (NVIDIA Reflex: latency mode on)
+        result = vkCreateSwapchainKHR(dev.device, &ci, nullptr, &sc);
+        // Passing oldSwapchain retires it even when creation fails. Nothing may acquire from it again.
+        drop_old();
     }
     if (result != VK_SUCCESS) {
         logf("vk: vkCreateSwapchainKHR failed (VkResult %d, extent %ux%u, format %d, usage %#x, mode %d, images %u)",
              (int)result, width, height, (int)fmt.format, ci.imageUsage, (int)mode, ci.minImageCount);
         return false;
     }
-    if (vkGetSwapchainImagesKHR(dev.device, sc, &n, nullptr) != VK_SUCCESS || !n) {
-        vkDestroySwapchainKHR(dev.device, sc, nullptr);
+    const auto destroy_new = [&] {   // (the swapchain just made, not kept: through the functions of its kind)
+        if (made_ffx) ffxfg::destroy_swapchain(sc);
+        else vkDestroySwapchainKHR(dev.device, sc, nullptr);
+    };
+    const auto get_images = [&](uint32_t* count, VkImage* out) {
+        return made_ffx ? ffxfg::get_images(sc, count, out) : vkGetSwapchainImagesKHR(dev.device, sc, count, out);
+    };
+    if (get_images(&n, nullptr) != VK_SUCCESS || !n) {
+        destroy_new();
         return false;
     }
     std::vector<VkImage> images(n);
-    if (vkGetSwapchainImagesKHR(dev.device, sc, &n, images.data()) != VK_SUCCESS || !n) {
-        vkDestroySwapchainKHR(dev.device, sc, nullptr);
+    if (get_images(&n, images.data()) != VK_SUCCESS || !n) {
+        destroy_new();
         return false;
     }
     images.resize(n);
@@ -687,7 +784,7 @@ bool create_swapchain(uint32_t width, uint32_t height) {
         if (vkCreateSemaphore(dev.device, &si, nullptr, &semaphore) != VK_SUCCESS) {
             for (auto made : rendered)
                 if (made) vkDestroySemaphore(dev.device, made, nullptr);
-            vkDestroySwapchainKHR(dev.device, sc, nullptr);
+            destroy_new();
             return false;
         }
     }
@@ -696,8 +793,9 @@ bool create_swapchain(uint32_t width, uint32_t height) {
     dev.swap_format = fmt.format;
     dev.swap_extent = {width, height};
     dev.swap_images = std::move(images);
-    logf("vk: swapchain %ux%u, %u images, %s", width, height, n,
-         mode == VK_PRESENT_MODE_MAILBOX_KHR ? "mailbox" : mode == VK_PRESENT_MODE_IMMEDIATE_KHR ? "immediate" : "fifo");
+    logf("vk: swapchain %ux%u, %u images, %s%s", width, height, n,
+         mode == VK_PRESENT_MODE_MAILBOX_KHR ? "mailbox" : mode == VK_PRESENT_MODE_IMMEDIATE_KHR ? "immediate" : "fifo",
+         made_ffx ? ", AMD's frame generation swapchain (presents a made frame between the game's)" : "");
     swap_views_make(ci.imageUsage, mutable_view ? view_formats[1] : fmt.format);
     reflex_swapchain_created(sc);   // (NVIDIA Reflex: its sleep mode on the new swapchain)
     return true;
@@ -1157,6 +1255,7 @@ int start(void* hwnd) {
     vkGetPhysicalDeviceSurfaceSupportKHR(dev.physical, dev.queue_family, dev.surface, &ok);
     if (!ok) return 0;
     choose_present_queue();
+    ffxfg::surface_made(dev.surface);
     RECT r{};
     GetClientRect((HWND)hwnd, &r);
     if (!create_swapchain((uint32_t)(r.right - r.left), (uint32_t)(r.bottom - r.top))) return 0;
@@ -1178,6 +1277,7 @@ int start(void* hwnd) {
         return 0;
     }
     choose_present_queue();
+    ffxfg::surface_made(dev.surface);
     int width = 0, height = 0;
     w->drawable_size(w->window, &width, &height);
     if (width <= 0 || height <= 0) {

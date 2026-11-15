@@ -11,7 +11,10 @@
 //
 // Sharpening is off here: Triforce sharpens at the window with its Sharpness row, after the HUD. (FSR's own RCAS comes later.)
 //
-// Only this file sees the 1.1.4 headers (third_party/ffx_api_114): FSR 4's 2.4 ones name the same types with other layouts.
+// The library is loaded here once for the whole back end: vk_ffx_fg.cpp (frame generation through the same library, its own
+// swapchain) takes the handle and the five entry points from ffx_library() (vk_ffx3.h).
+//
+// Only this file and vk_ffx_fg.cpp see the 1.1.4 headers (third_party/ffx_api_114): FSR 4's 2.4 ones name the same types with other layouts.
 #include "vk_ffx3.h"
 
 #include <algorithm>
@@ -114,16 +117,13 @@ void* symbol(const char* name) {
 #endif
 }
 
-/// Opens the library and resolves its entry points, once. false: Triforce's own FSR 3.1 (the log says why)
+/// Opens the library and resolves its entry points, once (any user of the library: this file's upscaler, vk_ffx_fg.cpp's frame
+/// generation). false: not there, or not the API (the log says why)
 bool load() {
     Library& l = lib();
     std::lock_guard lk(l.mu);
     if (l.tried) return l.ok;
     l.tried = true;
-    if (env_switch("RX_VK_FSR3_LIB") == 0) {
-        logf("vk: FSR 3.1: Triforce's own (RX_VK_FSR3_LIB=0)");
-        return false;
-    }
     std::string where;
     for (const std::string& dir : library_dirs()) {
         where += (where.empty() ? "" : ", ") + dir;
@@ -131,12 +131,12 @@ bool load() {
         const std::string path = dir + "\\" + kLibrary;
         if (GetFileAttributesA(path.c_str()) == INVALID_FILE_ATTRIBUTES) continue;
         l.lib = LoadLibraryExA(path.c_str(), nullptr, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
-        if (!l.lib) logf("vk: FSR 3.1: %s not loaded (Windows error %lu)", path.c_str(), (unsigned long)GetLastError());
+        if (!l.lib) logf("vk: FidelityFX: %s not loaded (Windows error %lu)", path.c_str(), (unsigned long)GetLastError());
 #else
         const std::string path = dir + "/" + kLibrary;
         if (access(path.c_str(), R_OK) != 0) continue;
         l.lib = (HMODULE)dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
-        if (!l.lib) logf("vk: FSR 3.1: %s not loaded: %s", path.c_str(), dlerror());
+        if (!l.lib) logf("vk: FidelityFX: %s not loaded: %s", path.c_str(), dlerror());
 #endif
         if (l.lib) {
             l.path = path;
@@ -144,7 +144,7 @@ bool load() {
         }
     }
     if (!l.lib) {
-        logf("vk: FSR 3.1: Triforce's own: no %s in %s", kLibrary, where.c_str());
+        logf("vk: FidelityFX: no %s in %s: FSR 3.1 and frame generation are Triforce's own", kLibrary, where.c_str());
         return false;
     }
     l.create = (PfnFfxCreateContext)symbol("ffxCreateContext");
@@ -153,10 +153,11 @@ bool load() {
     l.query = (PfnFfxQuery)symbol("ffxQuery");
     l.dispatch = (PfnFfxDispatch)symbol("ffxDispatch");
     if (!l.create || !l.destroy || !l.configure || !l.query || !l.dispatch) {
-        logf("vk: FSR 3.1: Triforce's own: %s lacks the FidelityFX API's entry points", l.path.c_str());
+        logf("vk: FidelityFX: %s lacks the FidelityFX API's entry points: FSR 3.1 and frame generation are Triforce's own",
+             l.path.c_str());
         return false;
     }
-    logf("vk: FSR 3.1: AMD's library %s (FidelityFX API 1.1.4), in place of Triforce's own", l.path.c_str());
+    logf("vk: FidelityFX: AMD's library %s (FidelityFX API 1.1.4)", l.path.c_str());
     l.ok = true;
     return true;
 }
@@ -471,8 +472,46 @@ bool ffx3_usable() {
     // (asked every frame: the library's lock only for the first answer)
     static std::atomic<int> loaded{-1};
     int v = loaded.load(std::memory_order_acquire);
-    if (v < 0) loaded.store(v = load() ? 1 : 0, std::memory_order_release);
+    if (v < 0) {
+        if (env_switch("RX_VK_FSR3_LIB") == 0) {
+            logf("vk: FSR 3.1: Triforce's own (RX_VK_FSR3_LIB=0)");
+            v = 0;
+        } else if (load()) {
+            logf("vk: FSR 3.1: AMD's library %s, in place of Triforce's own", lib().path.c_str());
+            v = 1;
+        } else {
+            v = 0;
+        }
+        loaded.store(v, std::memory_order_release);
+    }
     return v == 1;
+}
+
+bool ffx_library_present() {
+    // (the file only, looked for once: the device is made before anything loads it, and wants to know whether to make the queues
+    // AMD's frame generation swapchain needs)
+    static const bool present = [] {
+        for (const std::string& dir : library_dirs()) {
+#ifdef _WIN32
+            if (GetFileAttributesA((dir + "\\" + kLibrary).c_str()) != INVALID_FILE_ATTRIBUTES) return true;
+#else
+            if (access((dir + "/" + kLibrary).c_str(), R_OK) == 0) return true;
+#endif
+        }
+        return false;
+    }();
+    return present;
+}
+
+const FfxLibrary* ffx_library() {
+    static FfxLibrary out;
+    static std::once_flag once;
+    std::call_once(once, [] {
+        if (!load()) return;
+        Library& l = lib();
+        out = {(void*)l.create, (void*)l.destroy, (void*)l.configure, (void*)l.query, (void*)l.dispatch, l.path.c_str(), true};
+    });
+    return out.ok ? &out : nullptr;
 }
 
 const TemporalEngine* ffx3_engine() { return &kEngine; }

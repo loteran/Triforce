@@ -1,11 +1,18 @@
 // Frame interpolation (vk_framegen.cpp): made frames shown between the game's (in a window; RX_VK_FRAMEGEN=0: off).
 #pragma once
 
+#include "framegen_engine.h"
 #include "vk_internal.h"
 
 namespace mkwvk {
 
 bool framegen_on();
+/// (hookshot) Who makes the made frames for a Frame generation row value, from what is live now: DLSS Frame Generation, AMD's library at 2x,
+/// or the renderer's own (framegen_engine.h). No side effects
+fgengine::Choice framegen_choice(int framegen);
+/// (hookshot) Each present, first in do_present (the replay's thread): the choice, said in the log when it changes, and AMD's library's
+/// swapchain switched on or off with the display thread drained
+void framegen_engine_tick();
 /// Records the frame's processing into the present's recording (src: the window texture's view, sw x sh, the crop
 /// x, y, w, h); false when interpolation cannot run (the present goes to the window as without it)
 bool framegen_record(VkCommandBuffer cmd, VkImageView src, uint32_t sw, uint32_t sh, const int crop[4]);

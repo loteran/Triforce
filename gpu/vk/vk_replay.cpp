@@ -40,6 +40,8 @@
 #include "vk_gprof.h"
 #include "vk_framegen.h"
 #include "vk_ngxfg.h"   // (DLSS Frame Generation: idle)
+#include "vk_hudless.h"   // (the picture without the HUD kept for the made-frame engines: idle)
+#include "vk_ffx_fg.h"   // (AMD FSR 3.1 frame generation through AMD's library: its swapchain)
 #include "vk_menu.h"
 #include "vk_jobs.h"
 #include "vk_shader.h"
@@ -3043,6 +3045,8 @@ void do_present(const nvn_tex* t, const int crop[4]) {
     renodx_present();   // (local, RenoDX port) its settings as the menu has them now
     temporal_idle();   // (DLSS, FSR: their video memory let go once not used for a while)
     ngxfg::idle();   // (DLSS Frame Generation's too)
+    hudless::idle();   // (the picture without the HUD, kept for it and for AMD's frame generation)
+    framegen_engine_tick();   // (who makes the frames: AMD's library has a swapchain of its own, switched here, with the display thread idle)
     status_tick();   // (the status line, and the video-memory warning)
     reflex_present_begins();
     struct ReflexSleep { ~ReflexSleep() { reflex_sleep(); antilag_input(); } } reflex_sleep_after;
@@ -3147,8 +3151,11 @@ void do_present(const nvn_tex* t, const int crop[4]) {
         // before it submits its next frame, and the interpolation's GPU work (~1 ms) held it back. The display
         // thread's present follows it on the one queue. RX_VK_SHOT_MADE shots need it in this recording.)
         static const bool fg_inline = getenv("RX_VK_SHOT_MADE") != nullptr;
-        const bool fg_after = framegen_on() && tex && !fg_inline;
-        interpolated = framegen_on() && tex && fg_inline &&
+        // (AMD's frame generation, when its swapchain is the one in place: it presents the made frame itself, so the renderer makes
+        // none and presents the game's frame alone, here, through that swapchain: present_image below)
+        const bool ffx_swapchain = ffxfg::active() || ffxfg::target();   // (switching in or out: this frame goes straight to present_image too)
+        const bool fg_after = framegen_on() && tex && !fg_inline && !ffx_swapchain;
+        interpolated = framegen_on() && tex && fg_inline && !ffx_swapchain &&
                        framegen_record(r.cmd, texture_view(tex, t, nullptr, VK_IMAGE_VIEW_TYPE_2D, ViewUse::Sample), sw,
                                        sh, crop);
         texture_frame(completed());
@@ -3241,7 +3248,7 @@ void do_present(const nvn_tex* t, const int crop[4]) {
             submit_recording(g, false);
         }
         if (interpolated) framegen_queue(value);
-        else menu_note_frame(true);   // (the FPS counter's, as frame generation's thread counts what it shows)
+        else menu_note_frame(true, ffx_swapchain && ffxfg::generating() ? 2 : 1);   // (the FPS counter's, as frame generation's thread counts what it shows; AMD's swapchain shows a made frame too)
         {   // (RX_VK_WAIT_GPU=<frames>: the replay no further ahead of the GPU than that)
             static uint64_t values[8];
             static const int ahead = [] {
@@ -3655,11 +3662,13 @@ void present_image(VkImage src, uint32_t sw, uint32_t sh, const int crop[4], VkI
     const bool hdr_changed = hdr_was >= 0 && hdr_was != opts.hdr;   // (turned on or off: the swapchain's format)
     if (hdr_was < 0) hdr_was = opts.hdr;
     const uint64_t want = dev.swap_resize.exchange(0, std::memory_order_acquire);
-    if (want || !dev.swapchain || reflex_swapchain_stale() || hdr_changed) {   // (resized, gone, Reflex or HDR changed)
+    // (resized, gone, Reflex or HDR changed, or the engine choice changed the kind of swapchain: AMD's frame generation has one of its own)
+    if (want || !dev.swapchain || reflex_swapchain_stale() || hdr_changed || ffxfg::swapchain_stale()) {
+        ffxfg::quiesce();   // (AMD's threads done with what they were handed, before the lock they submit under is taken)
         std::lock_guard qk(dev.present_mu);
         const uint32_t width = want ? (uint32_t)(want >> 32) : dev.swap_extent.width;
         const uint32_t height = want ? (uint32_t)want : dev.swap_extent.height;
-        if (!create_swapchain(width, height)) {
+        if (!create_swapchain(width, height, true)) {
             // Retry without replacing a newer resize published while recreation was in progress.
             uint64_t empty = 0;
             dev.swap_resize.compare_exchange_strong(empty, ((uint64_t)width << 32) | height,
@@ -3692,7 +3701,8 @@ void present_image(VkImage src, uint32_t sw, uint32_t sh, const int crop[4], VkI
     static bool unseen = false;
     const uint64_t acquire_timeout = unseen ? 0 : 100000000ull;
 #endif
-    VkResult res = vkAcquireNextImageKHR(dev.device, dev.swapchain, acquire_timeout, f.acquired, VK_NULL_HANDLE, &index);
+    const bool ffx = ffxfg::active();   // (the swapchain is AMD's: its functions acquire, and present below)
+    VkResult res = ffx ? ffxfg::acquire(dev.swapchain, acquire_timeout, f.acquired, &index) : vkAcquireNextImageKHR(dev.device, dev.swapchain, acquire_timeout, f.acquired, VK_NULL_HANDLE, &index);
     if (res == VK_ERROR_DEVICE_LOST) device_lost();
 #ifndef _WIN32
     if (res == VK_TIMEOUT || res == VK_NOT_READY) {
@@ -3706,8 +3716,9 @@ void present_image(VkImage src, uint32_t sw, uint32_t sh, const int crop[4], VkI
     }
 #endif
     if (res == VK_ERROR_OUT_OF_DATE_KHR) {
+        if (ffx) ffxfg::quiesce();
         std::lock_guard qk(dev.present_mu);
-        create_swapchain(dev.swap_extent.width, dev.swap_extent.height);
+        create_swapchain(dev.swap_extent.width, dev.swap_extent.height, true);
         return;
     }
     if (res != VK_SUCCESS && res != VK_SUBOPTIMAL_KHR) return;
@@ -3764,6 +3775,14 @@ void present_image(VkImage src, uint32_t sw, uint32_t sh, const int crop[4], VkI
         vkCmdCopyImageToBuffer(f.cmd, log_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, l.buf, 1, &c);
         capture_host_read_barrier(f.cmd, l.buf, (VkDeviceSize)kLogW * kLogH * 4);
         l.used = true, l.at = host->now_ns(), l.seq = seq++, l.kind = present_kind.load();
+    }
+    if (ffx) {   // (AMD's frame generation: this frame's configuration, and its preparation recorded here, before the overlays go over the picture)
+        ffxfg::FrameArgs fa;
+        fa.cmd = f.cmd, fa.swapchain = dev.swapchain, fa.format = dev.swap_format, fa.extent = dev.swap_extent;
+        fa.rect[0] = (int)rect.x, fa.rect[1] = (int)rect.y, fa.rect[2] = (int)rect.w, fa.rect[3] = (int)rect.h;
+        fa.game_frame = src != VK_NULL_HANDLE;
+        fa.plain = trace_route == 0;
+        ffxfg::frame(fa);
     }
     // Geometry trace: after choosing the actual presentation route, without frame-log pixel readback.
     static const bool trace_geometry = getenv("RX_VK_PRESENT_LOG") && atoi(getenv("RX_VK_PRESENT_LOG")) != 0;
@@ -3850,7 +3869,12 @@ void present_image(VkImage src, uint32_t sw, uint32_t sh, const int crop[4], VkI
     // ~15% to submit. With a queue of their own (dev.present_queue, a compute family's: vk_main.cpp create_device) the presents go
     // out with the submits' lock let go: the blit above signals swap_rendered on the replay's queue (submitted already, as a binary
     // semaphore's wait needs). (Waiting for the blit's fence before the present, with the lock let go, was worse.)
-    if (dev.present_queue) {
+    if (ffx) {
+        // (AMD's swapchain: its present submits on the game's queue through its callback, which takes dev.present_mu itself, and
+        // hands the real presents to its own queue and thread: so with the lock let go, as for the queue of their own)
+        qk.unlock();
+        res = ffxfg::present(&pi);
+    } else if (dev.present_queue) {
         qk.unlock();
         std::lock_guard pq(dev.present_queue_mu);
         res = vkQueuePresentKHR(dev.present_queue, &pi);
@@ -3878,8 +3902,9 @@ void present_image(VkImage src, uint32_t sw, uint32_t sh, const int crop[4], VkI
         }
     }
     if (res == VK_ERROR_OUT_OF_DATE_KHR || res == VK_SUBOPTIMAL_KHR) {
+        if (ffx) ffxfg::quiesce();
         if (!qk.owns_lock()) qk.lock();
-        create_swapchain(dev.swap_extent.width, dev.swap_extent.height);
+        create_swapchain(dev.swap_extent.width, dev.swap_extent.height, true);
     }
 }
 

@@ -50,6 +50,7 @@
 #include "vk_fsr3fi.h"    // (the Frame generation row: whether FSR 3.1 makes the frame)
 #include "vk_fsr4.h"
 #include "vk_ngxfg.h"    // (the Frame generation row: whether DLSS Frame Generation makes the frames)
+#include "vk_framegen.h"   // (the Frame generation row's hint: which engine makes the frames, framegen_choice)
 #include "vk_temporal.h"
 #include "vk_renodx.h"    // (renodx_built: the RenoDX rows only in a build with its shaders)
 #include "vk_reflex.h"
@@ -558,28 +559,42 @@ MENU_HINTS(hn_preset, 0, "Each row as you set it. Changing most rows yourself co
 MENU_HINTS(hn_gpu, 0, "The best dedicated GPU.")
 /// Frame generation: how many frames are made for each of the game's
 const char* hn_framegen(int v, int variant) {
-    // (where NVIDIA DLSS Frame Generation runs (RTX 40 and 50, vk_ngxfg.h) it makes the frames, up to what the GPU allows: Auto and
-    // 2x and up. Its text is variant 1, or 2 at 2x, after the AMD one there (the variants run on without a gap, up to the
-    // first nullptr: line 1476); it replaces the AMD one when it is the one in use)
-    if (v >= 1 && (variant < 0 ? ngxfg::wanted_for(v) : variant == (v == 2 ? 2 : 1))) {
-        if (v == 1)
+    // The engine that makes the frames (framegen_engine.h: NVIDIA DLSS Frame Generation where it runs, else AMD FSR 3.1 through AMD's
+    // library at 2x, else the renderer's own: AMD's passes as ours at 2x, the optical flow otherwise) has its own text, the one
+    // the row shows live (variant < 0). The variants all run on without a gap, up to the first nullptr (line 1476): 0 the plain
+    // text; at 2x then 1 AMD's passes of the renderer's own, 2 AMD's library, 3 NVIDIA's; at any other value 1 NVIDIA's
+    static const char* const own = "One made frame between each two of the game's, by AMD FSR 3.1 from the scene's depth and motion.";
+    static const char* const lib = "One made frame between each two of the game's, by AMD FSR 3.1 frame generation (AMD's library, its own "
+                                   "swapchain) from the scene's depth and motion.";
+    const auto nvidia = [](int n) -> const char* {
+        if (n == 1)
             return "A frame for each of the display's refreshes, made by NVIDIA DLSS Frame Generation: none made when the game keeps up. Frame pacing does not apply.";
         static char d[9][128];
-        snprintf(d[v], sizeof d[v], "%s between each two of the game's, by NVIDIA DLSS Frame Generation from the scene's depth, motion and camera.",
-                 v == 2 ? "One made frame" : v == 3 ? "Two made frames" : v == 4 ? "Three made frames" : v == 5 ? "Four made frames"
-                 : v == 6 ? "Five made frames" : v == 7 ? "Six made frames" : "Seven made frames");
-        return d[std::clamp(v, 2, 8)];
+        snprintf(d[n], sizeof d[n], "%s between each two of the game's, by NVIDIA DLSS Frame Generation from the scene's depth, motion and camera.",
+                 n == 2 ? "One made frame" : n == 3 ? "Two made frames" : n == 4 ? "Three made frames" : n == 5 ? "Four made frames"
+                 : n == 6 ? "Five made frames" : n == 7 ? "Six made frames" : "Seven made frames");
+        return d[std::clamp(n, 2, 8)];
+    };
+    const auto plain = [](int n) -> const char* {
+        if (n <= 0) return "Only the game's own frames: no added delay.";
+        if (n == 1) return "A frame for each of the display's refreshes: none made when the game keeps up. Frame pacing does not apply.";
+        static char b[9][96];
+        snprintf(b[n], sizeof b[n], "%s between each two of the game's.", n == 2 ? "One made frame" : n == 3 ? "Two made frames" : n == 4 ? "Three made frames"
+                 : n == 5 ? "Four made frames" : n == 6 ? "Five made frames" : n == 7 ? "Six made frames" : "Seven made frames");
+        return b[std::clamp(n, 2, 8)];
+    };
+    if (variant < 0) {
+        if (v < 1) return plain(v);
+        switch (framegen_choice(v).engine) {
+        case fgengine::Engine::DlssG: return nvidia(v);
+        case fgengine::Engine::AmdLibrary: return lib;
+        case fgengine::Engine::Fsr3fi: return own;
+        default: return plain(v);
+        }
     }
-    // (2x: by AMD FSR 3.1 where it runs, from the scene's depth and motion: vk_framegen.cpp. Variant 1 is that text)
-    if (v == 2 && (variant < 0 ? fsr3fi::frames_wanted() != 0 : variant == 1))
-        return "One made frame between each two of the game's, by AMD FSR 3.1 from the scene's depth and motion.";
-    if (variant > 0) return nullptr;
-    if (v <= 0) return "Only the game's own frames: no added delay.";
-    if (v == 1) return "A frame for each of the display's refreshes: none made when the game keeps up. Frame pacing does not apply.";
-    static char b[9][96];
-    snprintf(b[v], sizeof b[v], "%s between each two of the game's.", v == 2 ? "One made frame" : v == 3 ? "Two made frames" : v == 4 ? "Three made frames"
-             : v == 5 ? "Four made frames" : v == 6 ? "Five made frames" : v == 7 ? "Six made frames" : "Seven made frames");
-    return b[std::clamp(v, 2, 8)];
+    if (variant == 0 || v < 1) return variant == 0 ? plain(v) : nullptr;
+    if (v == 2) return variant == 1 ? own : variant == 2 ? lib : variant == 3 ? nvidia(v) : nullptr;
+    return variant == 1 ? nvidia(v) : nullptr;
 }
 MENU_HINTS(hn_pace, 0, "As soon as it is ready.", "At an even interval: less stutter, at up to one frame of delay.")
 MENU_HINTS(hn_output_res, 0, "The game's own size.",

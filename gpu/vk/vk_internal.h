@@ -310,7 +310,9 @@ void vma_log_heaps();
 void vma_log_image_blocks();   // (the image pools' blocks: what they hold, and their free ranges)
 PFN_vkGetInstanceProcAddr instance_proc();   // vk_main.cpp
 
-bool create_swapchain(uint32_t width, uint32_t height);
+/// (hookshot) may_use_ffx: AMD's frame generation swapchain (vk_ffx_fg.h) may be the kind made, when the engine choice wants it: not from
+/// start-up (the engine choice asks NVIDIA's runtime, which only the device's threads may), only from present_image
+bool create_swapchain(uint32_t width, uint32_t height, bool may_use_ffx = false);
 bool replay_start();                          // vk_replay.cpp
 bool precompile_wanted();                     // vk_draw.cpp
 void precompile_run(void (*progress)(size_t done, size_t total));

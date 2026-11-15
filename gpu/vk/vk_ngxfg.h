@@ -3,14 +3,16 @@
 // (HOOKSHOT_NGX, scripts/ngx_sdk.py: Linux and Windows, as vk_dlss.cpp); without it these say it is not there and the
 // renderer's own frames are made.
 //
-// RX_VK_FRAMEGEN_VENDOR=auto|nvidia|triforce chooses who makes the frames: auto (the default) DLSS-G where it can run and the
-// renderer's own where it cannot, nvidia only DLSS-G (the renderer's own never replaces it: with it unusable the row makes no
-// frames at the multipliers DLSS-G does), triforce never DLSS-G (NGX is not even asked for its frame generation's extensions).
+// RX_VK_FRAMEGEN_VENDOR=auto|nvidia|amd|triforce chooses who makes the frames (framegen_engine.h): auto (the default) DLSS-G where it
+// can run, then AMD's library at 2x, then the renderer's own; nvidia only DLSS-G (the renderer's own never replaces it: with it
+// unusable the row makes no frames at the multipliers DLSS-G does); amd and triforce never DLSS-G (NGX is not even asked for its
+// frame generation's extensions).
 #pragma once
 
 #include <cstdint>
 
 #include "dlssg_math.h"
+#include "framegen_engine.h"
 #include "vk_internal.h"
 
 namespace mkwvk {
@@ -19,9 +21,12 @@ struct Texture;
 
 namespace ngxfg {
 
-enum Vendor { VENDOR_AUTO, VENDOR_NVIDIA, VENDOR_TRIFORCE };
+using Vendor = fgengine::Vendor;
+constexpr Vendor VENDOR_AUTO = Vendor::Auto, VENDOR_NVIDIA = Vendor::Nvidia, VENDOR_AMD = Vendor::Amd, VENDOR_TRIFORCE = Vendor::Triforce;
 /// RX_VK_FRAMEGEN_VENDOR, read once
 Vendor vendor();
+/// DLSS Frame Generation may be the engine at all: the vendor is auto or nvidia (amd and triforce never ask NGX for it)
+bool dlssg_allowed();
 
 /// Whether this build has DLSS-G in it (HOOKSHOT_NGX)
 bool built();
@@ -70,12 +75,6 @@ void release();
 /// Each present: what DLSS-G holds in video memory let go once it has not been used for a while (the row turned off, another
 /// multiplier, no scene drawn), as vk_temporal.cpp's temporal_idle does for the upscalers
 void idle();
-
-/// The picture without the HUD, for DLSS-G to tell the HUD apart by: called where an upscaler (NVIDIA DLSS, AMD FSR 4 or 3.1)
-/// has just written the game's gameplay upscale into `picture` (its level `level`), before the HUD is drawn into it. It is
-/// kept encoded as the game's last pass encodes its picture. Nothing when no upscaler runs (the game's own network's picture is
-/// not taken: none is better than a made-up one) or DLSS-G is not wanted. Recorded into cmd (GENERAL images)
-void hudless_note(VkCommandBuffer cmd, Texture* picture, uint32_t level);
 
 } // namespace ngxfg
 } // namespace mkwvk

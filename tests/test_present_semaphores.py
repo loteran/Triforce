@@ -40,7 +40,7 @@ fixture = r'''
 #include <mutex>
 using VkSemaphore=uint64_t; using VkImage=uint64_t; using VkSwapchainKHR=uint64_t; using VkResult=int;
 constexpr uint64_t VK_NULL_HANDLE=0;
-constexpr int VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO=1, VK_SUCCESS=0;
+constexpr int VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO=1, VK_SUCCESS=0, VK_ERROR_FEATURE_NOT_PRESENT=-7;
 constexpr int VK_PRESENT_MODE_MAILBOX_KHR=1, VK_PRESENT_MODE_IMMEDIATE_KHR=2;
 struct VkSemaphoreCreateInfo { int type; };
 struct Extent { uint32_t width,height; };
@@ -61,6 +61,13 @@ constexpr int VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO=2, VK_IMAGE_USAGE_
 struct VkImageFormatListCreateInfo {int sType;const void* pNext=nullptr;uint32_t viewFormatCount=0;const VkFormat* pViewFormats=nullptr;};
 VkFormat unorm_of(VkFormat f) {return f;}
 void reflex_swapchain_info(CreateInfo&) {}
+// (hookshot: AMD's frame generation swapchain, vk_ffx_fg.h: never the one wanted here, so the plain swapchain is what is tested)
+namespace ffxfg {
+bool target() {return false;} bool usable() {return false;} bool active() {return false;} bool swapchain_stale() {return false;}
+void quiesce() {} void release() {} void note_failed(const char*,int) {} void destroy_swapchain(uint64_t) {}
+int create_swapchain(const CreateInfo&,uint64_t*) {return VK_ERROR_FEATURE_NOT_PRESENT;}
+int get_images(uint64_t,uint32_t*,uint64_t*) {return VK_ERROR_FEATURE_NOT_PRESENT;}
+}
 struct Reflex {uint64_t swapchain=0,swapchain_generation=0;bool latency=false,frame_marked=false;int mode=-1;std::mutex mu;} cached;
 Reflex& rx(){return cached;}
 void reflex_swapchain_created(uint64_t sc) {cached.swapchain=sc;cached.latency=cached.frame_marked=true;cached.mode=1;}
@@ -96,6 +103,7 @@ void swap_views_drop() {}   // (hookshot: the overlays' views, vk_main.cpp)
 bool recreate() {
     uint32_t n=0,width=640,height=480; struct {int format=1;} fmt;
     CreateInfo ci;int mode=0;VkResult result;
+    const bool want_ffx=false, was_ffx=false;   // (the swapchain's kind: vk_main.cpp reads both before ci is filled in)
 ''' + tail + r'''
     reflex_swapchain_created(sc);
     return true;
@@ -103,7 +111,8 @@ bool recreate() {
 uint64_t pack(unsigned w,unsigned h) {return (uint64_t(w)<<32)|h;}
 unsigned called_width=0,called_height=0,acquires=0;
 bool preflight_fail=false,stale=false;uint64_t newer_resize=0;
-bool create_swapchain(unsigned width,unsigned height) {
+bool create_swapchain(unsigned width,unsigned height,bool may_use_ffx=false) {
+    (void)may_use_ffx;
     called_width=width;called_height=height;
     if(newer_resize)dev.swap_resize.store(newer_resize);
     if(preflight_fail)return false;

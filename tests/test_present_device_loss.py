@@ -51,6 +51,7 @@ def main():
 using VkResult = int;
 enum { VK_SUCCESS=0, VK_ERROR_DEVICE_LOST=-4, VK_TRUE=1, VK_NULL_HANDLE=0 };
 struct { int device=1, queue=2, present_queue=3, swapchain=4; } dev;
+bool ffx=false;   // (AMD's frame generation swapchain, vk_ffx_fg.h: not in place here, so the plain WSI calls are the ones routed)
 struct { int done=5, acquired=6, pool=7, cmd=8; } f;
 int bi=0, si=0, pi=0, index=0;
 uint64_t acquire_timeout=UINT64_MAX;
@@ -60,6 +61,7 @@ struct Lost {};
 '''
     for call in CALLS:
         fixture += "template<class... A> VkResult " + call + "(A...) { ++calls; return result; }\n"
+    fixture += "namespace ffxfg { template<class... A> VkResult acquire(A...) { ++calls; return result; } }\n"
     for i, (_, snippet) in enumerate(sites):
         fixture += "void site_%d() {\n%s\n(void)res; ++continued;\n}\n" % (i, snippet)
     fixture += "int main() {\nint failed=0;\n"
