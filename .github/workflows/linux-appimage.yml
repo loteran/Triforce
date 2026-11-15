@@ -159,7 +159,7 @@ jobs:
     steps:
       - name: What the check script needs
         run: |
-          if command -v apt-get >/dev/null; then apt-get update -qq && apt-get install -y -qq --no-install-recommends bash findutils
+          if command -v apt-get >/dev/null; then apt-get update -qq && apt-get install -y -qq --no-install-recommends bash findutils ca-certificates
           elif command -v dnf >/dev/null; then dnf install -y -q bash findutils
           elif command -v pacman >/dev/null; then pacman -Sy --noconfirm --needed bash findutils
           elif command -v zypper >/dev/null; then zypper -n -q install bash findutils
@@ -178,6 +178,8 @@ jobs:
           grep -h '^NAME=\|^VERSION=' /etc/os-release || true
           # sed -n 1p reads to EOF: `| head -1` gives ldd SIGPIPE (141) under pipefail
           ldd --version 2>&1 | sed -n 1p
+          # (NVIDIA DLSS ticked drops the prebuilt back end: its headers fetched into a temp folder, in one image only, the compile is the same)
+          if [ "${{ matrix.image }}" = "ubuntu:22.04" ]; then export CHECK_NGX=1; fi
           scripts/linux/check_player_build.sh dist/*.AppImage
 
   release:

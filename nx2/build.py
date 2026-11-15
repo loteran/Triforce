@@ -1010,6 +1010,22 @@ def main():
         print("dry run: %d files to compile besides the lift's, %d missing" % (len(jobs), len(missing)), flush=True)
         for f in missing:
             print("    missing: " + f)
+        if not missing and build_vk and os.environ.get("HOOKSHOT_VK_SYNTAX") == "1":
+            # (scripts/linux/check_player_build.sh: the back end's own files (gpu/vk/*.cpp, not Eden's or sirit's ~500) parsed with the
+            # flags the real compile uses, so a header the AppImage leaves out (ffx_api.h, 2026-11) fails in CI, not in a player's
+            # 77-minute build. -fsyntax-only: nothing is written. HOOKSHOT_FSR / HOOKSHOT_NGX_SDK / HOOKSHOT_RENODX add their files)
+            checks = [j for j in vk_jobs if os.path.dirname(j[1]) == vk and j[1].endswith(".cpp")]
+            def syntax(job):
+                r = subprocess.run([job[0]] + job[3] + ["-fsyntax-only", job[1]], capture_output=True, text=True)
+                return job[1], r.returncode, (r.stdout + r.stderr)
+            bad = 0
+            with concurrent.futures.ThreadPoolExecutor(max(1, a.jobs)) as ex:
+                for src, rc, text in ex.map(syntax, checks):
+                    if rc:
+                        bad += 1
+                        print("    syntax check FAILED: " + src + "\n" + "\n".join(text.splitlines()[:12]), flush=True)
+            print("syntax check: %d files of the Vulkan back end, %d failed" % (len(checks), bad), flush=True)
+            return 1 if bad else 0
         return 1 if missing else 0
     # (the builder's compile timer: HOOKSHOT_TIMES is make_game.py's record of the earlier builds on this PC. With it,
     # this run says which files it really rebuilds and how long each took before, and the builder shows the rest of the

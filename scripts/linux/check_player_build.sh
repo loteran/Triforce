@@ -41,6 +41,39 @@ echo "== nx2/build.py --standalone --dry-run (as nx2/make_game.py runs it, with 
 (cd "$T" && in_image env OOT_WORK="$TMP/work" RX_RELEASE=1 A64_HOT_CHUNK=1 PYTHONIOENCODING=utf-8 \
     "$R/usr/python/bin/python3" -I -B -u -X utf8 nx2/build.py --standalone --jobs 1 --dry-run)
 
+# (a player's build without the prebuilt back end, which is every build with NVIDIA DLSS ticked (HOOKSHOT_VK_PREBUILT dropped): nx2/build.py
+# compiles the back end from this tree. A header the image leaves out stopped those builds 77 minutes in ('ffx_api.h' not found,
+# 2026-11). The same build.py start-up as above, with the back end's headers found where a player's are (the image's cpm/) and HOOKSHOT_VK_SYNTAX=1:
+# every gpu/vk/*.cpp parsed (-fsyntax-only) with the flags the real compile uses, plain and with AMD FSR 4 ticked (its headers are
+# third_party/fidelityfx; the SDK DLL is not needed to compile). NVIDIA DLSS only with CHECK_NGX=1 (below). Not covered: RenoDX (its shaders are fetched on the player's PC). CHECK_VK_SYNTAX=0 skips it.)
+if [ "${CHECK_VK_SYNTAX:-1}" = "1" ]; then
+    JOBS=$(nproc 2>/dev/null || echo 2)
+    for fsr in 0 1; do
+        echo "== the Vulkan back end compiled from the image's tree, syntax only (as a player's build without the prebuilt, HOOKSHOT_FSR=$fsr)"
+        fsr_env=(); [ "$fsr" = 1 ] && fsr_env=(HOOKSHOT_FSR=1)
+        (cd "$T" && in_image env -u HOOKSHOT_VK_PREBUILT ${fsr_env[@]+"${fsr_env[@]}"} HOOKSHOT_VK_SYNTAX=1 OOT_WORK="$TMP/work" RX_RELEASE=1 \
+            A64_HOT_CHUNK=1 PYTHONIOENCODING=utf-8 \
+            "$R/usr/python/bin/python3" -I -B -u -X utf8 nx2/build.py --standalone --jobs "$JOBS" --dry-run)
+    done
+    # (NVIDIA DLSS ticked, the case that drops the prebuilt: NVIDIA's headers and static library fetched by the image's own
+    # scripts/ngx_sdk.py --build-only into a temp folder (nothing of it is kept or goes into the image), or CHECK_NGX_SDK=<folder>
+    # of one fetched already. CHECK_NGX=1 turns it on (CI: the Ubuntu 22.04 job; needs the network), off by default.)
+    if [ "${CHECK_NGX:-0}" = "1" ]; then
+        NGX=${CHECK_NGX_SDK:-$TMP/ngx-sdk}
+        if [ ! -f "$NGX/lib/libnvsdk_ngx.a" ]; then
+            echo "== NVIDIA's DLSS SDK, headers and static library (scripts/ngx_sdk.py --build-only)"
+            (cd "$T" && in_image "$R/usr/python/bin/python3" -I -B scripts/ngx_sdk.py --build-only --accept-nvidia-license "$NGX")
+        fi
+        for fsr in 0 1; do
+            echo "== the Vulkan back end with NVIDIA DLSS, syntax only (HOOKSHOT_FSR=$fsr)"
+            fsr_env=(); [ "$fsr" = 1 ] && fsr_env=(HOOKSHOT_FSR=1)
+            (cd "$T" && in_image env -u HOOKSHOT_VK_PREBUILT ${fsr_env[@]+"${fsr_env[@]}"} HOOKSHOT_NGX_SDK="$NGX" HOOKSHOT_VK_SYNTAX=1 \
+                OOT_WORK="$TMP/work" RX_RELEASE=1 A64_HOT_CHUNK=1 PYTHONIOENCODING=utf-8 \
+                "$R/usr/python/bin/python3" -I -B -u -X utf8 nx2/build.py --standalone --jobs "$JOBS" --dry-run)
+        done
+    fi
+fi
+
 echo "== AMD FSR 4's kit (nx2/fsr4_linux.py): its tools start, and the library's compiler links against the sysroot"
 K=$R/usr/lib/hookshot/fsr4
 for tool in dxil-spirv glslang spirv-as spirv-dis spirv-opt spirv-val; do
