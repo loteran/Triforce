@@ -41,6 +41,33 @@ echo "== nx2/build.py --standalone --dry-run (as nx2/make_game.py runs it, with 
 (cd "$T" && in_image env OOT_WORK="$TMP/work" RX_RELEASE=1 A64_HOT_CHUNK=1 PYTHONIOENCODING=utf-8 \
     "$R/usr/python/bin/python3" -I -B -u -X utf8 nx2/build.py --standalone --jobs 1 --dry-run)
 
+echo "== AMD FSR 4's kit (nx2/fsr4_linux.py): its tools start, and the library's compiler links against the sysroot"
+K=$R/usr/lib/hookshot/fsr4
+for tool in dxil-spirv glslang spirv-as spirv-dis spirv-opt spirv-val; do
+    [ -x "$K/tools/$tool" ] || { echo "the FSR 4 kit has no $tool"; exit 1; }
+done
+# (each runs here: the tools need nothing of this system but its C library; dxil-spirv finds its library beside it)
+in_image env LD_LIBRARY_PATH="$K/tools" "$K/tools/dxil-spirv" --help > /dev/null 2>&1 ||
+    in_image env LD_LIBRARY_PATH="$K/tools" "$K/tools/dxil-spirv" 2>&1 | grep -qi "usage" ||
+    { echo "dxil-spirv did not start:"; in_image env LD_LIBRARY_PATH="$K/tools" "$K/tools/dxil-spirv" --help 2>&1 | head -5; exit 1; }
+in_image "$K/tools/glslang" --version > /dev/null
+in_image "$K/tools/spirv-val" --version > /dev/null
+for py_tool in cmake ninja; do in_image "$R/usr/python/bin/$py_tool" --version > /dev/null; done
+in_image "$R/usr/lib/hookshot/emsdk/upstream/bin/llvm-objdump" --version > /dev/null
+[ -f "$K/src/CMakeLists.txt" ] && [ -f "$K/src/tools/setup.py" ] || { echo "the FSR 4 kit has no fsr4-vk sources"; exit 1; }
+# (a library that calls Vulkan, made as nx2/fsr4_linux.py makes AMD FSR 4's: the AppImage's clang and lld, its sysroot and
+# the sysroot's Vulkan loader, the C++ runtime inside)
+cat > "$TMP/vk.cpp" <<'CPP'
+#include <vulkan/vulkan.h>
+#include <string>
+extern "C" int vk_probe(void) { uint32_t n = 0; return vkEnumerateInstanceExtensionProperties(nullptr, &n, nullptr) + (int)std::to_string(n).size(); }
+CPP
+S=$R/usr/lib/hookshot/sysroot
+in_image "$R/usr/lib/hookshot/emsdk/upstream/bin/clang++" --sysroot="$S" -fuse-ld=lld -O2 -shared -fPIC \
+    -static-libstdc++ -static-libgcc -I"$K/src/third_party/Vulkan-Headers/include" "$TMP/vk.cpp" -o "$TMP/vk.so" \
+    "$S/usr/lib/x86_64-linux-gnu/libvulkan.so"
+echo "AMD FSR 4's kit runs here"
+
 # (Python's own __pycache__ aside: AppRun runs Python with -I, which writes it where it can, and does without where it cannot)
 written=$(find "$R" -type f -newer "$TMP/before" ! -path "*/__pycache__/*" -print)
 if [ -n "$written" ]; then
