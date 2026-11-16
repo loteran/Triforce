@@ -17,6 +17,7 @@
 #include <cstdarg>
 #include <deque>
 #include <exception>
+#include <list>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -28,6 +29,12 @@
 #include <thread>
 #include <setjmp.h>
 #include <signal.h>
+#ifndef _WIN32
+#include <cerrno>
+#include <dirent.h>
+#include <fcntl.h>
+#include <unistd.h>
+#endif
 
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
 
@@ -820,6 +827,74 @@ bool depth_aspect(VkFormat f) {
     return is_depth_format(f) && f != VK_FORMAT_S8_UINT;
 }
 
+// (Triforce) The game started again in a new process, with this one's command line and TRIFORCE_FAULT_RESTARTS=n+1 (n: the
+// restarts before this one), for driver_fault_restart and memory_watch below. Windows: a new process of this executable, and this
+// one ends at once. Linux: this process becomes the game again (execve of /proc/self/exe with /proc/self/cmdline, as
+// host/hos_relaunch.c does it), every file it opened closed first: the guest memory's memfd kept open across it would keep the
+// gigabytes it holds. Neither waits for an orderly close: that would wait on the threads stuck in the driver. False: it could
+// not be started, and this process goes on
+bool start_game_again(int n) {
+    char count[16];
+    snprintf(count, sizeof count, "%d", n + 1);
+    char before[16] = "";
+    if (n > 0) snprintf(before, sizeof before, "%d", n);
+#ifdef _WIN32
+    wchar_t exe[MAX_PATH * 4];
+    const DWORD len = GetModuleFileNameW(nullptr, exe, MAX_PATH * 4);
+    std::wstring cmd = GetCommandLineW();   // (CreateProcessW may write into it)
+    wchar_t pid[16];
+    swprintf(pid, 16, L"%lu", (unsigned long)GetCurrentProcessId());
+    SetEnvironmentVariableA("TRIFORCE_FAULT_RESTARTS", count);
+    SetEnvironmentVariableW(L"HOS_RESTART_OF", pid);   // (the new process waits for this one before it takes the log over)
+    STARTUPINFOW si{};
+    PROCESS_INFORMATION pi{};
+    si.cb = sizeof si;
+    if (!len || len >= MAX_PATH * 4 || !CreateProcessW(exe, cmd.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi)) {
+        logf("vk: the game could not be started again (error %lu): this start goes on in this process", (unsigned long)GetLastError());
+        SetEnvironmentVariableW(L"HOS_RESTART_OF", nullptr);
+        SetEnvironmentVariableA("TRIFORCE_FAULT_RESTARTS", before[0] ? before : nullptr);
+        return false;
+    }
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    memory_trial_orderly_end();   // (no verdict on the memory handling from a start ended on purpose)
+    if (host && host->log_flush) host->log_flush();
+    TerminateProcess(GetCurrentProcess(), 0);
+    return true;
+#else
+    std::vector<char> line;
+    if (FILE* f = fopen("/proc/self/cmdline", "rb")) {
+        char buf[4096];
+        for (size_t got; (got = fread(buf, 1, sizeof buf, f)) > 0;) line.insert(line.end(), buf, buf + got);
+        fclose(f);
+    }
+    std::vector<char*> argv;
+    for (size_t i = 0; i < line.size(); i += strlen(&line[i]) + 1) argv.push_back(&line[i]);
+    if (argv.empty()) {
+        logf("vk: the game could not be started again (this process's command was not found): this start goes on in this process");
+        return false;
+    }
+    argv.push_back(nullptr);
+    setenv("TRIFORCE_FAULT_RESTARTS", count, 1);
+    memory_trial_orderly_end();
+    if (host && host->log_flush) host->log_flush();
+    if (DIR* d = opendir("/proc/self/fd")) {
+        const int skip = dirfd(d);
+        for (struct dirent* e; (e = readdir(d));) {
+            const int fd = atoi(e->d_name);
+            if (fd > 2 && fd != skip) fcntl(fd, F_SETFD, fcntl(fd, F_GETFD) | FD_CLOEXEC);
+        }
+        closedir(d);
+    }
+    fflush(nullptr);
+    execv("/proc/self/exe", argv.data());
+    if (before[0]) setenv("TRIFORCE_FAULT_RESTARTS", before, 1);
+    else unsetenv("TRIFORCE_FAULT_RESTARTS");
+    logf("vk: the game could not be started again (execv: %s): this start goes on in this process", strerror(errno));
+    return false;
+#endif
+}
+
 // (hookshot) A driver's compiler that faults on a shader (amdvlk64.dll on a mesh program, Hookshot issue 26) costs that one draw, not the game
 #ifdef _WIN32
 // (Triforce, 11-13) Where the driver faulted: the module and offset of the faulting instruction, what it touched, and the
@@ -901,30 +976,7 @@ __declspec(noinline) void driver_fault_restart() {
     if (going.exchange(true)) Sleep(INFINITE);   // (another thread's fault is starting the game again already)
     logf("vk: the driver faulted during the start's shader work: it may hold its own locks for good now (a start hung that "
          "way), so the game starts again (restart %d of 2 at most; RX_VK_FAULT_RESTART=0: not)", n + 1);
-    wchar_t exe[MAX_PATH * 4];
-    const DWORD len = GetModuleFileNameW(nullptr, exe, MAX_PATH * 4);
-    std::wstring cmd = GetCommandLineW();   // (CreateProcessW may write into it)
-    char count[16];
-    wchar_t pid[16];
-    snprintf(count, sizeof count, "%d", n + 1);
-    swprintf(pid, 16, L"%lu", (unsigned long)GetCurrentProcessId());
-    SetEnvironmentVariableA("TRIFORCE_FAULT_RESTARTS", count);
-    SetEnvironmentVariableW(L"HOS_RESTART_OF", pid);   // (the new process waits for this one before it takes the log over)
-    STARTUPINFOW si{};
-    PROCESS_INFORMATION pi{};
-    si.cb = sizeof si;
-    if (!len || len >= MAX_PATH * 4 || !CreateProcessW(exe, cmd.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi)) {
-        logf("vk: the game could not be started again (error %lu): this start goes on in this process", (unsigned long)GetLastError());
-        SetEnvironmentVariableW(L"HOS_RESTART_OF", nullptr);
-        SetEnvironmentVariableA("TRIFORCE_FAULT_RESTARTS", before[0] ? before : nullptr);
-        going.store(false);
-        return;
-    }
-    CloseHandle(pi.hThread);
-    CloseHandle(pi.hProcess);
-    memory_trial_orderly_end();   // (no verdict on the memory handling from a start ended on purpose)
-    if (host && host->log_flush) host->log_flush();
-    TerminateProcess(GetCurrentProcess(), 0);
+    if (!start_game_again(n)) going.store(false);
 }
 __declspec(noinline) VkResult guarded_graphics(VkPipelineCache cache, const VkGraphicsPipelineCreateInfo* ci, VkPipeline* pl) {
     __try {
@@ -5660,6 +5712,168 @@ bool fallback_buffers_of(const Program& p, FallbackBuffers*& out) {
     return true;
 }
 
+// ---- (Triforce, 11-15) A fallback compile the driver never ends ----
+// RADV (Mesa 26.2.6, RX 580: no mesh shaders) never finished the compute pipelines of two mesh fallback programs: their
+// threads sat in ACO's spiller (aco::spill <- radv_CreateComputePipelines <- fallback_compute_pipelines) taking about 1 GB a
+// second, until the system's memory and swap were gone and it killed the game: five starts of five in a day on a 16 GB PC with
+// 8 GB of swap, in the precompile or the intro movie after it ("2974 of 2976 done, nothing finished for 30 s: the game starts,
+// the rest go on behind it"). A Vulkan call cannot be stopped, and the driver caches nothing it did not finish, so every start
+// did it again. So the fallback's compiles are watched: one that has run RX_VK_COMPILE_WATCH_S seconds (20; AMD's longest seen
+// to finish took 12) is said in the log, and when memory then runs short (RAM and swap free under max(1.5 GB, a sixteenth of
+// them)) the programs in such a compile are recorded (triforce_pipelines.bin.refused, for these programs and this driver) and
+// the game starts again (start_game_again; two restarts in a row at most), where their draws are left out as a refused
+// program's are. A compile that ends after all takes its program off the record. Only memory decides, not time alone: a
+// player who closes the game in a slow compile leaves no record. RX_VK_COMPILE_WATCH_S=0: no watch
+struct SlowCompile {
+    uint64_t key, variant;
+    std::chrono::steady_clock::time_point began;
+    bool said = false;
+};
+std::mutex slow_mu;
+std::list<SlowCompile> slow_compiles;   // (the fallback compiles in the driver now)
+std::set<std::pair<uint64_t, uint64_t>> slow_refused;   // (the record's programs: their draws are left out)
+bool slow_read = false;
+std::string slow_path() { return pipe_notes_path() + ".refused"; }
+uint64_t slow_stamp() {   // (these programs (the translator's stamp) on this driver: a driver that is updated may finish them)
+    uint64_t h = program_cache_stamp() ^ 0x5EF05EDC0391ull;
+    const auto add = [&h](const void* d, size_t n) {
+        for (size_t i = 0; i < n; i++) h = (h ^ ((const uint8_t*)d)[i]) * 1099511628211ull;
+    };
+    add(dev.props.pipelineCacheUUID, VK_UUID_SIZE);
+    const uint32_t v[] = {dev.props.vendorID, dev.props.deviceID, dev.props.driverVersion};
+    add(v, sizeof v);
+    return h;
+}
+/// (slow_mu held) the record read, once
+void slow_read_locked() {
+    if (slow_read) return;
+    slow_read = true;
+    if (FILE* f = fopen(slow_path().c_str(), "rb")) {
+        uint64_t v[2] = {};
+        if (fread(v, 8, 1, f) == 1 && v[0] == slow_stamp())
+            while (fread(v, 8, 2, f) == 2) slow_refused.insert({v[0], v[1]});
+        fclose(f);
+    }
+    if (!slow_refused.empty())
+        logf("vk: fallback: %zu programs whose compute pipelines this driver never finished compiling (%s): their draws are left out",
+             slow_refused.size(), slow_path().c_str());
+}
+/// (slow_mu held) the record written whole
+void slow_write_locked() {
+    std::vector<uint64_t> all{slow_stamp()};
+    for (const auto& [k, v] : slow_refused) all.push_back(k), all.push_back(v);
+    if (slow_refused.empty()) {
+        remove(slow_path().c_str());
+    } else if (FILE* f = fopen(slow_path().c_str(), "wb")) {
+        fwrite(all.data(), 8, all.size(), f);
+        fflush(f);
+        fclose(f);
+    }
+}
+/// MB of RAM and swap free now, and of both in all; false: not known
+bool memory_left(uint64_t& free_mb, uint64_t& total_mb) {
+#ifdef _WIN32
+    MEMORYSTATUSEX ms{};
+    ms.dwLength = sizeof ms;
+    if (!GlobalMemoryStatusEx(&ms)) return false;
+    free_mb = ms.ullAvailPageFile >> 20, total_mb = ms.ullTotalPageFile >> 20;   // (the commit limit: RAM and page file)
+    return total_mb != 0;
+#else
+    FILE* f = fopen("/proc/meminfo", "r");
+    if (!f) return false;
+    char line[128];
+    unsigned long long kb = 0, avail = 0, swap_free = 0, total = 0, swap_total = 0;
+    int got = 0;
+    while (got != 15 && fgets(line, sizeof line, f)) {
+        if (sscanf(line, "MemAvailable: %llu kB", &kb) == 1) avail = kb, got |= 1;
+        else if (sscanf(line, "SwapFree: %llu kB", &kb) == 1) swap_free = kb, got |= 2;
+        else if (sscanf(line, "MemTotal: %llu kB", &kb) == 1) total = kb, got |= 4;
+        else if (sscanf(line, "SwapTotal: %llu kB", &kb) == 1) swap_total = kb, got |= 8;
+    }
+    fclose(f);
+    free_mb = (avail + swap_free) >> 10, total_mb = (total + swap_total) >> 10;
+    return got == 15 && total_mb != 0;
+#endif
+}
+/// Whether the memory left calls for the restart: under max(1.5 GB, a sixteenth of RAM and swap)
+bool memory_short(uint64_t free_mb, uint64_t total_mb) {
+    return free_mb < std::max<uint64_t>(1536, total_mb / 16);
+}
+int slow_watch_s() {
+    static const int s = getenv("RX_VK_COMPILE_WATCH_S") ? std::max(0, atoi(getenv("RX_VK_COMPILE_WATCH_S"))) : 20;
+    return s;
+}
+/// (the watch's thread, started at the first watched compile, for the session)
+void slow_watch() {
+    for (;;) {
+        Sleep(250);
+        std::vector<std::pair<uint64_t, uint64_t>> long_ones;
+        {
+            std::lock_guard lk(slow_mu);
+            const auto now = std::chrono::steady_clock::now();
+            for (SlowCompile& c : slow_compiles) {
+                const double s = std::chrono::duration<double>(now - c.began).count();
+                if (s < slow_watch_s()) continue;
+                if (!c.said) {
+                    c.said = true;
+                    logf("vk: fallback: the driver has been compiling the compute pipeline of %016llx (variant %016llx) for %.0f s: "
+                         "watched; should memory run out, the program is recorded and the game starts again without it",
+                         (unsigned long long)c.key, (unsigned long long)c.variant, s);
+                }
+                long_ones.push_back({c.key, c.variant});
+            }
+        }
+        if (long_ones.empty()) continue;
+        uint64_t free_mb = 0, total_mb = 0;
+        if (!memory_left(free_mb, total_mb) || !memory_short(free_mb, total_mb)) continue;
+        {
+            std::lock_guard lk(slow_mu);
+            slow_read_locked();
+            slow_refused.insert(long_ones.begin(), long_ones.end());
+            slow_write_locked();
+        }
+        char before[16] = "";
+#ifdef _WIN32
+        GetEnvironmentVariableA("TRIFORCE_FAULT_RESTARTS", before, sizeof before);
+#else
+        if (const char* e = getenv("TRIFORCE_FAULT_RESTARTS")) snprintf(before, sizeof before, "%s", e);
+#endif
+        const int n = atoi(before);
+        logf("vk: fallback: memory has run out (%llu of %llu MB of RAM and swap free) while the driver compiled %zu program(s) for "
+             "over %d s without end: recorded in %s, and the game starts again without them%s",
+             (unsigned long long)free_mb, (unsigned long long)total_mb, long_ones.size(), slow_watch_s(), slow_path().c_str(),
+             n >= 2 ? " (not: two restarts in a row already, so it ends here)" : "");
+        if (n < 2 && start_game_again(n)) return;
+        // (no restart: the game ends here, as the system would end it in a moment, before it takes the desktop with it)
+        if (host && host->log_flush) host->log_flush();
+        _exit(1);
+    }
+}
+/// A watched fallback compile begins; true: the record has the program, and it is not compiled
+bool slow_begin(const Program& p, std::list<SlowCompile>::iterator& at) {
+    std::lock_guard lk(slow_mu);
+    slow_read_locked();
+    if (slow_refused.count({p.key, p.variant})) return true;
+    if (!slow_watch_s()) {
+        at = slow_compiles.end();
+        return false;
+    }
+    static std::once_flag once;
+    std::call_once(once, [] { std::thread(slow_watch).detach(); });
+    at = slow_compiles.insert(slow_compiles.end(), SlowCompile{p.key, p.variant, std::chrono::steady_clock::now()});
+    return false;
+}
+void slow_end(std::list<SlowCompile>::iterator at) {
+    std::lock_guard lk(slow_mu);
+    if (at == slow_compiles.end()) return;
+    if (at->said) {
+        const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - at->began).count();
+        logf("vk: fallback: the compute pipeline of %016llx was compiled after all, in %.0f s", (unsigned long long)at->key, s);
+        if (slow_refused.erase({at->key, at->variant})) slow_write_locked();
+    }
+    slow_compiles.erase(at);
+}
+
 bool fallback_compute_pipelines(Program& p) {
     static std::mutex mu;
     // (the programs whose compute pipeline the driver refused or faulted on, by key and variant: not tried again. Each try
@@ -5675,6 +5889,17 @@ bool fallback_compute_pipelines(Program& p) {
         if (!p.fallback_compute.empty()) return true;
         if (failed.count({p.key, p.variant})) return false;
     }
+    // (Triforce: watched while the driver compiles it; one an earlier start recorded as never finished is not compiled: slow_watch)
+    std::list<SlowCompile>::iterator watched;
+    if (slow_begin(p, watched)) {
+        std::lock_guard lk(mu);
+        failed.insert({p.key, p.variant});
+        return false;
+    }
+    struct Watched {
+        std::list<SlowCompile>::iterator at;
+        ~Watched() { slow_end(at); }
+    } watch{watched};
     std::vector<VkPipeline> made(p.stages.size(), VK_NULL_HANDLE);
     bool any = false;
     for (size_t i = 0; i < p.stages.size(); i++) {
@@ -7797,6 +8022,17 @@ bool precompile_keeps_all() {
     MEMORYSTATUSEX ms{};
     ms.dwLength = sizeof ms;
     if (GlobalMemoryStatusEx(&ms)) return ms.ullTotalPhys >= (20ull << 30);
+#else
+    // (Triforce, 11-15: Linux too, by /proc/meminfo's MemTotal. The rule was Windows' alone, and a 16 GB Linux PC kept every
+    // pipeline and program of the precompile for the session)
+    if (FILE* f = fopen("/proc/meminfo", "r")) {
+        char line[128];
+        unsigned long long kb = 0;
+        bool got = false;
+        while (!got && fgets(line, sizeof line, f)) got = sscanf(line, "MemTotal: %llu kB", &kb) == 1;
+        fclose(f);
+        if (got) return kb >= (20ull << 20);
+    }
 #endif
     return true;
 }
@@ -7893,6 +8129,9 @@ void precompile_run(void (*progress)(size_t done, size_t total)) {
         std::mutex mu, first_graphics;
         std::atomic<bool> graphics_begun{false};
         bool abandoned = false;
+        // (Triforce: what finished, for the record of a light start that goes on without its stragglers: under mu)
+        std::vector<uint64_t> graphics_done;
+        size_t others_done = 0;
     };
     const size_t graphics_n = notes.size(), computes_n = computes.size(), fallbacks_n = fallbacks.size();
     Pre* pre = new Pre;
@@ -7945,15 +8184,23 @@ void precompile_run(void (*progress)(size_t done, size_t total)) {
                     const VkPipeline made = build_graphics(*p, n.s, note_targets(n), (VkPrimitiveTopology)n.topo);
                     pre->graphics_begun = true;
                     if (first.owns_lock()) first.unlock();
-                    std::lock_guard lk(note_mu);
-                    auto it = pipelines.find(n.key);
-                    if (it == pipelines.end()) {
-                        auto e = std::make_unique<PipeEntry>();
-                        e->pipeline = made;
-                        e->ready.store(true, std::memory_order_release);
-                        pipelines.emplace(n.key, std::move(e));
+                    {
+                        std::lock_guard lk(note_mu);
+                        auto it = pipelines.find(n.key);
+                        if (it == pipelines.end()) {
+                            auto e = std::make_unique<PipeEntry>();
+                            e->pipeline = made;
+                            e->ready.store(true, std::memory_order_release);
+                            pipelines.emplace(n.key, std::move(e));
+                        }
                     }
                 }
+                std::lock_guard lk(pre->mu);
+                pre->graphics_done.push_back(n.key);
+            }
+            if (i < computes.size() + fallbacks.size()) {
+                std::lock_guard lk(pre->mu);
+                pre->others_done++;
             }
             pre->done++;
         }
@@ -7982,6 +8229,18 @@ void precompile_run(void (*progress)(size_t done, size_t total)) {
     }
     if (gone_on) {
         for (std::thread& t : threads) t.detach();
+        // (Triforce, 11-15: the record of what finished, as below. A start that went on without its stragglers wrote none, so a
+        // light start whose last pipelines never finish (two mesh fallback programs on RADV, RX 580) built every pipeline again
+        // at each start, and kept them all, the record never written)
+        if (light && !prepare_stopped()) {
+            {
+                std::lock_guard lk(pre->mu);   // (pre is let go, never freed: its workers may still write to it)
+                built.insert(pre->graphics_done.begin(), pre->graphics_done.end());
+                if (pre->others_done == computes_n + fallbacks_n) built.insert(kBuiltComputes);
+            }
+            pipeline_cache_save(true);
+            built_write(built_stamp, built);
+        }
     } else {
         for (std::thread& t : threads) t.join();
         delete pre;
