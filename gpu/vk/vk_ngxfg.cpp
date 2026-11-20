@@ -221,7 +221,7 @@ bool evaluate(VkCommandBuffer cmd, const Inputs& in, const Output* out, int coun
         cp.Width = in.width, cp.Height = in.height, cp.NativeBackbufferFormat = (unsigned)VK_FORMAT_R8G8B8A8_UNORM;
         cp.RenderWidth = in.render_width, cp.RenderHeight = in.render_height, cp.DynamicResolutionScaling = false;
         const NVSDK_NGX_Result r = NGX_VK_CREATE_DLSSG(cmd, 1, 1, &s.feature, s.params, &cp);
-        note_work();
+        note_work(cmd);
         if (NVSDK_NGX_FAILED(r) || !s.feature) {
             s.feature = nullptr, s.failed = true;
             logf("vk: ngxfg: DLSS Frame Generation's feature was not made (%#x) at %ux%u: the renderer's own frames", (unsigned)r,
@@ -323,7 +323,7 @@ bool evaluate(VkCommandBuffer cmd, const Inputs& in, const Output* out, int coun
         set_p(p, NVSDK_NGX_DLSSG_Parameter_OutputInterpolated, &ro);
         set_ui(p, NVSDK_NGX_DLSSG_Parameter_MultiFrameIndex, (unsigned)(i + 1));
         const NVSDK_NGX_Result r = NVSDK_NGX_VULKAN_EvaluateFeature_C(cmd, s.feature, p, nullptr);
-        note_work();   // (NGX's own commands, which vk_work.h does not see: the next full_barrier is not left out)
+        note_work(cmd);   // (NGX's own commands, which vk_work.h does not see: the next full_barrier is not left out)
         if (NVSDK_NGX_FAILED(r)) {
             static int told = 0;
             if (told++ < 5) logf("vk: ngxfg: DLSS Frame Generation's evaluation %d of %d failed (%#x)", i + 1, count, (unsigned)r);

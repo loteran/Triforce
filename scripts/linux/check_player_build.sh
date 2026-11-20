@@ -36,6 +36,20 @@ echo "== AppRun --cli --help"
 in_image "$R/AppRun" --cli --help > "$TMP/help.txt"
 grep -q -- "--nup" "$TMP/help.txt" || { cat "$TMP/help.txt"; echo "nx2/make_game.py did not start"; exit 1; }
 
+# ((Triforce) v0.5.0: the dry run stops before the compile, so a header the compile includes went unseen: v0.5.0's first
+# AppImage had no third_party/smaa and every Linux build stopped at gpu/vk/vk_aa.cpp. Each "../" include of the sources the
+# image compiles must be in the image)
+echo "== the sources' relative includes"
+missing=0
+while IFS= read -r src; do
+    d=$(dirname "$src")
+    for inc in $(grep -hoE '^[[:space:]]*#[[:space:]]*include[[:space:]]*"\.\./[^"]+"' "$src" | sed -E 's/.*"(.*)"/\1/'); do
+        [ -f "$d/$inc" ] || { echo "missing: $inc (included by ${src#"$T"/})"; missing=1; }
+    done
+done < <(find "$T/host" "$T/gpu" -type f \( -name "*.c" -o -name "*.cpp" -o -name "*.h" \))
+[ "$missing" = 0 ] || exit 1
+echo "every relative include of the image's sources is in it"
+
 echo "== nx2/build.py --standalone --dry-run (as nx2/make_game.py runs it, with no game)"
 # (-B: no __pycache__ written into the image's tree. make_game.py's other settings: nx2/make_game.py, the compile's run())
 (cd "$T" && in_image env OOT_WORK="$TMP/work" RX_RELEASE=1 A64_HOT_CHUNK=1 PYTHONIOENCODING=utf-8 \

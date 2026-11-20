@@ -31,6 +31,7 @@ PREFIX = r'''
 typedef long long LONG64;
 static volatile int present_interval = 1;
 static int64_t next_frame_at, window_start, frames_in_window, shown_at[16];
+static int64_t pace_period_ns;   /* (the period it paces by, kept for another limiter: tests/test_pace_handoff.py) */
 static volatile LONG64 presents, shown_count;
 static volatile uint64_t hos_mkw_pacer;
 static uint32_t guest32;
@@ -47,6 +48,7 @@ static void realtime_step(int64_t now) { (void)now; ++steps; }
 static void hos_log(const char *fmt, ...) { (void)fmt; }
 static uint64_t hos_ticks(void) { return 0; }
 static int fps_max(void) { return 60; }   /* (nn_vi.c's Frame rate cap: the console's 60 here) */
+static int64_t steady_period(int64_t base, int64_t now) { (void)now; return base; }   /* ((Triforce) the Steady frame rate row off) */
 '''
 
 SUFFIX = r'''
@@ -67,6 +69,7 @@ int main(int argc, char **argv) {
         }
     }
     if (presents != 5 || shown_count != 5 || scans != 5 || steps != 5 || sleeps != 0 || reads != 5) return 3;
+    if (pace_period_ns != 1000000000LL / 60) return 4; /* the period of the cap, an interval of 1 */
     printf("STATE %lld %lld %lld %d %d %d %d\n", (long long)presents, (long long)shown_count,
            (long long)next_frame_at, scans, steps, sleeps, reads);
     if (!enabled) {

@@ -50,7 +50,8 @@ class PipelineCacheSaveTests(unittest.TestCase):
             (directory / 'pipeline_cache_save.inc').write_text(save_function(source), encoding='utf-8')
             executable = directory / 'check.exe'
             command = [compiler, '-std=c++20', '-O1', '-Wall', '-Wextra', '-Werror', '-pthread',
-                       '-I' + str(directory), str(ROOT / 'tests/pipeline_cache_save_test.cpp'), '-o', str(executable)]
+                       '-I' + str(directory), '-I' + str(ROOT / 'gpu/vk'), str(ROOT / 'tests/pipeline_cache_save_test.cpp'),
+                       '-o', str(executable)]
             if os.name == 'nt':
                 command += ['-D_CRT_SECURE_NO_WARNINGS']  # Match the production Windows CRT contract.
             options = {'creationflags': subprocess.BELOW_NORMAL_PRIORITY_CLASS} if os.name == 'nt' else {}
@@ -106,6 +107,19 @@ class PipelineCacheSaveTests(unittest.TestCase):
             result = self.run_case('unchanged', original=True)
             self.assertNotEqual(result.returncode, 0, 'the original rewrites unchanged data')
             self.assertIn('FAIL line', result.stderr)
+
+    def test_data_over_the_bound_is_not_written(self):
+        # gpu/vk/pcache_bound.h: the file keeps its last save, which the next start reads.
+        self.check_case('over-bound')
+
+    def test_save_in_play_waits_while_the_copy_does_not_fit_in_ram(self):
+        # (Triforce) gpu/vk/mem_parts.h copy_fits: the whole cache fetched in play is what Windows pages out with the RAM
+        # short; the save waits for the next check, and the one at the game's close does not ask.
+        self.check_case('ram-short')
+
+    def test_cache_let_go_is_not_saved(self):
+        # (Triforce) gpu/vk/pcache_gate.h: let go for the RAM, the driver is asked nothing and the file keeps its last save.
+        self.check_case('let-go')
 
     def check_case(self, case):
         result = self.run_case(case)

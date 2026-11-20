@@ -14,6 +14,7 @@
 #include <memory>
 #include <string>
 #include <vector>
+#include "cmd_work.h"   // ((Triforce, P4) full_barrier's count and marks, each command buffer's own)
 
 namespace mkwvk {
 struct Allocation {
@@ -38,12 +39,15 @@ int invalidations=0;
 int waits=0;
 std::atomic<bool> par_active{false};
 std::atomic<uint64_t> work_epoch{0};
-VkCommandBuffer last_barrier_cmd{};
-uint64_t last_barrier_epoch=UINT64_MAX;
+VkCommandBuffer late_cmd{};   // ((Triforce) RX_VK_EVENT_BARRIER's held event writes: none here)
+void late_writes_after(VkCommandBuffer) {}
+bool rules_aside() { return work_global() && par_active.load(); }   // ((Triforce, P4) vk_texture.cpp's)
 std::atomic<int64_t> st_barriers_left_out{0}, st_barriers_made{0};
 struct GprofSpan { GprofSpan(VkCommandBuffer,const char*){} };
 void logf(const char* format,...) {
-    char b[2048];va_list a;va_start(a,format);vsnprintf(b,sizeof b,format,a);va_end(a);lines.emplace_back(b);
+    char b[2048];va_list a;va_start(a,format);vsnprintf(b,sizeof b,format,a);va_end(a);
+    if(!std::strncmp(b,"vk: barrier state:",18))return;   // ((Triforce, P4) full_barrier's line at its first call: not the dump's)
+    lines.emplace_back(b);
 }
 bool create_buffer(uint64_t n,VkBufferUsageFlags,bool,VkBuffer& b,VmaAllocation& a,void** map) {
     auto x=std::make_unique<Allocation>();x->gpu.resize(n);x->cpu.resize(n);
@@ -58,7 +62,8 @@ void invalidate_mapped(VmaAllocation a,uint64_t n) {
     if(a->host) a->cpu=a->gpu;
 }
 void vkGetPhysicalDeviceFormatProperties(VkPhysicalDevice,VkFormat,VkFormatProperties* p){p->optimalTilingFeatures=VK_FORMAT_FEATURE_BLIT_SRC_BIT;}
-void vkCmdPipelineBarrier2(VkCommandBuffer,const VkDependencyInfo* d) {
+void vkCmdPipelineBarrier2(VkCommandBuffer cb,const VkDependencyInfo* d) {
+    note_work(cb);   // ((Triforce, P4) as vk_work.h counts it)
     for(uint32_t i=0;i<d->memoryBarrierCount;i++) {
         const auto& b=d->pMemoryBarriers[i];
         bool transfer=(b.srcStageMask&(VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT|VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT|VK_PIPELINE_STAGE_2_COPY_BIT))!=0;
@@ -66,16 +71,15 @@ void vkCmdPipelineBarrier2(VkCommandBuffer,const VkDependencyInfo* d) {
         if(transfer && writes && (b.dstStageMask&VK_PIPELINE_STAGE_2_HOST_BIT) && (b.dstAccessMask&(VK_ACCESS_2_HOST_READ_BIT|VK_ACCESS_2_MEMORY_READ_BIT)))
             for(auto& a:allocations) if(a->copied&&!a->destroyed)a->host=true;
     }
-    work_epoch++;
 }
-void copy_to(VkBuffer b,size_t n) {
+void copy_to(VkCommandBuffer cb,VkBuffer b,size_t n) {
     auto a=reinterpret_cast<Allocation*>(b);
     if(n!=a->gpu.size()||payload.size()!=n){std::fprintf(stderr,"bad copy range\n");std::exit(8);}
-    a->gpu=payload;a->copied=true;a->host=implicit_host;work_epoch++;
+    a->gpu=payload;a->copied=true;a->host=implicit_host;note_work(cb);
 }
-void vkCmdCopyImageToBuffer(VkCommandBuffer,VkImage,VkImageLayout,VkBuffer b,uint32_t,const VkBufferImageCopy*){copy_to(b,payload.size());}
-void vkCmdCopyBuffer(VkCommandBuffer,VkBuffer,VkBuffer b,uint32_t,const VkBufferCopy* c){copy_to(b,c->size);}
-void vkCmdBlitImage(VkCommandBuffer,VkImage,VkImageLayout,VkImage,VkImageLayout,uint32_t,const VkImageBlit*,VkFilter){work_epoch++;}
+void vkCmdCopyImageToBuffer(VkCommandBuffer cb,VkImage,VkImageLayout,VkBuffer b,uint32_t,const VkBufferImageCopy*){copy_to(cb,b,payload.size());}
+void vkCmdCopyBuffer(VkCommandBuffer cb,VkBuffer,VkBuffer b,uint32_t,const VkBufferCopy* c){copy_to(cb,b,c->size);}
+void vkCmdBlitImage(VkCommandBuffer cb,VkImage,VkImageLayout,VkImage,VkImageLayout,uint32_t,const VkImageBlit*,VkFilter){note_work(cb);}
 void wait_value(uint64_t) {
     waits++;
     for(auto& a:allocations) if(a->copied&&!a->destroyed){a->completed=true;if(coherent&&a->host)a->cpu=a->gpu;}

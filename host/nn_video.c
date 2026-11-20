@@ -67,9 +67,13 @@ static DWORD WINAPI av1_notice(LPVOID unused) {
     return 0;
 }
 #endif
-/* (hookshot) host/mf_av1.c: AV1 on Media Foundation, as the static FFmpeg has no AV1 decoder */
+/* (hookshot) host/mf_av1.c: AV1 on Media Foundation (Windows' decoder, in hardware where the GPU has one).
+   (Triforce) It needs Microsoft's AV1 Video Extension, which not every PC has: without it the movies are decoded here, by
+   dav1d, when the FFmpeg the build links has it (the Tools' FFmpeg with AV1; nx2/build.py takes whichever is there), as
+   NX2navi decodes them always. No notice and no black movies then. HOS_AV1=dav1d: dav1d first, for tests;
+   HOS_AV1_MISSING=1: as if the extension were missing. */
 typedef void (*mf_av1_picture_fn)(void *user, const uint8_t *y, const uint8_t *uv, int w, int h, int stride, int64_t pts);
-void *mf_av1_open(int w, int h);
+void *mf_av1_open(int w, int h, int tell);
 void mf_av1_decode(void *m, const uint8_t *data, size_t n, int64_t pts, mf_av1_picture_fn fn, void *user);
 void mf_av1_flush(void *m);
 void mf_av1_close(void *m);
@@ -283,15 +287,23 @@ static void dec_init_sized(Ctx *c, enum AVCodecID id, const char *what, int w, i
     if (id == AV_CODEC_ID_AV1) codec = avcodec_find_decoder_by_name("libdav1d");
     if (!codec && id == AV_CODEC_ID_AV1) codec = avcodec_find_decoder_by_name("libaom-av1");
 #endif
-    if (!codec) codec = avcodec_find_decoder(id);
     Dec *d = (Dec *)calloc(1, sizeof *d);
     InitializeSRWLock(&d->lock);
+#ifdef _WIN32   /* (Triforce) AV1: Windows' decoder, else dav1d; never FFmpeg's own, which needs a hardware context */
+    if (id == AV_CODEC_ID_AV1) {
+        const char *first = getenv("HOS_AV1");
+        codec = avcodec_find_decoder_by_name("libdav1d");
+        if (!(codec && first && !strcmp(first, "dav1d"))) d->mf = mf_av1_open(w, h, 0);
+        if (d->mf) codec = NULL;
+    } else
+#endif
+    if (!codec) codec = avcodec_find_decoder(id);
     if (codec) {
         d->ctx = avcodec_alloc_context3(codec);
         d->ctx->thread_count = id == AV_CODEC_ID_AV1 ? 4 : 2;   /* (1080p AV1 in software) */
         if (avcodec_open2(d->ctx, codec, NULL) < 0) avcodec_free_context(&d->ctx);
     }
-    if (!d->ctx && id == AV_CODEC_ID_AV1) d->mf = mf_av1_open(w, h);
+    if (!d->ctx && !d->mf && id == AV_CODEC_ID_AV1) d->mf = mf_av1_open(w, h, 1);   /* (and its notice when there is none) */
 #ifdef _WIN32
     if (!d->ctx && !d->mf && id == AV_CODEC_ID_AV1) {   /* (issue 380: no AV1 decoder in Windows: the movies were black, with sound) */
         static volatile LONG told;
@@ -307,8 +319,8 @@ static void dec_init_sized(Ctx *c, enum AVCodecID id, const char *what, int w, i
     set_host(ARG(0), DEC_MAGIC, d);
     static int logged;
     if (logged++ < 4)
-        hos_log("video: %s decoder %s (%dx%d)", what, d->ctx ? "ready" : d->mf ? "ready on Media Foundation" :
-                "not available in this FFmpeg", w, h);
+        hos_log("video: %s decoder %s%s (%dx%d)", what, d->ctx ? "ready: " : d->mf ? "ready on Media Foundation" :
+                "not available in this FFmpeg", d->ctx ? d->ctx->codec->name : "", w, h);
     RET(0);
 }
 static void picture_free(Picture *p) {

@@ -18,6 +18,13 @@ focus down a row with the setter, without the pad. On the R button's item choice
 D-pad's right (down) and left (up), a notch each, one after another, and the mouse is not freed (it stays the
 camera's). With the cursor hidden (R held counts as the pad in use) the wheel still moves a list, and moving the mouse
 points at nothing. Once frames go on with no menu holding the mouse, the window is told at once.
+(Triforce) The game's Options screen has the mouse with no focused button found, and as the screen that came last when its
+address held another screen before (another vtable). Its rows' kinds are read from the screen's three lists of widgets (the
+button from a widget through the game's look-up f_80df5410, a fake here): a click on a plate is A, on a toggle's value Left
+for its left half (On, up to where the halves meet, past the value's middle) and Right for its right half (Off), on a
+choice's value Left or Right of its middle, on a name or a row of no kind A. A row scrolled away past the list is not
+pointed at, the header (our tabs', the renderer's) is neither pointed at nor clicked, the right button is B, and the wheel
+gives the focus to the row past the list's foot (the list's view, not the screen's).
 python -I -B tests/test_oot_menu_mouse.py   (Windows: the feature's; elsewhere it is skipped)
 """
 import shutil
@@ -48,6 +55,9 @@ VK_API_H = r"""
 #pragma once
 enum { HOS_MOUSE_LEFT = 1, HOS_MOUSE_RIGHT = 2, HOS_MOUSE_MIDDLE = 4 };
 enum { HOS_OPT_GAME_OPTIONS = 48 };
+enum { HOS_OPT_MODS_LIST = 150, HOS_OPT_MODS_X0, HOS_OPT_MODS_X1, HOS_OPT_MODS_Y0, HOS_OPT_MODS_Y1, HOS_OPT_MODS_PITCH, HOS_OPT_MODS_ENTER,
+       HOS_OPT_MODS_SELECTED, HOS_OPT_MODS_PRESS };
+enum { HOS_MODS_LIST_SHOWN = 1, HOS_MODS_LIST_LAST_FOCUSED = 2, HOS_MODS_LIST_TITLE = 4 };
 """
 
 FIXTURE = r"""
@@ -74,6 +84,7 @@ static int menu_frees, menu_gone;   /* (the game's menus' mouse: freed for a men
 void hos_mouse_game_menu(void) { menu_frees++; }
 void hos_mouse_game_menu_gone(void) { menu_gone++; }
 void rx_option_set(int id, int value) { (void)id, (void)value; }   /* (the Options screen named: the renderer's) */
+int rx_option(int id, int otherwise) { (void)id; return otherwise; }   /* ((Triforce) the Mods entry's: never selected here) */
 int hos_mouse_wheel_take(void) { const int w = wheel_next; wheel_next = 0; return w; }   /* (the wheel only, mouse kept) */
 int hos_mouse_game_pointer(int *x, int *y, int *w, int *h, uint32_t *pressed, int *wheel) {
     *x = ptr_x, *y = ptr_y, *w = 3840, *h = 2160, *pressed = pressed_next, *wheel = wheel_next;
@@ -105,12 +116,26 @@ static void focus_setter(Ctx *c) {
         other_pane = 0;
     }
 }
-A64Fn a64_lookup(uint64_t addr) { return addr == 0x8088ffc0ULL ? focus_setter : NULL; }
+static uint64_t get64(uint64_t a);
+/* (Triforce) the game's look-up of an Options row's button from its widget's pane (f_80df5410): here the pane's first word */
+static void find_button(Ctx *c) { c->x[0] = get64(c->x[0]); }
+A64Fn a64_lookup(uint64_t addr) { return addr == 0x8088ffc0ULL ? focus_setter : addr == 0x80df5410ULL ? find_button : NULL; }
 
 static uint64_t alloc(size_t n) { const uint64_t a = heap_top; heap_top += (n + 15) & ~(size_t)15; return a; }
 static void put64(uint64_t a, uint64_t v) { memcpy(GP(a), &v, 8); }
 static void putf(uint64_t a, float f) { memcpy(GP(a), &f, 4); }
 static uint64_t get64(uint64_t a) { uint64_t v; memcpy(&v, GP(a), 8); return v; }
+/* (Triforce) an Options row's widget, in the screen's list of its kind (+at the count, +at+8 the widgets): *(widget+24) its
+   layout's holder, *(holder+56) the pane the look-up is handed */
+static void options_widget(uint64_t s, int at, uint64_t button) {
+    int32_t n;
+    memcpy(&n, GP(s + at), 4);
+    if (!get64(s + at + 8)) put64(s + at + 8, alloc(8 * 16));
+    const uint64_t w = alloc(64), holder = alloc(64), pane = alloc(16);
+    put64(w + 24, holder), put64(w + 32, 0x5a), put64(holder + 56, pane), put64(pane, button);
+    put64(get64(s + at + 8) + 8ull * (unsigned)n, w), n++;
+    memcpy(GP(s + at), &n, 4);
+}
 
 /* a screen: its vtable, its focus manager (*(screen+32)+96), an empty list */
 static uint64_t screen_new(uint64_t vtable) {
@@ -142,7 +167,23 @@ static void frame(uint64_t s, float x, float y) {
     clock_ns += 16666667;
     hos_oot_menu_tick(&ctx, s);
 }
+/* a frame of two screens running (one opened over the other, both updated) */
+static void frame2(uint64_t under, uint64_t over, float x, float y) {
+    ptr_x = (int)(x + 1920), ptr_y = (int)(1080 - y);
+    clock_ns += 16666667;
+    hos_oot_menu_tick(&ctx, under);
+    hos_oot_menu_tick(&ctx, over);
+}
 static void reset(void) { taps[0] = 0, focus_asked = 0, focus_calls = 0; }
+/* a click at (x, y) on the Options screen over the list, the row there given the focus first */
+static void options_click_at(uint64_t under, uint64_t over, uint64_t row, float x, float y) {
+    frame2(under, over, x, y);
+    focused(row, 1);
+    reset();
+    pressed_next = HOS_MOUSE_LEFT;
+    frame2(under, over, x, y);
+    focused(row, 0);
+}
 /* the game takes the focus the setter asked for: its handler runs (the pause menu's), the button shows it */
 static void take_focus(uint64_t s, uint64_t from, uint64_t to, int pause) {
     focused(from, 0), focused(to, 1);
@@ -285,6 +326,72 @@ int main(void) {
     frame(choice, -300, 0);
     CHECK(!strcmp(taps, "0.000:RIGHT/60;"));
 
+    /* (Triforce) The game's Options screen, at the address another screen ran at before (another vtable), opened over a list
+       that still runs with its focus (first seen after that other screen): the Options came last, and the mouse is its own
+       with no focused button found. Its rows as it lays them out (1824 x 124 about x -730, 170 apart from y 674), their
+       widgets in the screen's lists by kind: a plate (amiibo), a toggle (On | Off), a choice, a row in no list, and one
+       scrolled away above the list, under the header */
+    clock_ns += 300000000LL;
+    const uint64_t opt = screen_new(0x84c10a00ULL);
+    frame(opt, 0, 0);
+    clock_ns += 300000000LL;
+    const uint64_t under = screen_new(0x84c106e8ULL);
+    const uint64_t u0 = button_new(under, 1300, -600, 60, 60);
+    focused(u0, 1);
+    frame(under, 1300, -600);
+    put64(opt, 0x84c0f108ULL);
+    const uint64_t o_plate = button_new(opt, -730, 674, 1824, 124), o_toggle = button_new(opt, -730, 504, 1824, 124),
+                   o_choice = button_new(opt, -730, 334, 1824, 124), o_none = button_new(opt, -730, 164, 1824, 124),
+                   o_away = button_new(opt, -730, 844, 1824, 124);
+    const uint64_t o_tall = button_new(opt, 1500, 700, 300, 600);   /* (a box of the screen's up into the header: 400 to 1000) */
+    options_widget(opt, 696, o_plate), options_widget(opt, 712, o_toggle), options_widget(opt, 728, o_choice);
+    menu_frees = 0;
+    frame2(under, opt, -400, 504);
+    frame2(under, opt, -400, 504);
+    CHECK(menu_frees > 0);   /* the mouse freed for it, no focused button found */
+    reset();
+    frame2(under, opt, -1200, 674);
+    CHECK(focus_asked == o_plate && focus_screen == opt);   /* hover: the row's focus, the Options', not the list's under it */
+    reset();
+    frame2(under, opt, -730, 800);
+    CHECK(focus_calls == 0);   /* a row scrolled away: not pointed at */
+    options_click_at(under, opt, o_plate, 0, 674);
+    CHECK(strstr(taps, ":A/80;") && !strstr(taps, "LEFT") && !strstr(taps, "RIGHT"));   /* a plate: A, on its right too */
+    options_click_at(under, opt, o_toggle, -500, 504);
+    CHECK(strstr(taps, ":LEFT/80;") != NULL);   /* a toggle's left half (On): Left */
+    options_click_at(under, opt, o_toggle, -180, 504);
+    CHECK(strstr(taps, ":LEFT/80;") != NULL);   /* past the value's middle, short of where the halves meet: still On */
+    options_click_at(under, opt, o_toggle, 0, 504);
+    CHECK(strstr(taps, ":RIGHT/80;") != NULL);   /* its right half (Off): Right */
+    options_click_at(under, opt, o_toggle, -1300, 504);
+    CHECK(strstr(taps, ":A/80;") != NULL);   /* its name: A, as before */
+    options_click_at(under, opt, o_choice, -300, 334);
+    CHECK(strstr(taps, ":LEFT/80;") != NULL);   /* a choice's left of its middle: Left (down) */
+    options_click_at(under, opt, o_choice, -180, 334);
+    CHECK(strstr(taps, ":RIGHT/80;") != NULL);   /* right of it: Right (up) */
+    options_click_at(under, opt, o_none, 0, 164);
+    CHECK(strstr(taps, ":A/80;") != NULL);   /* a row of no kind found: A */
+    reset();
+    pressed_next = HOS_MOUSE_LEFT;
+    frame2(under, opt, 1500, 960);
+    CHECK(taps[0] == 0 && focus_calls == 0);   /* the header: our tabs' (the renderer's), nothing here, a box under it or not */
+    options_click_at(under, opt, o_tall, 1500, 600);
+    CHECK(strstr(taps, ":A/80;") != NULL);   /* (the same box below the header: the game's) */
+    reset();
+    pressed_next = HOS_MOUSE_RIGHT;
+    frame2(under, opt, 0, 960);
+    CHECK(!strcmp(taps, "0:B/80;"));   /* the right button: B, anywhere */
+    /* the wheel down: the row laid out past the list's foot (y -960: scrolled away below it, on the screen still) is given
+       the focus, the list scrolls to it; the rows' view is the list's, not the screen's */
+    const uint64_t o_below = button_new(opt, -730, -1000, 1824, 124);
+    focused(o_toggle, 1);
+    reset();
+    wheel_next = -1;
+    frame2(under, opt, -1300, 504);
+    CHECK(focus_asked == o_below && taps[0] == 0);
+    focused(o_toggle, 0);
+    (void)o_away;
+
     /* Back in play (R let go): only the HUD's screen runs, no menu's. The window is told the menus have closed once
        50 ms of frames have had none: the camera gets its mouse back then, not 300 ms on */
     clock_ns += 300000000LL;
@@ -367,6 +474,7 @@ class OotOptionsScreenTests(unittest.TestCase):
             (tmp / "host" / "hos.h").write_text(HOS_H, encoding="utf-8")
             (tmp / "gpu" / "vk" / "vk_api.h").write_text(VK_API_H, encoding="utf-8")
             shutil.copy(ROOT / "host" / "oot_menu.c", tmp / "host" / "oot_menu.c")
+            shutil.copy(ROOT / "host" / "guest_bounds.h", tmp / "host" / "guest_bounds.h")   # (set_item_key's buffer check)
             (tmp / "host" / "t.c").write_text(OPTIONS_FIXTURE, encoding="utf-8")
             binary = tmp / "t.exe"
             other_half = ["-DHOS_OOT_MENU_NO_MOUSE"] if sys.platform == "win32" else []
@@ -397,6 +505,7 @@ class OotMenuMouseTests(unittest.TestCase):
             (tmp / "host" / "hos.h").write_text(HOS_H, encoding="utf-8")
             (tmp / "gpu" / "vk" / "vk_api.h").write_text(VK_API_H, encoding="utf-8")
             shutil.copy(ROOT / "host" / "oot_menu.c", tmp / "host" / "oot_menu.c")
+            shutil.copy(ROOT / "host" / "guest_bounds.h", tmp / "host" / "guest_bounds.h")   # (set_item_key's buffer check)
             (tmp / "host" / "t.c").write_text(FIXTURE, encoding="utf-8")
             binary = tmp / "t.exe"
             build = subprocess.run([compiler, "-std=gnu11", "-Wall", "-O1", "-g", "-D_WIN32_WINNT=0x0601",

@@ -146,7 +146,9 @@ Designed after totk-pc-recomp's runtime/vk_*.c (MIT) and Eden's renderer_vulkan,
 - **Mesh shading**: `NOP_DRAW_MESH` records NVN2's DrawMeshTasks*; programs whose code writes the internal stage
   buffer are the task / mesh stages (marked in their headers as Eden's GraphicsEnvironment does). Unverified.
 - **Frame interpolation** (`vk_framegen.cpp`, `RX_VK_FRAMEGEN=1`): the WebGPU renderer's, ported to GLSL
-  (`shaders/`, compiled with glslang): made frames between the game's, shown evenly by a display thread.
+  (`shaders/`, compiled with glslang): made frames between the game's, shown evenly by a display thread. (Triforce) Its
+  vectors are refined to one per 8x8 pixels, to a fraction of a pixel, and each made pixel takes one motion
+  (`fg_half`, `fg_fine_flow`, `fg_fine_pick`, `fg_fine_synth`; `RX_VK_FRAMEGEN_FINE=0`: the 16x16 blocks as ported).
 - **Headless**: without a window presents render offscreen; `RX_VK_SHOTS=<dir>` writes every `RX_VK_SHOT_EVERY`-th
   as a PNG. `work/run-vk.ps1` runs it (refuses while Siege runs, stops past `-MaxGB` of working set);
   `work/vksum.py <run>` summarises the log.

@@ -194,6 +194,14 @@ def write_image_c(gen, img, meta, exefs):
     start_hook, exit_hook = thread_hooks(img, meta)
     lines.append("const uint64_t hos_thread_start_hook = %#xULL, hos_thread_exit_hook = %#xULL;"
                  % (start_hook, exit_hook))
+    # (Triforce) for the mods' cheat files (host/mod_cheats.c): where the module main begins, which a cheat's addresses
+    # count from, and each module's code, which a cheat must not write (it is compiled ahead of time)
+    code = [(m["segments"][0]["addr"], m["segments"][0]["addr"] + m["segments"][0]["size"]) for m in meta["modules"]]
+    lines += ["const uint64_t hos_main_base = %#xULL;   /* (the module main) */"
+              % next((m["base"] for m in meta["modules"] if m["name"] == "main"), meta["base"]),
+              "const int hos_code_count = %d;" % len(code),
+              "const uint64_t hos_code[][2] = {%s};   /* (each module's .text: from, to) */"
+              % ", ".join("{%#xULL, %#xULL}" % span for span in code)]
     text = "\n".join(lines) + "\n"
     path = os.path.join(gen, "hos_image.c")
     if not os.path.exists(path) or open(path).read() != text:

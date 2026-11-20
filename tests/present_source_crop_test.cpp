@@ -16,6 +16,7 @@
 #define VK_USE_64_BIT_PTR_DEFINES 0
 #include <vulkan/vulkan.h>
 #include "vk_present_rect.h"
+#include "framegen_rows.h"   // (Triforce: the Frame generation row's AMD FSR 4, which framegen_record asks first)
 using namespace mkwvk;
 using VmaAllocation = void*;
 constexpr int kMaxMult = 8;
@@ -36,10 +37,20 @@ float hdr_uv[4]{};
 int blits = 0, clears = 0, initializations = 0, sizes = 0, dispatches = 0, copies = 0;
 uint32_t allocated_w = 0, allocated_h = 0;
 namespace fsr3fi { bool wanted = false; bool frames_wanted() { return wanted; } }
+// (Triforce) whether RivaTuner Statistics Server holds the display thread's presents (vk_pace.h): not here
+namespace pace { bool display_yields() { return false; } }
 int fsr_calls = 0, fsr_result = 1;
 int fsr3fi_frame(VkCommandBuffer, OutSet&, int, uint32_t w, uint32_t h, uint64_t sequence) {
     CHECK(w == allocated_w && h == allocated_h && sequence > 0);
     ++fsr_calls; return fsr_result;
+}
+// (Triforce) AMD FSR 4's frame generation (vk_framegen.cpp fsr4_frame, vk_fsr4.h): a stand-in that answers as told
+int fsr4_calls = 0;
+bool fsr4_blend = false;
+framegen_rows::Made fsr4_result = framegen_rows::OWN;
+framegen_rows::Made fsr4_frame(VkCommandBuffer, OutSet&, int, uint32_t w, uint32_t h, uint64_t sequence, bool blend) {
+    CHECK(w == allocated_w && h == allocated_h && sequence > 0);
+    ++fsr4_calls; fsr4_blend = blend; return fsr4_result;
 }
 VkImageBlit last_blit{};
 int32_t copy_pc[4]{};
@@ -79,6 +90,7 @@ void reset() {
     blits = clears = initializations = sizes = dispatches = copies = 0;
     allocated_w = allocated_h = 0;
     fsr3fi::wanted = false; fsr_calls = 0; fsr_result = 1;
+    opts.framegen = 2; fsr4_calls = 0; fsr4_blend = false; fsr4_result = framegen_rows::OWN;
     std::memset(copy_pc, 0, sizeof copy_pc);
 }
 void check(uint32_t sw, uint32_t sh, const int* crop, uint32_t x, uint32_t y, uint32_t w, uint32_t h) {
@@ -108,6 +120,35 @@ void check(uint32_t sw, uint32_t sh, const int* crop, uint32_t x, uint32_t y, ui
         CHECK(framegen_record(nullptr, 1, sw, sh, crop) && fsr_calls == 2 && fg.recorded->made == 1);
         CHECK(dispatches == 9 && copies == 3);
         CHECK(copy_pc[0] == int(x) && copy_pc[1] == int(y) && copy_pc[2] == int(w) && copy_pc[3] == int(h));
+        // (Triforce) The row's AMD FSR 4 is asked only at that value, and first. Its made frame stands (no blend passes);
+        // a new history gets no made frame and nothing blended in its place; a present it does not take falls to the
+        // shared interpolation, as a 2x
+        CHECK(fsr4_calls == 0);
+        const auto shown = [] { for (OutSet& set : fg.sets) set.busy = false; };   // (as the display thread leaves the sets)
+        opts.framegen = 9; fsr3fi::wanted = false;
+        shown();
+        fsr4_result = framegen_rows::MADE;
+        CHECK(framegen_record(nullptr, 1, sw, sh, crop) && fsr4_calls == 1 && fsr4_blend && fg.recorded->made == 1);
+        CHECK(dispatches == 11 && copies == 4 && fsr_calls == 2);
+        fsr4_result = framegen_rows::SKIP;
+        CHECK(framegen_record(nullptr, 1, sw, sh, crop) && fsr4_calls == 2 && fg.recorded->made == 0);
+        CHECK(dispatches == 13 && copies == 5);
+        fsr4_result = framegen_rows::OWN;
+        CHECK(framegen_record(nullptr, 1, sw, sh, crop) && fsr4_calls == 3 && fg.recorded->made == 1);
+        CHECK(dispatches == 18 && copies == 6);
+        shown();
+        fg.have_prev = false;   // (nothing before this frame: still handed over, as a frame with nothing to blend from)
+        CHECK(framegen_record(nullptr, 1, sw, sh, crop) && fsr4_calls == 4 && !fsr4_blend && fg.recorded->made == 0);
+        CHECK(dispatches == 20 && copies == 7);
+        opts.framegen = 2;
+        // ((Triforce) the fine vectors (vk_framegen.cpp fine_vectors), their pipelines made: a 2x frame is the copy, the
+        // quarter- and half-size luma, the coarse vectors and their median, the fine vectors, two picks and one made frame)
+        shown();
+        fg.have_prev = true;
+        fg.half.pipe = fg.fine_flow.pipe = fg.fine_pick.pipe = fg.fine_synth.pipe = 1;
+        CHECK(framegen_record(nullptr, 1, sw, sh, crop) && fg.recorded->made == 1);
+        CHECK(dispatches == 29 && copies == 8);
+        fg.half.pipe = fg.fine_flow.pipe = fg.fine_pick.pipe = fg.fine_synth.pipe = VK_NULL_HANDLE;
     } else {
         CHECK(dispatches == 0 && copies == 0 && !fg.recorded);
         fsr3fi::wanted = true; fg.have_prev = true;

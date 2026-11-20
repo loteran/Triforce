@@ -3,7 +3,14 @@
 // the camera jitter into the game: nx2/oot_jitter.py). AMD's signed amd_fidelityfx_loader_vk.dll and
 // amd_fidelityfx_upscaler_vk.dll are loaded from the user's PC at run time; none ship with Hookshot. Linux: a Vulkan FSR 4
 // library (such as fsr4-vk's amd_fidelityfx_upscaler_vk.so) in their place.
+// (Triforce) And AMD FSR 4's frame generation, the Frame generation row's last choice (fsr4fg, below): the same loader with
+// amd_fidelityfx_framegeneration_vk.dll beside it. Windows only: AMD publishes no library for it elsewhere.
 #pragma once
+
+#include <cstdint>
+
+#include "framegen_rows.h"
+#include "vk_loader.h"
 
 namespace mkwvk {
 
@@ -22,4 +29,60 @@ bool fsr4_wants_descriptor_buffer();
 /// FSR 4 as the temporal upscaler's engine (FSR 4 and its native AA on the Upscaler row); nullptr in a build without it
 const TemporalEngine* fsr4_engine();
 
-}  // namespace mkwvk
+/// (Triforce) AMD FSR 4's frame generation: the made frame of the Frame generation row's AMD FSR 4 (framegen_rows.h FSR4),
+/// by AMD's library from the two pictures and the scene's depth, motion and camera (vk_fsr3_inputs.h gathers them). The
+/// renderer keeps its own swapchain, presents and pacing: AMD's frame generation context is asked for the one frame in
+/// the present's recording (vk_framegen.cpp framegen_record) and the display thread shows it, as it shows the renderer's
+/// own made frames. Every function answers "not here" in a build without HOOKSHOT_FSR and outside Windows.
+namespace fsr4fg {
+
+/// One present's frame, everything in GENERAL
+struct Inputs {
+    VkImage color = VK_NULL_HANDLE;   ///< the picture the game has just finished, as it is presented: R8G8B8A8_UNORM, with the HUD
+    uint32_t width = 0, height = 0;
+    bool pq = false;                  ///< its bytes are HDR10 codes (HDR Native), not sRGB
+    float peak_nits = 1000.0f;        ///< the HDR peak, for a PQ picture
+    VkImage depth = VK_NULL_HANDLE;   ///< R32F, reversed (1 at the near plane), render_width x render_height
+    VkImage motion = VK_NULL_HANDLE;  ///< RG16F, render pixels toward the frame before, x right and y down, no jitter
+    uint32_t render_width = 0, render_height = 0;
+    float jitter[2]{};                ///< render pixels
+    float near_plane = 0.1f, far_plane = 1e8f, fov_y = 1.0f;   ///< far_plane: FLT_MAX for a far plane at infinity
+    float view[12]{};                 ///< the view matrix's three rows (framegen_rows.h pose_of)
+    float frame_ms = 16.667f;         ///< since the frame before
+    bool reset = false;               ///< no frame before this one to make a frame from (the first, a gap, a new size)
+    uint64_t sequence = 0;            ///< the caller's count of its presents: a frame that does not follow the last one given is a reset
+};
+
+/// Why AMD's library cannot make the frames here, FG_OK when it can. The first call after the device is made asks AMD's
+/// library (the loader and amd_fidelityfx_framegeneration_vk.dll beside the game, and whether they list an FSR 4 frame
+/// generation for this card and driver); RX_VK_FSR4_FG=0: never, =1: any version it lists counts (for trying the path on
+/// a card without FSR 4)
+framegen_rows::Why why();
+inline bool offered() { return why() == framegen_rows::FG_OK; }
+/// (Triforce) why() as it is known now, never asking AMD's library (nor waiting for another thread asking it): FG_NOT_YET until
+/// it has been asked. The menu's rows read this, so that drawing them never waits for the library (vk_menu.cpp menu_ahead asks
+/// it off the menu's thread)
+framegen_rows::Why why_known();
+inline bool offered_known() { return why_known() == framegen_rows::FG_OK; }
+/// Whether a made frame is asked of it now: the row at AMD FSR 4, where it can, and not beside NVIDIA DLSS frame generation.
+/// Read every frame; costs nothing while the row is elsewhere
+bool frames_wanted();
+/// The version AMD's library makes the frames with ("4.0.2"), "" before it is known
+const char* version();
+
+/// Hands AMD's library this present's frame and records its work into cmd. MADE: the made frame is in made_image(). SKIP: it
+/// was given the frame as a new history and no frame is to be made. OWN: it did not take the present (the renderer's own
+/// interpolation makes the frame)
+framegen_rows::Made generate(VkCommandBuffer cmd, const Inputs& in);
+/// The made frame of the last generate that answered MADE: R8G8B8A8_UNORM at the picture's size, GENERAL; else null
+VkImage made_image();
+
+/// Once a present, on the thread that calls generate, outside its recording: a context that failed, or that the row has left
+/// for a while, is taken down (framegen_rows.h release_due and teardown)
+void present_tick();
+/// The process is about to exit (HOS_OPT_EXITING): no call into AMD's library after this returns
+void exiting();
+
+} // namespace fsr4fg
+
+} // namespace mkwvk

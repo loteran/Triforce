@@ -1,6 +1,7 @@
 /* nn::fs: mounts map to host folders.
      rom:      the game's RomFS (extracted by tools/nx.py romfs), read-only
-     save:     <user>/save/<uid>     (MountSaveData / MountSaveDataReadOnly)
+     save:     <user>/save/<uid>     (MountSaveData / MountSaveDataReadOnly); MountSaveData's root is a working copy of it,
+               <user>/save-tx/<uid>/work, which Commit makes the save as a transaction (save_tx.h)
      cache:    <user>/cache/<index>  (MountCacheStorage)
      temp:     <user>/temp           (MountTemporaryStorage)
    hos_romfs_dir and hos_user_dir are set by hos_main.c. Reads are positional (ReadFile with an offset), so any number
@@ -185,6 +186,35 @@ static int host_path(const char *guest_mem, char *out, size_t cap, int *writable
 /* For other OS layer parts that open game files themselves (videos): "mount:/a/b" -> host path, 0 if unknown. */
 int hos_fs_host_path(const char *guest, char *out, size_t cap) { return host_path(guest, out, cap, NULL); }
 
+/* (Triforce) A file of the game's RomFS whole, for a part of the host that reads one itself on a thread that may wait for
+   the disk (menu_sound.c: the game's interface sounds). rel is its path from the RomFS root ("Sound/Resource/Stream/
+   x.bwav"); a mod's file is read where a mod has it (mods.c), as the game's own opens find it. From the RomFS folder,
+   not through the mounts: the game mounts rom: as it starts, and this may be asked before. NULL when the file is not
+   there, is empty or has more than `most` bytes; freed by the caller */
+uint8_t *hos_fs_rom_file(const char *rel, uint64_t most, uint64_t *size) {
+    char path[HOS_FS_PATH];
+    if (!hos_romfs_dir || !guest_path_ok(rel)) return NULL;
+    if (!hos_mods_romfs(rel, path, sizeof path) &&
+        (size_t)snprintf(path, sizeof path, "%s/%s", hos_romfs_dir, rel) >= sizeof path)
+        return NULL;
+    for (char *p = path; *p; p++) if (*p == '/') *p = '\\';   /* (as host_path) */
+    const HANDLE h = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING,
+                                 FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) return NULL;
+    LARGE_INTEGER sz = {0};
+    uint8_t *data = NULL;
+    if (GetFileSizeEx(h, &sz) && sz.QuadPart > 0 && (uint64_t)sz.QuadPart <= most && (data = (uint8_t *)malloc((size_t)sz.QuadPart)) != NULL) {
+        uint64_t done = 0;
+        DWORD got = 0;
+        while (done < (uint64_t)sz.QuadPart && ReadFile(h, data + done, (DWORD)((uint64_t)sz.QuadPart - done), &got, NULL) && got)
+            done += got;
+        if (done == (uint64_t)sz.QuadPart) *size = done;
+        else free(data), data = NULL;
+    }
+    CloseHandle(h);
+    return data;
+}
+
 /* (hookshot) a guest string: "" unless it lies in guest memory and ends within FS_PATH_MAX bytes */
 static const char *gstr(uint64_t a) {
     if (!a || a >= (uint64_t)HOS_SPACE_END) return "";
@@ -257,10 +287,187 @@ HLE(_ZN2nn2fs18IsSaveDataExistingENS_13ApplicationIdERKNS_7account3UidE) {
              (unsigned long long)G64(ARG(1)));
     RET(GetFileAttributesA(root) != INVALID_FILE_ATTRIBUTES);
 }
+/* (triforce) The save as a transaction (save_tx.h): MountSaveData mounts a working copy of the save, and Commit makes that
+   copy the save, whole or not at all, with the saves it replaces kept as backups. Commit's first part (the copy of the
+   working copy as it is then) runs on the game's thread; the second (written out to the disk, put in place, the backup) on a
+   thread of its own, which the next Commit, a mount of the save and the game's end wait for. */
+#include "save_tx.h"
+#include "save_tx_share.h"   /* (the newest save read for an export, an import that waits for the next start: below) */
+typedef struct { char name[32]; char uid[40]; SaveTxPaths p; } TxMount;
+static TxMount tx_mounts[4];
+static int ntx;
+static SRWLOCK tx_lock = SRWLOCK_INIT;   /* (tx_mounts, tx_thread and every step of a transaction) */
+static HANDLE tx_thread;                 /* (the thread finishing the last Commit, or NULL) */
+static SaveTxPaths tx_finish_paths;
+static int tx_plain;                     /* (a save was mounted without its working copy: the game writes it in place) */
+static int tx_import_looked;             /* (the run's first mount looked for an import that waits) */
+static char tx_import_note[HOS_FS_PATH + 160];   /* (what that mount did with one: hos_fs_save_import_note) */
+
+static DWORD WINAPI tx_finish_main(LPVOID arg) {
+    (void)arg;
+    char backup[HOS_FS_PATH];
+    const ULONGLONG t0 = GetTickCount64();
+    const int r = save_tx_finish(&tx_finish_paths, backup, sizeof backup);
+    if (r != 1) hos_log("fs: the save could not be committed as a transaction: its files were %s", r == 0 ? "copied over the save's instead" : "NOT saved (the disk?)");
+    else if (backup[0]) hos_log("fs: save committed (%llu ms on its thread); the save before it is kept in %s", (unsigned long long)(GetTickCount64() - t0), backup);
+    else if (hos_trace || getenv("HOS_FS_TRACE")) hos_log("fs: save committed (%llu ms on its thread)", (unsigned long long)(GetTickCount64() - t0));
+    return 0;
+}
+/* (with tx_lock held) the thread of the last Commit has ended */
+static void tx_wait_locked(void) {
+    if (!tx_thread) return;
+    WaitForSingleObject(tx_thread, INFINITE);
+    CloseHandle(tx_thread);
+    tx_thread = NULL;
+}
+/* The game ends (host/hos_relaunch.c, and at exit): a Commit still on its thread is finished first */
+void hos_fs_save_finish(void) {
+    AcquireSRWLockExclusive(&tx_lock);
+    tx_wait_locked();
+    ReleaseSRWLockExclusive(&tx_lock);
+}
+/* (triforce) The run's first mount of a save, once save_tx_mount put the disk right (ok: its answer): an import from the
+   System tab that waited for this start (save_tx_share.h) becomes the newest save, the one it replaces kept first, and
+   save_tx_mount runs again: it puts the import in place and makes the working copy from it. What was done is kept as a
+   sentence, for the log and the menu (hos_fs_save_import_note). With tx_lock held; the mount's answer */
+static int tx_import_at_mount(const SaveTxPaths *p, int ok) {
+    if (tx_import_looked) return ok;
+    tx_import_looked = 1;   /* (a later mount in the same run is not a start: the game has its progress in memory by then) */
+    if (!ok) return ok;
+    char kept[HOS_FS_PATH];
+    const int r = tx_share_import_apply(p, kept, sizeof kept);
+    if (r == 1) ok = save_tx_mount(p, NULL, 0);
+    if (r == 1 && kept[0])
+        snprintf(tx_import_note, sizeof tx_import_note,
+                 "The imported save was put in place at this start. The save it replaced is kept in %s", kept);
+    else if (r == 1) snprintf(tx_import_note, sizeof tx_import_note, "The imported save was put in place at this start.");
+    else if (r == -1)
+        snprintf(tx_import_note, sizeof tx_import_note,
+                 "The imported save was not put in place: the save it replaces could not be kept first. It waits for the next start.");
+    else if (r == -2) snprintf(tx_import_note, sizeof tx_import_note, "What waited as an imported save was not a save: it was dropped.");
+    return ok;
+}
+/* MountSaveData's root for uid: the working copy (1, in root), or 0: the save folder itself, as before */
+static int tx_mount(const char *name, const char *uid, char *root, size_t cap) {
+    if (!save_tx_enabled()) return 0;
+    static int at_exit;
+    int ok = 0, locked = 1;
+    char note[256] = "";
+    AcquireSRWLockExclusive(&tx_lock);
+    const int import_said = tx_import_note[0] != 0;
+    if (!at_exit) at_exit = 1, atexit(hos_fs_save_finish);
+    tx_wait_locked();
+    int i;
+    for (i = 0; i < ntx && strcmp(tx_mounts[i].uid, uid); i++) {}
+    if (i < ntx) {   /* (mounted already under another name: the same working copy, no second recovery under the game's files) */
+        if (ntx < 4) {
+            tx_mounts[ntx] = tx_mounts[i];
+            snprintf(tx_mounts[ntx].name, sizeof tx_mounts[ntx].name, "%s", name);
+            snprintf(root, cap, "%s", tx_mounts[ntx++].p.work);
+            ok = 1;
+        }
+    } else if (ntx < 4) {
+        TxMount *m = &tx_mounts[ntx];
+        save_tx_paths(&m->p, hos_user_dir, uid);
+        const int away = hos_vcore_away();
+        /* ((Triforce) the save's lock before the save is read: a copy Setup makes of it is waited for, up to 30 s; save_tx.h) */
+        if (!ntx) locked = save_tx_lock(hos_user_dir, 30000);
+        ok = save_tx_mount(&m->p, note, sizeof note);
+        ok = tx_import_at_mount(&m->p, ok);
+        if (away) hos_vcore_back();
+        if (ok) {
+            snprintf(m->name, sizeof m->name, "%s", name);
+            snprintf(m->uid, sizeof m->uid, "%s", uid);
+            snprintf(root, cap, "%s", m->p.work);
+            ntx++;
+        }
+    }
+    if (!ok) tx_plain = 1;
+    ReleaseSRWLockExclusive(&tx_lock);
+    if (locked == 0) hos_log("fs: save: another program held %s\\save.lock for 30 s (Setup copying a save?): the save is mounted anyway", hos_user_dir);
+    else if (locked < 0) hos_log("fs: save: %s\\save.lock could not be made: Setup cannot tell that the game runs", hos_user_dir);
+    if (note[0]) hos_log("fs: save: %s", note);
+    if (!import_said && tx_import_note[0]) hos_log("fs: save: %s", tx_import_note);
+    if (!ok) hos_log("fs: save: no working copy could be made: the save folder itself is mounted, and saves are written in place");
+    return ok;
+}
+/* (triforce) Sharing a save, for the System tab's rows and the bug capture (host/save_share.c; save_tx_share.h has what is
+   done on the disk). With tx_lock held: the folders of the save the game mounted, or before its mount those of the one
+   user's folder under <user>/save. 0: there is none yet */
+static int tx_share_paths(SaveTxPaths *p) {
+    if (ntx) {
+        *p = tx_mounts[0].p;
+        return 1;
+    }
+    char pat[HOS_FS_PATH];
+    WIN32_FIND_DATAA fd;
+    int found = 0;
+    if (!hos_user_dir) return 0;
+    snprintf(pat, sizeof pat, "%s\\save\\*", hos_user_dir);
+    HANDLE f = FindFirstFileA(pat, &fd);
+    if (f == INVALID_HANDLE_VALUE) return 0;
+    do {   /* (a user's folder: its id, 32 hex digits) */
+        if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || (fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)) continue;
+        if (strlen(fd.cFileName) != 32 || strspn(fd.cFileName, "0123456789abcdefABCDEF") != 32) continue;
+        save_tx_paths(p, hos_user_dir, fd.cFileName);
+        found = 1;
+    } while (!found && FindNextFileA(f, &fd));
+    FindClose(f);
+    return found;
+}
+/* The save the next start would load, read whole with no Commit under way: fn gets each file, its path below the save
+   with / between the parts (it only keeps the bytes: tx_lock is held, and a Commit of the game waits). The files read;
+   0: no save yet; -1: one could not be read; -2: the save is no transaction in this run (HOS_SAVE_TX=0, or no working
+   copy: the game writes its files in place, and a copy could catch one half written) */
+int hos_fs_save_read(int (*fn)(void *arg, const char *rel, const void *data, size_t n), void *arg) {
+    if (!save_tx_enabled()) return -2;
+    SaveTxPaths p;
+    char newest[HOS_FS_PATH];
+    int files = 0;
+    AcquireSRWLockExclusive(&tx_lock);
+    tx_wait_locked();
+    if (tx_plain) files = -2;
+    else if (tx_share_paths(&p) && tx_share_newest(&p, newest, sizeof newest)) files = tx_share_read(newest, "", 0, fn, arg);
+    ReleaseSRWLockExclusive(&tx_lock);
+    return files;
+}
+/* (the folders alone, for the import's calls: their own folders under <tx>, which no Commit touches, so written without
+   tx_lock and without holding a Commit up) */
+static int tx_share_paths_now(SaveTxPaths *p) {
+    if (!save_tx_enabled()) return 0;
+    AcquireSRWLockExclusive(&tx_lock);
+    const int found = tx_share_paths(p);
+    ReleaseSRWLockExclusive(&tx_lock);
+    return found;
+}
+/* An imported save, checked by the caller (host/save_pack.c), left to wait for the next start. 1: it waits; 0: it could not
+   be written; -2: no save to put it under (HOS_SAVE_TX=0, or the game has not made its save folder yet) */
+int hos_fs_save_import_stage(int n, const char *const *rels, const uint8_t *const *data, const size_t *sizes) {
+    SaveTxPaths p;
+    return tx_share_paths_now(&p) ? tx_share_import_stage(&p, n, rels, data, sizes) : -2;
+}
+int hos_fs_save_import_waits(void) {
+    SaveTxPaths p;
+    return tx_share_paths_now(&p) && tx_share_import_waits(&p);
+}
+int hos_fs_save_import_cancel(void) {   /* 1: none waits any more */
+    SaveTxPaths p;
+    return !tx_share_paths_now(&p) || tx_share_import_cancel(&p);
+}
+/* What this run's first mount did with an import that waited, as a sentence in out; 0 and "" when none did */
+int hos_fs_save_import_note(char *out, size_t cap) {
+    AcquireSRWLockExclusive(&tx_lock);
+    snprintf(out, cap, "%s", tx_import_note);
+    ReleaseSRWLockExclusive(&tx_lock);
+    return out[0] != 0;
+}
+void hos_save_share_start(void);   /* host/save_share.c */
 /* MountSaveData(char const*, account::Uid const&) */
 HLE(_ZN2nn2fs13MountSaveDataEPKcRKNS_7account3UidE) {
-    char sub[64];
+    char sub[64], root[HOS_FS_PATH];
     snprintf(sub, sizeof sub, "save\\%016llx%016llx", (unsigned long long)G64(ARG(1) + 8), (unsigned long long)G64(ARG(1)));
+    hos_save_share_start();   /* (triforce: the System tab's save rows answer from the first save mount on) */
+    if (tx_mount(gstr(ARG(0)), sub + 5, root, sizeof root)) { RET(mount(gstr(ARG(0)), root, 1) ? 0 : R_NOT_MOUNTED); return; }
     RET(user_mount(gstr(ARG(0)), sub) ? 0 : R_NOT_MOUNTED);
 }
 /* MountSaveDataReadOnly(char const*, ApplicationId, account::Uid const&) */
@@ -307,8 +514,36 @@ HLE(_ZN2nn2fs7UnmountEPKc) {
     for (int i = 0; i < nmounts; i++)
         if (!strcmp(mounts[i].name, gstr(ARG(0)))) { mounts[i] = mounts[--nmounts]; break; }
     ReleaseSRWLockExclusive(&mount_lock);
+    AcquireSRWLockExclusive(&tx_lock);   /* (the save's working copy stays on the disk until its next mount makes it again) */
+    for (int i = 0; i < ntx; i++)
+        if (!strcmp(tx_mounts[i].name, gstr(ARG(0)))) { tx_mounts[i] = tx_mounts[--ntx]; break; }
+    ReleaseSRWLockExclusive(&tx_lock);
 }
-HLE(_ZN2nn2fs6CommitEPKc) { RET(0); }
+/* nn::fs::Commit(char const*): the save mount's working copy becomes the save (save_tx.h); any other mount, and a save mounted
+   without a working copy, as before: nothing to do, its files are where they belong */
+HLE(_ZN2nn2fs6CommitEPKc) {
+    const char *name = gstr(ARG(0));
+    AcquireSRWLockExclusive(&tx_lock);
+    int i;
+    for (i = 0; i < ntx && strcmp(tx_mounts[i].name, name); i++) {}
+    if (i < ntx) {
+        const int away = hos_vcore_away();
+        const ULONGLONG t0 = GetTickCount64();
+        tx_wait_locked();   /* (the Commit before this one: its staging folder is this one's) */
+        const int staged = save_tx_stage(&tx_mounts[i].p);
+        if (staged == 1) {
+            tx_finish_paths = tx_mounts[i].p;
+            tx_thread = CreateThread(NULL, 0, tx_finish_main, NULL, 0, NULL);
+            if (!tx_thread) tx_finish_main(NULL);   /* (no thread: finished here) */
+        } else {
+            hos_log("fs: the save could not be staged for its commit: its files were %s", staged == 0 ? "copied over the save's instead" : "NOT saved (the disk?)");
+        }
+        if (hos_trace || getenv("HOS_FS_TRACE")) hos_log("fs: Commit(%s): staged in %llu ms", name, (unsigned long long)(GetTickCount64() - t0));
+        if (away) hos_vcore_back();
+    }
+    ReleaseSRWLockExclusive(&tx_lock);
+    RET(0);
+}
 HLE(_ZN2nn2fs26SetPriorityOnCurrentThreadENS0_8PriorityE) {}
 
 /* ---- files ---------------------------------------------------------------------------------------------------- */
@@ -390,6 +625,7 @@ static uint64_t read_at(Ctx *c, uint64_t id, int64_t off, uint64_t buf, uint64_t
         hos_sleep_ns(delay_ns);
     }
     const int away = hos_vcore_away();   /* (as OpenFile: no core held through the read) */
+    const int io = hos_guest_io_begin(GP(buf), size);   /* (Triforce: the kernel writes there: rx_backend.c) */
     while (done < size) {
         OVERLAPPED ov = {0};
         int64_t o = off + (int64_t)done;
@@ -399,6 +635,7 @@ static uint64_t read_at(Ctx *c, uint64_t id, int64_t off, uint64_t buf, uint64_t
         if (!ReadFile(fh->h, GP(buf + done), chunk, &got, &ov) || !got) break;
         done += got;
     }
+    hos_guest_io_end(io);
     if (away) hos_vcore_back();
     HOS_WRITTEN(GP(buf), (size_t)done);   /* (into guest memory: the GPU may read it) */
     {   /* HOS_FS_WATCH=<lo hex>:<hi hex> (debugging): reads into that guest range, with the file */
@@ -441,7 +678,11 @@ HLE(_ZN2nn2fs9WriteFileENS0_10FileHandleElPKvmRKNS0_11WriteOptionE) {
     ov.OffsetHigh = (DWORD)(ARG(1) >> 32);
     DWORD put = 0;
     /* (hookshot) from guest memory only, and the whole size: a DWORD cut wrote less than asked and said so */
-    if (ARG(3) <= 0xFFFFFFFFu && hos_guest_range(ARG(2), ARG(3))) WriteFile(fh->h, GP(ARG(2)), (DWORD)ARG(3), &put, &ov);
+    if (ARG(3) <= 0xFFFFFFFFu && hos_guest_range(ARG(2), ARG(3))) {
+        const int io = hos_guest_io_begin(GP(ARG(2)), ARG(3));   /* (Triforce: the kernel reads there: rx_backend.c) */
+        WriteFile(fh->h, GP(ARG(2)), (DWORD)ARG(3), &put, &ov);
+        hos_guest_io_end(io);
+    }
     RET(put == ARG(3) ? 0 : 0x2EE202);
 }
 HLE(_ZN2nn2fs11SetFileSizeENS0_10FileHandleEl) {

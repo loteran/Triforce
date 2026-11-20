@@ -50,6 +50,11 @@ import win_manifest
 NX2_RT = os.path.join(kit.HERE, "rt")
 HOST = os.path.join(kit.HERE, "..", "host")
 OPUS = os.path.join(kit.HERE, "..", "third_party", "opus")
+# (Triforce) zstd's decoder as the runtime compiles it (third_party/zstd/lib; host/host_zstd.h): every file the decoder needs,
+# and none of the rest. tests/test_host_zstd.py compiles the same list
+HOST_ZSTD_SOURCES = ("common/debug.c", "common/entropy_common.c", "common/error_private.c", "common/fse_decompress.c",
+                     "common/xxhash.c", "common/zstd_common.c", "decompress/huf_decompress.c", "decompress/zstd_ddict.c",
+                     "decompress/zstd_decompress.c", "decompress/zstd_decompress_block.c")
 OBJ_CACHE = os.path.join(kit.WORK, "objcache")
 # (hookshot) work/hot_order.txt: the functions that run, hottest first (sampled), packed together by the linker; RX_NO_ORDER=1: off
 PGO = os.environ.get("RX_PGO", "")
@@ -244,6 +249,109 @@ def vk_sources():
     return sorted(out)
 
 
+def strip_comments(data):
+    """(Triforce) C or C++ text without its comments, for translation_text, and whether it has a raw string literal. A block
+    comment becomes a space, a line's comment goes with the spaces before it; everything else is kept as it is. A string or
+    character literal ends at its closing quote or at the end of its line (a backslash takes the next character with it, a
+    line end too), a number's ' are digit separators, an #include's <name> and a raw string literal are kept whole: what this
+    reads wrongly it keeps, it never takes code or a literal for a comment"""
+    ident = frozenset(b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_$")
+    out, raw, i, n = bytearray(), False, 0, len(data)
+    while i < n:
+        c = data[i]
+        if data.startswith(b"//", i):
+            j = data.find(b"\n", i)
+            i = n if j < 0 else j
+            while out and out[-1] in b" \t":
+                del out[-1]
+            continue
+        if data.startswith(b"/*", i):
+            j = data.find(b"*/", i + 2)
+            i = n if j < 0 else j + 2
+            out += b" "
+            continue
+        j = i + 1
+        if c in b"\"'":
+            while j < n and data[j] != c and data[j] != 10:
+                j += 2 if data[j] == 92 else 1
+            j = min(j + 1 if j < n and data[j] == c else j, n)
+        elif c == 60 and out[out.rfind(b"\n") + 1:].strip().replace(b" ", b"").replace(b"\t", b"") in (b"#include", b"#include_next",
+                                                                                                         b"#import"):
+            while j < n and data[j] != 62 and data[j] != 10:
+                j += 1
+            j = min(j + 1 if j < n and data[j] == 62 else j, n)
+        elif 48 <= c <= 57 or (c == 46 and i + 1 < n and 48 <= data[i + 1] <= 57):   # (a pp-number)
+            while j < n:
+                if data[j] in b"eEpP" and j + 1 < n and data[j + 1] in b"+-":
+                    j += 2
+                elif data[j] == 39 and j + 1 < n and data[j + 1] in ident:
+                    j += 2
+                elif data[j] in ident or data[j] == 46:
+                    j += 1
+                else:
+                    break
+        elif c in ident:
+            while j < n and data[j] in ident:
+                j += 1
+            if data[i:j] in (b"R", b"LR", b"uR", b"UR", b"u8R") and j < n and data[j] == 34:
+                k = data.find(b"(", j + 1)
+                delim = data[j + 1:k] if k >= 0 else b"\n"
+                if len(delim) <= 16 and not any(ch in b" ()\\\t\v\f\n" for ch in delim):
+                    end = data.find(b")" + delim + b'"', k + 1)
+                    j, raw = n if end < 0 else end + len(delim) + 2, True
+        out += data[i:j]
+        i = j
+    return bytes(out), raw
+
+
+def translation_text(rel, data):
+    """(Triforce) A file of the translator as the translation stamp takes it (translation_stamp): its line ends as LF, and a C
+    or C++ file without the parts between an "Outside the translation stamp" mark and the next "Inside the translation stamp
+    again" (gpu/vk/vk_shader.cpp's: code that cannot change a translation, gpu/vk/program_carry.h), without its comments, and
+    without its blank lines and the spaces at its lines' ends (but for the line after one a backslash ends, and in a file with
+    a raw string literal). Marks that do not pair: the file whole, and the build says so"""
+    out_mark, in_mark = b"// ---- (Triforce) Outside the translation stamp", b"// ---- (Triforce) Inside the translation stamp again"
+    data = data.replace(bytes((13, 10)), bytes((10,)))
+    if not rel.endswith((".c", ".cc", ".cpp", ".h", ".hpp", ".inc")):
+        return data
+    lines, kept, out, paired = data.split(b"\n"), [], False, True
+    for line in lines:
+        mark = line.strip()
+        if mark.startswith(out_mark) or mark.startswith(in_mark):
+            paired = paired and out != mark.startswith(out_mark)
+            out = mark.startswith(out_mark)
+        elif not out:
+            kept.append(line)
+    if out or not paired:
+        print("build: %s: its translation stamp marks do not pair: the whole file is in the stamp (no program cache is carried "
+              "over this update)" % rel, flush=True)
+        kept = lines
+    data, raw = strip_comments(b"\n".join(kept))
+    if raw:
+        return data
+    lines = []
+    for line in data.split(b"\n"):
+        if lines and lines[-1].endswith(b"\\"):
+            lines.append(line)
+        elif line.rstrip(b" \t"):
+            lines.append(line.rstrip(b" \t"))
+    return b"\n".join(lines)
+
+
+def translation_stamp(vk, translator):
+    """(Triforce) The translation stamp (HOOKSHOT_TRANSLATION_STAMP, 16 hex digits), which the program cache is carried over an
+    update by (gpu/vk/program_carry.h has the rule): the files of the translator's stamp (HOOKSHOT_SHADER_STAMP), each as
+    translation_text takes it, but for gpu/vk/vk_api.h, the host's interface, which no translation reads a constant or a type
+    of (tests/test_program_carry.py). translator: the files of eden, sirit and compat"""
+    stamp = hashlib.sha1(usedforsecurity=False)
+    for f in sorted(translator) + [os.path.join(vk, n) for n in ("vk_shader.cpp", "vk_bank.cpp", "vk_state.h")]:
+        rel = os.path.relpath(f, vk).replace("\\", "/")
+        with open(f, "rb") as src:
+            text = translation_text(rel, src.read())
+        stamp.update(rel.encode() + b"\0" + len(text).to_bytes(8, "little") + text)
+    return stamp.hexdigest()[:16]
+
+
 def cpm_dirs():
     """CPM packages: RX_CPM, packaged tools/cpm, then legacy project caches.
     The packages provide Vulkan and SPIR-V headers, VMA and FFmpeg."""
@@ -415,21 +523,61 @@ def rss_mb(proc):
         return 0
 
 
+# (a function from this size on is counted by the square of its size: mem_need)
+GIANT_BYTES = int(1.2 * (1 << 20))
+GIANT_MB = 300
+# (the giant functions are counted so only on a PC with less memory free than this when the compile starts: giants_counted)
+GIANT_BELOW_MB = 14 * 1024
+_giants = None
+
+
+def giants_counted():
+    """Whether mem_need counts giant functions by the square of their size: decided once, when it is first asked. On a PC
+    with GIANT_BELOW_MB or more free it does not. The count is each file's true peak, but the gate holds a file's whole
+    peak back from the moment its compiler starts, and the giants reach theirs only near their end and not together: with
+    21 GB free, counting them in full left 4 to 9 game files compiling at once for the first six minutes where 10 to 13
+    had run without the memory ever running short, and the compile took 657 s for 462. Where memory is short the same
+    files are what ran a PC out of it, so there they are counted. HOOKSHOT_MEM_GIANT=1 or 0 decides it outright."""
+    global _giants
+    if _giants is None:
+        asked = os.environ.get("HOOKSHOT_MEM_GIANT")
+        if asked in ("0", "1"):
+            _giants = asked == "1"
+        else:
+            free = free_mb()
+            _giants = free is not None and free < GIANT_BELOW_MB
+        print("the memory gate: giant functions %s (%s)" % (
+            "counted by the square of their size" if _giants else "counted as the other functions",
+            "HOOKSHOT_MEM_GIANT" if asked in ("0", "1") else "less than %d GB free" % (GIANT_BELOW_MB >> 10) if _giants
+            else "%d GB or more free, or the free memory not known" % (GIANT_BELOW_MB >> 10)), flush=True)
+    return _giants
+
+
 def mem_need(src):
     """What compiling a file takes at its peak, in MB, a little over. Measured on a cold build (clang 23, x86-64): a chunk of lifted
     code 0.4 GB + 50 MB per MB of C + 250 MB per MB of its largest function (1.5 GB for 24 MB of small functions, 2.2 GB for a 6 MB
     function alone); a hot piece 0.8-1.3 GB whatever its size (-O2, the profile, inlining); the runtime's C files ~0.2 GB, the C++
-    files up to ~1 GB"""
+    files up to ~1 GB.
+    (Triforce, measured again with HOOKSHOT_MEM_LOG on a build of v0.4.0, clang 23.1.5) The few files with giant functions took
+    far more than that: 6.2 GB for a chunk that is one 5 MB function (counted 1.9), 3.7 and 3.1 GB for two others (counted 1.4
+    and 1.5), and 2.5 to 2.7 GB for the three hot pieces that hold functions near 2 MB (counted 1.5). The compiler's memory
+    grows with the square of a function's size, as its time does (nx2/chunks.py QUAD), so every function of GIANT_BYTES or
+    more now adds GIANT_MB for each MB squared, in a chunk and in a hot piece: of the 76 game files measured none is then
+    under by more than 250 MB, which the gate's reserve covers. Counted too low, such a file was started beside the others
+    on a PC without the memory for it, where Windows pages and Linux stops the compiler. Only on a PC short of memory:
+    giants_counted."""
     name = os.path.basename(src)
-    if name.startswith("code_hot"):
-        return COMPILER_MB
     if name.startswith("code_"):
         with open(src, "rb") as f:
             text = f.read()
         # (each function from the newline before its definition, as this was first measured)
         starts = [m.start() - 1 for m in lifted_c.HEAD_BYTES.finditer(text)] + [len(text)]
-        largest = max([b - a for a, b in zip(starts, starts[1:])] or [0])
-        return int(400 + 50 * len(text) / (1 << 20) + 250 * largest / (1 << 20))
+        sizes = [b - a for a, b in zip(starts, starts[1:])]
+        giant = GIANT_MB * sum((s / (1 << 20)) ** 2 for s in sizes if s >= GIANT_BYTES) if giants_counted() else 0
+        if name.startswith("code_hot"):
+            return int(COMPILER_MB + giant)
+        largest = max(sizes or [0])
+        return int(max(400 + 50 * len(text) / (1 << 20) + 250 * largest / (1 << 20), 300 + 50 * len(text) / (1 << 20) + giant))
     return 1000 if src.endswith(".cpp") else 400
 
 
@@ -537,6 +685,11 @@ def ffmpeg_version_key():
 # instead of Windows' write watch (GetWriteWatch over the 6 GB MKW's GPU sees took ~20 ms a scan, in one thread or
 # four: the race's replay waited ~12 ms a frame for it). RX_SOFT_WRITE_WATCH=0: Windows' write watch (a full rebuild)
 WRITE_TRACK = [] if os.environ.get("RX_SOFT_WRITE_WATCH") == "0" else ["-DA64_WRITE_TRACK"]
+# (triforce) RX_MARK_ONE=1: a lifted store marks the page of its first byte alone (one store and three instructions less
+# at every guest store; the marks were ~5-8% of the game threads' CPU at OoT's Market), and the collection takes a mark
+# as "this page and the next" (host/rx_backend.c collect_in): a store of up to 4 KB reaches no further. A full rebuild.
+if WRITE_TRACK and os.environ.get("RX_MARK_ONE") == "1":
+    WRITE_TRACK = WRITE_TRACK + ["-DA64_MARK_ONE"]
 
 # (hookshot) the host CPU the lifted game and the runtime are built for: x86-64-v3 (AVX2, FMA, BMI1/2, LZCNT,
 # MOVBE; Haswell and Zen 1 on). With FMA the FPX1 fast paths cover double-precision FMA (RECOMP_FPX_FMA64; it took
@@ -697,6 +850,19 @@ def compile_cost(src, costs):
     return costs.get(name, os.path.getsize(src)) * (HOT_COST if name.startswith("code_hot") else 1)
 
 
+# HOOKSHOT_MEM_LOG=1: each compile's peak memory beside what mem_need counted it at ("@@mem <file> <peak MB> <counted MB>
+# <seconds>"), sampled twice a second over the compiler and the processes it starts. For fitting mem_need and the gate to
+# what the compilers really take: off unless asked for, and nothing is sampled then
+MEM_LOG = os.environ.get("HOOKSHOT_MEM_LOG", "0") not in ("", "0")
+
+
+def sample_peak(proc, peak):
+    """(a thread of its own, beside communicate) peak[0]: the most MB the compiler's process tree was seen holding"""
+    while proc.poll() is None:
+        peak[0] = max(peak[0], rss_mb(proc))
+        time.sleep(0.5)
+
+
 def compile_one(job):
     cc, src, obj, fl, deps = job
     key = PLANNED.get((src, obj)) or object_key(src, fl, deps)
@@ -716,15 +882,20 @@ def compile_one(job):
         return src, 0.0, None
     lease = GATE.enter(src) if GATE else None
     t = time.time()
+    peak = [0]
     try:
         with subprocess.Popen([cc] + fl + ["-c", src, "-o", obj], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) as p:
             no_throttle(getattr(p, "_handle", None))
             if GATE:
                 GATE.started(lease, p)
+            if MEM_LOG:
+                threading.Thread(target=sample_peak, args=(p, peak), daemon=True).start()
             out, err = p.communicate()
     finally:
         if GATE:
             GATE.leave(lease)
+    if MEM_LOG:
+        print("@@mem %s %d %d %.1f" % (os.path.basename(src), peak[0], mem_need(src), time.time() - t), flush=True)
     r = subprocess.CompletedProcess(p.args, p.returncode, out, err)
     if r.returncode:
         failure = r.stderr or r.stdout or "Compiler exited with status %d without diagnostics." % r.returncode
@@ -732,6 +903,15 @@ def compile_one(job):
     open(stamp, "w").write(key)
     cache_put(obj, key)
     return src, time.time() - t, None
+
+
+# RX_EARLY=1 (nx2/make_game.py, while the game is being translated): only the files that need nothing of the translated
+# game are compiled, and nothing is linked: libopus, the WebGPU renderer and the Vulkan back end with its libraries, ~520 of
+# the build's ~630 files and a ninth of its compile time. The lift was one process on Windows and left every other
+# processor idle for two minutes (its emit has workers there now, nx2/emit_pool.py: half the processors at most); the build that follows finds these objects made (the same keys: their flags and
+# dependencies hold nothing the lift writes) and compiles the game's own files alone. The lifted files are not read here:
+# the lift is writing them
+EARLY = os.environ.get("RX_EARLY") == "1"
 
 
 def main():
@@ -754,7 +934,7 @@ def main():
     obj_dir = os.path.join(out, "obj")
     gen_dir = os.path.join(out, "gen")   # (the logo and the fonts the Vulkan back end compiles in: made with it, below)
     os.makedirs(obj_dir, exist_ok=True)
-    if os.environ.get("RX_VK_ONLY") or a.dry_run:   # (the Vulkan back end needs no game: built so with no lift, as the AppImage's is)
+    if os.environ.get("RX_VK_ONLY") or a.dry_run or EARLY:   # (the Vulkan back end needs no game: built so with no lift, as the AppImage's is)
         os.makedirs(gen, exist_ok=True)
     rt64 = rtgen.write(os.path.join(out, "rt64"))
     cc = toolchain.need(toolchain.find("clang"))
@@ -764,15 +944,17 @@ def main():
     stamp_def = version.define()
     print("version: %s" % version.describe(), flush=True)
     # (the lifted chunks include only the guest model: the emulator ABI header is a dependency of the shim alone)
-    deps = b"".join(open(os.path.join(d, f), "rb").read() for d in (gen, rt64) for f in sorted(os.listdir(d))
-                    if f.endswith(".h"))
+    # (RX_EARLY: none: the lift is writing those headers, and no file compiled early depends on them)
+    deps = b"" if EARLY else b"".join(open(os.path.join(d, f), "rb").read() for d in (gen, rt64) for f in sorted(os.listdir(d))
+                                      if f.endswith(".h"))
     shim_deps = deps + open(os.path.join(NX2_RT, "mkw_host.h"), "rb").read()
     eden_gen, eden_out = os.path.join(kit.WORK, "gen"), os.path.join(kit.WORK, "build")
-    migrate_stamps(eden_gen, os.path.join(eden_out, "obj"),
-                   flags(eden_gen, os.path.join(eden_out, "rt64"), a.opt, not a.no_polls) +
-                   (["-DA64_POLL_CTX"] if a.dll else []), deps)   # (as fl below: the flags its objects were built with)
-    migrate_stamps(gen, obj_dir, fl, deps)
-    chunks = sorted(f for f in os.listdir(gen) if f.startswith("code_") and f.endswith(".c"))
+    if not EARLY:
+        migrate_stamps(eden_gen, os.path.join(eden_out, "obj"),
+                       flags(eden_gen, os.path.join(eden_out, "rt64"), a.opt, not a.no_polls) +
+                       (["-DA64_POLL_CTX"] if a.dll else []), deps)   # (as fl below: the flags its objects were built with)
+        migrate_stamps(gen, obj_dir, fl, deps)
+    chunks = [] if EARLY else sorted(f for f in os.listdir(gen) if f.startswith("code_") and f.endswith(".c"))
     if a.only:
         want = {"code_%03d.c" % int(n) for n in a.only.split(",")}
         chunks = [c for c in chunks if c in want]
@@ -794,6 +976,8 @@ def main():
             srcs += [os.path.join(NX2_RT, "eden_shim.c"), write_info(out)]
     if os.environ.get("RX_VK_ONLY"):   # (no lift needed: the back end alone)
         srcs = [s for s in srcs if os.path.exists(s)]
+    if EARLY:   # (the lift's files are on their way: none of them now)
+        srcs = []
     if a.dry_run:   # (the lift's files: there is no game here)
         srcs = [s for s in srcs if os.path.dirname(s) != gen]
     # the longest first, so the long ones do not end up alone at the end (compile_cost)
@@ -802,6 +986,15 @@ def main():
     # (hookshot) code_hot.c, the lift's hot functions together (A64_HOT_FUNCS + A64_HOT_CHUNK=1): at RX_HOT_OPT
     # (default O2), so the hot callees inline into their hot callers
     hot_fl = [("-" + os.environ.get("RX_HOT_OPT", "O2")) if f == "-" + a.opt else f for f in fl]
+    # (triforce) RX_HOT_CAPTURE=<n>: the hot pieces' own -capture-tracking-max-uses-to-explore (see flags()): a hot function
+    # that names the context more often than the limit is compiled as if the context escaped (every guest store may change
+    # it), and the largest functions are among the hottest
+    if os.environ.get("RX_HOT_CAPTURE"):
+        hot_fl = [("-capture-tracking-max-uses-to-explore=" + os.environ["RX_HOT_CAPTURE"])
+                  if f.startswith("-capture-tracking-max-uses-to-explore=") else f for f in hot_fl]
+    # (triforce) RX_HOT_FLAGS=<flags>: more flags for the hot pieces alone (a variant of them without building the rest again)
+    if os.environ.get("RX_HOT_FLAGS"):
+        hot_fl = hot_fl + os.environ["RX_HOT_FLAGS"].split()
     # (hookshot) RX_PGO=gen: code_hot.c counts its branches (host/pgo_rt.c writes them; -O1 builds much sooner, and the counters are
     # placed before the optimiser, so a profile from it fits the -O2 build). RX_PGO=<merged .prof>: built with that profile
     if PGO == "gen":
@@ -850,6 +1043,21 @@ def main():
         for rel in open(os.path.join(OPUS, "sources.txt")).read().split():
             jobs.append((cc, os.path.join(OPUS, rel), os.path.join(obj_dir, "opus_" + rel.replace("/", "_")[:-2] + ".o"),
                          oflags, b"opus-1.5.2"))
+    # (Triforce) zstd's decoder for the runtime too (third_party/zstd: the same files the Vulkan back end compiles into its
+    # DLL for the game's fonts, further down, where their names stay inside it). host/hos_zstd.c decodes the game's files
+    # with it when HOS_HOST_ZSTD is set (host/host_zstd.h). Its names are hidden (zstd.h marks its functions visible by
+    # itself), so that they are never among the names the program exports: on Linux those come first for every library
+    # loaded into it, and a GPU driver that uses the system's libzstd would be handed this decoder for half of its calls
+    if host_srcs:
+        hzstd = os.path.normpath(os.path.join(kit.HERE, "..", "third_party", "zstd", "lib"))
+        hzflags = target() + CPU + ["-O2", "-g0", "-DNDEBUG", "-Wno-everything", "-DZSTD_DISABLE_ASM", "-DZSTD_LEGACY_SUPPORT=0",
+                                    "-DZSTD_MULTITHREAD=0", "-fvisibility=hidden", "-DZSTDLIB_VISIBLE=", "-DZSTDERRORLIB_VISIBLE="]
+        hzdeps = b"".join(open(os.path.join(d, f), "rb").read()
+                          for d in (hzstd, os.path.join(hzstd, "common"), os.path.join(hzstd, "decompress"))
+                          for f in sorted(os.listdir(d)) if f.endswith(".h"))
+        for f in HOST_ZSTD_SOURCES:
+            jobs.append((cc, os.path.join(hzstd, *f.split("/")), os.path.join(obj_dir, "hostzstd_" + os.path.basename(f)[:-2] + ".o"),
+                         hzflags, hzdeps))
     # the renderer (C++20, NDEBUG: no asserts in it or suyu), when a wgpu-native release is there
     wgpu = a.standalone and not a.only and not LINUX and os.path.isfile(os.path.join(WGPU, "include", "webgpu", "webgpu.h"))
     if a.standalone and not a.only and not wgpu and not LINUX:
@@ -903,6 +1111,8 @@ def main():
             with open(f, "rb") as src:
                 stamp.update(os.path.relpath(f, vk).replace("\\", "/").encode() + src.read().replace(bytes((13, 10)), bytes((10,))))
         shader_stamp = "-DHOOKSHOT_SHADER_STAMP=0x%sull" % stamp.hexdigest()[:16]
+        # ((Triforce) and what of those translates: the program cache is carried over an update by it, translation_stamp)
+        translation_def = "-DHOOKSHOT_TRANSLATION_STAMP=0x%sull" % translation_stamp(vk, translator)
         vflags = target() + CPU + (["-fPIC", "-I" + POSIX, "-D_GNU_SOURCE"] if LINUX else []) + [   # (hookshot: the replay is the frame's limit now)
             # (what the code takes for granted, which newer C++ libraries bring in by themselves and older ones do not: issue 48)
             "-include", "algorithm", "-include", "cstdio", "-include", "cstdlib", "-include", "cstring", "-include", "functional",
@@ -925,6 +1135,18 @@ def main():
         ngx_deps = tree_headers(os.path.join(NGX_SDK, "include")) if NGX_SDK else b""
         if NGX_SDK:
             print("the Vulkan back end: with NVIDIA DLSS (NVIDIA's NGX SDK in %s)" % NGX_SDK, flush=True)
+        # (NVIDIA DLSS frame generation, a local build's option: HOOKSHOT_STREAMLINE_SDK=<NVIDIA's Streamline SDK, unpacked>.
+        # Only vk_dlssg.cpp sees its headers; nothing of it is linked (sl.interposer.dll is loaded beside the game at run
+        # time). Without it that file is the stubs that say it is not there. Windows only)
+        sl_sdk = os.environ.get("HOOKSHOT_STREAMLINE_SDK", "")
+        if sl_sdk and (LINUX or not os.path.isfile(os.path.join(sl_sdk, "include", "sl_dlss_g.h"))):
+            print("build: HOOKSHOT_STREAMLINE_SDK=%s has no include/sl_dlss_g.h (or this is not a Windows build): built "
+                  "without NVIDIA DLSS frame generation" % sl_sdk, flush=True)
+            sl_sdk = ""
+        sl_flags = ["-DHOOKSHOT_DLSSG", "-I" + os.path.join(sl_sdk, "include")] if sl_sdk else []
+        sl_deps = tree_headers(os.path.join(sl_sdk, "include")) if sl_sdk else b""
+        if sl_sdk:
+            print("the Vulkan back end: with NVIDIA DLSS frame generation (NVIDIA's Streamline SDK in %s)" % sl_sdk, flush=True)
         # (AMD FSR 4, a build's option too: only vk_fsr4.cpp sees AMD's headers; without them it is the stubs that say FSR is
         # not there)
         fsr_flags = ["-DHOOKSHOT_FSR", "-I" + os.path.join(kit.HERE, "..", "third_party", "fidelityfx")] if FSR else []
@@ -956,7 +1178,7 @@ def main():
                        "-DIMGUI_DISABLE_WIN32_FUNCTIONS", "-DIMGUI_DISABLE_DEMO_WINDOWS", "-DIMGUI_DISABLE_DEBUG_TOOLS"]
         imgui_deps = b"".join(open(os.path.join(d, f), "rb").read() for d in (imgui, os.path.join(imgui, "backends"), zstd)
                               for f in sorted(os.listdir(d)) if f.endswith(".h"))
-        imgui_users = ("vk_imgui.cpp", "vk_menu.cpp")
+        imgui_users = ("vk_imgui.cpp", "vk_menu.cpp", "vk_salesman.cpp")   # (vk_salesman.cpp: the game's files through vk_game_font.h)
         for f in ("imgui.cpp", "imgui_draw.cpp", "imgui_tables.cpp", "imgui_widgets.cpp", "backends/imgui_impl_vulkan.cpp"):
             vk_jobs.append((cxx, os.path.join(imgui, *f.split("/")),
                             os.path.join(obj_dir, "vk_imgui_" + os.path.basename(f)[:-4] + ".o"), vflags + imgui_flags, imgui_deps))
@@ -977,9 +1199,10 @@ def main():
             name = os.path.relpath(src, vk).replace(os.sep, "_")[:-4]
             lib = os.path.relpath(src, vk).split(os.sep)[0] in ("eden", "sirit")
             vk_jobs.append((cxx, src, os.path.join(obj_dir, "vk_" + name + ".o"),
-                            vflags + ([shader_stamp] if os.path.basename(src) == "vk_shader.cpp" else []) +
+                            vflags + ([shader_stamp, translation_def] if os.path.basename(src) == "vk_shader.cpp" else []) +
                             ([stamp_def] if os.path.basename(src) == "vk_menu.cpp" else []) +
                             (ngx_flags if os.path.basename(src) in ("vk_dlss.cpp", "vk_ngxfg.cpp") else []) +
+                            (sl_flags if os.path.basename(src) == "vk_dlssg.cpp" else []) +
                             (imgui_flags if os.path.basename(src) in imgui_users else []) +
                             (fsr_flags if os.path.basename(src) == "vk_fsr4.cpp" else []) +
                             (ffx3_flags if os.path.basename(src) in ("vk_ffx3.cpp", "vk_ffx_fg.cpp") else []) +
@@ -988,6 +1211,7 @@ def main():
                             (renodx_deps if os.path.basename(src) == "vk_renodx.cpp" else b"") +
                             (ngx_deps if os.path.basename(src) in ("vk_dlss.cpp", "vk_ngxfg.cpp") else b"") +
                             (ffx3_deps if os.path.basename(src) in ("vk_ffx3.cpp", "vk_ffx_fg.cpp") else b"") +
+                            (sl_deps if os.path.basename(src) == "vk_dlssg.cpp" else b"") +
                             (imgui_deps if os.path.basename(src) in imgui_users else b"")))
         if NGX_SDK and not LINUX and toolchain.mingw():
             # (llvm-mingw: NVIDIA's static library was built with Microsoft's compiler for its static runtime (/MT). What it asks
@@ -1004,6 +1228,8 @@ def main():
     vk_only = bool(os.environ.get("RX_VK_ONLY"))   # (the renderer alone, the game's objects as they are)
     if vk_only:
         jobs = list(vk_jobs)
+    if EARLY:   # (by their objects' names: libopus, the WebGPU renderer, the Vulkan back end; never the runtime's host_*.o)
+        jobs = [j for j in jobs if os.path.basename(j[2]).startswith(("opus_", "gpu_", "vk_"))]
     if a.dry_run:   # (the compile starts here: what it would read, said and checked, and nothing compiled)
         missing = sorted({j[1] for j in jobs if not os.path.isfile(j[1])} |
                          ({vk_prebuilt} if vk_prebuilt and not os.path.isfile(vk_prebuilt) else set()))
@@ -1083,6 +1309,8 @@ def main():
     print("compiled in %.0fs, %d failed" % (time.time() - t0, still), flush=True)
     if still:
         return 1
+    if EARLY:   # (nothing to link yet: the game's own objects come with the build after the lift)
+        return 0
     vk_objs = {j[2] for j in vk_jobs}
     objs = [j[2] for j in jobs if j[2] not in vk_objs]
     rsp = os.path.join(out, "objs.rsp")
@@ -1167,9 +1395,9 @@ def main():
                 "-fuse-ld=lld", "-shared", "-o", vdll, "-Wl,-Map=" + vdll + ".map", "-Wl,-Bsymbolic", "-Wl,--gc-sections",
                 "-static-libstdc++", "-static-libgcc", "@" + vrsp] + \
                 ([ngx_library(NGX_SDK, True)] if NGX_SDK else []) + ["-ldl", "-lpthread", "-lm"]
-        else:
+        else:   # (Triforce: advapi32 for RivaTuner Statistics Server's folder in the registry, gpu/vk/rtss_sys_win.cpp)
             link = [cc] + toolchain.native_target() + toolchain.native_link() + \
-                ["-shared", "-o", vdll, toolchain.link_opt("/map:" + vdll[:-4] + ".map"), "@" + vrsp, "-luser32"] +                 (["-lc++", "-lunwind"] if toolchain.mingw() else []) + ngx_link(NGX_SDK, toolchain.mingw())
+                ["-shared", "-o", vdll, toolchain.link_opt("/map:" + vdll[:-4] + ".map"), "@" + vrsp, "-luser32", "-ladvapi32"] +               (["-lc++", "-lunwind"] if toolchain.mingw() else []) + ngx_link(NGX_SDK, toolchain.mingw())
         r = subprocess.run(link, capture_output=True, text=True)
         if r.returncode:
             undefined = sorted({l.strip() for l in (r.stdout + r.stderr).splitlines() if "undefined symbol" in l})

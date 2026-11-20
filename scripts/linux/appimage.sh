@@ -52,13 +52,19 @@ cp -a gpu/render/*.h "$T/gpu/render/"
 # (every gpu/vk header the host's sources include: v2.0.6 shipped without oot_cheat_items.h and no Linux build finished, issue 990.
 # tests/test_appimage_headers.py checks that this covers what host/ includes)
 for h in $(grep -rhoE 'gpu/vk/[A-Za-z0-9_]+[.]h' host | sort -u); do if [ -f "$h" ]; then cp -a "$h" "$T/gpu/vk/"; fi; done
+# ((Triforce) zstd's decoder here, with what host/ compiles: host/host_zstd.h includes its headers since the host's zstd
+# decoder for the game's files, and tests/test_appimage_source_headers.py checks the copy up to the next line)
+cp -a third_party/zstd "$T/third_party/"
 cp -a third_party/opus "$T/third_party/"
 cp -a third_party/kenney_input "$T/third_party/"
+# ((Triforce) v0.5.0: SMAA's lookup textures, which gpu/vk/vk_aa.cpp includes: left out of v0.5.0's first AppImage, and every
+# Linux build stopped at vk_aa.cpp. scripts/linux/check_player_build.sh now checks every relative include of the image's sources)
+cp -a third_party/smaa "$T/third_party/"
 # (NVIDIA DLSS, when ticked in the builder: scripts/ngx_sdk.py and the Vulkan back end's sources, compiled with HOOKSHOT_NGX_SDK)
 mkdir -p "$T/scripts"
 cp scripts/ngx_sdk.py "$T/scripts/"
 cp -a gpu/vk gpu/compat gpu/third_party "$T/gpu/"
-cp -a third_party/imgui third_party/zstd third_party/fonts "$T/third_party/"
+cp -a third_party/imgui third_party/fonts "$T/third_party/"
 # (the AMD FidelityFX API headers the back end compiles against in a player's build without the prebuilt: nx2/build.py's ffx3_flags
 # (vk_ffx3.cpp, vk_ffx_fg.cpp: every build) and fsr_flags (vk_fsr4.cpp: FSR 4 ticked). Missing, DLSS's build stopped after 77 minutes on 'ffx_api.h' not found.
 # scripts/linux/check_player_build.sh compiles the back end from this tree, so the next one is found in CI)

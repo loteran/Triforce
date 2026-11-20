@@ -26,9 +26,16 @@ sealed partial class Shell
 {
     public readonly Window Window;
     const long NeededBytes = 60L << 30;
+    // (what the tools take unpacked, until their zip is here to say it exactly: v0.4.0's Triforce-Tools.zip is 284 MB and unpacks
+    // to 1.1 GB in 13,230 files, 3.9 times its size)
+    const int ToolsUnpackedTimes = 5;
     // (the build's steps, and the stone each one lights when it is done; the last one makes the whole crest gleam)
+    // ((Triforce, 11-18) "shaders": the game's --prepare-shaders after the folder is put together (nx2/make_game.py prepare_shaders;
+    // its "@@stage shaders" and progress, gpu/vk/vk_main.cpp). Without a row it ran under four finished steps with no bar: an
+    // update on an AMD card sat there over an hour and looked stuck)
     static readonly (string Id, S Text, int Stone)[] Stages =
-        { ("read", S.Read, Art.Emerald), ("lift", S.Lift, Art.Sapphire), ("compile", S.Compile, Art.Ruby), ("finish", S.Finish, -1) };
+        { ("read", S.Read, Art.Emerald), ("lift", S.Lift, Art.Sapphire), ("compile", S.Compile, Art.Ruby), ("finish", S.Finish, -1),
+          ("shaders", S.Shaders, -1) };
 
     // parts of Main.xaml
     readonly Grid Root, InstallPage, FetchPage, SetupPage, BuildPage, NupRow, AskLayer;
@@ -135,6 +142,9 @@ sealed partial class Shell
         FitToScreen();
         // (asked once the window is up: an off-screen run showed a SourceInitialized handler added here is never called)
         Window.Loaded += (_, _) => Frame();
+        // (started by the Setup it replaces, which stays until it hears that this window is up: StartNewSetup, Guard.cs Handover)
+        if (relaunched) Window.Loaded += (_, _) => Handover.Up(Install.InstalledDir ?? Install.SelfDir, Install.TestRoot);
+        if (Application.Current is { } app) app.SessionEnding += (_, _) => sessionEnding = true;
         if (snapshot != null)
         {
             Window.WindowStartupLocation = WindowStartupLocation.Manual;
@@ -229,8 +239,8 @@ sealed partial class Shell
         // already built started at one click: 45 minutes and the same game again. Back goes home; Build asks first then)
         BuildButton.Click += (_, _) =>
         {
-            if (HasGame) Ask("You have already built a game folder. Do you want to build it again? It takes about 45 minutes.", "Build again", T(S.Back), StartBuild);
-            else StartBuild();
+            if (HasGame) Ask("You have already built a game folder. Do you want to build it again? It takes about 45 minutes.", "Build again", T(S.Back), BuildIfRoom);
+            else BuildIfRoom();
         };
         SetupBack = Part<Button>("SetupBack");
         // (11-13) NVIDIA DLSS in the game that is built: NVIDIA's files come under NVIDIA's own license, so the tick stays only
@@ -241,11 +251,18 @@ sealed partial class Shell
         {
             if (DlssTick.IsChecked != true) { Install.Set("Dlss", "0"); return; }
             DlssTick.IsChecked = false;
-            Ask("NVIDIA DLSS is NVIDIA's, under NVIDIA's own license (github.com/NVIDIA/DLSS, LICENSE.txt). Its files are downloaded to " +
-                "this PC; a game folder built with them must not be shared. Do you accept NVIDIA's license?", "I accept", T(S.Back),
+            // (11-15: the tick brings DLSS frame generation too: NVIDIA's Streamline (MIT) and nvngx_dlssg.dll, under the NVIDIA RTX
+            // SDKs License as DLSS itself: nx2/make_game.py fetch_streamline_sdk, scripts/streamline_sdk.py)
+            Ask("NVIDIA DLSS and DLSS frame generation are NVIDIA's, under NVIDIA's own licenses (github.com/NVIDIA/DLSS, LICENSE.txt; " +
+                "github.com/NVIDIA-RTX/Streamline, license.txt). Their files are downloaded to this PC; a game folder built with them " +
+                "must not be shared. Do you accept NVIDIA's licenses?", "I accept", T(S.Back),
                 () => { DlssTick.IsChecked = true; Install.Set("Dlss", "1"); });
         };
         SetupBack.Click += (_, _) => ShowHome(homeOffline);
+        // (a build that stopped: what there is to send in one click, where the details had to be selected and copied by hand and
+        // setup.log found in the install folder)
+        CopyReport = Part<Button>("CopyReport");
+        CopyReport.Click += (_, _) => CopyTheReport();
         CancelButton.Click += (_, _) => { fetch?.Cancel(); runner?.Cancel(); };
         BackButton.Click += (_, _) => ShowSetup();
         OpenButton.Click += (_, _) => Process.Start(new ProcessStartInfo("explorer.exe", "\"" + finished + "\"") { UseShellExecute = true });
@@ -263,16 +280,18 @@ sealed partial class Shell
 
     void CloseWindow() => Window.Close();
 
-    /// A question over the whole window: the gold button does it, the other one (or Esc) leaves things as they are
+    /// A question over the whole window: the gold button does it, the other one (or Esc) leaves things as they are. (Without
+    /// words for the other one it is a notice: one button)
     void Ask(string question, string yes, string no, Action onYes)
     {
         AskText.Text = question;
         AskYes.Content = yes;
         AskNo.Content = no;
+        AskNo.Visibility = no.Length > 0 ? Visibility.Visible : Visibility.Collapsed;
         askYes = onYes;
         AskLayer.Visibility = Visibility.Visible;
         Fx.Once(AskLayer, UIElement.OpacityProperty, 0, 1, Fx.Base);
-        AskNo.Focus();
+        (no.Length > 0 ? AskNo : AskYes).Focus();
     }
 
     void HideAsk()
@@ -283,10 +302,10 @@ sealed partial class Shell
 
     void Show(Grid page)
     {
-        foreach (var p in new[] { InstallPage, FetchPage, HomePage, SavesPage, SetupPage, BuildPage }) p.Visibility = p == page ? Visibility.Visible : Visibility.Collapsed;
+        foreach (var p in new[] { InstallPage, FetchPage, HomePage, SavesPage, ModsPage, SetupPage, BuildPage }) p.Visibility = p == page ? Visibility.Visible : Visibility.Collapsed;
         if (page != BuildPage && ShowLog.IsChecked == true) ShowLog.IsChecked = false;
         // (nothing to wait for on these pages: the crest whole, every stone alight)
-        if (page == InstallPage || page == HomePage || page == SavesPage || page == SetupPage) stage.All(true);
+        if (page == InstallPage || page == HomePage || page == SavesPage || page == ModsPage || page == SetupPage) stage.All(true);
         if (shown == page) return;
         shown = page;
         Fx.Arrive(page);
@@ -297,7 +316,11 @@ sealed partial class Shell
     void Begin()
     {
         var dir = Install.InstalledDir;
-        try { var old = System.IO.Path.Combine(dir ?? Install.SelfDir, "TriforceSetup.old.exe"); if (File.Exists(old)) File.Delete(old); } catch (Exception) { }
+        var before = System.IO.Path.Combine(dir ?? Install.SelfDir, "TriforceSetup.old.exe");
+        void RemoveBefore() { try { if (File.Exists(before)) File.Delete(before); } catch (Exception) { } }
+        RemoveBefore();
+        // (the Setup this one replaced still runs for a moment, until it has heard that this window is up, StartNewSetup: again once it is gone)
+        if (relaunched) Task.Delay(5000).ContinueWith(_ => RemoveBefore());
         if (autoBuild != null && Tools.Find() is { } auto)
         {
             Program.Log("auto-build (test) " + string.Join(" | ", autoBuild));
@@ -354,15 +377,91 @@ sealed partial class Shell
         }
     }
 
-    void Relaunch(string exe, bool afterSelfUpdate)
+    /// Starts the Setup that takes this one's place (the installed one after an install, the new one after an update) with what
+    /// this one was asked to do, and closes. (stay: not closed yet: after its own update Setup waits for the new one, StartNewSetup)
+    Process? Relaunch(string exe, bool afterSelfUpdate, bool stay = false)
     {
         var a = new List<string>();
         if (updateFolder != null) { a.Add("--update"); a.Add("\"" + updateFolder + "\""); }
         if (afterSelfUpdate) a.Add("--relaunched");
         if (merge && updateFolder == null) a.Add("--merge");
-        Process.Start(new ProcessStartInfo(exe, string.Join(" ", a)) { UseShellExecute = false, WorkingDirectory = System.IO.Path.GetDirectoryName(exe)! });
+        // (the Setup started here takes this install over: it must find the folder free, Guard.cs Instance)
+        Instance.Release();
+        Process? next;
+        try { next = Process.Start(new ProcessStartInfo(exe, string.Join(" ", a)) { UseShellExecute = false, WorkingDirectory = System.IO.Path.GetDirectoryName(exe)! }); }
+        catch (Exception) { Instance.TakeAgain(); throw; }
+        if (stay) return next;
         fetch = null;
         Window.Close();
+        return next;
+    }
+
+    bool sessionEnding;   // (Windows is shutting down or the player logging off: programs are being ended)
+
+    /// Is the release's Setup one to replace this one with? Not one that could not start on this PC (StartNewSetup): that one is not
+    /// fetched again, and this Setup goes on with the release's tools until the next release brings another
+    bool SetupNewer(Release r) => Program.Version != "dev" && r.Tag != Program.Version && r.SetupUrl != null && Install.Get("SetupSkip") != r.Tag;
+
+    /// After Setup replaced itself (the new exe under its name, this one running on as TriforceSetup.old.exe): the new one is
+    /// started, and this one waits out of sight until the new window is up, then goes. A new Setup that cannot be started, or
+    /// ends at once with an error, would be all the player has under their shortcut: this one takes its name back instead
+    /// (Guard.cs Handover), shows itself again and says so, and that release's Setup is not fetched again.
+    async Task StartNewSetup(string self, string old, string tag)
+    {
+        // (testing, TRIFORCE_UI_SCRIPT: the script goes on in the new Setup, and this one must not go on running its steps beside it)
+        if (scriptFile != null) { Relaunch(self, true); return; }
+        EventWaitHandle up;
+        try { up = Handover.Expect(Install.InstalledDir ?? Install.SelfDir, Install.TestRoot); }
+        catch (Exception) { Relaunch(self, true); return; }   // (no sign can be waited for here: started and left to itself, as it always was)
+        var outcome = Handover.Outcome.Unclear;
+        var why = "";
+        using (up)
+        {
+            Process? next = null;
+            try { next = Relaunch(self, true, stay: true); }
+            catch (Exception e) { outcome = Handover.Outcome.Failed; why = e.Message; }
+            if (next != null)
+            {
+                Window.Hide();
+                try { outcome = await Task.Run(() => Handover.Watch(next, up, TimeSpan.FromSeconds(30))); }
+                catch (Exception) { }
+                try { if (outcome == Handover.Outcome.Failed) why = "it ended at once, with exit code 0x" + next.ExitCode.ToString("X8"); } catch (Exception) { }
+            }
+        }
+        Program.Log("Setup " + tag + " after the restart: " + (outcome == Handover.Outcome.Up ? "its window is up" : outcome == Handover.Outcome.Failed ? "it did not start (" + why + ")" : "no sign of its window, left to itself"));
+        // (when Windows ends the session the new Setup is ended like everything else, which says nothing about it. And when another
+        // Setup has the folder by now, the new one started after all: the player started it again)
+        if (outcome != Handover.Outcome.Failed || sessionEnding || !Instance.TakeAgain())
+        {
+            fetch = null;
+            Window.Close();
+            return;
+        }
+        var back = await Task.Run(() => Handover.Restore(old, self));
+        Program.Log(back ? "Setup " + Program.Version + " is back under its name, and Setup " + tag + " will not be fetched again" : "Setup " + Program.Version + " could not be put back under its name");
+        if (back) Install.Set("SetupSkip", tag);
+        Window.Show();
+        Window.Activate();
+        throw new NotStartedException(back
+            ? "Triforce Setup " + tag + " could not start on this PC (" + why + "), so Setup " + Program.Version + " is back in its place. Try again goes on with this one."
+            : "Triforce Setup " + tag + " could not start on this PC (" + why + "), and Setup " + Program.Version + " could not be put back in its place. Keep this window open and download Triforce Setup again from " + Program.Home + ".");
+    }
+
+    /// A second Setup was started for this install (Guard.cs Instance): it has ended, and this window comes to the front in its place
+    public void ComeForward()
+    {
+        Program.Log("a second Setup was started for this install: this window comes to the front instead");
+        if (snapshot != null || scriptFile != null) return;   // (testing: the window stays off the screen)
+        try
+        {
+            if (!Window.IsVisible) return;
+            if (Window.WindowState == WindowState.Minimized) Window.WindowState = WindowState.Normal;
+            Window.Activate();
+            // (Windows may only flash the taskbar button of a window that is not in front: a moment as the topmost one brings it there)
+            Window.Topmost = true;
+            Window.Topmost = false;
+        }
+        catch (Exception) { }
     }
 
     // ---- gather: the update check, Setup's own update, the tools ----
@@ -447,7 +546,7 @@ sealed partial class Shell
         FetchUnknown(false);
         FetchCancel.IsEnabled = true;
         var offline = e is HttpRequestException || e is TaskCanceledException && !cancelled;
-        FetchTitle.Text = cancelled ? "Stopped" : offline ? "GitHub could not be reached" : "Something went wrong";
+        FetchTitle.Text = cancelled ? "Stopped" : offline ? "The Triforce site could not be reached" : e is NoRoomException ? "Not enough room on the disk" : e is CutOffException ? "The download stopped" : e is NotStartedException ? "The new Setup could not start" : "Something went wrong";
         FetchNote.Text = cancelled ? "Nothing was changed." : offline ? "Check your internet connection, then try again." : e.Message;
         FetchNote.Foreground = Brush(cancelled ? "Text" : "Bad");
         FetchStep.Text = "";
@@ -473,21 +572,20 @@ sealed partial class Shell
         {
             using var http = Http();
             // 1. Setup itself
-            if (!relaunched && Program.Version != "dev" && release.Tag != Program.Version && release.SetupUrl != null)
+            if (Install.Get("SetupSkip") == release.Tag) Program.Log("Setup " + release.Tag + " is not fetched: it could not start on this PC (SetupSkip)");
+            if (!relaunched && SetupNewer(release) && release.SetupUrl != null)
             {
                 FetchState("A new Setup is here", "Triforce Setup " + release.Tag + " replaces " + Program.Version + ". It restarts by itself and carries on.", "Downloading Setup " + release.Tag);
                 var dir = Install.InstalledDir ?? Install.SelfDir;
                 var fresh = System.IO.Path.Combine(dir, "TriforceSetup.new.exe");
                 FetchProgress(0, "");
-                await Release.Download(http, release.SetupUrl, fresh, release.SetupSize, (f, have) => Ui(() => FetchProgress(f, (have >> 10) + " KB")), token);
+                await Download.ToFile(http, release.SetupUrl, fresh, release.SetupSize, (f, have) => Ui(() => FetchProgress(f, (have >> 10) + " KB")), token);
                 var self = System.IO.Path.Combine(dir, Program.SetupAsset);
                 var old = System.IO.Path.Combine(dir, "TriforceSetup.old.exe");
-                if (File.Exists(old)) File.Delete(old);
-                File.Move(self, old);
-                File.Move(fresh, self);
+                Handover.Swap(fresh, self, old);
                 Program.Log("Setup updated to " + release.Tag + ", restarting");
                 merge = true;
-                Relaunch(self, true);
+                await StartNewSetup(self, old, release.Tag);
                 return;
             }
             stage.Set(Art.Sapphire, true);
@@ -504,18 +602,42 @@ sealed partial class Shell
                 var cache = System.IO.Path.Combine(Install.InstalledDir ?? Install.SelfDir, "downloads");
                 Directory.CreateDirectory(cache);
                 var zip = System.IO.Path.Combine(cache, "Triforce-Tools-" + string.Concat(release.Tag.Where(c => char.IsLetterOrDigit(c) || c == '.' || c == '-')) + ".zip");
+                // (room for the zip and for what it unpacks to, asked before the first byte is fetched, Guard.cs Space: a disk that filled
+                // in the middle left half a download or half a tools folder and an error that named no cause. What an unpacking that was
+                // cut off left behind goes first. The part of the zip a try before this one fetched is gone on from, Guard.cs Download,
+                // so only the rest takes room; and a zip that is there whole, by its size, from a try that got no further than its
+                // unpacking, is not fetched again)
+                await Task.Run(Tools.Sweep);
+                long Length(string file) { try { return File.Exists(file) ? new FileInfo(file).Length : 0; } catch (Exception) { return 0; } }
+                var whole = release.ToolsSize > 0 && Length(zip) == release.ToolsSize;
+                var unpacked = release.ToolsSize * ToolsUnpackedTimes;
+                if (release.ToolsSize > 0 && Space.Problem("the Triforce tools (a download of " + (release.ToolsSize >> 20) + " MB that unpacks to about " + (unpacked >> 20) + " MB)",
+                        (whole ? 0 : Math.Max(0, release.ToolsSize - Length(zip + ".part"))) + unpacked, Space.Free(cache), Space.Disk(cache)) is { } none)
+                    throw new NoRoomException(none);
                 FetchProgress(0, "");
-                await Release.Download(http, release.ToolsUrl, zip, release.ToolsSize, (f, got) => Ui(() =>
-                {
-                    FetchProgress(f, (got >> 20) + " / " + (release.ToolsSize >> 20) + " MB");
-                    stage.Charge(Art.Ruby, f * 0.7);
-                }), token);
+                if (!whole)
+                    await Download.ToFile(http, release.ToolsUrl, zip, release.ToolsSize, (f, got) => Ui(() =>
+                    {
+                        FetchProgress(f, (got >> 20) + " / " + (release.ToolsSize >> 20) + " MB");
+                        stage.Charge(Art.Ruby, f * 0.7);
+                    }), token);
+                else Program.Log("tools " + release.Tag + ": the zip is here already, whole (" + release.ToolsSize + " bytes)");
                 FetchStep.Text = "Unpacking the tools";
                 FetchCancel.IsEnabled = false;
                 FetchProgress(0, "");
-                await Task.Run(() => Tools.Unpack(zip, release.Tag, f => Ui(() => { FetchProgress(f, ""); stage.Charge(Art.Ruby, 0.7 + f * 0.3); })));
+                try { await Task.Run(() => Tools.Unpack(zip, release.Tag, f => Ui(() => { FetchProgress(f, ""); stage.Charge(Art.Ruby, 0.7 + f * 0.3); }))); }
+                catch (Exception e) when (e is not NoRoomException && !Space.Full(e))
+                {
+                    // (a zip that does not unpack is fetched again at the next try, not tried again; one there was no room for is kept)
+                    try { File.Delete(zip); } catch (Exception) { }
+                    throw;
+                }
                 FetchCancel.IsEnabled = true;
-                try { File.Delete(zip); } catch (Exception) { }
+                // (the zip, and what downloads of other releases left there: parts nothing will go on from)
+                string[] leavings = { };
+                try { leavings = Directory.GetFiles(cache, "Triforce-Tools-*"); } catch (Exception) { }
+                foreach (var f in leavings)
+                    try { File.Delete(f); } catch (Exception) { }
                 Program.Log("tools " + release.Tag + " unpacked into " + Tools.Folder);
             }
             stage.Set(Art.Ruby, true);
@@ -539,6 +661,9 @@ sealed partial class Shell
         {
             fetch = null;
             Program.Log("update failed: " + e.GetType().Name + ": " + e.Message);
+            // (a disk that filled while it was written to all the same, another program's doing: said as that, with the disk's name)
+            if (Space.Full(e))
+                e = new NoRoomException(Space.Disk(Install.InstalledDir ?? Install.SelfDir) + " is full: the download or the tools could not be written. Make room there and try again.");
             Failed(e, e is OperationCanceledException && token.IsCancellationRequested);
         }
     }
@@ -550,6 +675,8 @@ sealed partial class Shell
 
     static bool HasGame => Install.Get("GameFolder") is { } g && GameExe(g) != null;
     Button SetupBack = null!;   // (the build page's way back home)
+    Button CopyReport = null!;   // (after a build that stopped: what a player sends, Guard.cs Report)
+    string? buildLine, stopped;   // (the build that ran last: what it was started with, and what it stopped by)
     CheckBox DlssTick = null!;   // (NVIDIA DLSS, its license accepted)
     static bool DlssChosen => Install.Get("Dlss") == "1";
     /// Where NVIDIA's DLSS SDK is kept: beside Setup, not in the tools folder (an update replaces that one whole)
@@ -644,9 +771,19 @@ sealed partial class Shell
         // (Setup just asked about updates: the game's own offer, host/hos_update.c, would ask again)
         var si = new ProcessStartInfo(exe) { UseShellExecute = false, WorkingDirectory = folder };
         si.EnvironmentVariables["HOOKSHOT_NO_UPDATE_CHECK"] = "1";
+        // ((Triforce) 11-17, his "when you select play in the launcher i want the same sound that plays when you press load
+        // game": the Load list's sound, before the game is there (Setup is silent while it runs); the window goes at once,
+        // Setup itself once the sound is over: it would stop with Setup)
+        playing = true;
+        sounds.Play(Sounds.Start);
+        var wait = sounds.Seconds(Sounds.Start);
         Process.Start(si);
         Program.Log("started the game: " + exe);
-        Window.Close();
+        if (wait <= 0) { Window.Close(); return; }
+        Window.Hide();
+        var t = new System.Windows.Threading.DispatcherTimer { Interval = TimeSpan.FromSeconds(Math.Min(wait, 3) + 0.1) };
+        t.Tick += (_, _) => { t.Stop(); Window.Close(); };
+        t.Start();
     }
 
     void ApplyLanguage()
@@ -660,6 +797,7 @@ sealed partial class Shell
         SaveToLabel.Label = T(S.SaveTo);
         BuildButton.Content = T(S.Build);
         ShowLog.Content = T(ShowLog.IsChecked == true ? S.HideDetails : S.ShowDetails);
+        CopyReport.Content = T(S.CopyReport);
         CancelButton.Content = T(S.Cancel);
         BackButton.Content = T(S.Back);
         OpenButton.Content = T(S.OpenFolder);
@@ -710,7 +848,8 @@ sealed partial class Shell
         var tools = Tools.Find();
         if (tools == null) { Say(T(S.ToolsMissing), "Bad", "Bad"); return; }
         var args = new List<string> { "--check" };
-        args.AddRange(UseNup.IsChecked == true ? new[] { "--nup", NupPath.Text } : new[] { "--exefs", ExefsPath.Text });
+        // (the romfs folder too: NX2navi's holds one packed romfs.bin, which the builder refuses, nx2/make_game.py refuse_packed_romfs)
+        args.AddRange(UseNup.IsChecked == true ? new[] { "--nup", NupPath.Text } : new[] { "--exefs", ExefsPath.Text, "--romfs", RomfsPath.Text });
         var (ok, text) = await Runner.Check(tools, args);
         if (serial != checkSerial) return;
         sourceOk = ok;
@@ -753,6 +892,17 @@ sealed partial class Shell
 
     // ---- the build ----
 
+    /// The Build button: with less room on the disk than a build takes, the player is told both numbers first. (The line under the
+    /// form only turned red, and such a build stopped somewhere in its 45 minutes. Going on stays possible, as it was: the 60 GB are
+    /// a first build's, and a folder that already holds the game's files takes far less.)
+    void BuildIfRoom()
+    {
+        if (Space.Free(OutPath.Text) is { } free && free < NeededBytes)
+            Ask(Space.Disk(OutPath.Text) + " has " + (free >> 30) + " GB free. A build takes about " + (NeededBytes >> 30) + " GB and may stop halfway without them. Build anyway?",
+                "Build anyway", T(S.Back), StartBuild);
+        else StartBuild();
+    }
+
     void StartBuild()
     {
         var tools = Tools.Find();
@@ -793,7 +943,13 @@ sealed partial class Shell
         // (NVIDIA DLSS chosen: its SDK fetched first, only what is missing, and built in; a build and an update alike)
         var dlss = DlssChosen;
         if (dlss && !args.Contains("--fetch-ngx-sdk")) args.AddRange(new[] { "--fetch-ngx-sdk", "--accept-nvidia-license" });
-        Program.Log("build: make_game.py " + string.Join(" ", args) + " (tools " + tools.Root + ")");
+        // (11-15: AMD FSR 4 in every build: its code is built in and AMD's two signed libraries (MIT license) are fetched
+        // from AMD's repository and put beside the game: nx2/make_game.py --fsr, scripts/fsr_sdk.py. The Upscaler row offers
+        // it only on a card AMD's library says runs it)
+        if (!args.Contains("--fsr") && !args.Contains("--no-fsr")) args.Add("--fsr");
+        buildLine = "make_game.py " + string.Join(" ", args) + " (tools " + tools.Root + ")";
+        stopped = null;
+        Program.Log("build: " + buildLine);
         runner = new Runner(tools, args, dlss ? NgxSdk : null);
         ShowClock();
         runner.Line += l => Ui(() => Line(l));
@@ -809,6 +965,7 @@ sealed partial class Shell
             if (current != null && rows.TryGetValue(current, out var was)) was.Done();
             current = id;
             if (rows.TryGetValue(id, out var row)) row.Begin();
+            ShowClock();   // (the note under the title is the step's: the shaders' says what that step is)
         }
         else if (line.StartsWith("@@progress "))
         {
@@ -841,6 +998,8 @@ sealed partial class Shell
             BuildTitle.Text = T(S.Ready);
             BuildNote.Text = finished + "  ·  " + T(S.BuiltIn) + " " + Span(elapsed.Elapsed);
             Install.Set("GameFolder", finished);
+            MarkModsBuilt(finished);   // (the mods' code patches and cheats are in it as they are now: Shell.Mods.cs)
+            LoadSounds();   // (a game folder now, or another one: its interface sounds are Setup's, Shell.Sounds.cs)
             SetButtons(done: true);
             return;
         }
@@ -848,18 +1007,57 @@ sealed partial class Shell
         BuildNote.Text = failure == "cancelled" ? T(S.CancelledNote) : failure ?? "";
         BuildNote.Foreground = Brush(failure == "cancelled" ? "Text" : "Bad");
         if (current != null && rows.TryGetValue(current, out var row)) row.Stopped();
-        SetButtons(back: true);
+        stopped = failure;
+        SetButtons(back: true, report: failure != "cancelled");
+    }
+
+    /// Copy report, after a build that stopped: what Setup knows of it, the last lines of its details and of setup.log, onto the
+    /// clipboard to paste where help is asked for (Guard.cs Report: the account's folder reads %USERPROFILE% in it, so the
+    /// player's name does not go along)
+    void CopyTheReport()
+    {
+        var home = Install.InstalledDir ?? Install.SelfDir;
+        string Room(string folder) => Space.Free(folder) is { } free ? " (" + Space.Disk(folder) + " has " + (free >> 30) + " GB free)" : "";
+        var step = "its start";
+        foreach (var (id, text, _) in Stages)
+            if (id == current) step = "\"" + Strings.All[0].Text[(int)text] + "\"";
+        var known = new[]
+        {
+            "Triforce Setup " + Program.Version + ", tools " + (Tools.InstalledVersion ?? "none") + ", " + Environment.OSVersion.VersionString,
+            "The build stopped at " + step + " after " + Span(elapsed.Elapsed) + ": " + (stopped ?? "no reason given"),
+            buildLine ?? "",
+            "Game folder: " + OutPath.Text + Room(OutPath.Text),
+            "Setup: " + home + Room(home),
+        };
+        var log = "";
+        try { log = File.ReadAllText(System.IO.Path.Combine(home, "setup.log")); } catch (Exception) { }
+        var profile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+        try
+        {
+            // (kept on the clipboard when Setup closes)
+            Clipboard.SetDataObject(Report.Compose(known, Log.Text, log, profile, Report.Short(profile)), true);
+            CopyReport.Content = T(S.ReportCopied);
+        }
+        catch (Exception e)
+        {
+            // (another program has the clipboard open)
+            Program.Log("the report could not be copied: " + e.Message);
+            CopyReport.Content = T(S.ReportNotCopied);
+        }
     }
 
     void ShowClock()
     {
-        if (runner != null) BuildNote.Text = T(S.Patience) + "  " + T(S.Elapsed) + ": " + Span(elapsed.Elapsed);
+        if (runner != null) BuildNote.Text = (current == "shaders" ? T(S.ShadersNote) : T(S.Patience)) + "  " + T(S.Elapsed) + ": " + Span(elapsed.Elapsed);
     }
 
     static string Span(TimeSpan t) => t.TotalHours >= 1 ? (int)t.TotalHours + " h " + t.Minutes + " min" : t.TotalMinutes >= 1 ? t.Minutes + " min" : t.Seconds + " s";
 
-    void SetButtons(bool cancel = false, bool done = false, bool back = false)
+    void SetButtons(bool cancel = false, bool done = false, bool back = false, bool report = false)
     {
+        // (Copy report: only after a build that stopped by itself, and under its first words each time it is offered)
+        CopyReport.Content = T(S.CopyReport);
+        CopyReport.Visibility = report ? Visibility.Visible : Visibility.Collapsed;
         CancelButton.Visibility = cancel ? Visibility.Visible : Visibility.Collapsed;
         PlayButton.Visibility = OpenButton.Visibility = done ? Visibility.Visible : Visibility.Collapsed;
         BackButton.Visibility = back ? Visibility.Visible : Visibility.Collapsed;

@@ -7,6 +7,7 @@
 // projection (nx2/oot_jitter.py: P[0][2] and P[1][2]) is read back from it, given to FSR in render pixels and taken off the
 // motion, with dlss_math.h's functions: the same jitter, read the same way, as DLSS's.
 #include "vk_fsr3_inputs.h"
+#include "vk_dlssg.h"
 
 #include <algorithm>
 #include <atomic>
@@ -24,7 +25,9 @@
 #include "vk_fsr3fi.h"
 #include "vk_ngxfg.h"
 #include "vk_ffx_fg.h"   // (AMD's frame generation keeps the scene's inputs too)
+#include "vk_fsr4.h"   // (Triforce: fsr4fg, AMD FSR 4's frame generation takes these inputs too)
 #include "vk_texture.h"
+#include "vk_temporal.h"   // ((Triforce) temporal_scene_format: the run's scene format, B10G11R11 or RenoDX's RGBA16F)
 
 #include "shaders/fsr3_prep_comp_spv.h"
 #include "vk_work.h"   // (after the others: counts the commands that do GPU work, for full_barrier)
@@ -52,7 +55,11 @@ struct Camera {
     float jitter[2]{};        // (the projection's offset of the picture's centre, in clip space: nx2/oot_jitter.py)
     uint32_t width = 0, height = 0;
     Texture* depth = nullptr;
-    uint64_t depth_gen = 0;   // (texture_destroy_generation when taken: a depth texture destroyed since is not used)
+    // (the depth texture's creation number and texture_destroyed_count when taken: destroyed since, it is not used. It was
+    // texture_destroy_generation, which any texture's end changes: with the video memory full the cache lets textures go
+    // in most frames, and each of those frames was left to the game's own upscale)
+    uint32_t depth_id = 0;
+    uint64_t noted = 0;
     uint64_t frame = 0;       // (texture_frame_no when taken)
     bool valid = false;
 };
@@ -212,12 +219,21 @@ VkImageView depth_view(Texture* t) {
 
 } // namespace
 
-bool wanted() { return fsr3_wanted() || fsr3fi::frames_wanted() != 0 || ngxfg::inputs_wanted() || ffxfg::inputs_wanted(); }
+// (Triforce: or NVIDIA DLSS frame generation, through NGX here (vk_ngxfg.h) or Streamline on Windows (vk_dlssg.cpp), which take the
+// same depth and motion; AMD's frame generation through its library (vk_ffx_fg.h); or AMD FSR 4's frame generation, Windows only: vk_fsr4.h fsr4fg)
+bool wanted() {
+    return fsr3_wanted() || fsr3fi::frames_wanted() != 0 || ngxfg::inputs_wanted() || ffxfg::inputs_wanted() || dlssg::active() ||
+           fsr4fg::frames_wanted();
+}
 
 void note_scene_draw(const Texture* color0, uint32_t width, uint32_t height, Texture* depth, uint64_t camera,
                      uint64_t camera_size) {
     if (!color0 || !depth || !camera || camera_size < 0x230 || width < 640 || height < 360) return;
-    if (color0->format != VK_FORMAT_B10G11R11_UFLOAT_PACK32 || !wanted()) return;
+    // ((Triforce, 11-16: DLSS frame generation never made a frame for the owner, HDR Native with RenoDX) the scene's target in
+    // the format this run draws it in, as vk_temporal.cpp's note takes it: B10G11R11, or RGBA16F where the run's scene is
+    // (RenoDX's HDR, host/nn_vi.c hos_scene_rgba16f). With B10G11R11 alone no camera was kept in an RGBA16F run, so frame
+    // generation's inputs were never made and it stayed paused)
+    if (!temporal_scene_format(color0->format) || !wanted()) return;
     State& s = st();
     std::lock_guard lk(s.mu);
     const uint64_t now = texture_frame_no();
@@ -235,7 +251,7 @@ void note_scene_draw(const Texture* color0, uint32_t width, uint32_t height, Tex
     std::memcpy(k.projection, c + 0x70 / 4, sizeof k.projection);
     // (the offset sead's projection gave the frustum, in its third column: 2 * offset, which moves the picture by -that)
     k.jitter[0] = -c[0x78 / 4], k.jitter[1] = -c[0x88 / 4];
-    k.width = width, k.height = height, k.depth = depth, k.depth_gen = texture_destroy_generation(), k.frame = now;
+    k.width = width, k.height = height, k.depth = depth, k.depth_id = depth->id, k.noted = texture_destroyed_count(), k.frame = now;
     k.valid = true;
 }
 
@@ -255,7 +271,7 @@ bool prepare(VkCommandBuffer cmd, Texture* in, VkImageView in_view, Frame& out, 
     if (!in || !in_view) return fail("no input view");
     const uint64_t now = texture_frame_no();
     if (!cam.valid || now - cam.frame > 1) return fail("no scene camera this frame");
-    if (cam.depth_gen != texture_destroy_generation()) return fail("the scene depth may be gone");
+    if (texture_destroyed_since(cam.depth_id, cam.noted)) return fail("the scene depth is gone");
     const uint32_t rw = in->width, rh = in->height;
     if (rw != cam.width || rh != cam.height) return fail("the input is not the scene's size");
     if (cam.depth->width != rw || cam.depth->height != rh || !(cam.depth->usage & VK_IMAGE_USAGE_SAMPLED_BIT) ||
@@ -341,6 +357,16 @@ bool prepare(VkCommandBuffer cmd, Texture* in, VkImageView in_view, Frame& out, 
             std::memcpy(s.last_pos, f.dlssg.pos, sizeof s.last_pos), std::memcpy(s.last_fwd, f.dlssg.fwd, sizeof s.last_fwd);
     } else {
         s.last_cam_ok = false;
+    }
+    {   // (Triforce, NVIDIA DLSS frame generation's: the images, and the matrices with no jitter in them on either side)
+        f.depth_image = s.depth.image, f.motion_image = s.motion.image;
+        std::memcpy(f.projection, projection, sizeof f.projection);
+        std::memcpy(f.view, cam.view, sizeof f.view);
+        float current[16];
+        std::memcpy(current, cam.current, sizeof current);
+        dlss_math::unjitter(current, cam.jitter);
+        if (!motion || !dlss_math::reprojection(current, previous, f.clip_to_prev))
+            for (int i = 0; i < 16; i++) f.clip_to_prev[i] = i % 5 == 0 ? 1.0f : 0.0f;
     }
     f.frame_ms = s.last_time.time_since_epoch().count() && !reset
                      ? (float)std::min(250.0, std::chrono::duration<double, std::milli>(t - s.last_time).count())

@@ -23,6 +23,13 @@ The Switch face keeps the game's own images for its default controls; only the o
 Pad inputs: `south east west north back guide start lstick rstick lshoulder rshoulder up down left right ltrigger rtrigger`.
 Switch buttons: `a b x y ls rs l r zl zr plus minus left up right down`.
 
+The `keyboard` face (the keyboard and mouse) is drawn by `nx2/prompt_keys.py` from nothing but Libertinus Sans Bold
+(`third_party/fonts`): a cap with its label for every key that can be bound, a mouse for each mouse button. Its notes and
+letters are named by the key's code where the others have a pad input, `OcarinaButtonA_00.key69.png` for E, and a PNG of
+that name in `nx2/prompt_faces/keyboard/` takes the image's place as for any face. It has no controller picture and no
+leader lines: the controls page keeps the game's. `python -I nx2/prompt_keys.py --out <dir>` writes every icon into one
+picture, to look at.
+
 ## Drawing one by hand
 
 1. Write out what the build makes (and the game's own textures, to draw over):

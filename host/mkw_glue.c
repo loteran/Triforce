@@ -15,15 +15,37 @@
    The runtime commits what it hands out (image, system region, heap, address regions: hos_commit), because host
    APIs given guest buffers (ReadFile into a game buffer) fail on reserved pages without raising an exception. A
    guest or host access to a page nothing committed is committed on first touch, 64 KB at a time, by the handler. */
-void hos_commit(uint64_t addr, uint64_t size) {
-    if (!size) return;
+void *hos_mem_commit_begin(uint64_t addr, uint64_t size);   /* ((Triforce) hos_mem.c: the census's notes around the commit) */
+void hos_mem_commit_end(void *had, uint64_t addr, uint64_t size, int committed);
+int hos_commit(uint64_t addr, uint64_t size) {
+    if (!size) return 1;
     if (!hos_guest_range(addr, size)) {   /* (hookshot: guest pages only; the posix layer's commit changes any page's protection) */
         hos_log("mem: commit of %#llx bytes at %#llx: outside the guest window", (unsigned long long)size, (unsigned long long)addr);
-        return;
+        return -1;
     }
-    const uint64_t lo = addr & ~0xFFFFULL, hi = (addr + size + 0xFFFF) & ~0xFFFFULL;
-    if (!VirtualAlloc(GP(lo), (SIZE_T)(hi - lo), MEM_COMMIT, PAGE_READWRITE)) {
-        const DWORD err = GetLastError();
+    uint64_t lo = addr & ~0xFFFFULL, hi = (addr + size + 0xFFFF) & ~0xFFFFULL;
+    {   /* (HOS_LARGE_PAGES: the heap's large pages are a reservation of their own, committed whole; what lies below or
+           above them is committed by itself) */
+        extern uint64_t hos_large_lo, hos_large_hi;
+        if (hos_large_hi && lo < hos_large_hi && hi > hos_large_lo) {
+            const uint64_t llo = lo > hos_large_lo ? lo : hos_large_lo, lhi = hi < hos_large_hi ? hi : hos_large_hi;
+            hos_mem_note(HOS_MEM_COMMITTED, llo, lhi - llo);   /* ((Triforce) the census: committed already, handed out now) */
+            const int below = lo < hos_large_lo ? hos_commit(lo, hos_large_lo - lo) : 1;
+            if (hi <= hos_large_hi) return below;
+            lo = hos_large_hi;
+        }
+    }
+    /* ((Triforce) the census: held before the commit, under the lock the give-back's decommit checks under; no longer kept once
+       it is made, and as before if it fails: hos_mem.c hos_mem_commit_begin) */
+    void *const census_had = hos_mem_commit_begin(lo, hi - lo);
+    /* (Triforce: a commit of committed pages resets their protection, the lazy write-back's too: rx_backend.c) */
+    const int io = hos_guest_io_begin(GP(lo), hi - lo);
+    const int committed = VirtualAlloc(GP(lo), (SIZE_T)(hi - lo), MEM_COMMIT, PAGE_READWRITE) != NULL;
+    const DWORD commit_err = committed ? 0 : GetLastError();
+    hos_guest_io_end(io);
+    hos_mem_commit_end(census_had, lo, hi - lo, committed);
+    if (!committed) {
+        const DWORD err = commit_err;
         hos_log("mem: commit of %#llx bytes at %#llx failed (error %lu)", (unsigned long long)(hi - lo),
                 (unsigned long long)lo, err);
         if (err == ERROR_COMMITMENT_LIMIT) {   /* (1455: RAM and page file full; the game crashes soon after. Said once, on its own thread) */
@@ -34,7 +56,9 @@ void hos_commit(uint64_t addr, uint64_t size) {
                 CloseHandle(CreateThread(NULL, 0, hos_out_of_memory_box, NULL, 0, NULL));
             }
         }
+        return 0;
     }
+    return 1;
 }
 
 DWORD WINAPI hos_out_of_memory_box(LPVOID unused) {
@@ -60,8 +84,9 @@ static LONG CALLBACK commit_on_touch(EXCEPTION_POINTERS *info) {
     static volatile LONG touched;
     if (InterlockedIncrement(&touched) <= 16)
         hos_log("mem: %#llx committed on first touch (nothing handed it out)", (unsigned long long)guest);
-    return VirtualAlloc(GP(guest & ~0xFFFFULL), 0x10000, MEM_COMMIT, PAGE_READWRITE) ? EXCEPTION_CONTINUE_EXECUTION
-                                                                                      : EXCEPTION_CONTINUE_SEARCH;
+    if (!VirtualAlloc(GP(guest & ~0xFFFFULL), 0x10000, MEM_COMMIT, PAGE_READWRITE)) return EXCEPTION_CONTINUE_SEARCH;
+    hos_mem_note(HOS_MEM_TOUCHED, guest & ~0xFFFFULL, 0x10000);   /* ((Triforce) the census: atomics only, no lock) */
+    return EXCEPTION_CONTINUE_EXECUTION;
 }
 
 /* A crash nothing handles: what, where (mkw.exe+offset: nx2/dllmap.py reads mkw.map the same way), and the guest
@@ -73,6 +98,11 @@ static uint64_t peek_guest(uint64_t a) {
 }
 
 static LONG WINAPI report_crash(EXCEPTION_POINTERS *info) {
+    /* (Triforce) one report for a failed run (hos_thread.c hos_ending_enter): another thread that crashes or hits a fatal
+       error while this one reports waits instead of ending the process under it, and a crash inside this thread's own
+       report, or the same crash handed here twice (report_fatal below, then the unhandled filter), is not reported again */
+    int hos_ending_enter(void);
+    if (!hos_ending_enter()) return EXCEPTION_CONTINUE_SEARCH;
     EXCEPTION_RECORD *rec = info->ExceptionRecord;
     const uint64_t rip = info->ContextRecord->Rip;
     HMODULE mod = NULL;
@@ -752,4 +782,126 @@ void hos_process_memory(uint64_t *private_bytes, uint64_t *working_set) {
     if (!fn || !fn(GetCurrentProcess(), &m, sizeof m)) memset(&m, 0, sizeof m);
     *private_bytes = m.PrivateUsage;
     *working_set = m.WorkingSetSize;
+}
+
+/* ---- (Triforce) the guest memory census's thread (host/guest_census.h has why) ---------------------------------------------
+   HOS_MEM_CENSUS=<seconds> (5 by default; 0: none): every that many seconds a "mem: census" line: what the runtime handed out
+   of the guest window by kind (the program and the system region, the heap, the address regions and the game's pages in them,
+   what lies outside them: the physical maps and first touches), what the game counts against the memory it is told it has,
+   the pages it let go that stay committed and what the give-back gave back, the process's commit and working set, and the
+   PC's commit and RAM; then a "mem: census, the renderer" line with the renderer's big holders (gpu/vk/vk_memory.cpp
+   mkwvk_memory_holders). A count of the bits of the gigabytes in use (guest_census.h GC_WALK steps over the rest) and a few
+   system calls, on a thread of its own.
+   HOS_MEM_GIVE_BACK=1 (off by default, not yet run in the game): each pass first gives back up to 256 MB of the pages the game
+   let go that stay committed, where no import holds them (hos_mem.c hos_mem_give_back); =2: only while the PC is short, its
+   commit past 85% of its limit or under 1.5 GB of RAM available */
+#include "guest_census.h"
+void hos_mem_census(GcCensus *c);                  /* (hos_mem.c) */
+int rx_memory_holders(char *out, size_t n);        /* (rx_backend.c: 0 when there is no renderer's part) */
+static int census_every = 5, census_line = 1, census_give_back;
+
+/* The process's and the PC's figures, -1 where not known */
+static void census_figures(GcCensus *c) {
+    c->proc_commit = c->proc_peak = c->working_set = c->sys_commit = c->sys_limit = c->ram_avail = c->ram_total = -1;
+#ifdef _WIN32
+    typedef struct {
+        DWORD cb, PageFaultCount;
+        SIZE_T PeakWorkingSetSize, WorkingSetSize, QuotaPeakPagedPoolUsage, QuotaPagedPoolUsage,
+            QuotaPeakNonPagedPoolUsage, QuotaNonPagedPoolUsage, PagefileUsage, PeakPagefileUsage, PrivateUsage;
+    } Counters;
+    typedef struct {   /* (PERFORMANCE_INFORMATION: pages) */
+        DWORD cb;
+        SIZE_T CommitTotal, CommitLimit, CommitPeak, PhysicalTotal, PhysicalAvailable, SystemCache, KernelTotal, KernelPaged,
+            KernelNonpaged, PageSize;
+        DWORD HandleCount, ProcessCount, ThreadCount;
+    } Perf;
+    typedef BOOL(WINAPI * ProcFn)(HANDLE, Counters *, DWORD);
+    typedef BOOL(WINAPI * PerfFn)(Perf *, DWORD);
+    static ProcFn proc;
+    static PerfFn perf;
+    static int looked;
+    if (!looked) {
+        looked = 1;
+        HMODULE k = GetModuleHandleA("kernel32.dll");
+        proc = (ProcFn)(void *)GetProcAddress(k, "K32GetProcessMemoryInfo");
+        perf = (PerfFn)(void *)GetProcAddress(k, "K32GetPerformanceInfo");
+    }
+    Counters m;
+    memset(&m, 0, sizeof m);
+    m.cb = sizeof m;
+    if (proc && proc(GetCurrentProcess(), &m, sizeof m))
+        c->proc_commit = (int64_t)m.PrivateUsage, c->proc_peak = (int64_t)m.PeakPagefileUsage, c->working_set = (int64_t)m.WorkingSetSize;
+    Perf p;
+    memset(&p, 0, sizeof p);
+    p.cb = sizeof p;
+    if (perf && perf(&p, sizeof p) && p.PageSize) {
+        c->sys_commit = (int64_t)(p.CommitTotal * p.PageSize), c->sys_limit = (int64_t)(p.CommitLimit * p.PageSize);
+        c->ram_avail = (int64_t)(p.PhysicalAvailable * p.PageSize), c->ram_total = (int64_t)(p.PhysicalTotal * p.PageSize);
+    }
+#else
+    /* (linux: the PC's committed memory and its limit, /proc/meminfo; the process's resident set, /proc/self/status) */
+    FILE *f = fopen("/proc/meminfo", "r");
+    if (f) {
+        char line[128];
+        unsigned long long kb;
+        while (fgets(line, sizeof line, f)) {
+            if (sscanf(line, "MemTotal: %llu kB", &kb) == 1) c->ram_total = (int64_t)kb << 10;
+            else if (sscanf(line, "MemAvailable: %llu kB", &kb) == 1) c->ram_avail = (int64_t)kb << 10;
+            else if (sscanf(line, "Committed_AS: %llu kB", &kb) == 1) c->sys_commit = (int64_t)kb << 10;
+            else if (sscanf(line, "CommitLimit: %llu kB", &kb) == 1) c->sys_limit = (int64_t)kb << 10;
+        }
+        fclose(f);
+    }
+    if ((f = fopen("/proc/self/status", "r"))) {
+        char line[128];
+        unsigned long long kb;
+        while (fgets(line, sizeof line, f)) {
+            if (sscanf(line, "VmRSS: %llu kB", &kb) == 1) c->working_set = (int64_t)kb << 10;
+            else if (sscanf(line, "VmHWM: %llu kB", &kb) == 1) c->proc_peak = (int64_t)kb << 10;
+        }
+        fclose(f);
+    }
+#endif
+}
+
+static DWORD WINAPI census_main(void *unused) {
+    (void)unused;
+    hos_host_thread_register_self("hos memory census");
+    for (;;) {
+        Sleep((DWORD)census_every * 1000);
+        GcCensus c;
+        memset(&c, 0, sizeof c);
+        census_figures(&c);
+        if (census_give_back > 0) {   /* (first, so that the line says what it did) */
+            const int short_now = (c.sys_limit > 0 && c.sys_commit > c.sys_limit / 100 * 85) ||
+                                  (c.ram_avail >= 0 && c.ram_avail < (1536LL << 20));
+            if (census_give_back == 1 || short_now) {
+                if (hos_mem_give_back(256ULL << 20) < 0) {
+                    hos_log("mem: the give-back is off: the renderer cannot say which pages its imports hold (no mkwvk_guest_release)");
+                    census_give_back = 0;
+                }
+            }
+        }
+        if (!census_line) continue;
+        hos_mem_census(&c);
+        char line[1024];
+        gc_line(line, sizeof line, &c);
+        hos_log("mem: %s", line);
+        char holders[1000];
+        if (rx_memory_holders(holders, sizeof holders) > 0) hos_log("mem: census, the renderer (MB): %s", holders);
+    }
+    return 0;
+}
+
+void hos_mem_census_start(void) {
+    const char *e = getenv("HOS_MEM_CENSUS"), *g = getenv("HOS_MEM_GIVE_BACK");
+    census_line = !(e && atoi(e) <= 0);
+    census_every = e && atoi(e) > 0 ? atoi(e) : 5;
+    census_give_back = g ? atoi(g) : 0;
+    if (!census_line && census_give_back <= 0) return;
+    char every[32] = "off";
+    if (census_line) snprintf(every, sizeof every, "every %d s", census_every);
+    hos_log("mem: census %s; give-back %s (HOS_MEM_CENSUS, HOS_MEM_GIVE_BACK)", every,
+            census_give_back == 1 ? "on" : census_give_back >= 2 ? "while the PC is short" : "off");
+    CloseHandle(CreateThread(NULL, 0, census_main, NULL, 0, NULL));
 }

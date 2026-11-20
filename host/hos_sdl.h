@@ -73,6 +73,11 @@ int16_t hos_sdl_pad_axis(void *pad, int axis);
 const char *hos_sdl_pad_name(void *pad);
 int32_t hos_sdl_pad_id(void *pad);
 void hos_sdl_pad_rumble(void *pad, uint16_t low, uint16_t high, uint32_t ms);
+/* ((Triforce) the motors in the triggers, an Xbox One or Series pad's: SDL_RumbleGamepadTriggers /
+   SDL_GameControllerRumbleTriggers) whether the SDL has the call; the left and the right trigger's strength for ms: 1
+   when SDL took it, 0 when the pad has none, its driver cannot reach them, or the SDL has no such call */
+int hos_sdl_pad_has_trigger_rumble(void);
+int hos_sdl_pad_rumble_triggers(void *pad, uint16_t left, uint16_t right, uint32_t ms);
 /* (HD rumble, host/pad_sdl.c) the pad's SDL_GetGamepadType / SDL_GameControllerGetType, in the loaded SDL's numbers (0
    unknown, or no such call); whether the SDL has the effect call; a raw effect sent (SDL_SendGamepadEffect /
    SDL_GameControllerSendEffect): 1 when SDL took it */

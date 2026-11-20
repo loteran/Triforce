@@ -42,7 +42,7 @@
 #include "vk_work.h"   // (after the others: counts the commands that do GPU work, for full_barrier)
 
 namespace mkwvk {
-VkPipelineCache shared_pipeline_cache();   // (vk_draw.cpp: the pipeline cache kept across runs)
+VkResult shared_cache_compute(const VkComputePipelineCreateInfo* ci, VkPipeline* out);   // (vk_draw.cpp: with the pipeline cache kept across runs)
 }
 
 namespace mkwvk::fsr3 {
@@ -305,7 +305,7 @@ bool make_pipeline(Pipeline& p, const PassInfo& info) {
     ci.layout = p.layout;
     // (hookshot, a stutter: through the pipeline cache kept across runs. Made with none, FSR 3.1's dozen passes were compiled
     // again at every start, inside the first upscaled frame: a 2.7 s first frame of play against 1.0 s without FSR, 2026-11-10)
-    const VkResult made = vkCreateComputePipelines(dev.device, shared_pipeline_cache(), 1, &ci, nullptr, &p.pipeline);
+    const VkResult made = shared_cache_compute(&ci, &p.pipeline);
     vkDestroyShaderModule(dev.device, m, nullptr);
     if (made != VK_SUCCESS) {
         logf("vk: fsr3: the %s pass pipeline was not made (%d)", info.name, (int)made);
@@ -735,7 +735,7 @@ bool make_out_pipeline() {
     ci.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT, m, "main",
                 nullptr};
     ci.layout = o.layout;
-    const VkResult r = vkCreateComputePipelines(dev.device, shared_pipeline_cache(), 1, &ci, nullptr, &o.pipe);   // (kept across runs, above)
+    const VkResult r = shared_cache_compute(&ci, &o.pipe);   // (kept across runs, above)
     vkDestroyShaderModule(dev.device, m, nullptr);
     if (r != VK_SUCCESS) return o.pipe = VK_NULL_HANDLE, false;
     VkSamplerCreateInfo si{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
@@ -760,15 +760,22 @@ bool fail(const char* why) {   // (the network runs: why, when it changes and ev
 bool fsr3_requested() {
     static const int env = env_switch("RX_VK_FSR");
     if (env == 0) return false;
-    // (the Upscaler row's FSR 3.1, upscaler_rows.h, read each time: the row changes it while the game runs. RX_VK_DLSS=1 / 2
-    // or RX_VK_FSR4=1 / 2 goes over the row, its FSR 3.1 too: vk_temporal.cpp's chain draws then)
-    return env > 0 || (opts.dlss == upscaler_rows::FSR3 && !temporal_env_chosen());
+    // (the Upscaler row's FSR 3.1 or its Native AA, upscaler_rows.h, read each time: the row changes it while the game runs.
+    // RX_VK_DLSS=1 / 2 or RX_VK_FSR4=1 / 2 goes over the row, its FSR 3.1 too: vk_temporal.cpp's chain draws then)
+    return env > 0 || (upscaler_rows::is_fsr3(opts.dlss) && !temporal_env_chosen());
 }
 
 bool fsr3_wanted() {
     // (AMD's own library draws FSR 3.1 through the temporal chain when it is there and works (vk_ffx3.cpp); these passes are the
     // fallback, and what runs without it)
     return fsr3_requested() && !ffx3_usable() && fsr3::supported();
+}
+
+bool fsr3_native() {
+    static const int env = env_switch("RX_VK_FSR");
+    // (the switch decides the size too when it turns FSR 3.1 on: 1 scaled, 2 and up its Native AA, as RX_VK_DLSS and
+    // RX_VK_FSR4 count. (linux fork) Whichever draws it: AMD's library through the temporal chain, or the passes here)
+    return (fsr3_wanted() || (fsr3_requested() && ffx3_usable())) && (env > 0 ? env >= 2 : opts.dlss == upscaler_rows::FSR3_AA);
 }
 
 bool fsr3_pre_wanted() { return fsr3_wanted() && fsr3fi::frames_wanted() == 0; }
@@ -821,7 +828,10 @@ bool fsr3_upscale(VkCommandBuffer cmd, uint64_t key, bool known, Texture* in, Vk
         return temporal_pre_dispatch(cmd, in, in_view, out, out_view, out_level, true);
     // (another network of the upscale's shape, as temporal_upscale takes them: only the scene into the picture. The gameplay
     // networks sample the scene's B10G11R11 colour and write the B10G11R11 picture)
-    if (!known && (in->format != VK_FORMAT_B10G11R11_UFLOAT_PACK32 || out->format != VK_FORMAT_B10G11R11_UFLOAT_PACK32 ||
+    // ((Triforce, 11-16) in the run's scene format: an RGBA16F run's (RenoDX's HDR) networks sample the RGBA16F scene and write an
+    // RGBA16F picture, as the owner's log showed ("2208x932x1/97 4416x1864x1/97"); with B10G11R11 alone frame generation's
+    // inputs were never made there and DLSS frame generation stayed paused)
+    if (!known && (!temporal_scene_format(in->format) || out->format != in->format ||
                    (out->width >> out_level) <= in->width || !fsr3_inputs::is_scene(in)))
         return false;
     // (it did not: the point learnt for the next frame)

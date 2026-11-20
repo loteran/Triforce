@@ -11,6 +11,7 @@
 #include "vk_loader.h"
 #include "vk_api.h"
 #include "vk_vendor.h"
+#include "write_gen.h"   // (WriteGen: a page write generation, 64 bits)
 
 #if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
 #include <intrin.h>
@@ -29,6 +30,11 @@ namespace mkwvk {
 extern std::vector<std::string> gpu_device_names;
 extern const MkwVkHost* host;
 void logf(const char* fmt, ...);
+// (Triforce, lab) RX_VK_FT=<present>, RX_VK_FT_N=<n>: the steps the renderer takes in those frames, by the clock of the host,
+// in the plain mode too (vk_replay.cpp; the other half is HOS_FT, nvn_native.c; reader perf/night/ft.py)
+bool vk_ft_on();
+void recorder_auto(bool on);   // ((Triforce) vk_replay.cpp: the recorder thread's default, vk_recorder.h g_auto_thread)
+void vk_ft(const char* fmt, ...);
 void queue_flush_locked();   // (vk_replay.cpp, RX_VK_BATCH: held submits out; dev.present_mu held)
 void queue_flush();          // (the same, taking dev.present_mu)
 // (hookshot) held submits out, then vkDeviceWaitIdle with the present queue's lock taken too (dev.present_mu held): the device's
@@ -94,6 +100,16 @@ struct Device {
 };
 extern Device dev;
 
+/// (hookshot) Where a storage buffer binding starts: the address rounded down to this, the shaders' offsets counted from there
+/// (vk_shader.cpp make_profile / host_info, the translator's ssbo_align_mask; vk_draw.cpp's descriptor writer). At least 16
+/// bytes, whatever the device allows: the translator reads 8- and 16-byte accesses through vector views (offset >> 3, >> 4),
+/// exact only while a binding starts on a 16-byte boundary. At AMD's 4 bytes an aligned access could start at any word of the
+/// binding and the view read the vector before it: OoT's light colours shifted (green lighting, cyan sky). Found for Lichii
+/// (zortos293/Lichii#295, Fritchii 57ed438cd, from Matt Artist and sharkiix); NVIDIA's own alignment is 16 already
+inline uint64_t storage_binding_align() {
+    return dev.props.limits.minStorageBufferOffsetAlignment > 16 ? dev.props.limits.minStorageBufferOffsetAlignment : 16;
+}
+
 /// A range of guest memory as the GPU sees it: a buffer (an imported pool), the offset in it, and its device address
 struct BufferRef {
     VkBuffer buffer = VK_NULL_HANDLE;
@@ -104,6 +120,20 @@ struct BufferRef {
     }
 };
 bool memory_init();                                   // vk_memory.cpp
+bool pools_mirrored();   // ((Triforce, upstream #2464) vk_memory.cpp mirror_on: the buffer pools have VRAM mirrors)
+// ((Triforce) The PC's RAM and what the process holds (vk_memory.cpp, mem_parts.h). memory_ram_watch: once a present (it asks
+// every 60 presents, and every 600 has the memory line written on a thread of its own); the answers are those of its last look)
+void memory_ram_watch(uint64_t presents);
+bool memory_ram_low();                       // (under 3 GB available, or a tenth of a PC of more than 30 GB)
+bool memory_ram_short();                     // (under 1.5 GB available at two looks in a row)
+bool memory_ram_fits(uint64_t bytes);        // (a copy of that many bytes fits in the RAM available, with 2 GB to spare)
+void memory_process(uint64_t* working_set, uint64_t* private_bytes);   // (the process's, asked now; 0 when not known)
+void pcache_let_go(uint64_t avail);          // (vk_draw.cpp: the pipeline cache let go for the RAM, once; pcache_gate.h)
+// (vk_draw.cpp) the cache as last read or saved (-1: let go), the graphics pipelines kept, the stage libraries kept, how many
+// of the pipelines a draw has looked up, and how many no draw used were given back for the RAM
+void pipeline_parts(int64_t* cache_bytes, int64_t* pipelines_kept, int64_t* libraries_kept, int64_t* drawn, int64_t* released);
+void pipelines_release_tick(uint64_t presents);   // (vk_draw.cpp, the thread presenting with replay_mu held: pipe_release.h)
+int64_t vma_system_blocks();                 // (vk_vma.cpp: the allocator's blocks in system memory, bytes)
 void memory_cpu_owned(uint64_t guest, uint64_t size);   // (hookshot: words the replay writes on the CPU, left out of write-backs)
 // (hookshot) The replay's own CPU writes of guest memory, by GPU address: every one goes through guest_cpu_write (or, for a
 // write made in pieces, host->gpu_write and then guest_cpu_wrote over the whole range), so that the write-back diff's shadows
@@ -112,7 +142,8 @@ int guest_cpu_write(uint64_t gpu, const void* src, uint64_t n);
 void guest_cpu_wrote(uint64_t gpu, uint64_t n);
 void memory_table_begin();                         // (hookshot: a recording's page table changes held back for its upload commands)
 bool memory_table_flush();
-uint64_t memory_guest_pages();                        // (hookshot: the device address of guest memory's page table, 0: none)
+void memory_table_segments_end();                  // (Triforce: a parallel replay's page table changes once more, in the order they were made)
+uint64_t memory_guest_pages();                       // (hookshot: the device address of guest memory's page table, 0: none)
 void memory_sync();                                   // (at each submit: pools the game made or let go)
 extern std::atomic<int64_t> memsync_lock_wait_ns;     // (hookshot, diagnostics: time memory_sync waited for its two locks; the slow-submit line)
 extern std::atomic<int64_t> memsync_part_ns[3];       // (hookshot, diagnostics: submit_memory_work's memory_sync, memory_take_capture, memory_collect_written)
@@ -134,6 +165,13 @@ bool probe_serial();
 void probe_dump_all(const char* why);
 void probe_log(uint64_t frame);
 void memory_end_submission(VkCommandBuffer cmd);
+// (Triforce) The lazy write-back (vk_memory.cpp, the Debug tab's row; each returns at once with it off): a recording went
+// onto the queue (submit_recording, dev.present_mu held); guest memory [p, p + n) is about to be handed to the kernel or
+// to have its pages' state changed (host/rx_backend.c hos_guest_io_begin, import_pool), and that call is over (held: what
+// the first returned)
+void memory_lazy_submitted();
+bool memory_lazy_io_begin(const void* p, uint64_t n);
+void memory_lazy_io_end(bool held);
 /// The game made a memory pool (gpu address, bytes): imported in the background, before it is used
 /// RX_VK_CHECKPOINTS: the draws the GPU reached, logged once the device is lost (vk_draw.cpp)
 void checkpoints_report();
@@ -143,8 +181,14 @@ void checkpoints_report();
 void buffer_markers_init();
 void coopmat_init();   // vk_coopmat.cpp (once the device is made)
 /// A marker of another kind of GPU work (m: mirror sync, b: write-back, u: texture upload, g: GPU unswizzle; key: its
-/// pool or texture), RX_VK_CHECKPOINTS
+/// pool or texture), RX_VK_CHECKPOINTS. (Triforce) And the boundaries between them (checkpoint_kinds.h): w the write-back diff
+/// pass, r and z a recording begun and ended, v its uploads begun, p, M and P the present's blit begun, its menu, its end
 void checkpoint_mark(VkCommandBuffer cmd, uint64_t key, char kind);
+/// (Triforce) The device lost's report: the queue's timeline and the replay's ways (vk_replay.cpp), the memory work under way and
+/// the mirrors' piece binds the submits wait for (vk_memory.cpp). Read without their locks: the thread that lost the device may
+/// hold them
+void replay_lost_report();
+void memory_lost_report();
 
 /// Parallel replay (vk_replay.cpp, RX_VK_PARALLEL): while segments of a submission are recorded on several threads,
 /// what they share (textures and their uploads, programs, pipelines, samplers, pools and memory stamps) is used under
@@ -180,7 +224,21 @@ void memory_stats(int64_t* mirrors, uint64_t* mirror_mb, int64_t* sync_bytes, in
 void memory_collect_written();
 /// RX_VK_CAPTURE (on with the mirrors; =0 off): at a submit, on the submitting thread, the pages the CPU wrote since the
 /// last one, and a copy of them as they are then; the replay stamps them and fills the mirrors from that copy
-void memory_capture_submit();
+/// (Triforce) behind: the submitting thread replays this submission before it goes back to the game (vk_replay.cpp submit_q,
+/// RX_VK_ASYNC off), so the capture's copies may be left to the copy helpers while it replays (capture_behind.h,
+/// RX_VK_CAPTURE_BEHIND); memory_capture_copies_done before it returns
+bool memory_capture_submit(bool behind = false);   // (true: a capture was queued for the replay to take)
+/// (Triforce) The copies of a capture left to the helpers, all made and flushed (they are, before a recording is submitted:
+/// memory_mirror_binds_flush). Nothing to do when none are
+void memory_capture_copies_done();
+/// (Triforce) The submit-time captures so far, for the 120-present line and the stall line (vk_replay.cpp status_tick)
+struct MemoryCaptureStats {
+    int64_t captures = 0, ns = 0, scan_ns = 0, copy_ns = 0;   // (capture_make: on the thread that submits; its scan; its copies)
+    int64_t wait_ns = 0;      // (the copies behind made or waited for by the threads that replay, and before a submitting thread returns)
+    int64_t pages = 0, behind = 0;   // (pages copied, of them left to the helpers)
+    int64_t parts_helper = 0, parts_reader = 0, parts_finish = 0, waited = 0, failed = 0;
+};
+void memory_capture_stats(MemoryCaptureStats* s);
 /// The replay of the next submit: its capture (false: none, the pages are collected now as before)
 bool memory_take_capture(uint64_t value, uint64_t completed);
 bool memory_capture_now(uint64_t value, uint64_t completed);   // (hookshot: made and taken at once)
@@ -195,7 +253,7 @@ bool memory_has_shadow(uint64_t guest, uint64_t n);
 /// there (the game writes several submits ahead of the replay), the rest from guest memory. False when unreadable
 bool memory_read_as_submitted(uint64_t gpu, void* dst, uint64_t n);
 uint64_t memory_capture_view();          // (bumped when a capture is published or any page is stamped)
-uint32_t memory_page_stamp(uint64_t gpu); // (that address's page only)
+WriteGen memory_page_stamp(uint64_t gpu); // (that address's page only)
 uint64_t gpu_pool_end(uint64_t gpu);   // (hookshot) where the memory pool holding that address ends, 0: in none (vk_memory.cpp)
 uint64_t gpu_pool_start(uint64_t gpu); // (EvilOOT) and where it begins
 bool create_buffer_cached(uint64_t size, VkBufferUsageFlags usage, VkBuffer& buffer, VmaAllocation& allocation,
@@ -210,6 +268,12 @@ void memory_protect_gpu(uint64_t guest, uint64_t size);  // (RX_VK_PROTECT_BARE=
 bool ub_read(uint64_t addr, void* dst, uint64_t n);
 /// [guest, guest + n) as of the submit being replayed: live itself, or scratch holding it with the kept pages over it
 const uint8_t* memory_as_submitted(uint64_t guest, const uint8_t* live, uint64_t n, std::vector<uint8_t>& scratch);
+/// (Triforce) the same bytes given to fn part by part, a part within one 4 KB page, with no copy of the whole (upload_same.h)
+void memory_visit_as_submitted(uint64_t guest, const uint8_t* live, uint64_t n,
+                               void (*fn)(void* ctx, uint64_t off, const uint8_t* bytes, uint64_t len), void* ctx);
+/// (Triforce) and those parts' hashes (upload_same.h content_hash), a kept page's kept with its copy until other bytes are copied in
+void memory_hash_as_submitted(uint64_t guest, const uint8_t* live, uint64_t n,
+                              void (*fn)(void* ctx, uint64_t off, uint64_t len, uint64_t hash), void* ctx);
 void memory_drop_shadow(uint64_t guest, uint64_t size);   // (a write the capture did not take: the copies go)
 /// (EvilBoyce) the newest submission value whose write-back reaches into [guest, guest + size) (0: none ever); *ever set
 /// when any write-back ever did
@@ -226,13 +290,15 @@ void memory_note_gpu_write(uint64_t gpu, uint64_t size);
 /// (vk_replay.cpp) The GPU's progress on the recordings' timeline, and a wait for it to reach v
 uint64_t vk_timeline_completed();
 void vk_timeline_wait(uint64_t v);
-uint32_t memory_generation();
-uintptr_t memory_stamp_who(uint64_t guest, uint32_t* gen, uintptr_t* anchor);   // (RX_VK_STAMP_SRC: who wrote that page last)
+/// ((Triforce, wp20) of this thread's last vk_timeline_wait, the part after the writer's recording was done (ns): wb_rec_wait.h)
+int64_t vk_timeline_wait_held_last();
+WriteGen memory_generation();
+uintptr_t memory_stamp_who(uint64_t guest, WriteGen* gen, uintptr_t* anchor);   // (RX_VK_STAMP_SRC: who wrote that page last)
 /// 1: a page of [guest, guest + size) was written after generation gen; 0: none was
-bool memory_written_since(uint64_t guest, uint64_t size, uint32_t gen);
+bool memory_written_since(uint64_t guest, uint64_t size, WriteGen gen);
 void memory_stamp(uint64_t guest, uint64_t size);   // a write the watch does not see (GPU writes, host writes)
 /// The page runs of [guest, guest + size) written after gen, as byte ranges from guest (appended to out)
-void memory_written_runs(uint64_t guest, uint64_t size, uint32_t gen, std::vector<std::pair<uint64_t, uint64_t>>& out, bool tex = false);
+void memory_written_runs(uint64_t guest, uint64_t size, WriteGen gen, std::vector<std::pair<uint64_t, uint64_t>>& out, bool tex = false);
 uint64_t memory_pages_collected();                  // (statistics)
 
 /// An NVN format as Vulkan stores it (vk_formats.cpp): ASTC is decoded to RGBA8, block_w x block_h
@@ -321,6 +387,7 @@ bool prepare_is_update();
 void prepare_background();
 void state_list_run();                        // (an update: the state list's pipelines noted before precompile_run)
 void predict_background();   // (Triforce: the predicted pipelines predict_run did not get to, built behind the game)
+void frame_shown_note(int draws);   // (Triforce, 11-14: a frame was shown with this many draws; the builder rests in play)
 void predict_plan_ensure();  // (Triforce: its plan, made before the precompile when an older build prepared this install)
 void predict_run(void (*progress)(size_t done, size_t total));   // (after a prepare_run that prepared: the notes' predictions)
 /// (hookshot) The window was closed while the shaders were prepared: prepare_run and precompile_run take nothing more and return,

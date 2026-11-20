@@ -11,7 +11,8 @@ enum Part {
     kTabPrev,   // the tab strip's left end
     kTab,       // a tab: index
     kTabNext,   // its right end
-    kRow,       // an option's row: index (the tab's own), side -1 the value's left half, 1 its right half, 0 the name
+    kRow,       // an option's row: index (the tab's own), side -1 the value's left half, 1 its right half, 0 the name;
+                // (Triforce) halves: a toggle's two halves (On | Off), side by where they meet
     kSlider,    // a slider row's track: index, permille 0 to 1000 along it
     kCtlOption, // the Controls page: one of its own rows above the grid (index), side -1 the value's left half, 1 its right
                 // half, 0 the name
@@ -19,12 +20,15 @@ enum Part {
     kCtlCell,   // a binding: index the row, side 0 the gamepad's, 1 the keyboard's
     kListLine,  // a list (the teleport list, the inventory): a line as shown (index, 0 the top one), side -1 the left half, 1 the right half
     kButton,    // the restart question's buttons: index 0 Later, 1 Restart now
+    kSearch,    // ((Triforce) the Mods screen's search bar)
+    kKey,       // ((Triforce) a key of its on-screen keyboard: index row * 10 + column, the wide keys' row 4 by their first column)
 };
 struct Hit {
     Part part = kNone;
     int index = -1;
     int side = 0;
     int permille = 0;
+    bool halves = false;   // ((Triforce) side is which of a toggle's halves: Map::Box::vm)
 };
 
 /// A point in the window's pixels (the cursor's, in a window win_w x win_h pixels) in the window's image (img_w x img_h:
@@ -56,6 +60,7 @@ struct Map {
         float v0, v1;   // (a value's span, for its halves: side -1 left of the middle, 1 right; v0 >= v1: none)
         float t0, t1;   // (a slider's track: kSlider along it; t0 >= t1: none)
         int side;       // (a fixed side: the Controls page's cells)
+        float vm;       // ((Triforce) where a toggle's halves meet, v0 < vm < v1: side by it, not by the middle; else none)
     };
     static constexpr int kMax = 96;
     static constexpr float kGrab = 6;   // (a click this far past either end of a track still takes the end, in pixels)
@@ -65,8 +70,8 @@ struct Map {
 
     void clear(float x0, float y0, float x1, float y1) { n = 0, ax0 = x0, ay0 = y0, ax1 = x1, ay1 = y1; }
     void add(float x0, float y0, float x1, float y1, Part part, int index, float v0 = 0, float v1 = 0, float t0 = 0, float t1 = 0,
-             int side = 0) {
-        if (n < kMax) box[n++] = {x0, y0, x1, y1, part, index, v0, v1, t0, t1, side};
+             int side = 0, float vm = 0) {
+        if (n < kMax) box[n++] = {x0, y0, x1, y1, part, index, v0, v1, t0, t1, side, vm};
     }
     Hit at(float x, float y) const {
         Hit hit;
@@ -80,7 +85,10 @@ struct Map {
                 hit.permille = permille(b, x);
                 return hit;
             }
-            if (b.v0 < b.v1 && x >= b.v0 && x < b.v1) hit.side = x < (b.v0 + b.v1) / 2 ? -1 : 1;
+            if (b.v0 < b.v1 && x >= b.v0 && x < b.v1) {
+                hit.halves = b.vm > b.v0 && b.vm < b.v1;
+                hit.side = x < (hit.halves ? b.vm : (b.v0 + b.v1) / 2) ? -1 : 1;
+            }
             return hit;
         }
         return hit;

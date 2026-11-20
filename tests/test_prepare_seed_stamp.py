@@ -55,6 +55,7 @@ def main():
 #include <filesystem>
 #include <string>
 #include <vector>
+#include "file_whole.h"
 """ + helpers + r"""
 int fails = 0;
 std::string dir, rec, seed;
@@ -220,7 +221,7 @@ int main(int argc, char** argv) {
     with tempfile.TemporaryDirectory(prefix="seed-stamp-") as tmp:
         c, exe = Path(tmp) / "fixture.cpp", Path(tmp) / ("fixture.exe" if os.name == "nt" else "fixture")
         c.write_text(cpp, encoding="utf-8")
-        subprocess.run([a.cxx, "-std=c++20", "-Wall", "-O1", str(c), "-o", str(exe)], check=True)
+        subprocess.run([a.cxx, "-std=c++20", "-Wall", "-O1", "-I" + str(ROOT / "gpu" / "vk"), str(c), "-o", str(exe)], check=True)
         work = Path(tmp) / "game"
         work.mkdir()
         got = subprocess.run([str(exe), str(work)], capture_output=True, text=True)

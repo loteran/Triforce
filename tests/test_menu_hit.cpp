@@ -54,6 +54,19 @@ int main() {
     CHECK("a drag on a row without a track", m.drag(720, 3) == -1);
     CHECK("the slider's value", slider_value(m.drag(720, 7), 0, 100, 10) == 30 && slider_value(1000, 0, 100, 10) == 100);
     CHECK("the knob's place", slider_permille(60, 0, 100) == 600 && slider_permille(500, 10, 300) == 1000);
+    CHECK("a value's halves by the middle: no toggle's", !m.at(650, 110 + 48 * 3).halves);
+
+    // ---- (Triforce) a toggle's value, On | Off: its halves meet at 0.632 of it (vk_menu.cpp halves_meet), not the middle ----
+    m.clear(0, 0, 1920, 1080);
+    m.add(100, 100, 1000, 140, kRow, 0, 600, 1000, 0, 0, 0, 852.8f);
+    h = m.at(700, 120);
+    CHECK("a toggle's left half (On)", h.part == kRow && h.side == -1 && h.halves);
+    h = m.at(840, 120);
+    CHECK("past the middle, short of where they meet: still On", h.side == -1 && h.halves);
+    h = m.at(860, 120);
+    CHECK("past where they meet: Off", h.side == 1 && h.halves);
+    h = m.at(300, 120);
+    CHECK("a toggle's name: neither half", h.side == 0 && !h.halves);
 
     // ---- the Controls page: a name and two cells (gamepad, keyboard) a row, Reset to defaults at the end ----
     m.clear(0, 0, 1920, 1080);

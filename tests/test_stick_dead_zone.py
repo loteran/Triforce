@@ -1,11 +1,13 @@
 """The sticks' dead zone is the player's: the Insert menu's "Stick dead zone" row (stick_dead_zone in
-hookshot_options.ini), issue 752.
+triforce_options.ini), issue 752.
 
 Both pad paths, SDL (host/pad_sdl.c) and XInput (host/nn_hid.c), cut each axis at XInput's 7849 (~24%), a lot on a
 worn or a precise stick. They now cut through one function, host/nn_hid.c's hos_stick_axis, whose threshold is the
 row's (option 11): Default (7849, the same output as before for every input), 5%, 10%, 15%, 20%, 30%.
 The function, pad_sdl.c's stick_value and the menu's row, label and ini parsing are compiled alone (gcc, g++) and
-checked over every int16 input.
+checked over every int16 input. Both paths now cut through hos_stick_axis_own, which is hos_stick_axis for a stick with
+no dead zone of its own (the Left and Right stick dead zone rows at "As Stick dead zone", their default): checked here
+with none; tests/test_stick_own_zone.py has the sticks' own.
 
 python -I -B tests/test_stick_dead_zone.py [--cc gcc] [--cxx g++]
 """
@@ -63,14 +65,17 @@ def main():
     check(not re.search(r"HOS_OPT_\w+ = 11\b", api), "a HOS_OPT_ enum also takes option 11")
     check("int32_t hos_stick_axis(" in hid, "nn_hid.c has no hos_stick_axis")
     pads = block(hid, "static void pads_read(")
-    check("rx_option(11, 0)" in pads and "hos_stick_axis(thumb[i], zone)" in pads,
-          "XInput's sticks do not go through hos_stick_axis with the row's zone (option 11)")
+    check("rx_option(11, 0)" in pads and "hos_stick_axis_own(thumb[i], zone, own[i >> 1])" in pads,
+          "XInput's sticks do not go through hos_stick_axis_own with the row's zone (option 11)")
     check("7849" not in pads, "XInput's sticks still cut at 7849 themselves")
     poll = block(sdl, "static void pads_poll")
     check("rx_option(11, 0)" in poll, "SDL's sticks do not read the row (option 11)")
     check(poll.count("stick_value(") == 4, "SDL's four axes do not all go through stick_value")
     value = block(sdl, "static int32_t stick_value(")
-    check("hos_stick_axis(" in value and "7849" not in value, "pad_sdl.c's stick_value cuts on its own")
+    check("hos_stick_axis_own(" in value and "7849" not in value, "pad_sdl.c's stick_value cuts on its own")
+    own = block(hid, "int32_t hos_stick_axis_own(")
+    check("if (own < 0) return hos_stick_axis(v, zone);" in own,
+          "a stick with no dead zone of its own is no longer cut by hos_stick_axis and the row's zone alone")
     option = replay[replay.index("t.option = "):]
     option = option[:option.index("};") + 2]
     check("if (id == 11) return opts.stick_dead_zone;" in option, "the host cannot see the menu's row (option 11)")
@@ -80,14 +85,14 @@ def main():
     check(row is not None, "the Insert menu has no Stick dead zone row (0 to 5)")
     check(row.group(0).rstrip().endswith("nullptr, false, true},"),
           "the row is not preset_exempt: changing the dead zone would set the quality preset to Custom")
-    check("| | Stick dead zone | Default (24%), 5%, 10%, 15%, 20%, 30% | Default (24%) |" in readme,
-          "readme.md's option table has no Stick dead zone row")
+    check("\n| Stick dead zone | Default (24%), 5%, 10%, 15%, 20%, 30%" in readme,   # (the table is Setting | Options now)
+          "readme.md's settings table has no Stick dead zone row")
 
     c = r'''#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #define CHECK(x) do { if (!(x)) { fprintf(stderr, "FAIL:%d %s\n", __LINE__, #x); exit(1); } } while (0)
-''' + block(hid, "int32_t hos_stick_axis(") + "\n" + block(sdl, "static int32_t stick_value(") + r'''
+''' + block(hid, "int32_t hos_stick_axis(") + "\n" + own + "\n" + block(sdl, "static int32_t stick_value(") + r'''
 /* (before issue 752: nn_hid.c's XInput cut, and pad_sdl.c's, which flips first) */
 static int32_t old_xinput(int16_t t) { const int a = t < -32767 ? -32767 : t; return (a > 7849 || a < -7849) ? a : 0; }
 static int32_t old_sdl(int16_t v, int flip) {
@@ -102,11 +107,13 @@ int main(void) {
         const int16_t v = (int16_t)i;
         CHECK(hos_stick_axis(v, 0) == old_xinput(v));
         for (int k = 0; k < 4; k++) CHECK(hos_stick_axis(v, bad[k]) == old_xinput(v));   /* (out of range: Default) */
-        CHECK(stick_value(v, 0, 0) == old_sdl(v, 0) && stick_value(v, 1, 0) == old_sdl(v, 1));
+        /* (-1: a stick with no dead zone of its own, the Left and Right stick dead zone rows' default) */
+        CHECK(stick_value(v, 0, 0, -1) == old_sdl(v, 0) && stick_value(v, 1, 0, -1) == old_sdl(v, 1));
+        CHECK(hos_stick_axis_own(v, 0, -1) == old_xinput(v));
         for (int z = 0; z < 6; z++) {
             const int32_t a = i < -32767 ? -32767 : i, want = a > t[z] || a < -t[z] ? a : 0;
-            CHECK(hos_stick_axis(v, z) == want);
-            CHECK(stick_value(v, 0, z) == want && stick_value(v, 1, z) == -want);
+            CHECK(hos_stick_axis(v, z) == want && hos_stick_axis_own(v, z, -1) == want);
+            CHECK(stick_value(v, 0, z, -1) == want && stick_value(v, 1, z, -1) == -want);
         }
     }
     for (int z = 0; z < 6; z++)
@@ -127,10 +134,10 @@ int main(void) {
 #include <cstring>
 #define CHECK(x) do { if (!(x)) { fprintf(stderr, "FAIL:%d %s\n", __LINE__, #x); exit(1); } } while (0)
 enum MenuTab { TAB_CONTROLS };
-struct Options { int output_res = 0, resolution = 0, fps_cap = 0, upscale = 0, dlss = 0, stick_dead_zone = 0; } opts;
+struct Options { int output_res = 0, resolution = 0, fps_cap = 0, upscale = 0, dlss = 0, stick_dead_zone = 0, language = 0; } opts;
 static int output_choice(int v) { return v; }
 ''' + block(menu, "struct Row {") + ";\n" + block(menu, "const char* tx_stick_dead_zone(") + "\n" + \
-        "Row rows[] = {" + row.group(0) + "};\n" + block(menu, "const char* ini_key(") + r'''
+        "Row rows[] = {" + row.group(0) + "};\n" + block(menu, "bool ini_row(") + "\n" + block(menu, "const char* ini_key(") + r'''
 static int parse(const char* text) {
     opts.stick_dead_zone = 0;
     char line[80];

@@ -462,11 +462,26 @@ void a64_svc(Ctx *c, uint32_t imm) {
         c->x[0] = R_OK;
         return;
     }
-    case 0x2C:   /* MapPhysicalMemory(address, size) */
-        hos_commit(c->x[0], c->x[1]);
+    case 0x2C: { /* MapPhysicalMemory(address, size) */
+        const int committed = hos_commit(c->x[0], c->x[1]);
         if (hos_trace) hos_log("MapPhysicalMemory(%#llx, %#llx)", (unsigned long long)c->x[0], (unsigned long long)c->x[1]);
+        if (committed > 0) hos_mem_note(HOS_MEM_MAPPED, c->x[0], c->x[1]);   /* (Triforce: the census, the game's physical maps) */
+        /* ((Triforce) Windows refused the commit (the PC's commit is spent; hos_commit logged it): Horizon's LimitReached, which
+           the SDK turns into its out-of-memory result, rather than success and a crash at the first touch of a page that is
+           not there. HOS_MEM_MAP_RESULT=0: success, as before) */
+        static int refuse = -1;
+        if (refuse < 0) refuse = !(getenv("HOS_MEM_MAP_RESULT") && atoi(getenv("HOS_MEM_MAP_RESULT")) == 0);
+        if (committed == 0 && refuse) {
+            static volatile LONG told;
+            if (InterlockedIncrement(&told) <= 16)
+                hos_log("mem: MapPhysicalMemory(%#llx, %#llx): the commit failed: LimitReached (%#x) to the game", (unsigned long long)c->x[0],
+                        (unsigned long long)c->x[1], 0x10801u);
+            c->x[0] = 0x10801;   /* (svc::ResultLimitReached) */
+            return;
+        }
         c->x[0] = R_OK;
         return;
+    }
     case 0x2D:   /* UnmapPhysicalMemory(address, size): the pages read as zero if mapped again */
         if (!hos_guest_range(c->x[0], c->x[1])) {   /* (hookshot: guest pages only) */
             c->x[0] = 0xCA01;
@@ -474,8 +489,12 @@ void a64_svc(Ctx *c, uint32_t imm) {
         }
         {   /* (pages under a Vulkan import stay committed, zeroed: hos_mem.c FreeMemoryPages) */
             extern int rx_guest_imported(uint64_t lo, uint64_t hi);
-            if (rx_guest_imported(c->x[0], c->x[0] + c->x[1])) memset(GP(c->x[0]), 0, (size_t)c->x[1]);
-            else VirtualFree(GP(c->x[0]), (SIZE_T)c->x[1], MEM_DECOMMIT);
+            const int io = hos_guest_io_begin(GP(c->x[0]), c->x[1]);   /* (Triforce: the lazy write-back's pages first: rx_backend.c) */
+            /* ((Triforce) the census: zeroed pages stay committed, kept for the give-back once no import holds them) */
+            if (rx_guest_imported(c->x[0], c->x[0] + c->x[1]))
+                memset(GP(c->x[0]), 0, (size_t)c->x[1]), hos_mem_note(HOS_MEM_ZEROED, c->x[0], c->x[1]);
+            else VirtualFree(GP(c->x[0]), (SIZE_T)c->x[1], MEM_DECOMMIT), hos_mem_note(HOS_MEM_DECOMMITTED, c->x[0], c->x[1]);
+            hos_guest_io_end(io);
         }
         c->x[0] = R_OK;
         return;

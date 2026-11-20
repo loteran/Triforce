@@ -114,7 +114,14 @@ bool texture_of(int h, nvn_tex *t, nvn_view *v, bool *hv) {
     *hv = override_view;
     return true;
 }
-Texture *texture_get(const nvn_tex *t, bool) { return t->gpu == 10 ? &src : &dst; }
+// (the recording lock of a parallel replay: upscale_stub holds it around the texture cache and the typed helper, and never
+// across the temporal upscaler, which takes its own lock first. The stand-ins below say so each time they are called)
+static int lock_depth;
+struct ParLock {
+    ParLock() { lock_depth++; }
+    ~ParLock() { lock_depth--; }
+};
+Texture *texture_get(const nvn_tex *t, bool) { assert(lock_depth > 0); return t->gpu == 10 ? &src : &dst; }
 void vkGetPhysicalDeviceFormatProperties(VkPhysicalDevice, VkFormat format, VkFormatProperties *p) {
     p->optimalTilingFeatures = VK_FORMAT_FEATURE_BLIT_SRC_BIT | VK_FORMAT_FEATURE_BLIT_DST_BIT |
                                VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT |
@@ -130,6 +137,7 @@ void end_pass(VkCommandBuffer) {}
 // (the temporal upscaler, off here: upscale_stub offers it the frame first, vk_draw.cpp temporal_rejected_network)
 bool temporal_wanted() { return false; }
 static bool temporal_rejected_network(VkCommandBuffer, uint64_t, Texture *, const nvn_tex *, Texture *, const nvn_tex *) {
+    assert(lock_depth == 0);
     return false;
 }
 void full_barrier(VkCommandBuffer) {}
@@ -141,7 +149,7 @@ void logf(const char *format, ...) {
         gameplay_warnings++;
 }
 void texture_written(Texture *t) {
-    assert(t == &dst);
+    assert(t == &dst && lock_depth > 0);
     writes++;
 }
 void dump_image(VkCommandBuffer, Texture *, unsigned, unsigned, const char *) {}
@@ -155,7 +163,7 @@ bool gameplay_network(uint64_t key) {
 enum class ViewUse { Sample, Storage };
 VkImageView texture_view(Texture *t, const nvn_tex *, const nvn_view *v, VkImageViewType type,
                          ViewUse use, VkFormat *f, VkFormat forced = VK_FORMAT_UNDEFINED) {
-    assert(!v && type == VK_IMAGE_VIEW_TYPE_2D);
+    assert(!v && type == VK_IMAGE_VIEW_TYPE_2D && lock_depth > 0);
     views++;
     if (t == &src) {
         assert(use == ViewUse::Sample && forced == VK_FORMAT_UNDEFINED);
@@ -169,7 +177,7 @@ VkImageView texture_view(Texture *t, const nvn_tex *, const nvn_view *v, VkImage
 static bool typed_upscale(VkCommandBuffer, VkImageView input, VkImageView output, Texture *t,
                           uint32_t level, uint64_t, const char *, bool temporal) {
     assert(input == (VkImageView)101 && output == (VkImageView)102 && t == &dst && level == 0 &&
-           !temporal);
+           !temporal && lock_depth > 0);
     typed_calls++;
     return pipeline_ok;
 }

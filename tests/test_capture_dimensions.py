@@ -34,12 +34,14 @@ def main():
     globals_and_setup = source[start:source.index("void image_barrier(", start)]
     gate = "if (src && (dev.offscreen || shots) && offscreen_init())"
     assert gate in source
-    tail = "if (dev.offscreen || interpolated) return;\n    present_image(src, sw, sh, crop, direct_view);"
+    tail = ("if (dev.offscreen || interpolated) return;\n    smooth_mine = true;\n    present_image(src, sw, sh, crop, direct_view);\n"
+            "    smooth_mine = false;")
     assert tail in source
     png = block(source, "uint32_t crc32(") + "\n" + block(source, "bool write_png(")
     template = (ROOT / "tests/capture_dimensions_test.cpp").read_text(encoding="utf-8")
     fixture = template.replace("/* SETUP */", globals_and_setup).replace("/* GATE */", gate)
     fixture = fixture.replace("/* PRESENT_TAIL */", tail).replace("/* PNG */", png)
+    fixture = '#include "file_writers.h"\n' + fixture   # ((Triforce, handoff §8) write_png's Writing: the standard library alone)
     cases = [
         (None, None, 16384, True), ("3440", "1440", 16384, True), ("5120", "1440", 16384, True),
         ("1439", "701", 16384, True), ("1", "1", 16384, True), ("16384", "1440", 16384, True),
@@ -56,7 +58,7 @@ def main():
         cpp, exe = Path(temp) / "fixture.cpp", Path(temp) / "fixture.exe"
         cpp.write_text(fixture, encoding="utf-8")
         subprocess.run([a.cxx, "-std=c++20", "-O1", "-Wall", "-Wextra", "-Werror", "-Wno-missing-field-initializers",
-                        "-I" + str(a.headers), str(cpp), "-o", str(exe)], check=True)
+                        "-I" + str(a.headers), "-I" + str(ROOT / "gpu/vk"), str(cpp), "-o", str(exe)], check=True)
         if a.case != "png":
             for width, height, limit, valid in cases:
                 if a.case == "valid" and not valid or a.case == "invalid" and valid:

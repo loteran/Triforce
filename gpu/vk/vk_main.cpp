@@ -1,6 +1,7 @@
 // The Vulkan back end's start: vulkan-1.dll, the instance, the device (Vulkan 1.3 and the extensions the NVN replay
 // wants where the GPU has them: mesh shaders, host memory import, graphics pipeline libraries), the window's
 // swapchain, and the rx_* table (vk_api.h). The NVN replay itself is vk_replay.cpp.
+#include "vk_dlssg.h"
 #include "vk_paths.h"
 #include "vk_loader.h"
 
@@ -19,6 +20,7 @@
 #include "vk_framegen.h"
 #include "vk_internal.h"
 #include "gpu_choice.h"
+#include "present_mode.h"   // (the swapchain's present mode: the VSync row and the switches)
 #include "vk_menu.h"
 #include "vk_dlss.h"
 #include "vk_ffx_fg.h"
@@ -38,6 +40,9 @@ VKX_DEVICE3(VKX_DEFINE)
 #undef VKX_DEFINE
 
 static PFN_vkGetInstanceProcAddr get_instance_proc;
+// (Triforce, NVIDIA DLSS frame generation, vk_dlssg.cpp: while Streamline is up, get_instance_proc is its interposer's,
+// so the instance, the device and every function of both are fetched through it; this is the loader's own)
+static PFN_vkGetInstanceProcAddr loader_instance_proc;
 
 bool load_global() {
 #ifdef _WIN32   // (hookshot: the loader from System32 only, not from the current folder or PATH)
@@ -48,6 +53,8 @@ bool load_global() {
     if (!m) return false;
     get_instance_proc = (PFN_vkGetInstanceProcAddr)(void*)GetProcAddress(m, "vkGetInstanceProcAddr");
     if (!get_instance_proc) return false;
+    loader_instance_proc = get_instance_proc;
+    if (const PFN_vkGetInstanceProcAddr interposer = mkwvk::dlssg::early()) get_instance_proc = interposer;
 #define VKX_LOAD(f) f = (PFN_##f)get_instance_proc(nullptr, #f);
     VKX_GLOBAL(VKX_LOAD)
 #undef VKX_LOAD
@@ -58,6 +65,12 @@ void load_instance(VkInstance instance) {
 #define VKX_LOAD(f) f = (PFN_##f)get_instance_proc(instance, #f);
     VKX_INSTANCE(VKX_LOAD)
 #undef VKX_LOAD
+}
+/// (Triforce) Streamline is given up for this run before the device is made: the instance's functions from the loader again
+void use_loader(VkInstance instance) {
+    if (!loader_instance_proc || get_instance_proc == loader_instance_proc) return;
+    get_instance_proc = loader_instance_proc;
+    load_instance(instance);
 }
 void load_device(VkDevice device) {
 #define VKX_LOAD(f) f = (PFN_##f)vkGetDeviceProcAddr(device, #f);
@@ -211,6 +224,8 @@ bool pick_device() {
     }
     dev.physical = all[best];
     vkGetPhysicalDeviceProperties(dev.physical, &dev.props);
+    // (Triforce, 11-16) the recorder thread by default on NVIDIA with 12 logical processors or more (vk_recorder.h mode_from_env)
+    recorder_auto(dev.props.vendorID == 0x10DE && std::thread::hardware_concurrency() >= 12);
     vkGetPhysicalDeviceMemoryProperties(dev.physical, &dev.memory);
     return true;
 }
@@ -261,7 +276,14 @@ bool create_device() {
     dlss_device_extensions(want, exts);   // (hookshot: NVIDIA DLSS's, vk_dlss.cpp)
     bool fsr_descriptor_buffer = false;   // (hookshot, linux: only with a Vulkan FSR 4 library beside the game, vk_fsr4.cpp)
     if (fsr4_wants_descriptor_buffer()) optional(VK_EXT_DESCRIPTOR_BUFFER_EXTENSION_NAME, fsr_descriptor_buffer);
-    reflex_device_extensions(want, exts);   // (hookshot: NVIDIA Reflex's, vk_reflex.cpp)
+    // (Triforce, NVIDIA DLSS frame generation: Streamline's device asks for Reflex's extensions itself, and the renderer's
+    // own Reflex stays off in such a run; another vendor's card is made by the loader, without it)
+    if (dlssg::early() && dev.props.vendorID != 0x10de) {
+        dlssg::gave_up("the graphics card in use is not an NVIDIA card");
+        vkx::use_loader(dev.instance);
+    }
+    if (dlssg::early()) dlssg::device_extensions(want, exts);
+    else reflex_device_extensions(want, exts);   // (hookshot: NVIDIA Reflex's, vk_reflex.cpp)
     antilag_device_extensions(want, exts);   // (hookshot: AMD Anti-Lag 2's, vk_antilag.cpp)
 
     // the queue: one family for graphics, compute and transfer
@@ -400,7 +422,7 @@ bool create_device() {
     // (bounds-checked buffer access: an out-of-range access dropped instead of faulting the device. On by default: the GPU
     // culling pass 53caac5f faulted the device while a save loaded, about one start in three, and the scene's lighting read garbage
     // for single frames (the black flashes); with it, neither in A/B runs at the same GPU time. Lichii's OoT branch keeps it on too.
-    // The 'Robust buffers' row of triforce_options.ini chooses (0 Auto: on, on every vendor; 1 Off; 2 On); RX_VK_ROBUST=0 or 1
+    // The 'Robust buffers' row of triforce_options.ini chooses (0 Auto: off since 11-17, the owner's call; 1 Off; 2 On); RX_VK_ROBUST=0 or 1
     // over it. Off is null descriptors only: some NVIDIA cards ran slower with it on, issues 394, 418, 419)
     static const bool robust = []() -> bool {
         if (const char* e = getenv("RX_VK_ROBUST")) return atoi(e) != 0;
@@ -408,7 +430,7 @@ bool create_device() {
         const DWORD n = game_module_path(exe, MAX_PATH);   // (the game folder, not bin beside the launcher: vk_paths.h)
         std::string ini(exe, n);
         ini = ini.substr(0, ini.find_last_of("\\/") + 1) + "triforce_options.ini";
-        int v = 0;   // (Auto)
+        int v = 1;   // (no line: Off, the row's default)
         if (FILE* f = fopen(ini.c_str(), "r")) {
             char line[80];
             while (fgets(line, sizeof line, f))
@@ -418,7 +440,8 @@ bool create_device() {
                 }
             fclose(f);   // (once: the PR closed it twice when the row said Auto)
         }
-        return v != 1;   // (Auto and On: on)
+        // ((Triforce) 11-17, the owner's "keep robust buffers off by default": Auto is off now; only On (2) turns it on)
+        return v == 2;
     }();
     const bool robust_ok = robust && robust2.robustBufferAccess2 && f.features.robustBufferAccess;
     robust2.robustBufferAccess2 = robust_ok ? VK_TRUE : VK_FALSE;
@@ -441,6 +464,7 @@ bool create_device() {
     dev.eds3_clamp = dev.dynamic_state3 && eds3.extendedDynamicState3DepthClampEnable;
     dev.eds3_blend = dev.dynamic_state3 && eds3.extendedDynamicState3ColorBlendEnable &&
                      eds3.extendedDynamicState3ColorBlendEquation && eds3.extendedDynamicState3ColorWriteMask;
+    bool amd_older = false;   // (AMD's Windows driver for RDNA 1 and 2: vk_vendor.h amd_older_compiler; the task + mesh default below)
     {   // (hookshot) the vendor and driver workarounds this device needs: vk_vendor.h, each forced by its RX_VK_ switch
         VkPhysicalDeviceDriverProperties drv{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
         VkPhysicalDeviceProperties2 p2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
@@ -452,6 +476,7 @@ bool create_device() {
         facts.device_type = p2.properties.deviceType;
         facts.driver_info = drv.driverInfo;
         dev.fixes = vendor_fixes(facts);
+        amd_older = amd_older_compiler(facts);
         vendor_fixes_env(dev.fixes, [](const char* name) -> const char* { return getenv(name); });
         logf("vk: vendor fixes for %s (%s): out-of-bounds texel fetches 0 %d, NaN tests by bits %d, gather offset %d",
              drv.driverName, drv.driverInfo, (int)dev.fixes.fetch_bounds, (int)dev.fixes.nan_bits, (int)dev.fixes.gather_offset);
@@ -497,10 +522,32 @@ bool create_device() {
     // (driver 0x800161) the native path lost the device within minutes at Hyrule Castle's entrance, while the fallback played
     // 25 minutes there with none. Navi 21 is 0x73bf (RX 6800, 6800 XT, 6900 XT), 0x73af (RX 6900 XT, XTXH boards) and 0x73a5
     // (RX 6950 XT): the same chip on the same driver, not tested on their own. Navi 22 is 0x73df (RX 6700 XT)
-    task_mesh_fallback = dev.props.vendorID == 0x1002 &&
-                         (dev.props.deviceID == 0x73bf || dev.props.deviceID == 0x73af || dev.props.deviceID == 0x73a5 ||
-                          dev.props.deviceID == 0x73df);
+    // (Triforce, after NX2navi's mesh_fallback = auto) Every GPU of that driver branch now, not those four chips alone: AMD's
+    // Windows driver for RDNA 1 and 2, the one whose driverInfo names the "AMD proprietary shader compiler" (vk_vendor.h
+    // amd_older_compiler). It has mesh shaders on RDNA 2 only, so this is the RX 6000 cards and that generation's integrated
+    // GPUs. NX2navi's players lost the device minutes into play on RX 6600 to RX 6950 XT cards alike, with the pass in
+    // progress one that starts with a native mesh draw, and the reports here of a game that stops after the first cutscene
+    // name an RX 6600 beside the RX 6700 XT. That the native mesh path is the cause on the other chips is not shown: this
+    // is the path that played where it was tried, at the cost of a compute pass for each mesh draw. The driver for RDNA 3
+    // and 4 (LLPC) draws them natively, as before. tests/test_task_mesh_fallback_devices.py
+    task_mesh_fallback = dev.props.vendorID == 0x1002 && amd_older;
 #endif
+    {   // ((Triforce, 11-18) the menu's Mesh shaders row, mesh_shaders= in triforce_options.ini: 1 Compute fallback on any GPU with
+        // mesh shaders (an RX 7700S's glowing walls went with it, #bug-tracker); 0 Auto, the rule above. RX_VK_TASK_MESH_FALLBACK over it)
+        char exe[MAX_PATH];
+        const DWORD n = game_module_path(exe, MAX_PATH);
+        std::string ini(exe, n);
+        ini = ini.substr(0, ini.find_last_of("\\/") + 1) + "triforce_options.ini";
+        if (FILE* f = fopen(ini.c_str(), "r")) {
+            char line[80];
+            while (fgets(line, sizeof line, f))
+                if (!strncmp(line, "mesh_shaders=", 13)) {
+                    if (atoi(line + 13) == 1) task_mesh_fallback = true;
+                    break;
+                }
+            fclose(f);
+        }
+    }
     if (const char* e = getenv("RX_VK_TASK_MESH_FALLBACK")) task_mesh_fallback = atoi(e) != 0;
     dev.task_mesh_fallback = task_mesh_fallback && dev.mesh_shader && f12.bufferDeviceAddress && !getenv("RX_VK_NO_MESH_FALLBACK");
     if (dev.task_mesh_fallback) logf("vk: task + mesh programs use the compute fallback (RX_VK_TASK_MESH_FALLBACK=0: native)");
@@ -516,8 +563,16 @@ bool create_device() {
     ci.pQueueCreateInfos = qs.data();
     ci.enabledExtensionCount = (uint32_t)want.size();
     ci.ppEnabledExtensionNames = want.data();
-    if (vkCreateDevice(dev.physical, &ci, nullptr, &dev.device) != VK_SUCCESS) {
-        logf("vk: vkCreateDevice failed");
+    VkResult made = vkCreateDevice(dev.physical, &ci, nullptr, &dev.device);
+    if (made != VK_SUCCESS && dlssg::early()) {   // (Streamline's refused it: the loader's, without frame generation)
+        char why[96];
+        snprintf(why, sizeof why, "Streamline could not make the device (VkResult %d)", (int)made);
+        dlssg::gave_up(why);
+        vkx::use_loader(dev.instance);
+        made = vkCreateDevice(dev.physical, &ci, nullptr, &dev.device);
+    }
+    if (made != VK_SUCCESS) {
+        logf("vk: vkCreateDevice failed (VkResult %d)", (int)made);
         return false;
     }
 
@@ -536,6 +591,10 @@ bool create_device() {
              "%u (the game's: family %u queue 0)", ffx_present.family, ffx_present.index, ffx_acquire.family, ffx_acquire.index,
              dev.queue_family);
     }
+    dlssg::device_ready(dev.physical, dev.device);
+    // (with DLSS frame generation the presents stay on the replay's queue: the generated frames are Streamline's work
+    // inside the present, on that queue)
+    if (dlssg::active()) dev.present_queue = VK_NULL_HANDLE, dev.present_family = dev.queue_family;
     if (dev.buffer_marker) buffer_markers_init();
     coopmat_init();
     reflex_device_created();
@@ -582,6 +641,24 @@ void swap_views_make(VkImageUsageFlags usage, VkFormat format) {
         vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
         if (vkCreateImageView(dev.device, &vi, nullptr, &dev.swap_views[i]) != VK_SUCCESS) dev.swap_views[i] = VK_NULL_HANDLE;
     }
+}
+
+// (Triforce) the present mode of the swapchain there is (present_mode.h's numbers; -1 none yet, or offscreen): the VSync row
+// says what its choice came to on this driver
+static std::atomic<int> present_mode_now{-1};
+int swapchain_present_mode() { return present_mode_now.load(std::memory_order_relaxed); }
+
+// (Triforce) The GPU the game renders on, its LUID (VkPhysicalDeviceIDProperties.deviceLUID, 8 bytes), for the performance
+// overlay's GPU load: Windows' counters name an adapter by it (perf_machine.cpp; after NX2navi's perf_gpu_once). False when
+// there is no device yet or the driver gives none
+bool gpu_device_luid(uint8_t out[8]) {
+    if (!dev.physical) return false;
+    VkPhysicalDeviceIDProperties id{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES};
+    VkPhysicalDeviceProperties2 p2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &id};
+    vkGetPhysicalDeviceProperties2(dev.physical, &p2);
+    if (!id.deviceLUIDValid) return false;
+    std::memcpy(out, id.deviceLUID, VK_LUID_SIZE);
+    return true;
 }
 
 bool create_swapchain(uint32_t width, uint32_t height, bool may_use_ffx) {
@@ -646,23 +723,24 @@ bool create_swapchain(uint32_t width, uint32_t height, bool may_use_ffx) {
     }
     if (result != VK_SUCCESS || modes.empty())
         logf("vk: querying present modes failed (VkResult %d, count %u); trying mandatory FIFO mode", (int)result, n);
-    VkPresentModeKHR mode = VK_PRESENT_MODE_FIFO_KHR;
     const bool force_fifo = getenv("RX_VK_FIFO") != nullptr;   // (as on a card or driver with vsync forced)
-    if (!force_fifo) {
-        for (auto m : modes)
-            if (m == VK_PRESENT_MODE_MAILBOX_KHR) mode = m;
-        // (Windows, no mailbox: AMD's driver has none, and FIFO held anything under 60 fps at 30.
-        //  Linux: immediate on NVIDIA's X11 path turns vblank off for every output, so the other
-        //  monitor and other programs tear. RX_VK_IMMEDIATE=1 still asks for it.)
-        const bool want_immediate = getenv("RX_VK_IMMEDIATE") != nullptr;
+    // (Windows, no mailbox: AMD's driver has none, and FIFO held anything under 60 fps at 30.
+    //  Linux: immediate on NVIDIA's X11 path turns vblank off for every output, so the other
+    //  monitor and other programs tear. RX_VK_IMMEDIATE=1 still asks for it.)
+    const bool want_immediate = getenv("RX_VK_IMMEDIATE") != nullptr;
+    // (Triforce) the Insert menu's VSync row off asks for immediate too, wherever the surface lists it; on, the choice is the
+    // one above, from before the row. present_mode.h has the rule, the two switches still over the row
+    bool has_mailbox = false, has_immediate = false;
+    for (auto m : modes) has_mailbox |= m == VK_PRESENT_MODE_MAILBOX_KHR, has_immediate |= m == VK_PRESENT_MODE_IMMEDIATE_KHR;
 #ifdef _WIN32
-        if (want_immediate || mode == VK_PRESENT_MODE_FIFO_KHR)
+    const bool windows = true;
 #else
-        if (want_immediate)
+    const bool windows = false;
 #endif
-            for (auto m : modes)
-                if (m == VK_PRESENT_MODE_IMMEDIATE_KHR) mode = m;
-    }
+    const present_mode::Mode chosen = present_mode::choose(has_mailbox, has_immediate, opts.vsync != 0, windows, force_fifo, want_immediate);
+    const VkPresentModeKHR mode = chosen == present_mode::kMailbox     ? VK_PRESENT_MODE_MAILBOX_KHR
+                                  : chosen == present_mode::kImmediate ? VK_PRESENT_MODE_IMMEDIATE_KHR
+                                                                       : VK_PRESENT_MODE_FIFO_KHR;
     VkSwapchainCreateInfoKHR ci{VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR};
     ci.surface = dev.surface;
     // (hookshot) AMD's frame generation swapchain (vk_ffx_fg.h), where the engine choice wants it and it can run: made through its
@@ -793,14 +871,16 @@ bool create_swapchain(uint32_t width, uint32_t height, bool may_use_ffx) {
     dev.swap_format = fmt.format;
     dev.swap_extent = {width, height};
     dev.swap_images = std::move(images);
-    logf("vk: swapchain %ux%u, %u images, %s%s", width, height, n,
-         mode == VK_PRESENT_MODE_MAILBOX_KHR ? "mailbox" : mode == VK_PRESENT_MODE_IMMEDIATE_KHR ? "immediate" : "fifo",
+    logf("vk: swapchain %ux%u, %u images, %s%s%s", width, height, n, present_mode::name(chosen),
+         force_fifo ? " (RX_VK_FIFO)" : want_immediate ? " (RX_VK_IMMEDIATE)" : opts.vsync ? "" : " (VSync off)",
          made_ffx ? ", AMD's frame generation swapchain (presents a made frame between the game's)" : "");
+    present_mode_now.store((int)chosen, std::memory_order_relaxed);
     swap_views_make(ci.imageUsage, mutable_view ? view_formats[1] : fmt.format);
     // (NVIDIA Reflex: its sleep mode on the new swapchain. Never on AMD's: its handle is the library's own object, not a driver
     // swapchain, and vkSetLatencySleepModeNV on it crashed the driver (libnvidia-glcore) at the first present. Reflex is off with frame generation)
     if (made_ffx) reflex_swapchain_destroyed();
     else reflex_swapchain_created(sc);
+    dlssg::swapchain_created();     // (Triforce, DLSS frame generation: Streamline's Reflex mode is the swapchain's too)
     return true;
 }
 
@@ -1139,10 +1219,17 @@ bool started_up() {
     if (prepare_only()) {
         // (three parts: the programs, the pipelines the notes predict, then those they name; most of the time is the first)
         static int part;
+        // ((Triforce, 11-18) the bar's share of each part as it takes its time: on NVIDIA the programs are most of it (56 s of
+        // ~70 on an RTX 4070 SUPER); elsewhere the pipelines, which AMD's driver builds in seconds each (an update on an AMD card
+        // ran over an hour in that last part and sat at 90% and more: Setup's "Preparing shaders" row shows this bar)
+        static const bool nvidia = dev.props.vendorID == 0x10de;
         const auto progress = [](size_t done, size_t total) {
             static size_t last = ~(size_t)0;
             if (!total) return;
-            static const size_t from[3] = {0, 700, 900}, span[3] = {700, 200, 100};
+            static const size_t from_nv[3] = {0, 700, 900}, span_nv[3] = {700, 200, 100};
+            static const size_t from_other[3] = {0, 300, 400}, span_other[3] = {300, 100, 600};
+            const size_t* from = nvidia ? from_nv : from_other;
+            const size_t* span = nvidia ? span_nv : span_other;
             const size_t at = from[part] + done * span[part] / total;
             if (at == last) return;
             last = at;

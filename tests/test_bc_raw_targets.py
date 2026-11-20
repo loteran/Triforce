@@ -66,6 +66,18 @@ class BcRawTargetTests(unittest.TestCase):
         self.assertNotIn("53509044401d78d2", line)
         self.assertRegex(self.draw, r"default_list && cp->key == 0x53509044401d78d2ull && !at\.n")
 
+    def test_3d_bc_images_take_no_attachment_usage_on_nvidia_before_turing(self):
+        # (Pascal loses the device on a raw view of a 3D BC image, upstream #2327: no usage there, so no view, and
+        # the noise pass is left out by the rule above)
+        raw = self.tex.index("Raw storage views address one compressed block per texel")
+        branch = self.tex[raw:self.tex.index("CUBE_COMPATIBLE_BIT", raw)]
+        self.assertIn("dev.props.vendorID == 0x10de && dev.props.deviceID < 0x1e00", branch)
+        guard = branch.index("if (x.type == VK_IMAGE_TYPE_3D && !bc3d_target)")
+        usage = branch.index("x.usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;")
+        self.assertLess(guard, usage)
+        self.assertIn("} else if (format_props(raw).optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT)", branch)
+        self.assertIn('getenv("RX_VK_BC3D_TARGET")', branch)
+
 
 if __name__ == "__main__":
     unittest.main()

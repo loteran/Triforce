@@ -26,10 +26,55 @@ enum { HOS_OPT_DLSS_JITTER_W = 24, HOS_OPT_DLSS_JITTER_H, HOS_OPT_DLSS_JITTER_PH
 /* (hookshot) the Insert menu's HDR set to Native (host/nn_vi.c QueryDisplayHdrStatus and QueryDisplayHdrPaperWhite): whether
    the game is told its display is HDR10 (the swapchain is one), and the peak and paper white it is told, in nits */
 /* (HOS_OPT_DISCORD, 43: the Insert menu's Discord status row, host/discord_rpc.c: 1 on) */
-enum { HOS_OPT_HDR_NATIVE = 40, HOS_OPT_HDR_PEAK, HOS_OPT_HDR_WHITE, HOS_OPT_DISCORD };
+/* (HOS_OPT_SPRINT, 45, and HOS_OPT_SPRINT_HOLD, 46: the Sprint button row (0 off, 1 the left stick's click, 2 B) and
+   the Sprint mode row (0 toggle, 1 hold), host/oot_sprint.c) */
+/* (HOS_OPT_VOLUME, 44: the Insert menu's Master volume row, host/nn_audio.c: percent of the game's own, 0 to 100) */
+enum { HOS_OPT_HDR_NATIVE = 40, HOS_OPT_HDR_PEAK, HOS_OPT_HDR_WHITE, HOS_OPT_DISCORD, HOS_OPT_VOLUME, HOS_OPT_SPRINT, HOS_OPT_SPRINT_HOLD };
 /* (Triforce) option_set only, each frame the game's own Options screen runs (host/oot_menu.c): the menu then draws its tabs
    over that screen's header, the game's own list the first of them (gpu/vk/vk_menu.cpp game_options_shown) */
-enum { HOS_OPT_GAME_OPTIONS = 48 };
+/* (Triforce) HOS_OPT_EXITING, option_set only: the process is about to exit (host/hos_relaunch.c): what must be shut
+   down in order before the DLLs are unloaded is (NVIDIA's Streamline, gpu/vk/vk_dlssg.cpp) */
+enum { HOS_OPT_GAME_OPTIONS = 48, HOS_OPT_EXITING };
+/* (Triforce) HOS_OPT_DISPLAY_CAP: the frame rate cap the display the window is on gives, for the Insert menu's Game frame
+   rate cap on Monitor's rate (host/nn_vi.c fps_max, gpu/vk/fps_cap.h): its refresh rate rounded, 30 to 240; 0 when the
+   rate cannot be read. 60 to 69 are the display, graphics and system rows' */
+enum { HOS_OPT_DISPLAY_CAP = 60 };
+/* (Triforce) The System tab's save rows (gpu/vk/vk_menu.cpp), whose work the host does on a thread of its own
+   (host/save_share.c): HOS_OPT_SHARE_ASK, option: what a row asked for since the last read, HOS_SHARE_*, 0 nothing (taken:
+   the next read answers 0). HOS_OPT_SHARE_TEXT, option_set: the next byte of a line for the menu, UTF-8, and
+   HOS_OPT_SHARE_SAID, option_set: the bytes sent so far are the line the row of that HOS_SHARE_* shows under its help
+   (HOS_SHARE_NOTICE: the line at the foot of the screen for a moment, while the options are closed).
+   HOS_OPT_SHARE_IMPORT, option_set: 1 while an imported save waits for the next start (the Import row then cancels it).
+   The bug capture (host/bug_capture.c, F8 or its row: HOS_SHARE_CAPTURE; HOS_SHARE_CAPTURE_KEY is F8 where the window
+   has no key handler of the host's, Linux) asks for its picture with HOS_OPT_BUG_SHOT, option_set: 1 the frame shown next
+   is written as captures/frame-pending.png in the game folder (gpu/vk/vk_bugshot.cpp), 0 asked no longer; option: 0 none
+   asked, 1 not there yet, 2 written, 3 no picture */
+enum { HOS_OPT_SHARE_ASK = 70, HOS_OPT_SHARE_TEXT, HOS_OPT_SHARE_SAID, HOS_OPT_SHARE_IMPORT, HOS_OPT_BUG_SHOT };
+enum { HOS_SHARE_EXPORT = 1, HOS_SHARE_EXPORT_BUG, HOS_SHARE_IMPORT, HOS_SHARE_IMPORT_CANCEL, HOS_SHARE_CAPTURE, HOS_SHARE_CAPTURE_KEY,
+       HOS_SHARE_NOTICE };
+/* (Triforce) The Debug tab's name pages (gpu/vk/vk_menu.cpp; gpu/vk/oot_debug_link.h has the lines). HOS_OPT_DEBUG_ASK, option:
+   the next byte of a line the Game flags or the Cutscenes page asks of the game's side (host/hos_main.c reads it on the
+   game's thread, at Link's update), a line feed at a line's end, 0 while there is none. HOS_OPT_DEBUG_TEXT, option_set: the
+   next byte of a line for the pages, and HOS_OPT_DEBUG_SAID, option_set: the bytes sent so far are a line of that kind
+   (OOT_SAID_*). HOS_OPT_AMIIBO_ASK, option: the same for the Scan amiibo page, the name of a file of the game folder's
+   amiibo folder, or a line of its own for none (host/nn_nfp.c reads it at the game's pad read). HOS_OPT_AMIIBO_SAID,
+   option_set: what became of the figure, HOS_AMIIBO_* (host/amiibo.h's NFP_SAID_*): none chosen, waiting for the game to
+   look for a figure, on the reader, read by the game and lifted off, the file is not a figure's dump, the file is not
+   there */
+enum { HOS_OPT_DEBUG_ASK = 115, HOS_OPT_DEBUG_TEXT, HOS_OPT_DEBUG_SAID, HOS_OPT_AMIIBO_ASK, HOS_OPT_AMIIBO_SAID };
+enum { HOS_AMIIBO_NONE, HOS_AMIIBO_WAITING, HOS_AMIIBO_ON_READER, HOS_AMIIBO_READ, HOS_AMIIBO_REFUSED, HOS_AMIIBO_NO_FILE };
+/* (Triforce) The game's frame pacing beside other limiters (host/nn_vi.c hos_vi_native_acquire, gpu/vk/vk_pace.cpp), on the
+   game's presenting thread where its frame starts, once a frame. HOS_OPT_PACE_PERIOD, option_set: the period the host
+   paces the frame by, in nanoseconds (the frame rate cap in effect). HOS_OPT_PACE_MOVIE, option_set: 1 while a movie
+   plays (the game's own wait holds a movie). HOS_OPT_PACE_START, option, right after them: 0 the host's own wait paces
+   this frame, as without a renderer to ask; 1 another limiter holds it and the host's wait steps aside for this frame
+   (RivaTuner Statistics Server, which holds the frame's presents, or NVIDIA Reflex with DLSS frame generation, whose
+   sleep is taken inside the call). 85 to 89 are pacing's.
+   (Triforce) HOS_OPT_PACE_STEADY, the Steady frame rate row (host/pace_steady.h): option_set, after the period, 1 while the
+   period told is the steady frame rate's (the present then holds the game's pictures to it: gpu/vk/present_smooth.h
+   present_smooth_paced_at), 0 otherwise; option, the microseconds the present held the game's presenting thread for it since
+   the last ask (what the frames needed is measured without that wait) */
+enum { HOS_OPT_PACE_PERIOD = 85, HOS_OPT_PACE_START, HOS_OPT_PACE_MOVIE, HOS_OPT_PACE_STEADY };
 
 /* (hookshot) the controls' names (host/nn_hid.c, host/pad_sdl.c, the pad_ and key_ lines of triforce_options.ini):
    the Switch's buttons in nn::hid's bit order, and a gamepad's inputs by position, SDL's order (the bottom face
@@ -39,13 +84,68 @@ enum { HOS_SW_A, HOS_SW_B, HOS_SW_X, HOS_SW_Y, HOS_SW_LS, HOS_SW_RS, HOS_SW_L, H
 enum { HOS_PAD_SOUTH, HOS_PAD_EAST, HOS_PAD_WEST, HOS_PAD_NORTH, HOS_PAD_BACK, HOS_PAD_GUIDE, HOS_PAD_START,
        HOS_PAD_LSTICK, HOS_PAD_RSTICK, HOS_PAD_LSHOULDER, HOS_PAD_RSHOULDER, HOS_PAD_UP, HOS_PAD_DOWN, HOS_PAD_LEFT,
        HOS_PAD_RIGHT, HOS_PAD_LTRIGGER, HOS_PAD_RTRIGGER, HOS_PAD_N };
+/* ((Triforce) 11-17) the left stick pushed past half its travel, in the menus' pad bits only (host/nn_hid.c hos_pad_raw):
+   the overlay's lists move by the stick as by the D-pad. Past HOS_PAD_N, so no binding takes them */
+enum { HOS_PAD_LS_UP = 20, HOS_PAD_LS_DOWN, HOS_PAD_LS_LEFT, HOS_PAD_LS_RIGHT,
+       HOS_PAD_RS_UP, HOS_PAD_RS_DOWN };   /* (and the right stick up or down: the Mods screen's description scrolls by it) */
 enum { HOS_BIND_PAD, HOS_BIND_KEY };
 /* (hookshot) the controller faces of the button prompts (host/prompts.c): the Switch, then nx2/prompt_faces.py FACES' order;
-   the Button prompts row's value is one more (0 Auto) */
-enum { HOS_PROMPT_SWITCH, HOS_PROMPT_XBOX, HOS_PROMPT_PS4, HOS_PROMPT_PS5, HOS_PROMPT_STEAMDECK, HOS_PROMPT_N };
+   the Button prompts row's value is one more (0 Auto). (Triforce) HOS_PROMPT_KEYBOARD: the keyboard and mouse, no
+   controller's: each button's icon is the key or the mouse button bound to it (nx2/prompt_keys.py) */
+enum { HOS_PROMPT_SWITCH, HOS_PROMPT_XBOX, HOS_PROMPT_PS4, HOS_PROMPT_PS5, HOS_PROMPT_STEAMDECK, HOS_PROMPT_KEYBOARD, HOS_PROMPT_N };
 /* keys only (HOS_BIND_KEY), after the Switch's buttons: the left stick's and the camera's directions */
 enum { HOS_KEY_MOVE_UP = HOS_SW_N, HOS_KEY_MOVE_DOWN, HOS_KEY_MOVE_LEFT, HOS_KEY_MOVE_RIGHT, HOS_KEY_CAM_UP,
        HOS_KEY_CAM_DOWN, HOS_KEY_CAM_LEFT, HOS_KEY_CAM_RIGHT, HOS_KEY_N };
+/* (Triforce) more of the Controls tab's rows, after NX2navi's (host/pad_sdl.c and host/nn_hid.c read them, vk_replay.cpp's
+   option answers them; 50 to 59 are theirs). HOS_OPT_RUMBLE_CURVE: the Vibration curve, the power on the motors' rumble
+   in hundredths, 20 to 150, 100 none. HOS_OPT_RUMBLE_TRIGGERS: Trigger vibration, 1 the rumble in an Xbox pad's triggers
+   too. HOS_OPT_LSTICK_ZONE, HOS_OPT_RSTICK_ZONE: the left and the right stick's own dead zone, one more than the row's
+   value: 0 none (As Stick dead zone), 1 to 51 for 0% to 50% (host/nn_hid.c hos_stick_own). HOS_OPT_WALK_KEY: the Walk
+   key row, 0 Off, 1 Caps Lock, 2 Shift, 3 Ctrl, 4 Tab (host/nn_hid.c walk_key_code). HOS_OPT_WALK_SCALE: how far the
+   movement keys push the left stick while it is held, in hundredths, 20 to 90 */
+enum { HOS_OPT_RUMBLE_CURVE = 50, HOS_OPT_RUMBLE_TRIGGERS, HOS_OPT_LSTICK_ZONE, HOS_OPT_RSTICK_ZONE, HOS_OPT_WALK_KEY,
+       HOS_OPT_WALK_SCALE };
+/* (Triforce) The System tab's rows for the cheats of the mods' cheat files (host/mod_cheats.c runs them, gpu/vk/vk_menu.cpp
+   and gpu/vk/mod_cheat_rows.h show them; 130 to 134 are theirs, 134 not used). At the first frame the host names its
+   cheats, in the rows' order: HOS_OPT_MODCHEAT_TEXT, option_set: the next byte of a cheat's name, UTF-8, then a line feed
+   and the line the row shows under its help; HOS_OPT_MODCHEAT_ADD, option_set: the bytes sent so far are the next row's,
+   the value its HOS_MODCHEAT_* bits; HOS_OPT_MODCHEAT_COUNT, option_set: the list is whole, the rows are shown (0: none).
+   HOS_OPT_MODCHEAT_ASK, option: a switch the player changed since the last read, (its row + 1) * 2 + 1 for on, + 0 for
+   off; 0 nothing (taken: the next read answers the next change, or 0) */
+enum { HOS_OPT_MODCHEAT_TEXT = 130, HOS_OPT_MODCHEAT_ADD, HOS_OPT_MODCHEAT_COUNT, HOS_OPT_MODCHEAT_ASK };
+enum { HOS_MODCHEAT_ON = 1,       /* switched on */
+       HOS_MODCHEAT_ALWAYS = 2,   /* a master code: always runs, the row cannot be changed */
+       HOS_MODCHEAT_REFUSED = 4   /* cannot run here (the row's line says why): the row cannot be changed */ };
+/* (Triforce) The options' own sounds, the game's interface sounds, after NX2navi's menu sounds (gpu/vk/vk_menu.cpp and
+   gpu/vk/menu_sound_events.h say which, host/menu_sound.c plays them; 135 to 139 are theirs). HOS_OPT_MENU_SOUND, option:
+   the next sound the options asked for, HOS_MENU_SOUND_*, 0 none (taken: the next read answers the one after it). Read
+   by the host's sound thread alone, at each block it mixes, so a sound starts within one block of its press.
+   HOS_OPT_MENU_SOUND_VOLUME, option: the Audio tab's Menu sounds row, percent, 0 to 100 (0: silent) */
+enum { HOS_OPT_MENU_SOUND = 135, HOS_OPT_MENU_SOUND_VOLUME };
+enum { HOS_MENU_SOUND_OPEN = 1, HOS_MENU_SOUND_CLOSE, HOS_MENU_SOUND_CURSOR, HOS_MENU_SOUND_DECIDE, HOS_MENU_SOUND_CANCEL,
+       HOS_MENU_SOUND_TAB_LEFT, HOS_MENU_SOUND_TAB_RIGHT,
+       HOS_MENU_SOUND_FANFARE,   /* ((Triforce) a mod installed from the Mods screen: the game's item-get fanfare) */
+       /* ((Triforce) 11-17) the Mods entry under the game's lists sounds as those lists do: the system menu's cursor and its
+          "decide" (the title's Continue, the Load list's choice: the lab's file opens, HOS_FS_TRACE) */
+       HOS_MENU_SOUND_SYS_CURSOR, HOS_MENU_SOUND_SYS_DECIDE,
+       HOS_MENU_SOUND_N };
+/* (Triforce) The Mods entry under a game list's last button (host/oot_menu.c tells, gpu/vk/vk_menu.cpp draws it): the pause
+   menu's System page and the title's list. Each frame such a list runs, option_set: HOS_OPT_MODS_X0 .. HOS_OPT_MODS_Y1 its
+   last button's box in the layout's units (3840 x 2160, the origin at the middle, y up), HOS_OPT_MODS_PITCH the distance to
+   the button above it, then HOS_OPT_MODS_LIST: HOS_MODS_LIST_* bits (that frame's report is whole). HOS_OPT_MODS_ENTER,
+   option_set: the cursor goes onto Mods (1: the game's Down there, which the game is not given, host/nn_hid.c), or Mods was
+   clicked (2: open it). HOS_OPT_MODS_SELECTED, option: 1 while the cursor is on Mods or its screen is open (the game gets
+   no input then: host/nn_hid.c). HOS_OPT_MODS_PRESS, option_set: presses the game was given meanwhile that are the menu's (a
+   test's scripted ones, which reach no window): HOS_MODS_PRESS_* bits */
+enum { HOS_OPT_MODS_LIST = 150, HOS_OPT_MODS_X0, HOS_OPT_MODS_X1, HOS_OPT_MODS_Y0, HOS_OPT_MODS_Y1, HOS_OPT_MODS_PITCH, HOS_OPT_MODS_ENTER,
+       HOS_OPT_MODS_SELECTED, HOS_OPT_MODS_PRESS };
+enum { HOS_MODS_LIST_SHOWN = 1, HOS_MODS_LIST_LAST_FOCUSED = 2, HOS_MODS_LIST_TITLE = 4 };
+enum { HOS_MODS_PRESS_UP = 1, HOS_MODS_PRESS_DOWN = 2, HOS_MODS_PRESS_LEFT = 4, HOS_MODS_PRESS_RIGHT = 8, HOS_MODS_PRESS_A = 16,
+       HOS_MODS_PRESS_B = 32, HOS_MODS_PRESS_L = 64, HOS_MODS_PRESS_R = 128 };
+/* ((Triforce) 11-17) Text typed into the menu (the Mods screen's search). HOS_OPT_TEXT_WANTED, option: 1 while the menu takes
+   text. HOS_OPT_TEXT_CHAR, option_set (the window's thread, host/display.c): a code point typed, or 8 Backspace, 127
+   Ctrl+Backspace (a pasted text comes as its characters) */
+enum { HOS_OPT_TEXT_CHAR = 159, HOS_OPT_TEXT_WANTED };
 
 /* (hookshot) the mouse over the window while it is free (not captured): the Insert menu's (host/display.c,
    host/posix/display_sdl.c). x and y: the cursor in the window's pixels, of a window width x height pixels (the

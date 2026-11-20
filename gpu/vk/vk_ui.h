@@ -212,20 +212,22 @@ inline void cursor(Ctx& c, ImVec2 a, ImVec2 b) {
 inline void glow(Ctx& c, ImVec2 a0, ImVec2 b0) { cursor(c, a0, b0); }
 /// The game's arrow at m, pointing left or right: on its Options screen a plain white triangle, 18 x 22 units
 inline void arrow(Ctx& c, ImVec2 m, bool right, ImU32 col = kInk) { triangle(c, m, lu(c, 28), right ? 1 : 0, col); }   // (28: its anti-aliased rim counted)
-/// The game's separator across x0..x1 at y: its mark in the middle, a fine line to either side (PaSlideListSeparator)
-inline void separator(Ctx& c, float x0, float x1, float y) {
+/// The game's separator across x0..x1 at y: its mark in the middle, a fine line to either side (PaSlideListSeparator). col:
+/// the game's own tint on the options' column, a dim tan (71,53,32 over 50,36,23); (Triforce) the performance overlay asks
+/// for its own, the mark's and the lines' (line_col 0: col)
+inline void separator(Ctx& c, float x0, float x1, float y, ImU32 col = rgba(104, 80, 46), ImU32 line_col = 0) {
     const float m = (x0 + x1) * 0.5f, mw = lu(c, 171), mh = lu(c, 60);
-    const ImU32 col = rgba(104, 80, 46);   // (the game's: a dim tan on the column, 71,53,32 over 50,36,23)
+    if (!line_col) line_col = col;
     if (const Art* t = art("OptionSeparateMark_00")) image(c, t, ImVec2(m - mw, y - mh), ImVec2(m + mw, y + mh), col);
     else diamond(c, ImVec2(m, y), lu(c, 14), col);
     const Art* line = art("SystemLine_03");
     const float gap = lu(c, 150), lh = lu(c, 32);
     if (line) {
-        image(c, line, ImVec2(x0, y - lh), ImVec2(m - gap, y + lh), col, false);
-        image(c, line, ImVec2(m + gap, y - lh), ImVec2(x1, y + lh), col, true);
+        image(c, line, ImVec2(x0, y - lh), ImVec2(m - gap, y + lh), line_col, false);
+        image(c, line, ImVec2(m + gap, y - lh), ImVec2(x1, y + lh), line_col, true);
     } else {
-        c.d->AddLine(ImVec2(x0, y), ImVec2(m - gap, y), col, std::max(1.0f, lu(c, 3)));
-        c.d->AddLine(ImVec2(m + gap, y), ImVec2(x1, y), col, std::max(1.0f, lu(c, 3)));
+        c.d->AddLine(ImVec2(x0, y), ImVec2(m - gap, y), line_col, std::max(1.0f, lu(c, 3)));
+        c.d->AddLine(ImVec2(m + gap, y), ImVec2(x1, y), line_col, std::max(1.0f, lu(c, 3)));
     }
 }
 
@@ -359,13 +361,14 @@ inline void column_bg(Ctx& c, float x0, float x1) {
     if (const Art* t = art("SystemBg_05")) nine(c, t, ImVec2(x0, -lu(c, 160)), ImVec2(x1, c.h + lu(c, 160)), 80, 242);
     else c.d->AddRectFilled(ImVec2(x0 + lu(c, 30), 0), ImVec2(x1 - lu(c, 30), c.h), kColumn);
 }
-/// A box (the help, a question): the game's caption plate (SystemCaptionBg_00)
-inline void box(Ctx& c, ImVec2 a, ImVec2 b) {
+/// A box (the help, a question): the game's caption plate (SystemCaptionBg_00). (Triforce) opacity: under 1, the plate lets
+/// the rest of what is behind it through (the performance overlay's); the plain plate's edge line stays whole
+inline void box(Ctx& c, ImVec2 a, ImVec2 b, float opacity = 1) {
     const float m = lu(c, 82);   // (the plate's own soft rim: the layout's 1800 x 640 pane shows 476 units of height)
-    if (const Art* t = art("SystemCaptionBg_00")) nine(c, t, a - ImVec2(m, m), b + ImVec2(m, m), 133, 133);
+    if (const Art* t = art("SystemCaptionBg_00")) nine(c, t, a - ImVec2(m, m), b + ImVec2(m, m), 133, 133, alpha(IM_COL32_WHITE, opacity));
     else {
-        shadow(c, a, b, 18 * c.s, 0.8f, 4 * c.s);
-        c.d->AddRectFilled(a, b, kBox);
+        shadow(c, a, b, 18 * c.s, 0.8f * opacity, 4 * c.s);
+        c.d->AddRectFilled(a, b, alpha(kBox, opacity));
         c.d->AddRect(a, b, kBoxEdge, 0, 1.5f * c.s);
     }
 }

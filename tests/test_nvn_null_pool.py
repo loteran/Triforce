@@ -74,6 +74,7 @@ static uint64_t h2g(void *p) { return (uint64_t)(uintptr_t)p; }
 #define RETP(p) RET(h2g(p))
 #define U64(i) (c->x[i])
 static void rx_nvn_invalidate(uint64_t a, uint64_t b) { (void)a; (void)b; }
+static void flush_note(Ctx *c, int kind, uint64_t gpu, uint64_t size) { (void)c; (void)kind; (void)gpu; (void)size; }   /* (the lab's HOS_NVN_LOG_FLUSH line) */
 ''' + guard + "\n" + flags + "\n" + size + "\n" + map_ + "\n" + address + "\n" + invalidate + r'''
 int main(void) {
     Ctx c;

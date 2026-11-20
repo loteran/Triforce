@@ -4,7 +4,8 @@ host/nn_hid.c rumble_map: each band's strength (rumble_motor) is split between t
 frequency (rumble_heavy_share: all heavy up to 160 Hz, all light from 200 Hz, a constant-power crossfade between, on a
 log scale). At the Switch's default frequencies and the ones OoT sends, every band lands on the motor it did before, at
 the same strength. host/pad_sdl.c rumble_strength: the Insert menu's Rumble strength, in percent, on the motors'
-0..65535; above 100% both motors are scaled by the same factor when the stronger would pass the top.
+0..65535; above 100% (the row goes to 300%) both motors are scaled by the same factor when the stronger would pass the
+top.
 
 Run with: python -I -B tests/test_rumble_mapping.py
 """
@@ -141,13 +142,14 @@ int main(void) {
     }
 
     /* the strength: Off is silence, it grows with the percentage and the motor's value, and stops at the top */
-    static const int percents[] = {0, 25, 50, 75, 100, 125, 150};
+    static const int percents[] = {0, 25, 50, 75, 100, 125, 150, 175, 200, 250, 300};   /* (the row's: Off to 300%%) */
+    enum { PERCENTS = sizeof percents / sizeof *percents };
     static const unsigned values[] = {0, 1, 300, 6880, 20000, 43690, 50000, 65535};
     for (int i = 0; i < 8; i++)
         for (int j = 0; j < 8; j++) {
             const unsigned h = values[i], l = values[j];
             CHECK(strength1(h, l, 0, 0) == 0 && strength1(h, l, 0, 1) == 0 && strength1(h, l, -5, 0) == 0);
-            for (int p = 1; p < 7; p++) {
+            for (int p = 1; p < PERCENTS; p++) {
                 CHECK(strength1(h, l, percents[p], 0) >= strength1(h, l, percents[p - 1], 0));
                 CHECK(strength1(h, l, percents[p], 1) >= strength1(h, l, percents[p - 1], 1));
             }
@@ -155,7 +157,7 @@ int main(void) {
                 CHECK(strength1(h, l, percents[p], 0) == h * (unsigned)percents[p] / 100u);
                 CHECK(strength1(h, l, percents[p], 1) == l * (unsigned)percents[p] / 100u);
             }
-            for (int p = 5; p < 7; p++) {   /* above: the balance kept; the stronger at most the top, at it when it would pass */
+            for (int p = 5; p < PERCENTS; p++) {   /* above: the balance kept; the stronger at most the top, at it when it would pass */
                 const unsigned long long sh = (unsigned long long)h * (unsigned)percents[p] / 100u;
                 const unsigned long long sl = (unsigned long long)l * (unsigned)percents[p] / 100u;
                 const unsigned oh = strength1(h, l, percents[p], 0), ol = strength1(h, l, percents[p], 1);
@@ -170,6 +172,11 @@ int main(void) {
     CHECK(strength1(30000, 50000, 150, 0) == 39321 && strength1(30000, 50000, 150, 1) == 0xFFFF);
     CHECK(strength1(65535, 65535, 150, 0) == 0xFFFF && strength1(65535, 65535, 150, 1) == 0xFFFF);
     CHECK(strength1(43690, 0, 150, 0) == 65535 && strength1(43690, 0, 150, 1) == 0);
+    /* the row's top, 300%%: a third of the motor's strength and up is its top, the other motor in step */
+    CHECK(strength1(10000, 5000, 300, 0) == 30000 && strength1(10000, 5000, 300, 1) == 15000);
+    CHECK(strength1(21845, 0, 300, 0) == 65535 && strength1(21846, 100, 300, 0) == 65535);
+    CHECK(strength1(50000, 30000, 300, 0) == 0xFFFF && strength1(50000, 30000, 300, 1) == 39321);
+    CHECK(strength1(65535, 65535, 300, 0) == 0xFFFF && strength1(65535, 65535, 300, 1) == 0xFFFF);
     return 0;
 }
 """

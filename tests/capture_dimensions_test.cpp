@@ -42,6 +42,7 @@ void destroy_image(VkImage,VmaAllocation) {}
 void destroy_buffer(VkBuffer,VmaAllocation) {}
 VKAPI_ATTR void VKAPI_CALL vkDestroyImageView(VkDevice,VkImageView,const VkAllocationCallbacks*) {}
 /* SETUP */
+thread_local bool smooth_mine = false;   // ((Triforce) vk_replay.cpp: the present under way is the game's own, for Frame pacing)
 void present_image(VkImage,uint32_t,uint32_t,const int*,VkImageView) { presented++; }
 void tick() {
     VkImage src=reinterpret_cast<VkImage>(uintptr_t(0xff)); const char* shots="test";

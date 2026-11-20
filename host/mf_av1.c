@@ -88,9 +88,13 @@ static void av1_missing(void) {
     CreateThread(NULL, 0, av1_missing_notice, NULL, 0, NULL);
 }
 
-void *mf_av1_open(int w, int h) {
+/* tell: say so (the log, the notice) when Windows has no decoder; 0 when the caller has another one to use */
+void *mf_av1_open(int w, int h, int tell) {
     if (!com_ready()) return NULL;
-    if (getenv("HOS_AV1_MISSING")) { av1_missing(); return NULL; }
+    if (getenv("HOS_AV1_MISSING")) {
+        if (tell) av1_missing();
+        return NULL;
+    }
     MFT_REGISTER_TYPE_INFO in = {MFMediaType_Video, MFVideoFormat_AV1};
     IMFActivate **acts = NULL;
     UINT32 n = 0;
@@ -119,7 +123,10 @@ void *mf_av1_open(int w, int h) {
         CoTaskMemFree(acts);
         acts = NULL, n = 0;
     }
-    if (!mft) { av1_missing(); return NULL; }
+    if (!mft) {
+        if (tell) av1_missing();
+        return NULL;
+    }
     IMFMediaType *t = NULL;
     MFCreateMediaType(&t);
     IMFMediaType_SetGUID(t, &MF_MT_MAJOR_TYPE, &MFMediaType_Video);

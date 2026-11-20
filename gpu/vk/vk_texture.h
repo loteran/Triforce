@@ -16,6 +16,8 @@
 #include <vector>
 
 #include "vk_internal.h"
+#include "upload_owed.h"
+#include "upload_same.h"
 
 namespace mkwvk {
 
@@ -29,6 +31,8 @@ struct Texture {
     VkImageCreateFlags create_flags = 0;   // (hookshot: as its image was made, for the compaction's copy of it)
     uint32_t width = 1, height = 1, depth = 1, levels = 1, layers = 1;   // the image's (after skip)
     uint32_t skip = 0;        // top levels of the texture left out (huge textures: RX_VK_TEX_MAX_DIM, _MAX_MB)
+    bool detail_skip = false; // (Triforce) levels of it are left out by the card's texture detail (tex_detail.h)
+    bool whole_asked = false; // (and a shader reads it by texel position: it goes, and is made whole: texture_want_whole)
     // (a huge array kept whole as a sparse resident image instead: each layer gets device memory when it is first
     // written, so only what the game streams in costs VRAM. MKW's terrain arrays, 8192 x 8192 x 68 BC6H: 5.8 GB
     // each, written by the GPU's copies into level 0, which a texture with its top level left out lost)
@@ -45,6 +49,8 @@ struct Texture {
     bool astc = false;        // ASTC blocks decoded into RGBA8 (block_w x block_h)
     bool bc = false;          // (and kept as BC3: big ones, re-encoded on the GPU after decoding; vk_texture.cpp)
     bool bc_resized = false;  // (hookshot-amd: its BC3 image is a resized copy, uneven block levels on AMD; vk_texture.cpp)
+    bool bc1 = false;         // (Triforce) and that kept image is BC1, not BC3: every block of it decodes opaque (tex_bc1.h)
+    bool bc1_no = false;      // (Triforce) it was BC1 and had to become BC3 (content with alpha, a copy on the GPU): it stays BC3
     int block_w = 1, block_h = 1, bpb = 0;   // the storage's blocks
     // the game's texture
     uint64_t gpu = 0, guest = 0, guest_size = 0;   // storage (GPU address, guest address, bytes)
@@ -53,8 +59,10 @@ struct Texture {
     int nvn_format = 0;       // the format it was made for
     // contents
     bool uploaded = false;    // from guest memory, as of upload_gen
-    uint32_t upload_gen = 0;
+    WriteGen upload_gen;      // (Triforce: a page write generation, 64 bits: write_gen.h)
     uint64_t bc_retry_frame = 0;   // (hookshot) a BC3 image whose upload failed: tried again from this frame (vk_texture.cpp)
+    upload_owed::Owed owed;        // (Triforce) an upload that found no memory: what it was to bring, and when it is tried again
+    upload_same::State same;       // (Triforce) a re-upload's check against the bytes its image holds (upload_same.h)
     uint64_t map_sig = 0;     // (a texture in a virtual pool: its pages' mapping when last uploaded)
     std::vector<uint64_t> page_map;   // (and each 64 KB page's guest address then: what a remap changed)
     struct Run { uint64_t off, guest, n; };   // (and its storage as runs of contiguous guest memory)
@@ -62,11 +70,13 @@ struct Texture {
     uint32_t runs_maps_gen = ~0u;             // (the GPU mappings' generation the runs were made at)
     bool gpu_written = false; // the GPU rendered, copied or stored into it: the image is the content
     bool only_cleared = false; // (hookshot) all the GPU did was clear it: what the CPU writes after still counts (a font cache's glyphs)
-    uint32_t gpu_gen = 0;     // (the memory generation when the GPU last wrote it: CPU writes after it are taken)
+    WriteGen gpu_gen;         // (the memory generation when the GPU last wrote it: CPU writes after it are taken)
     bool released = false;    // its texture was finalized after the GPU wrote it: CPU writes count again
     uint64_t let_go = 0;      // (Triforce) the present at which the game finalized a texture over it, 0 once it is used again:
                               // one uploaded from memory goes first while VRAM is short (texture_sweep)
-    uint32_t release_gen = 0;
+    uint32_t back_gap = 0;    // ((Triforce) and the longest it stayed let go before it was used again, in presents: it goes
+                              // early no sooner than 8 times that after a let-go (tex_pressure.h, keep taken)
+    WriteGen release_gen;
     uint64_t gpu_wrote_seen = 0;   // (the newest finished GPU write into its storage it was uploaded after)
     uint64_t last_written = 0;     // (the frame the GPU last wrote it: a render target, each frame it is used)
     uint64_t first_written = 0;    // (the frame its GPU contents began: written in that frame alone, a table the game baked)
@@ -74,6 +84,8 @@ struct Texture {
     uint32_t checked_epoch = 0;
     uint64_t upload_value = 0;   // (the submission its last upload was recorded in, and the parallel replay's segment
     uint64_t upload_seg = 0;     // that recorded it: one before it in the stream uploads it again)
+    std::atomic<uint32_t> touching{0};   // (Triforce) a locked look of it is under way (texture_touch): the look without
+                                         // the lock does not take it for up to date meanwhile (touch_quick.h)
     uint64_t last_frame = 0;  // the present it was last used in (the cache's age)
     uint64_t first_render_frame = 0;   // the present it was first rendered into in (0: never)
     uint64_t last_value = 0;  // the timeline value of the last submission that used it
@@ -98,6 +110,8 @@ struct Texture {
     VmaAllocation twin3d_alloc = nullptr;
     uint32_t twin3d_layer = 0;
     uint64_t twin3d_value = ~0ull, twin3d_written = ~0ull;
+    uint64_t twin3d_rec = 0, twin3d_seg = 0;   // (and the submission and parallel segment that copied it last: an earlier
+                                               // segment of that submission copies it again, as an upload: upload_seg)
     std::unordered_map<uint64_t, VkImageView> twin3d_views;
 };
 
@@ -123,6 +137,10 @@ VkCommandBuffer upload_command_buffer();
 bool texture_copy_into_bc(VkCommandBuffer cmd, Texture* src, uint32_t src_level, uint32_t src_layer, int sx, int sy,
                           Texture* dst, uint32_t dst_level, uint32_t dst_layer, int dx, int dy, uint32_t w, uint32_t h,
                           uint32_t layers);
+/// (Triforce) Before a copy on the GPU writes a kept texture, or copies one's blocks into another: a texture kept as BC1
+/// (tex_bc1.h) becomes BC3, its new image filled from the game's memory again when it had been uploaded. True when it is
+/// not BC1 (any more); false when its BC3 image could not be made or filled: the copy is then left out. The replay's lock held
+bool texture_bc1_to_bc3(Texture* tex, const char* why);
 /// A texture already found used again (its age, and its contents from guest memory when written since: texture_get's
 /// second half)
 Texture* texture_touch(Texture* tex, bool for_sampling);
@@ -150,6 +168,27 @@ int texture_segment_end(int index);
 uint32_t texture_epoch();
 /// Changes whenever a texture is destroyed (pointers to textures kept elsewhere go stale)
 uint64_t texture_destroy_generation();
+/// (Triforce) Changes at a frame's end when the frame left textures for later (a new texture's first upload, a new ASTC texture's
+/// placeholder): a look that resolved to the dummy for want of a texture goes stale, and nothing else does
+uint64_t texture_dummy_generation();
+/// (Triforce) The texture detail in effect: 0 full, 1 reduced, 2 low (tex_detail.h; chosen at the first call, which needs
+/// the device and its allocator). RX_VK_TEX_DETAIL, else the Insert menu's Texture detail row, else the video memory's
+int texture_detail_level();
+/// (Triforce) What the video memory alone gives this card (tex_detail.h by_vram), whichever level is in effect: the Texture
+/// detail row says it beside Automatic. -1 until the level is chosen
+int texture_detail_auto();
+/// (Triforce) A shader reads the texture by texel position or asks for its size (spv_exact.h) and the texture detail left
+/// levels of it out: it is let go at the next sweep and made whole from then on. Any thread of the replay.
+void texture_want_whole(Texture* tex);
+/// One texture's own end, where the generation above is too wide (any texture's end changes it, and textures go in most
+/// frames while the video memory is full): how many textures were destroyed so far, and whether the one with this creation
+/// number (Texture::id) was, since a count taken while it was there. True too when it cannot be told (texture_gone.h)
+uint64_t texture_destroyed_count();
+bool texture_destroyed_since(uint32_t id, uint64_t since);
+/// (Triforce) The creation numbers of the textures whose views went (destroyed, made again in another format, moved by the
+/// compaction) from record count `since` on, appended to out, and the count now (*now, always). False when they cannot all be
+/// told. Each is recorded before texture_destroy_generation moves for it (view_keep.h, vk_draw.cpp texture_view_of)
+bool texture_views_gone_since(uint64_t since, std::vector<uint32_t>& out, uint64_t* now);
 /// The texture an NVN texture's storage is (made and uploaded at first use, uploaded again when the CPU wrote its
 /// storage since). null for formats and targets that have no image (buffers, unknown formats).
 Texture* texture_get(const nvn_tex* t, bool for_sampling);
@@ -205,15 +244,44 @@ void barrier_stats(int64_t* made, int64_t* left_out);
 /// (hookshot) Set around a draw's sampled-texture lookups (vk_draw.cpp): a new ASTC texture there may wait for a later frame
 /// once this frame's uploads passed their budget (texture_touch). Never for compute: a dispatch may bake what it reads once
 extern thread_local bool upload_defer_ok;
-/// A draw pass just ended on cmd (end_pass): pass_start_barrier knows nothing else ran after it
+/// (Triforce) The hold of the last picture (present_hold.h, vk_replay.cpp do_present): what the draws of the next frame may do
+/// with a new texture once its uploads took their budget (present_hold::Mode), set at each present
+void texture_hold_mode(int mode);
+/// This frame's looks of a draw that left a texture owed its first bytes (it sampled the dummy or the placeholder in its
+/// place): not zero, the frame is held. Read at the present, before texture_frame starts the next frame
+int64_t texture_frame_owed();
+/// New textures whose first upload was left for a later frame, since the start (the hold's budget and the ASTC one's)
+int64_t texture_new_later();
+/// A draw pass just ended on cmd (end_pass): pass_start_barrier knows nothing else ran after it ((Triforce) on cmd: its own count,
+/// cmd_work.h)
 void note_pass_end(VkCommandBuffer cmd);
-/// The barrier a draw pass starts with. Full, unless RX_VK_PASS_BARRIER=game and the last thing on cmd was a draw pass with no
-/// barrier of the game's after it: then the new pass waits for the earlier work in its fragment stages only, so its vertex work
-/// may overlap the previous pass's fragments (NVN asks for a barrier before rendering results are read; only vertex-stage
-/// reads of the previous pass's output with no barrier from the game can change order)
+/// (Triforce) The pass just ended on cmd was ended by the replay itself, to keep a draw or a clear apart from its own pass's work
+/// (vk_draw.cpp draw_hazards, clear_after_draws): the next pass starts with a full barrier whatever RX_VK_PASS_BARRIER says
+void note_pass_split(VkCommandBuffer cmd);
+/// The barrier a draw pass starts with. Full, unless the game mode is on (RX_VK_PASS_BARRIER=game, and by default with NVIDIA's
+/// driver) and the last thing on cmd was a draw pass with no barrier of the game's after it: then the new pass waits for the
+/// earlier work in its fragment stages only, so its vertex work may overlap the previous pass's fragments (NVN asks for a barrier
+/// before rendering results are read; only vertex-stage reads of the previous pass's output with no barrier from the game can
+/// change order). The rule and why: pass_barrier.h
 void pass_start_barrier(VkCommandBuffer cmd);
 /// Pass starts with the fragment-stage barrier, since the start
 int64_t pass_barriers_relaxed();
+/// (Triforce) The barrier a draw pass begun again after a part's split starts with (RX_VK_SPLIT_BARRIER, barrier_rules.h): the
+/// attachments' outputs before the next draws' (what one pass orders); nothing right after a full barrier
+void pass_resume_barrier(VkCommandBuffer cmd);
+/// Passes begun again behind that barrier, since the start
+int64_t pass_resumes();
+/// (Triforce) RX_VK_EVENT_BARRIER (barrier_rules.h): an event's write held for the next full barrier on cmd, which records it right
+/// after itself (event_writes_record), as work: the next full barrier is not left out after it
+void event_writes_hold(VkCommandBuffer cmd);
+/// Whether writes are held (for cmd; VK_NULL_HANDLE: for any command buffer)
+bool event_writes_held(VkCommandBuffer cmd);
+/// The writes held for cmd recorded now, behind a full barrier (before a recording's end: its write-backs copy the events' words to
+/// the game's memory; before a second write of a held word). Nothing when none is held
+void event_writes_flush(VkCommandBuffer cmd, const char* why);
+/// (vk_replay.cpp) The held writes recorded into cmd, by full_barrier right after itself. Takes no lock (their buffers were bound at
+/// their signals): a full barrier may be recorded under the pools' lock (vk_memory.cpp transfer_barrier)
+void event_writes_record(VkCommandBuffer cmd);
 void texture_stats(int64_t* uploads, int64_t* astc_gpu, int64_t* bytes_uploaded);
 /// (hookshot) whether texture_read_texels' walk of r at that row stride (0: the region's own) and its own image stride
 /// stays within avail bytes of the data it is given (overflow-checked: the stride is the game's)

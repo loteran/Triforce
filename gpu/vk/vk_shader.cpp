@@ -17,6 +17,8 @@
 #include <algorithm>
 #include <cctype>
 #include <chrono>
+#include <condition_variable>
+#include <deque>
 #include <stdexcept>
 #include <cstdio>
 #include <functional>
@@ -24,6 +26,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <unordered_set>
@@ -53,6 +56,9 @@
 
 #include "vk_paths.h"
 #include "vk_internal.h"
+#include "program_readahead.h"   // (Triforce: programs read ahead of their first draw)
+#include "program_carry.h"   // (Triforce: the program cache over an update of the translator)
+#include "stage_code_cache.h"   // (Triforce: the stages' decoded code kept by their bytes)
 #include "vk_jobs.h"
 #include "vk_draw.h"
 
@@ -95,6 +101,8 @@ void ptr_diag_log(uint64_t key, const char* kind) {
 }
 } // namespace
 #include "vk_shader.h"
+#include "spv_exact.h"
+#include "vk_texture.h"
 
 namespace mkwvk {
 namespace {
@@ -129,6 +137,10 @@ struct Code {
     bool header_only = false;       // a graphics header and no code (NVN2's per-primitive output map of a mesh program)
     uint8_t sph[sizeof(Shader::ProgramHeader)]{};
     bool ok = false;
+    // ((Triforce) RX_VK_STAGE_CODE_LAZY) a stage read for the picks as its head (stage_head): whole false, its code not lowered
+    // yet, ok until the lowering says (codes_whole), its control section and code area in bytes for that
+    bool whole = true;
+    std::shared_ptr<const std::vector<uint8_t>> bytes;
 };
 
 /// Whether this is a control section, and how much code it says there is
@@ -146,32 +158,57 @@ bool control_end(const uint8_t* ctl, uint32_t* end_out) {
 uint64_t code_key(const uint8_t* ctl, const uint8_t* area, uint32_t end) {
     return hash_bytes(area, end, hash_bytes(ctl, kControlSize));
 }
-Code parse_code(const uint8_t* ctl, const std::vector<uint8_t>& area);
+Code parse_code(const uint8_t* ctl, const uint8_t* area, uint32_t end);
 
-Code read_code(const nvn_stage_data& sd) {
-    uint8_t ctl[kControlSize];
-    uint32_t end = 0;
-    if (!sd.control || !sd.data || !host->gpu_read(sd.control, ctl, sizeof ctl) || !control_end(ctl, &end)) return Code{};
-    std::vector<uint8_t> area(end);
-    if (!host->gpu_read(sd.data, area.data(), end)) return Code{};
-    if (const char* dir = getenv("RX_VK_DUMP_STAGES")) {   // (hookshot, RX_VK_DUMP_STAGES=<folder>: control and code as the game has them)
-        char path[512];
-        snprintf(path, sizeof path, "%s/%016llx.bin", dir, (unsigned long long)code_key(ctl, area.data(), end));
-        if (FILE* f = fopen(path, "wb")) fwrite(ctl, 1, sizeof ctl, f), fwrite(area.data(), 1, end, f), fclose(f);
-    }
-    return parse_code(ctl, area);
+// (Triforce) The stages' decoded code kept by their bytes (stage_code_cache.h has why): a program object met for the first time
+// takes what was made of the same bytes before. RX_VK_STAGE_CODE_CACHE=<MB> (64), 0: each decoded again, as before
+stage_code_cache::Cache<Code>& stage_cache() {
+    static stage_code_cache::Cache<Code> c(stage_code_cache::budget(getenv("RX_VK_STAGE_CODE_CACHE")));
+    return c;
+}
+std::atomic<int64_t> st_stage_reads{0}, st_stage_kept{0}, st_stage_decoded{0}, st_stage_decode_ns{0};
+std::atomic<int64_t> st_stage_heads{0}, st_stage_lowered{0};   // ((Triforce) read as heads; lowered for a translation since)
+/// What a Code takes besides its stage's bytes (the stage code cache's budget)
+size_t code_cost(const Code& c) {
+    return sizeof(Code) + c.code.size() * sizeof(uint64_t) + c.c1.size();
+}
+/// (the log, now and then: the stages read for the picks, how many were taken from the cache, and the decoding's time)
+void stage_cache_log() {
+    size_t entries = 0, used = 0;
+    stage_cache().usage(&entries, &used);
+    logf("vk: the stages' code read for the program picks: %lld stages, %lld taken from the stage code cache, %lld read without "
+         "lowering their code, %lld of them lowered since for a translation, %lld decoded (%.1f ms in all); the cache keeps %zu "
+         "stages, %.1f of %zu MB (RX_VK_STAGE_CODE_CACHE=0: none, each decoded again; RX_VK_STAGE_CODE_LAZY=0: each lowered as read)",
+         (long long)st_stage_reads.load(), (long long)st_stage_kept.load(), (long long)st_stage_heads.load(),
+         (long long)st_stage_lowered.load(), (long long)st_stage_decoded.load(), st_stage_decode_ns.load() / 1e6, entries,
+         used / 1048576.0, stage_cache().budget() >> 20);
 }
 
-/// A control section and its code, from the game's memory or the archives (the seed)
-Code parse_code(const uint8_t* ctl, const std::vector<uint8_t>& area) {
+// ((Triforce) The stages read for the picks before their code is lowered (stage_code_cache.h has why): a pick needs a stage's
+// key, NVN stage and header to find its program, the lowered code only to translate one. RX_VK_STAGE_CODE_LAZY=0: each lowered
+// as it is read, as before; so too with the switches that act in the lowering itself, whose stages are lowered as before)
+bool stage_lazy() {
+    static const bool on = stage_code_cache::lazy_on(getenv("RX_VK_STAGE_CODE_LAZY")) && !getenv("RX_VK_REJECT_STAGES") &&
+                           !getenv("RX_VK_REJECT_KEYS") && !getenv("RX_VK_OLD_LOWERING") && !getenv("RX_VK_DUMP_NATIVE") &&
+                           !getenv("RX_VK_DUMP_FAILED");
+    return on;
+}
+// ((Triforce) A pick reads the stages of a program object met for the first time with the shaders' lock let go where it may
+// (codes_read, program_read_once.h). RX_VK_STAGE_CODE_UNLOCKED=0: under the lock, as before)
+bool stage_unlocked() {
+    static const bool on = stage_code_cache::unlocked_on(getenv("RX_VK_STAGE_CODE_UNLOCKED"));
+    return on;
+}
+/// ((Triforce) A stage's head: what parse_code makes of it before it lowers the code (its key, NVN stage, task / mesh words and
+/// graphics header). Whole when that is all there is to it (a header alone); else ok until the lowering says, which parse_code
+/// goes on to do
+Code stage_head(const uint8_t* ctl, const uint8_t* area, uint32_t end) {
     Code c;
-    uint32_t len, c1o;
-    const uint32_t end = (uint32_t)area.size();
+    uint32_t len;
     uint16_t st;
     std::memcpy(&len, ctl + 0x38, 4);
-    std::memcpy(&c1o, ctl + 0x40, 4);
     std::memcpy(&st, ctl + 0x56, 2);
-    c.key = code_key(ctl, area.data(), end);
+    c.key = code_key(ctl, area, end);
     c.stage = st;
     if (st == 6 || st == 7) {
         uint32_t w58, w60;
@@ -183,18 +220,84 @@ Code parse_code(const uint8_t* ctl, const std::vector<uint8_t>& area) {
     }
     const bool graphics = st != 5;
     const uint32_t hdr = graphics ? kAmpereHeader : 0;
-    if (graphics) std::memcpy(c.sph, area.data(), std::min<size_t>(sizeof c.sph, area.size()));
+    if (graphics) std::memcpy(c.sph, area, std::min<size_t>(sizeof c.sph, end));
     if (graphics && len <= hdr + 16) {   // (a header alone)
         c.header_only = true;
         c.ok = true;
         return c;
     }
+    c.ok = true, c.whole = false;
+    return c;
+}
+
+/// A stage's code from guest memory, decoded; ((Triforce) head: for the picks (codes_of), its head where RX_VK_STAGE_CODE_LAZY,
+/// or what the stage code cache kept for its bytes, whole or a head)
+Code read_code(const nvn_stage_data& sd, bool head = false) {
+    uint8_t ctl[kControlSize];
+    uint32_t end = 0;
+    if (!sd.control || !sd.data || !host->gpu_read(sd.control, ctl, sizeof ctl) || !control_end(ctl, &end)) return Code{};
+    // ((Triforce) the control section and the code area in one buffer: the stage code cache's key)
+    auto bytes = std::make_shared<std::vector<uint8_t>>(kControlSize + end);
+    std::memcpy(bytes->data(), ctl, kControlSize);
+    const uint8_t* area = bytes->data() + kControlSize;
+    if (!host->gpu_read(sd.data, bytes->data() + kControlSize, end)) return Code{};
+    if (const char* dir = getenv("RX_VK_DUMP_STAGES")) {   // (hookshot, RX_VK_DUMP_STAGES=<folder>: control and code as the game has them)
+        char path[512];
+        snprintf(path, sizeof path, "%s/%016llx.bin", dir, (unsigned long long)code_key(ctl, area, end));
+        if (FILE* f = fopen(path, "wb")) fwrite(ctl, 1, sizeof ctl, f), fwrite(area, 1, end, f), fclose(f);
+    }
+    if (st_stage_reads.fetch_add(1, std::memory_order_relaxed) % 1024 == 1023) stage_cache_log();
+    if (const auto kept = stage_cache().find(*bytes); kept && (head || kept->whole)) {
+        st_stage_kept.fetch_add(1, std::memory_order_relaxed);
+        return *kept;
+    }
+    Code c;
+    if (head && stage_lazy()) {
+        c = stage_head(ctl, area, end);
+        st_stage_heads.fetch_add(1, std::memory_order_relaxed);
+        if (!c.whole) c.bytes = bytes;   // (for its lowering: codes_whole)
+    } else {
+        const auto t0 = std::chrono::steady_clock::now();
+        c = parse_code(ctl, area, end);
+        st_stage_decoded.fetch_add(1, std::memory_order_relaxed);
+        st_stage_decode_ns.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count(),
+                                     std::memory_order_relaxed);
+    }
+    stage_cache().put(bytes, std::make_shared<const Code>(c), code_cost(c));
+    return c;
+}
+
+/// ((Triforce, RX_VK_STAGE_CODE_LAZY) A head's stage whole: what the stage code cache kept whole for its bytes, else lowered now
+/// and kept so (in place of the head)
+Code stage_whole(const std::shared_ptr<const std::vector<uint8_t>>& bytes) {
+    if (const auto kept = stage_cache().find(*bytes); kept && kept->whole) return *kept;
+    const auto t0 = std::chrono::steady_clock::now();
+    Code c = parse_code(bytes->data(), bytes->data() + kControlSize, (uint32_t)(bytes->size() - kControlSize));
+    st_stage_decoded.fetch_add(1, std::memory_order_relaxed), st_stage_lowered.fetch_add(1, std::memory_order_relaxed);
+    st_stage_decode_ns.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count(),
+                                 std::memory_order_relaxed);
+    stage_cache().put(bytes, std::make_shared<const Code>(c), code_cost(c));
+    return c;
+}
+
+/// A control section and its code (end bytes), from the game's memory or the archives (the seed)
+Code parse_code(const uint8_t* ctl, const uint8_t* area, uint32_t end) {
+    Code c = stage_head(ctl, area, end);   // ((Triforce) the key, the stage, its words and header: stage_head's)
+    if (c.whole) return c;
+    c.ok = false, c.whole = true;
+    uint32_t len, c1o;
+    uint16_t st;
+    std::memcpy(&len, ctl + 0x38, 4);
+    std::memcpy(&c1o, ctl + 0x40, 4);
+    std::memcpy(&st, ctl + 0x56, 2);
+    const bool graphics = st != 5;
+    const uint32_t hdr = graphics ? kAmpereHeader : 0;
     using Shader::Ampere::Instruction;
     std::vector<Instruction> native;
     Shader::Ampere::ProgramCaptureState capture;
     for (uint32_t i = 0; hdr + (i + 1) * sizeof(Instruction) <= len; i++) {
         Instruction& insn = native.emplace_back();
-        std::memcpy(&insn, area.data() + hdr + i * sizeof(Instruction), sizeof insn);
+        std::memcpy(&insn, area + hdr + i * sizeof(Instruction), sizeof insn);
         const auto r = capture.Observe(insn, i);
         if (r == Shader::Ampere::ProgramCaptureState::Result::InvalidTarget) return c;
         if (r == Shader::Ampere::ProgramCaptureState::Result::Complete) break;
@@ -313,14 +416,14 @@ Code parse_code(const uint8_t* ctl, const std::vector<uint8_t>& area) {
     }
     c.texture_bound = lowered.required_texture_buffer;
     c.code.assign(sizeof(Shader::ProgramHeader) / 8, 0);
-    if (graphics) std::memcpy(c.code.data(), area.data(), sizeof(Shader::ProgramHeader));
+    if (graphics) std::memcpy(c.code.data(), area, sizeof(Shader::ProgramHeader));
     for (const uint64_t instruction : lowered.instructions) {
         if (c.code.size() * 8 % 32 == 0) c.code.push_back(0);   // (the Maxwell scheduling word)
         c.code.push_back(instruction);
     }
     c.code.push_back(0);
     Shader::Ampere::AppendNativeAddressMap(c.code, lowered.source_instruction_offsets);
-    c.c1.assign(area.begin() + c1o, area.end());
+    c.c1.assign(area + c1o, area + end);
     if (!graphics) {
         std::memcpy(c.local, ctl + 0x58, 12);
         std::memcpy(&c.shared_memory, ctl + 0x64, 4);
@@ -584,7 +687,7 @@ Shader::Profile make_profile() {
     // (hookshot) gathers nudged by 1/512 of a texel on AMD's and Intel's drivers, as Eden and Lichii have it (vk_vendor.h; in the
     // cache's stamp)
     p.need_gather_subpixel_offset = dev.fixes.gather_offset;
-    p.min_ssbo_alignment = dev.props.limits.minStorageBufferOffsetAlignment;
+    p.min_ssbo_alignment = storage_binding_align();   // (at least 16: vk_internal.h)
     return p;
 }
 
@@ -598,7 +701,7 @@ Shader::HostTranslateInfo host_info() {
     h.needs_demote_reorder = false;
     h.support_snorm_render_buffer = true;
     h.support_viewport_index_layer = true;
-    h.min_ssbo_alignment = dev.props.limits.minStorageBufferOffsetAlignment;
+    h.min_ssbo_alignment = storage_binding_align();
     h.support_geometry_shader_passthrough = false;
     h.support_conditional_barrier = true;   // (barriers in loops kept: see the WebGPU renderer's 4f5e3e6)
     return h;
@@ -635,6 +738,9 @@ std::unique_ptr<Translation> translate(Env& env, bool graphics, bool one_exit = 
 namespace mkwvk {
 namespace {
 
+// ---- (Triforce) Outside the translation stamp, to the next mark (nx2/build.py translation_text; the rule: program_carry.h): the
+// shader modules made of a translation's SPIR-V, which they take const, and their packing. A program read from the cache and one
+// just translated go through them alike, and a record holds the SPIR-V, not the module ----
 /// (local, RenoDX port) The CRC-32 of a module's words as the bytes they are: RenoDX names the shaders it replaces by it
 uint32_t spirv_crc32(const std::vector<uint32_t>& spirv) {
     static const std::array<uint32_t, 256> table = [] {
@@ -653,6 +759,122 @@ uint32_t spirv_crc32(const std::vector<uint32_t>& spirv) {
 }
 
 /// (local, RenoDX port) *renodx: set when RenoDX has a replacement for this module, which is made in its place (vk_renodx.h)
+// (Triforce, texture detail: the texture bindings each module reads by texel position or asks the size of, spv_exact.h;
+// kept only where the card's detail level leaves levels out, and only for the modules that have such a binding)
+std::mutex exact_mu;
+std::atomic<uint64_t> exact_gen{1};   // (bumped when an entry changes: shader_reads_exact's per-thread answer)
+std::unordered_map<VkShaderModule, spv_exact::Bindings> exact_of;
+void exact_note(VkShaderModule m, const std::vector<uint32_t>& code) {
+    if (!m || texture_detail_level() <= 0) return;
+    const spv_exact::Bindings b = spv_exact::scan(code.data(), code.size());
+    std::lock_guard lk(exact_mu);
+    if (spv_exact::any(b)) exact_of[m] = b;
+    else if (!exact_of.erase(m)) return;   // (a handle used again; nothing kept and nothing there: no thread's answer changes)
+    exact_gen.fetch_add(1, std::memory_order_release);
+}
+// ---- (Triforce) RX_VK_SPV_PACK: a ready program's stages keep their SPIR-V packed and no module (spv_store.h, where the
+// reasons and the measurements are). make_module packs the words it hands to the driver and keeps the store beside the
+// module's handle (pack_note); program_pack, called where a program becomes ready, gives each stage its store and destroys
+// the module; StageModule (vk_shader.h) makes one again for a pipeline's creation. On by default since 11-15 (RX_VK_SPV_PACK=0:
+// every module kept for the run, as before): Vulkan lets a module go once the pipelines and libraries made with it are
+// made, and a module made again from the same words is the same module to the driver's caches (they go by its words) ----
+using StageCode = spv_store::Code<VkShaderModule>;
+std::mutex pack_mu;
+std::unordered_map<VkShaderModule, std::shared_ptr<StageCode>> pack_made;   // (by the module made from the same words)
+std::atomic<int64_t> st_pack_stages{0}, st_pack_plain{0}, st_pack_bytes{0}, st_pack_modules{0};
+// ((Triforce) the stores alive and what they take, for the memory line (mem_parts.h): a store counts from its fill to its end.
+// And what the packing costs, for the "shader code packed" line: the packing, on the thread that made the module, and the
+// modules made again for pipelines, on the thread that builds the pipeline)
+std::atomic<int64_t> st_pack_live{0}, st_pack_live_bytes{0}, st_pack_ns{0}, st_remake_ns{0}, st_remake_max_ns{0};
+// ((Triforce) The programs whose modules are let go soon after they are made gain nothing from a store, and would pay its
+// packing (about 0.2 ms a 70 KiB stage) and a module made again from it for each pipeline: those the prepare translates and
+// lets go (seed_translate), those borrowed for the driver's part and the predicted pipelines (program_cache_borrow), and
+// compute programs, which keep their modules (program_pack). A program a draw reads from the cache itself is read on the
+// thread replaying, under shader_mu: it keeps its modules, as before, rather than have its packing there. PackSkip says so
+// for the modules made on this thread while it lives)
+thread_local int pack_skip = 0;
+struct PackSkip {
+    PackSkip() { pack_skip++; }
+    ~PackSkip() { pack_skip--; }
+    PackSkip(const PackSkip&) = delete;
+    PackSkip& operator=(const PackSkip&) = delete;
+};
+/// (a handle used again by the driver names the new module's store: every program module is made by make_module, which
+/// writes its entry over whatever an earlier module of that handle left, or takes that entry away)
+void pack_note(VkShaderModule m, const uint32_t* words, size_t n) {
+    if (!m || !spv_pack_on()) return;
+    if (pack_skip) {   // (no store: and none that a module of this handle left before, which program_pack would take for this one)
+        std::lock_guard lk(pack_mu);
+        pack_made.erase(m);
+        return;
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+    std::shared_ptr<StageCode> code(new StageCode, [](StageCode* c) {
+        if (c->filled()) st_pack_live--, st_pack_live_bytes -= (int64_t)c->packed_bytes();
+        delete c;
+    });
+    const bool ok = code->fill(words, n);
+    if (ok) st_pack_live++, st_pack_live_bytes += (int64_t)code->packed_bytes();
+    st_pack_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
+    std::lock_guard lk(pack_mu);
+    if (ok) pack_made[m] = std::move(code);
+    else pack_made.erase(m);   // (it did not come back the same: this stage keeps its module)
+}
+// ---- (Triforce) The program variants' shader modules alive, and the SPIR-V they were made of: the memory line's
+// (mem_parts.h). make_module notes each, stage_module_destroy (and program_pack) forget it; a handle the driver uses again
+// for a module let go unseen is noted anew ----
+std::mutex module_mu;
+std::unordered_map<VkShaderModule, uint32_t> module_words;
+std::atomic<int64_t> st_module_live{0}, st_module_bytes{0};
+void module_note(VkShaderModule m, size_t words) {
+    if (!m) return;
+    std::lock_guard lk(module_mu);
+    const auto [it, fresh] = module_words.try_emplace(m, (uint32_t)words);
+    if (fresh) st_module_live++;
+    else st_module_bytes -= (int64_t)it->second * 4, it->second = (uint32_t)words;
+    st_module_bytes += (int64_t)words * 4;
+}
+void module_forget(VkShaderModule m) {
+    if (!m) return;
+    std::lock_guard lk(module_mu);
+    const auto it = module_words.find(m);
+    if (it == module_words.end()) return;
+    st_module_live--, st_module_bytes -= (int64_t)it->second * 4;
+    module_words.erase(it);
+}
+void exact_move(VkShaderModule from, VkShaderModule to);
+/// A program that is about to be ready (no other thread has it yet): each stage's module gives way to its packed SPIR-V.
+/// Graphics and mesh programs, the mesh fallback's too: their pipelines are made by build_graphics and
+/// fallback_compute_pipelines (vk_draw.cpp), which take the modules through StageModule. A compute program keeps its
+/// module: it has one pipeline, and the four places that make it read the module's field
+void program_pack(Program& p) {
+    if (!spv_pack_on()) return;
+    for (Stage& st : p.stages) {
+        if (!st.module || st.code) continue;
+        std::shared_ptr<StageCode> code;
+        {
+            std::lock_guard lk(pack_mu);
+            const auto it = pack_made.find(st.module);
+            if (it == pack_made.end()) continue;
+            code = std::move(it->second);
+            pack_made.erase(it);
+        }
+        if (p.failed || p.compute) continue;   // (its store is let go, its module stays)
+        exact_move(st.module, (VkShaderModule)(uintptr_t)code.get());
+        module_forget(st.module);
+        vkDestroyShaderModule(dev.device, st.module, nullptr);
+        st.module = VK_NULL_HANDLE;
+        st_pack_plain += (int64_t)code->words() * 4, st_pack_bytes += (int64_t)code->packed_bytes();
+        st.code = std::move(code);
+        const int64_t n = ++st_pack_stages;
+        if (n == 1 || n % 4096 == 0)
+            logf("vk: shader code packed (RX_VK_SPV_PACK=0: not): %lld stages, %.1f MB of SPIR-V kept as %.1f MB (the packing %.0f ms "
+                 "in all); %lld modules made again for pipelines since the start, in %.0f ms in all (the longest %.2f ms)", (long long)n,
+                 st_pack_plain.load() / 1048576.0, st_pack_bytes.load() / 1048576.0, st_pack_ns.load() / 1e6,
+                 (long long)st_pack_modules.load(), st_remake_ns.load() / 1e6, st_remake_max_ns.load() / 1e6);
+    }
+}
+
 VkShaderModule make_module(const std::vector<uint32_t>& spirv, uint32_t* renodx = nullptr, uint32_t* crc_out = nullptr) {
     const uint32_t crc = spirv_crc32(spirv);
     if (crc_out) *crc_out = crc;
@@ -682,13 +904,94 @@ VkShaderModule make_module(const std::vector<uint32_t>& spirv, uint32_t* renodx 
         salted[2] ^= salt;
         ci.pCode = salted.data();
         vkCreateShaderModule(dev.device, &ci, nullptr, &m);
+        module_note(m, salted.size());
+        exact_note(m, code);
+        pack_note(m, salted.data(), salted.size());
         return m;
     }
     vkCreateShaderModule(dev.device, &ci, nullptr, &m);
+    module_note(m, code.size());
+    exact_note(m, code);
+    pack_note(m, code.data(), code.size());
     return m;
+}
+/// (the packed stage's answer for shader_reads_exact goes with it, under the key that stands for its module: stage_exact_key)
+void exact_move(VkShaderModule from, VkShaderModule to) {
+    std::lock_guard lk(exact_mu);
+    const auto it = exact_of.find(from);
+    const bool had = it != exact_of.end();
+    if (had) exact_of[to] = it->second, exact_of.erase(from);
+    else if (!exact_of.erase(to)) return;   // (nothing kept for either: no thread's answer changes)
+    exact_gen.fetch_add(1, std::memory_order_release);
 }
 
 } // namespace
+
+bool spv_pack_on() {
+    static const bool on = !(getenv("RX_VK_SPV_PACK") && atoi(getenv("RX_VK_SPV_PACK")) == 0);
+    return on;
+}
+void stage_module_destroy(VkShaderModule m) {
+    if (!m) return;
+    module_forget(m);
+    if (spv_pack_on()) {   // (a store made for it that no program took: let go with it)
+        std::lock_guard lk(pack_mu);
+        pack_made.erase(m);
+    }
+    vkDestroyShaderModule(dev.device, m, nullptr);
+}
+void program_module_stats(int64_t* modules, int64_t* module_bytes, int64_t* packed, int64_t* packed_bytes) {
+    *modules = st_module_live.load(), *module_bytes = st_module_bytes.load();
+    *packed = st_pack_live.load(), *packed_bytes = st_pack_live_bytes.load();
+}
+StageModule::StageModule(const Stage& st) {
+    if (!st.code) {
+        m_ = st.module;
+        return;
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+    bool made = false;
+    m_ = st.code->pin([&made](const uint32_t* words, size_t n) {
+        VkShaderModuleCreateInfo ci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+        ci.codeSize = n * 4;
+        ci.pCode = words;
+        VkShaderModule m = VK_NULL_HANDLE;
+        if (vkCreateShaderModule(dev.device, &ci, nullptr, &m) != VK_SUCCESS) m = VK_NULL_HANDLE;
+        if (m) st_pack_modules++;
+        made = m != VK_NULL_HANDLE;
+        return m;
+    });
+    if (made) {   // ((Triforce) what a module made again costs the thread building the pipeline: the unpacking and the driver's part)
+        const int64_t ns = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
+        st_remake_ns += ns;
+        for (int64_t was = st_remake_max_ns.load(); ns > was && !st_remake_max_ns.compare_exchange_weak(was, ns);) {
+        }
+    }
+    if (m_) code_ = st.code;
+    else {
+        static std::atomic<int> logged{0};
+        if (logged++ < 10) logf("vk: a packed stage's module could not be made again: its pipeline is not built");
+    }
+}
+StageModule::~StageModule() {
+    if (code_) code_->unpin([](VkShaderModule m) { vkDestroyShaderModule(dev.device, m, nullptr); });
+}
+
+bool shader_reads_exact(VkShaderModule module, uint32_t binding) {
+    // (the last module asked about, a thread: draws that follow each other mostly share their program)
+    static thread_local VkShaderModule last = VK_NULL_HANDLE;
+    static thread_local spv_exact::Bindings last_bits{};
+    static thread_local uint64_t last_gen = 0;
+    const uint64_t gen = exact_gen.load(std::memory_order_acquire);   // (a new module may have taken an old one's handle)
+    if (module != last || last_gen != gen) {
+        std::lock_guard lk(exact_mu);
+        const auto it = exact_of.find(module);
+        last_bits = it == exact_of.end() ? spv_exact::Bindings{} : it->second;
+        last = module, last_gen = gen;
+    }
+    return spv_exact::has(last_bits, binding);
+}
+// ---- (Triforce) Inside the translation stamp again ----
 
 /// A word of a stage's constant bank: c0 / c2 the driver's banks, c1 its own constants, c3.. its uniform buffers
 uint32_t stage_cbuf_word(const NvnState& s, const Stage& st, uint32_t index, uint32_t offset) {
@@ -876,6 +1179,16 @@ bool still_valid(const NvnState& s, const Program& p) {
 std::mutex shader_mu;
 std::unordered_map<uint64_t, std::vector<std::unique_ptr<Program>>> programs;   // by the stages' code keys
 std::unordered_map<uint64_t, std::vector<Code>> codes;                          // by program serial
+/// The stages of s's program object read, those that are ok ((Triforce) heads where RX_VK_STAGE_CODE_LAZY: codes_whole lowers
+/// them). No lock of the shaders' needed (codes_read lets it go)
+std::vector<Code> stages_read(const NvnState& s) {
+    std::vector<Code> v;
+    for (uint32_t i = 0; i < s.prog.nstage && i < 6; i++) {
+        Code c = read_code(s.prog.sd[i], true);
+        if (c.ok) v.push_back(std::move(c));
+    }
+    return v;
+}
 const Shader::Profile& profile() {
     static const Shader::Profile p = make_profile();
     return p;
@@ -909,12 +1222,26 @@ const Shader::Profile& profile_graphics(VkShaderStageFlags stage) {
 
 const std::vector<Code>& codes_of(const NvnState& s) {
     auto& v = codes[s.prog.serial];
-    if (v.empty())
-        for (uint32_t i = 0; i < s.prog.nstage && i < 6; i++) {
-            Code c = read_code(s.prog.sd[i]);
-            if (c.ok) v.push_back(std::move(c));
-        }
+    if (v.empty()) v = stages_read(s);
     return v;
+}
+
+/// ((Triforce, shader_mu held; RX_VK_STAGE_CODE_LAZY) The stages of s's program object read as heads made whole (stage_whole),
+/// each in its place in its list (codes_of): before a pick translates a variant of them, and for what names them. One that does
+/// not lower stays in its place, not ok, so that a pick that has the lock let go keeps its pointers into the list
+/// (program_read_once.h): the picks take the stages that are ok, and start again when one they took turns out not to be. A list
+/// none of whose stages lowers is emptied, to be read again at the next pick, as such a list was before (no pick of it can have
+/// the lock let go: a program none of whose stages lowers is in no cache)
+void codes_whole(const NvnState& s) {
+    const auto it = codes.find(s.prog.serial);
+    if (it == codes.end()) return;
+    std::vector<Code>& v = it->second;
+    for (Code& c : v)
+        if (!c.whole && c.bytes) {
+            const auto bytes = c.bytes;
+            c = stage_whole(bytes);
+        }
+    if (!v.empty() && std::none_of(v.begin(), v.end(), [](const Code& c) { return c.ok; })) v.clear();
 }
 
 std::atomic<int64_t> st_translated, st_failed, st_translate_ns;
@@ -1331,8 +1658,12 @@ void mesh_nocull(Shader::IR::Program& program, uint64_t code_key) {
 // ---- (hookshot) The program cache, triforce_programs.bin beside the executable: what translation made, by the key of the
 // stages' code and inputs. A program met for the first time stopped the frame for its translation, 9 s of it each run,
 // the long stutters when walking somewhere (replay workers in jobs_wait for up to 150 ms). The pipelines themselves were
-// already kept (mkw_vk_pipelines.bin). Written as made; good for this translator (HOOKSHOT_SHADER_STAMP) and these switches only
-// (a file made by another starts again). RX_VK_NO_PROGRAM_CACHE=1: off ----
+// already kept (mkw_vk_pipelines.bin). Written as made; good for these switches and this translator only (a file made by another
+// starts again). (Triforce) By what of the translator translates: a build that changed none of it carries the file over
+// (HOOKSHOT_TRANSLATION_STAMP; program_carry.h has the rule; RX_VK_PROGRAM_CARRY=0: a file for one build of the translator, as
+// before). RX_VK_NO_PROGRAM_CACHE=1: off ----
+// ---- (Triforce) Outside the translation stamp, to the next mark (nx2/build.py translation_text; the rule: program_carry.h): the
+// program cache's file and its list of records, where the records are, not what they hold ----
 struct DiskRecord { int64_t at; size_t size; uint32_t kind; };
 std::mutex disk_mu;
 // (read as wanted: with every program of the game in it the file is gigabytes, and it was read into memory whole)
@@ -1349,6 +1680,11 @@ constexpr uint32_t kDiskMagic = 0x31505348;
 constexpr uint32_t kIdxMagic = 0x58495048;   // ("HPIX", then a version and the cache's stamp; 20 bytes a record: key, size, kind)
 constexpr uint32_t kIdxVersion = 1;
 constexpr size_t kIdxEntry = 20;
+// ((Triforce) after a start that threw the cache away, its keys as its index named them and how many records it had, and the
+// programs translated since whose key it had and those it had not: the log's, dropped_note. disk_mu)
+std::unordered_set<uint64_t> disk_dropped;
+size_t disk_dropped_records = 0;
+int64_t st_again = 0, st_first = 0;
 
 void idx_put(std::vector<uint8_t>& o, uint64_t key, uint64_t size, uint32_t kind) {
     uint8_t e[kIdxEntry];
@@ -1371,6 +1707,30 @@ void idx_write(const std::string& path, uint64_t stamp, const std::vector<std::p
     if (ok) disk_idx = fopen(path.c_str(), "ab");
     else remove(path.c_str());   // (a short one would only be read as far as it goes, but the next start makes it again anyway)
 }
+/// ((Triforce) disk_mu held) A program just kept (program_cache_save): after a start that threw a cache of other translations
+/// away (disk_init), counted as translated again (that cache had its key) or not, for the log now and then
+void dropped_note(uint64_t key) {
+    if (disk_dropped.empty()) return;
+    (disk_dropped.count(key) ? st_again : st_first)++;
+    if (st_again + st_first == 1 || (st_again + st_first) % 4096 == 0)
+        logf("vk: program cache: %lld programs translated again since the translation changed (of keys the cache before had: %zu "
+             "programs of %zu keys), %lld of keys it had not", (long long)st_again, disk_dropped_records, disk_dropped.size(),
+             (long long)st_first);
+}
+// ---- (Triforce) Inside the translation stamp again ----
+
+// (Triforce) The translation stamp (nx2/build.py translation_stamp): 0 in a build made without it, which then keeps a file for
+// one build of the translator, as before
+#ifdef HOOKSHOT_TRANSLATION_STAMP
+constexpr uint64_t kTranslationStamp = HOOKSHOT_TRANSLATION_STAMP;
+#else
+constexpr uint64_t kTranslationStamp = 0;
+#endif
+/// (Triforce) Whether the program cache is carried over an update by the translation stamp (RX_VK_PROGRAM_CARRY, on unless 0)
+bool carry_on() {
+    static const bool on = kTranslationStamp != 0 && program_carry::on(getenv("RX_VK_PROGRAM_CARRY"));
+    return on;
+}
 
 uint64_t disk_stamp() {
     uint64_t h = 0xCBF29CE484222325ull;
@@ -1378,9 +1738,10 @@ uint64_t disk_stamp() {
         for (size_t i = 0; i < n; i++) h = (h ^ ((const uint8_t*)d)[i]) * 1099511628211ull;
     };
     // (what translates shaders, nx2/build.py: a rebuild of anything else keeps the cache. It was the DLL's bytes, and every build
-    // lost it)
-    const uint64_t translator = HOOKSHOT_SHADER_STAMP;
-    add(&translator, sizeof translator);
+    // lost it. (Triforce) With the carry, what of it translates: HOOKSHOT_TRANSLATION_STAMP, program_carry.h)
+    uint64_t translator[2];
+    program_carry::translator_words(carry_on(), kTranslationStamp, HOOKSHOT_SHADER_STAMP, translator);
+    add(translator, sizeof translator);
     const uint32_t depth = host->depth_minus_w() != 0;   // (d3zessete's PR 54: programs made in either depth mode are kept apart)
     add(&depth, sizeof depth);
     // (and a GPU's mesh shaders: a file of native task and mesh programs is no use to the compute fallback, nor its to one)
@@ -1391,7 +1752,10 @@ uint64_t disk_stamp() {
     // the pinned graphics profile even if the base profile already has the requested width)
     const uint32_t lanes[] = {profile().warp_size_potentially_larger_than_guest ? 1u : 0u, profile().max_subgroup_size,
                               profile().has_broken_spirv_fragment_shuffle ? 1u : 0u, (uint32_t)dev.sg32_stages,
-                              getenv("RX_VK_WARP64") ? 1u : 0u};
+                              getenv("RX_VK_WARP64") ? 1u : 0u,
+                              // (and where the translation starts a storage binding: offsets are counted from there, so a cache
+                              // made on a 16-aligned GPU is no use on a 64-aligned one in the same folder, a laptop's two GPUs)
+                              (uint32_t)storage_binding_align()};
     add(lanes, sizeof lanes);
     // (the records keep Shader::Info as it lies in memory: a cache written by another C++ library (the MSVC build's, then the
     // llvm-mingw one's libc++) has other layouts, and reading it crashed at start. The library and the sizes, so it starts again)
@@ -1426,6 +1790,8 @@ uint64_t disk_stamp() {
     return h;
 }
 
+// ---- (Triforce) Outside the translation stamp, to the next mark (nx2/build.py translation_text; the rule: program_carry.h): the
+// program cache opened, its records listed when it was made for this stamp ----
 void disk_init() {
     static std::once_flag once;
     std::call_once(once, [] {
@@ -1455,6 +1821,12 @@ void disk_init() {
             }
         }
         const uint64_t stamp = disk_stamp();
+        // ((Triforce) the file's second word: the build of the translator that opened it last. A file made for this stamp by
+        // another build is carried over the update: its translations are the ones this build makes, program_carry.h)
+        const uint32_t writer = program_carry::writer(HOOKSHOT_SHADER_STAMP);
+        program_carry::Verdict verdict = program_carry::Verdict::Fresh;
+        uint32_t had_writer = 0;
+        uint64_t had_stamp = 0;
         // (triforce_programs.idx: the records' heads, 20 bytes each, in the file's order. The records follow one another in the
         // file, so finding them was a read of each one's head, 22000 of them over the 4 GB: seconds at every start, each a read
         // somewhere else on the disk (and on a compressed file system a block of 128 KB unpacked for those 20 bytes). The index
@@ -1471,7 +1843,10 @@ void disk_init() {
             _fseeki64(f, 0, SEEK_SET);
             uint32_t head[2]{};
             uint64_t kept = 0;
-            if (whole >= 16 && fread(head, 4, 2, f) == 2 && fread(&kept, 8, 1, f) == 1 && head[0] == kDiskMagic && kept == stamp) {
+            const bool read = whole >= 16 && fread(head, 4, 2, f) == 2 && fread(&kept, 8, 1, f) == 1;
+            verdict = program_carry::verdict(read, head[0], head[1], kept, kDiskMagic, stamp, writer);
+            had_writer = head[1], had_stamp = kept;
+            if (verdict == program_carry::Verdict::Kept || verdict == program_carry::Verdict::Carried) {   // (kept == stamp)
                 good = 16;
                 size_t idx_n = 0;
                 bool idx_short = false;   // (it named records the file does not have whole)
@@ -1541,15 +1916,39 @@ void disk_init() {
             }
             fclose(f);
         }
+        // ((Triforce) a cache made for another stamp: its keys, as its own index names them, before the index is made again, for
+        // the log's "translated again")
+        if (verdict == program_carry::Verdict::Dropped) {
+            if (FILE* x = fopen(idx_path.c_str(), "rb")) {
+                uint32_t ih[2]{};
+                uint64_t is = 0;
+                uint8_t e[kIdxEntry];
+                if (fread(ih, 4, 2, x) == 2 && fread(&is, 8, 1, x) == 1 && ih[0] == kIdxMagic && ih[1] == kIdxVersion && is == had_stamp)
+                    while (fread(e, 1, kIdxEntry, x) == kIdxEntry) {
+                        uint64_t key;
+                        std::memcpy(&key, e, 8);
+                        disk_dropped.insert(key), disk_dropped_records++;
+                    }
+                fclose(x);
+            }
+        }
         if (good) {
             if (good != whole) {   // (a record cut short: without it)
                 if (FILE* f = fopen(path.c_str(), "r+b")) _chsize_s(_fileno(f), good), fclose(f);
+            }
+            // ((Triforce) carried: its head names this build now, and the next start keeps it)
+            if (verdict == program_carry::Verdict::Carried) {
+                if (FILE* f = fopen(path.c_str(), "r+b")) {
+                    _fseeki64(f, 4, SEEK_SET);
+                    fwrite(&writer, 4, 1, f);
+                    fclose(f);
+                }
             }
             disk_out = fopen(path.c_str(), "ab");
         } else {
             disk_out = fopen(path.c_str(), "wb");
             if (disk_out) {
-                const uint32_t h[2] = {kDiskMagic, 0};
+                const uint32_t h[2] = {kDiskMagic, writer};
                 fwrite(h, 4, 2, disk_out);
                 fwrite(&stamp, 8, 1, disk_out);
                 fflush(disk_out);
@@ -1563,9 +1962,27 @@ void disk_init() {
         disk_in = disk_out ? fopen(path.c_str(), "rb") : nullptr;
         disk_path = path;
         disk_on = disk_out != nullptr && disk_in != nullptr;
-        logf("vk: program cache %s: %zu program keys kept, %lld KB", path.c_str(), disk_records.size(), (long long)(good >> 10));
+        if (verdict == program_carry::Verdict::Carried) {
+            logf("vk: program cache %s: %zu program keys kept, %lld KB: their %zu programs carried over an update of the translator "
+                 "(made by its build %08x, this one is %08x), which did not change what translates them (program_carry.h; "
+                 "RX_VK_PROGRAM_CARRY=0: translated again)", path.c_str(), disk_records.size(), (long long)(good >> 10), order.size(),
+                 had_writer, writer);
+        } else if (verdict == program_carry::Verdict::Dropped) {
+            char had[96];
+            if (disk_dropped_records)
+                snprintf(had, sizeof had, "%zu programs of %zu keys, %lld KB", disk_dropped_records, disk_dropped.size(),
+                         (long long)(whole >> 10));
+            else
+                snprintf(had, sizeof had, "%lld KB", (long long)(whole >> 10));
+            logf("vk: program cache %s: 0 program keys kept, 0 KB: the one there (%s) was made for other translations (a translator "
+                 "whose translation is another%s, or another GPU or other switches): its programs are translated again as they are met",
+                 path.c_str(), had, carry_on() ? "" : ", or another build of it: RX_VK_PROGRAM_CARRY=0");
+        } else {
+            logf("vk: program cache %s: %zu program keys kept, %lld KB", path.c_str(), disk_records.size(), (long long)(good >> 10));
+        }
     });
 }
+// ---- (Triforce) Inside the translation stamp again ----
 
 void put_bytes(std::vector<uint8_t>& o, const void* d, size_t n) {
     o.insert(o.end(), (const uint8_t*)d, (const uint8_t*)d + n);
@@ -1738,6 +2155,7 @@ void program_cache_save(const Program& p, const std::vector<std::vector<uint32_t
     }
     // (the precompile's: nothing holds them but the file, and the game starts on them at once)
     if (disk_listing) disk_records[p.key].push_back({at + 16, o.size(), (uint32_t)((p.compute ? 1 : 0) | (p.mesh ? 2 : 0) | (p.fallback ? 4 : 0))});
+    dropped_note(p.key);   // ((Triforce) the log's "translated again")
 }
 
 /// The kept variants of key read from the file (in: a handle on it, used under mu when given) and made ready, to variants
@@ -1767,6 +2185,8 @@ void program_cache_read(FILE* in, std::mutex* mu, uint64_t key, const std::vecto
         p->variant = answers_hash(*p);
         const uint64_t n = r.count(1);
         bool ok = !r.bad && n <= 8;   // (a program has at most a few stages)
+        std::optional<PackSkip> compute_skip;   // ((Triforce) a compute program keeps its module: no store for it)
+        if (p->compute) compute_skip.emplace();
         for (uint64_t k = 0; ok && k < n; k++) {
             p->stages.emplace_back();
             Stage& st = p->stages.back();
@@ -1789,7 +2209,7 @@ void program_cache_read(FILE* in, std::mutex* mu, uint64_t key, const std::vecto
             // Program owns the stage containers, but their Vulkan handles are not RAII-managed.
             for (Stage& st : p->stages) {
                 if (st.module) {
-                    vkDestroyShaderModule(dev.device, st.module, nullptr);
+                    stage_module_destroy(st.module);
                     st.module = VK_NULL_HANDLE;
                 }
             }
@@ -1798,31 +2218,540 @@ void program_cache_read(FILE* in, std::mutex* mu, uint64_t key, const std::vecto
                      (unsigned long long)key, (long long)d.at, d.size);
             continue;
         }
+        program_pack(*p);   // ((Triforce) RX_VK_SPV_PACK: before anyone else has it)
         p->ready.store(true, std::memory_order_release);
         variants.push_back(std::move(p));
         st_cache_hits++;
     }
 }
 
-/// (shader_mu held) the kept variants of key go to its list, ready, once
+// ---- (Triforce) Outside the translation stamp, to the next mark (nx2/build.py translation_text; the rule: program_carry.h): the
+// records read for the draws and read ahead of them, which program_cache_read reads ----
+// ---- (Triforce) programs read ahead of their first draw (program_readahead.h has why). A worker with a handle of its own on the
+// file reads, after each program a draw read itself, the next records in the file's order and keeps them made (parked); the
+// draw that comes to one takes it from there, and its record leaves disk_records then, as when the draw reads it. The records
+// stay listed while parked, so that every other reader of the list (the precompile, the borrows, the prepare in play) sees
+// them as before. Locks: ra_mu, then disk_mu, never the other way; the worker never takes shader_mu. ----
+std::mutex ra_mu;
+std::condition_variable ra_cv;
+std::deque<int64_t> ra_asks;        // (file offsets to read after)
+std::deque<int64_t> ra_note_asks;   // ((Triforce, test16) note indexes to read after, program_readahead.h notes_order)
+std::unordered_map<uint64_t, std::vector<std::unique_ptr<Program>>> ra_parked;
+std::deque<uint64_t> ra_park_order;   // ((Triforce) the parked keys, oldest first: the full shelf lets these go first)
+std::unordered_set<uint64_t> ra_reading;   // (the keys the workers read now)
+std::deque<std::pair<uint64_t, std::vector<DiskRecord>>> ra_pending;   // ((Triforce) keys an ask chose, for the workers to read)
+std::vector<std::pair<int64_t, uint64_t>> ra_order;   // (the listed records' first offsets and keys, in the file's order; ra_mu)
+std::vector<std::pair<int64_t, uint64_t>> ra_note_order;   // ((Triforce) the notes' programs in the notes' order; ra_mu)
+std::vector<std::pair<uint64_t, int64_t>> ra_note_index;   // ((Triforce) key -> note index, program_readahead::by_key; ra_mu)
+bool ra_started = false;
+std::atomic<int64_t> st_ra_read{0}, st_ra_taken{0}, st_ra_waits{0}, st_ra_wait_ns{0}, st_ra_dropped{0}, st_ra_let_go{0};
+std::atomic<int64_t> st_ra_by_notes{0}, st_ra_read_ns{0};   // ((Triforce) read ahead in the notes' order; the workers' read time)
+std::atomic<int64_t> st_draw_reads{0}, st_draw_read_ns{0};   // (programs a draw read itself, and their time: the stall line's)
+// ((Triforce) the draws' own reads with shader_mu let go (program_read_once.h has why): the keys being read and the picks that
+// have the lock let go, and for the stall line the waits for a program another draw was reading and those to take the lock
+// again. RX_VK_PROGRAM_READ_UNLOCKED=0: read under the lock, as before)
+program_read_once::Reads<std::mutex> draw_once(shader_mu);
+std::atomic<int64_t> st_once_waits{0}, st_once_wait_ns{0}, st_once_relock_ns{0}, st_once_unlocked{0};
+bool read_unlocked() {
+    static const bool on = program_read_once::on(getenv("RX_VK_PROGRAM_READ_UNLOCKED"));
+    return on;
+}
+// ((Triforce) the read-ahead in the order the last sessions first needed their programs (program_order.h has why): where it is
+// and what it keeps (ra_mu), this session's order and the file's at the start (order_mu: taken under shader_mu or alone, nothing
+// taken under it), and for the stall line why the draws read what they read themselves. RX_VK_PROGRAM_ORDER=0: none, as before)
+program_order::Ahead ra_ahead;
+std::unordered_set<uint64_t> ra_let_go_keys;   // (let go unused, from the shelf or the order: "let go before"; ra_mu)
+std::mutex order_mu, order_file_mu;
+program_order::Record order_rec;
+std::vector<uint64_t> order_before;
+std::chrono::steady_clock::time_point order_written;
+std::atomic<int64_t> st_order_read{0}, st_order_taken{0}, st_order_let_go{0}, st_order_writes{0};
+std::atomic<int64_t> st_why_unnamed{0}, st_why_let_go{0}, st_why_ahead{0};
+bool order_on() {
+    static const bool on = program_order::on(getenv("RX_VK_PROGRAM_ORDER"));
+    return on;
+}
+// ((Triforce, wp19) the programs read in the order kept until needed, the whole order read (program_order.h Ahead::keep_all);
+// RX_VK_PROGRAM_ORDER_KEEP=0: 512 at most, let go behind where the draws are, as before)
+bool order_keep_all() {
+    static const bool on = program_order::on(getenv("RX_VK_PROGRAM_ORDER_KEEP"));
+    return on;
+}
+std::atomic<int64_t> st_order_asks_kept{0}, st_order_ram_let_go{0}, st_order_rewarmed{0};   // ((Triforce, wp19) asks' reads kept with
+// the order's; let go, the RAM short; read cold and warmed later)
+std::string order_path() {   // (beside the program cache)
+    return disk_path.substr(0, disk_path.find_last_of("\\/") + 1) + "triforce_program_order.bin";
+}
+int readahead_count() {
+    static const int n = program_readahead::count(getenv("RX_VK_PROGRAM_READAHEAD"));
+    return n;
+}
+bool readahead_notes() {
+    static const bool on = program_readahead::notes_on(getenv("RX_VK_PROGRAM_READAHEAD_NOTES"));
+    return on;
+}
+void readahead_drop(std::vector<std::unique_ptr<Program>>& variants) {   // (made for nothing: their modules go)
+    for (auto& p : variants) {
+        for (Stage& st : p->stages)
+            if (st.module) stage_module_destroy(st.module), st.module = VK_NULL_HANDLE;
+        // ((Triforce, test18) a compute pipeline the warm made for it (vk_draw.cpp warm_compute): no dispatch had it
+        if (p->compute_pipeline) vkDestroyPipeline(dev.device, p->compute_pipeline, nullptr), p->compute_pipeline = VK_NULL_HANDLE;
+    }
+    variants.clear();
+}
+/// ((Triforce, ra_mu held) The shelf's programs: those parked but the ones kept for the sessions' order, which it does not count
+/// nor let go (program_order.h)
+size_t shelf_locked() {
+    return ra_parked.size() - std::min(ra_parked.size(), ra_ahead.kept.size());
+}
+/// ((Triforce, ra_mu held) k let go unused: noted for the stall line's "let go before" (bounded: a long session forgets)
+void let_go_note_locked(uint64_t k) {
+    if (ra_let_go_keys.size() >= 65536) ra_let_go_keys.clear();
+    ra_let_go_keys.insert(k);
+}
+/// ((Triforce, ra_mu held) A draw met key (took it, read it or found it nowhere): the sessions' order's furthest place moves on,
+/// and what it kept far behind that goes (program_order.h Ahead::met)
+void ahead_met_locked(uint64_t key) {
+    if (!order_on() || ra_ahead.order.empty()) return;
+    std::vector<uint64_t> gone;
+    ra_ahead.met(key, gone);
+    for (const uint64_t k : gone) {
+        auto it = ra_parked.find(k);
+        if (it == ra_parked.end()) continue;
+        readahead_drop(it->second), ra_parked.erase(it), st_order_let_go++;
+        let_go_note_locked(k);
+    }
+}
+/// ((Triforce, ra_mu held) Whether the sessions' order has more for the workers to read now (not with the RAM short)
+bool ahead_more_locked() {
+    return order_on() && ra_ahead.more() && !memory_ram_low() && !memory_ram_short();
+}
+/// ((Triforce, shader_mu held) A draw needs key for the first time this session: into the session's order
+void order_note(uint64_t key) {
+    std::lock_guard lk(order_mu);
+    order_rec.add(key);
+}
+/// ((Triforce, ra_mu held, as the workers start) The last sessions' order, read from its file: the workers read in it
+void order_load_locked() {
+    std::vector<uint64_t> keys;
+    if (FILE* f = fopen(order_path().c_str(), "rb")) {
+        std::vector<uint8_t> data(16 + program_order::kKeysMax * 8 + 8 + 1);
+        const size_t n = fread(data.data(), 1, data.size(), f);
+        fclose(f);
+        keys = program_order::read(data.data(), n);
+    }
+    logf("vk: programs read ahead in the order the last sessions first needed them: %zu programs (%s; RX_VK_PROGRAM_ORDER=0: "
+         "none)", keys.size(), order_path().c_str());
+    {
+        std::lock_guard lk(order_mu);
+        order_before = keys, order_written = std::chrono::steady_clock::now();
+    }
+    ra_ahead.keep_all = order_keep_all();   // ((Triforce, wp19))
+    ra_ahead.load(std::move(keys));
+}
+/// ((Triforce, wp19, ra_mu held) The RAM short: every program kept for the sessions' order goes (program_order.h keep_all; the
+/// rules before let none go for it)
+void ahead_ram_let_go_locked() {
+    if (!ra_ahead.keep_all || ra_ahead.kept.empty() || !memory_ram_short()) return;
+    std::vector<uint64_t> gone;
+    ra_ahead.let_go_all(gone);
+    for (const uint64_t k : gone) {
+        auto it = ra_parked.find(k);
+        if (it == ra_parked.end()) continue;
+        readahead_drop(it->second), ra_parked.erase(it), st_order_let_go++, st_order_ram_let_go++;
+        let_go_note_locked(k);
+    }
+    logf("vk: the RAM is short: %zu programs read ahead in the last sessions' order let go (%lld so far)", gone.size(),
+         (long long)st_order_ram_let_go.load());
+}
+/// ((Triforce, a worker's, no lock held) The session's order written beside the program cache when it grew, at most every few
+/// seconds (program_order.h kSaveEveryMs): this session's programs first, then those of the sessions before it has not met.
+/// Whole or not at all: a file of its own, then put in the old one's place
+void order_write_maybe() {
+    std::unique_lock fk(order_file_mu, std::try_to_lock);
+    if (!fk.owns_lock()) return;
+    std::vector<uint64_t> keys;
+    {
+        std::lock_guard lk(order_mu);
+        const auto now = std::chrono::steady_clock::now();
+        if (!order_rec.due(std::chrono::duration_cast<std::chrono::milliseconds>(now - order_written).count())) return;
+        keys = program_order::merge(order_rec.keys, order_before);
+        order_rec.saved = order_rec.keys.size(), order_written = now;
+    }
+    const std::string path = order_path(), part = path + ".part";
+    const std::vector<uint8_t> data = program_order::write(keys);
+    FILE* f = fopen(part.c_str(), "wb");
+    if (!f) return;
+    const bool ok = fwrite(data.data(), 1, data.size(), f) == data.size();
+    if (fclose(f) != 0 || !ok) {
+        remove(part.c_str());
+        return;
+    }
+#ifdef _WIN32
+    const bool moved = MoveFileExA(part.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING) != 0;
+#else
+    const bool moved = rename(part.c_str(), path.c_str()) == 0;
+#endif
+    if (!moved) remove(part.c_str());
+    else if (++st_order_writes == 1)
+        logf("vk: the order this session first needed its programs in written beside the program cache: %zu programs (%s)", keys.size(),
+             path.c_str());
+}
+/// ((Triforce, shader_mu held) A draw reads key itself: why the read-ahead had not read it (the stall line): named by no order
+/// (neither the pipeline notes' nor the sessions'), read ahead and let go unused before, or not read ahead yet
+void readahead_why(uint64_t key) {
+    if (!readahead_count()) return;
+    std::lock_guard lk(ra_mu);
+    const bool named = (!ra_note_index.empty() && program_readahead::index_of(ra_note_index, key) >= 0) || ra_ahead.place.count(key);
+    (!named ? st_why_unnamed : ra_let_go_keys.count(key) ? st_why_let_go : st_why_ahead)++;
+}
+} // namespace (readahead_computes_let_go is vk_shader.h's: vk_draw.cpp links to it)
+/// ((Triforce) Why the draws read what they read themselves (readahead_why), and the programs taken read ahead in the sessions'
+/// order (program_order.h), for the stall line (vk_replay.cpp status_tick)
+void program_order_stats(int64_t* unnamed, int64_t* let_go, int64_t* ahead, int64_t* order_taken) {
+    *unnamed = st_why_unnamed.load(std::memory_order_relaxed), *let_go = st_why_let_go.load(std::memory_order_relaxed);
+    *ahead = st_why_ahead.load(std::memory_order_relaxed), *order_taken = st_order_taken.load(std::memory_order_relaxed);
+}
+/// ((Triforce, test19) The draws' and dispatches' waits for a program the read-ahead was reading, and their time, for the stall
+/// line (vk_replay.cpp status_tick)
+void readahead_wait_stats(int64_t* waits, int64_t* wait_ns) {
+    *waits = st_ra_waits.load(std::memory_order_relaxed), *wait_ns = st_ra_wait_ns.load(std::memory_order_relaxed);
+}
+/// ((Triforce, test18) vk_shader.h: the warm's compute pipelines on the programs still read ahead, the RAM short. ra_mu tried:
+/// the presents' thread waits for nobody)
+bool readahead_computes_let_go(std::vector<VkPipeline>& out) {
+    std::unique_lock lk(ra_mu, std::try_to_lock);
+    if (!lk.owns_lock()) return false;
+    for (auto& [k, variants] : ra_parked)
+        for (auto& p : variants)
+            if (p->compute_pipeline) {
+                out.push_back(p->compute_pipeline);
+                p->compute_pipeline = VK_NULL_HANDLE;
+                p->compute_state.store(0, std::memory_order_release);   // (its dispatch builds it as before)
+            }
+    return true;
+}
+/// ((Triforce) The draws' own reads with shader_mu let go (program_read_once.h), for the stall line (vk_replay.cpp status_tick):
+/// the waits for a program another draw was reading and their time, and the picks' waits to take shader_mu again after a read
+/// or a wait for the read-ahead's worker
+void program_read_stats(int64_t* waits, int64_t* wait_ns, int64_t* relock_ns) {
+    *waits = st_once_waits.load(std::memory_order_relaxed), *wait_ns = st_once_wait_ns.load(std::memory_order_relaxed);
+    *relock_ns = st_once_relock_ns.load(std::memory_order_relaxed);
+}
+/// ((Triforce) vk_replay.cpp do_program_released) p let go once no program pick has shader_mu let go: such a pick holds its
+/// program's stage codes (codes_of), which the release erases (program_read_once.h close)
+void program_released_after_reads(const nvn_prog* p) {
+    const program_read_once::Closed closed(draw_once);
+    program_released(p);
+}
+namespace {
+/// (ra_mu held) An ask's keys to the pending list: the next records after its place in the notes' order, or in the file's
+void readahead_choose_locked() {
+    const bool by_notes = !ra_note_asks.empty();
+    const int64_t at = by_notes ? ra_note_asks.front() : ra_asks.front();
+    (by_notes ? ra_note_asks : ra_asks).pop_front();
+    // ((Triforce) the shelf full: as before, nothing more (RX_VK_PROGRAM_READAHEAD_NOTES=0); with the notes, its oldest go)
+    // ((Triforce) the shelf: not the programs kept for the sessions' order, shelf_locked)
+    if (!readahead_notes() && shelf_locked() >= program_readahead::kParkedMax) return;
+    std::lock_guard dk(disk_mu);
+    if (ra_order.empty()) {   // (once: the list as it is now; records written later are not read ahead)
+        for (const auto& [k, recs] : disk_records)
+            if (!recs.empty()) ra_order.push_back({recs[0].at, k});
+        std::sort(ra_order.begin(), ra_order.end());
+    }
+    const size_t room = readahead_notes() ? program_readahead::kParkedMax
+                                          : program_readahead::kParkedMax - std::min(shelf_locked(), program_readahead::kParkedMax);
+    const auto wanted = [](uint64_t k) {   // ((Triforce) and not being read by a draw: program_read_once.h)
+        if (ra_parked.count(k) || ra_reading.count(k) || !disk_records.count(k) || draw_once.reading(k)) return false;
+        for (const auto& [pk, recs] : ra_pending)
+            if (pk == k) return false;
+        return true;
+    };
+    for (const uint64_t k : program_readahead::next_keys(by_notes ? ra_note_order : ra_order, at,
+                                                         std::min<size_t>(room, (size_t)readahead_count()), wanted)) {
+        const std::vector<DiskRecord>& recs = disk_records.find(k)->second;   // (listed: next_keys asked)
+        if (recs.empty()) continue;
+        // ((Triforce) the compute programs too, with the notes: where the precompile keeps no pipelines (RAM spared) it reads none
+        // of them either, and a load's dispatches read theirs where they are dispatched. As before without: left to the precompile)
+        if (!readahead_notes() && (recs[0].kind & 1)) continue;
+        ra_pending.push_back({k, recs});
+        if (by_notes) st_ra_by_notes++;
+    }
+}
+/// ((Triforce, ra_mu held) Nothing asked: the next program of the sessions' order to the pending list (program_order.h), one
+/// at a time, so that an ask that comes is served after the read under way
+void ahead_choose_locked() {
+    if (!ahead_more_locked()) return;
+    std::lock_guard dk(disk_mu);
+    const auto wanted = [](uint64_t k) {
+        if (ra_parked.count(k) || ra_reading.count(k) || draw_once.reading(k)) return false;
+        const auto it = disk_records.find(k);
+        // (no compute program without the notes: as the asks' choice, left to the precompile)
+        if (it == disk_records.end() || it->second.empty() || (!readahead_notes() && (it->second[0].kind & 1))) return false;
+        for (const auto& [pk, recs] : ra_pending)
+            if (pk == k) return false;
+        return true;
+    };
+    if (const uint64_t k = ra_ahead.choose(wanted)) ra_pending.push_back({k, disk_records.find(k)->second});
+    // ((Triforce, wp19) the whole order gone through: said once, for the lab's runs (read before the load or not)
+    static bool told = false;
+    if (!told && ra_ahead.next >= (int64_t)ra_ahead.order.size()) {
+        told = true;
+        logf("vk: programs read ahead in the order the last sessions first needed them: all %zu places gone through, %zu programs kept "
+             "for the draws (%zu at most; %zu of them read without the pipelines' warm, made when the draws come near), %lld taken by "
+             "them so far, %lld read by the asks kept with them (RX_VK_PROGRAM_ORDER_KEEP=0: 512 at most, let go behind where the "
+             "draws are)", ra_ahead.order.size(), ra_ahead.kept.size(), ra_ahead.max_kept(), ra_ahead.cold.size(),
+             (long long)st_order_taken.load(), (long long)st_order_asks_kept.load());
+    }
+}
+void readahead_main() {
+    SetThreadDescription(GetCurrentThread(), L"mkw_vk program read-ahead");
+    FILE* in = fopen(disk_path.c_str(), "rb");
+    if (!in) return;
+    for (;;) {
+        uint64_t k = 0;
+        int64_t at = -1;   // ((Triforce, test18) its place in the notes' order, for the warm)
+        std::vector<DiskRecord> recs;
+        std::vector<std::unique_ptr<Program>> made;
+        bool rewarm = false, cold = false;   // ((Triforce, wp19) a kept program's warm now; one read without it: program_order.h)
+        {
+            std::unique_lock lk(ra_mu);
+            const auto work = [] {
+                return !ra_pending.empty() || !ra_asks.empty() || !ra_note_asks.empty() || ahead_more_locked() || ra_ahead.warm_due();
+            };
+            // ((Triforce) with the sessions' order, awake now and then to write this session's: order_write_maybe)
+            if (order_on()) ra_cv.wait_for(lk, std::chrono::seconds(1), work);
+            else ra_cv.wait(lk, work);
+            if (order_on()) ahead_ram_let_go_locked();   // ((Triforce, wp19) the RAM short: what the order kept goes)
+            if (ra_pending.empty() && (!ra_asks.empty() || !ra_note_asks.empty())) readahead_choose_locked();
+            // ((Triforce, wp19) nothing asked: first the warm of the nearest program the order kept cold, now that the warm has
+            // room (the draws took warmed ones), taken in hand as a read is (a draw that comes to it waits for it)
+            if (ra_pending.empty() && order_on())
+                if (const uint64_t w = ra_ahead.next_warm())
+                    if (auto it = ra_parked.find(w); it != ra_parked.end())
+                        k = w, made = std::move(it->second), ra_parked.erase(it), ra_reading.insert(k), rewarm = true;
+            if (!rewarm && ra_pending.empty()) ahead_choose_locked();   // ((Triforce) nothing asked: the sessions' order)
+            if (!rewarm && ra_pending.empty()) {
+                lk.unlock();
+                if (order_on()) order_write_maybe();
+                continue;
+            }
+            if (!rewarm) {
+                k = ra_pending.front().first, recs = std::move(ra_pending.front().second);
+                ra_pending.pop_front();
+                ra_reading.insert(k);
+                cold = ra_ahead.is_cold(k);
+            }
+            if (!ra_note_index.empty()) at = program_readahead::index_of(ra_note_index, k);
+        }
+        if (!rewarm) {
+            const auto t0 = std::chrono::steady_clock::now();
+            program_cache_read(in, nullptr, k, recs, made);
+            st_ra_read_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
+        }
+        // ((Triforce, test16) their noted pipelines made, while no draw can have them (k is being read: a draw waits for it):
+        // vk_draw.cpp pipelines_warm, pipe_warm.h. A worker that has them still in hand holds no lock of the read-ahead's.
+        // ((Triforce, wp19) not for one read cold, beyond the warm's window: its warm comes when the window reaches it)
+        if (!cold) pipelines_warm(made, at);
+        std::lock_guard lk(ra_mu);
+        bool listed;   // ((Triforce) and not being read by a draw, which keeps its record listed until done: program_read_once.h)
+        {
+            std::lock_guard dk(disk_mu);
+            listed = disk_records.count(k) != 0 && !draw_once.reading(k);
+        }
+        if (rewarm) {   // ((Triforce, wp19) parked again, unless a draw read it itself meanwhile or the RAM let it go)
+            if (listed && !made.empty() && ra_ahead.kept.count(k)) {
+                ra_parked[k] = std::move(made), st_order_rewarmed++;
+            } else {
+                readahead_drop(made), st_ra_dropped++;
+                ra_ahead.taken(k);
+            }
+            ra_reading.erase(k);
+            ra_cv.notify_all();
+            continue;
+        }
+        const bool by_order = ra_ahead.is_chosen(k);   // ((Triforce) the sessions' order's: kept apart from the shelf)
+        if (listed && !made.empty() && by_order) {
+            ra_parked[k] = std::move(made), ra_ahead.read_done(k, true), st_order_read++;
+        } else if (listed && !made.empty() && order_on() && !memory_ram_short() && ra_ahead.keep(k)) {
+            // ((Triforce, wp19) an ask's read of a program the order names: kept with the order's, not on the shelf, which lets
+            // its oldest go; the order passed it by while it was being read or parked (program_order.h keep). Not while the RAM
+            // is short: the shelf's, as before
+            ra_parked[k] = std::move(made), st_order_asks_kept++;
+        } else if (listed && !made.empty()) {
+            // ((Triforce) the shelf full: its oldest go, program_readahead.h to_let_go)
+            for (size_t n = program_readahead::to_let_go(shelf_locked(), 1); n && !ra_park_order.empty(); ra_park_order.pop_front()) {
+                auto old = ra_parked.find(ra_park_order.front());
+                if (old == ra_parked.end()) continue;   // (taken since)
+                let_go_note_locked(old->first);
+                readahead_drop(old->second), ra_parked.erase(old), st_ra_let_go++, n--;
+            }
+            ra_parked[k] = std::move(made), ra_park_order.push_back(k), st_ra_read++;
+        } else {
+            readahead_drop(made), st_ra_dropped++;   // (taken by another reader meanwhile: the precompile's, say)
+            if (by_order) ra_ahead.read_done(k, false);
+        }
+        ra_reading.erase(k);
+        ra_cv.notify_all();
+    }
+}
+/// (shader_mu held) key's variants read ahead, into variants: true when there were (a key the worker is reading is waited for,
+/// at most program_readahead::kWaitMs); after a read of its own, the worker is asked to read on from there (at)
+bool readahead_take(uint64_t key, std::vector<std::unique_ptr<Program>>& variants) {
+    if (!readahead_count()) return false;
+    std::unique_lock lk(ra_mu);
+    if (ra_reading.count(key)) {
+        const auto t0 = std::chrono::steady_clock::now();
+        const auto wait = [&] {
+            ra_cv.wait_for(lk, std::chrono::milliseconds(program_readahead::kWaitMs), [&] { return !ra_reading.count(key); });
+        };
+        // ((Triforce) with shader_mu let go, program_read_once.h: the other picks go on meanwhile. ra_mu is let go before
+        // shader_mu is taken again and taken after it, as everywhere; a pick of the same program that took it meanwhile left
+        // nothing parked, and its records unlisted: the caller finds its variants in the list)
+        if (read_unlocked() && draw_once.may_let_go()) {
+            draw_once.unlocked([&] {
+                wait();
+                lk.unlock();
+            }, &st_once_relock_ns);
+            lk.lock();
+        } else {
+            wait();
+        }
+        st_ra_waits++;
+        st_ra_wait_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
+    }
+    // ((Triforce) a program the draws need for the first time: where they are in the sessions' order, and what it kept far
+    // behind them goes, program_order.h)
+    const bool by_order = ra_ahead.kept.count(key) != 0;
+    if (variants.empty()) ahead_met_locked(key);
+    auto it = ra_parked.find(key);
+    if (it == ra_parked.end()) return false;
+    for (auto& p : it->second) variants.push_back(std::move(p));
+    ra_parked.erase(it), ra_ahead.taken(key);
+    st_ra_taken++;
+    if (by_order && ++st_order_taken % 256 == 0)
+        logf("vk: programs read ahead in the order the last sessions first needed them: %lld taken by the draws, %lld read, %lld let go "
+             "far behind the draws, %zu kept now (%zu at most), %zu places of %zu read (RX_VK_PROGRAM_ORDER=0: none)",
+             (long long)st_order_taken.load(), (long long)st_order_read.load(), (long long)st_order_let_go.load(), ra_ahead.kept.size(),
+             ra_ahead.max_kept(), (size_t)ra_ahead.next, ra_ahead.order.size());
+    return true;
+}
+/// After key, read or taken by a draw (its record's place in the file at): the next records in the notes' order when the notes
+/// name it ((Triforce) program_readahead.h), else in the file's
+void readahead_ask(uint64_t key, int64_t at) {
+    if (!readahead_count() || disk_path.empty()) return;
+    std::lock_guard lk(ra_mu);
+    if (!ra_started) {
+        ra_started = true;
+        if (order_on()) order_load_locked();   // ((Triforce) the last sessions' order, for the workers: program_order.h)
+        for (int i = 0; i < (readahead_notes() ? program_readahead::kWorkers : 1); i++) std::thread(readahead_main).detach();
+    }
+    const int64_t note = readahead_notes() && !ra_note_index.empty() ? program_readahead::index_of(ra_note_index, key) : -1;
+    pipelines_warm_consumed(note);   // ((Triforce, test18) where the draws are, for the warm: vk_draw.cpp, pipe_warm.h)
+    if (note >= 0) program_readahead::ask(ra_note_asks, note);
+    else program_readahead::ask(ra_asks, at);
+    ra_cv.notify_all();
+}
+
+/// (shader_mu held, but by a borrow (keep)) the kept variants of key go to its list, ready, once
 void program_cache_load(uint64_t key, std::vector<std::unique_ptr<Program>>& variants, bool keep = false) {
     disk_init();
     if (!disk_on || probe_names(key)) return;
+    // ((Triforce) a program a draw needs for the first time this session: into its order, program_order.h)
+    if (!keep && variants.empty() && order_on()) order_note(key);
+    // (Triforce) read ahead already (readahead_take): only the record's place in the list goes, as below
+    if (!keep && readahead_take(key, variants)) {
+        int64_t at = -1;
+        {
+            std::lock_guard lk(disk_mu);
+            auto it = disk_records.find(key);
+            if (it != disk_records.end() && !it->second.empty()) at = it->second[0].at;
+            disk_records.erase(key);
+        }
+        if (at >= 0) readahead_ask(key, at);   // (and on from there: the scene's draws keep ahead of the worker's reads otherwise)
+        return;
+    }
+    // ((Triforce) a draw's own read with shader_mu let go, program_read_once.h: its records stay listed until it is done, and a
+    // second draw of the program waits for the first's result. RX_VK_PROGRAM_READ_UNLOCKED=0: under the lock, as before)
+    const bool once = !keep && read_unlocked();
     std::vector<DiskRecord> recs;
     {
         std::lock_guard lk(disk_mu);
         auto it = disk_records.find(key);
         if (it == disk_records.end()) return;
-        if (keep) {   // (borrowed: still on disk for play)
+        if (keep || once) {   // (borrowed: still on disk for play; read once: listed until read)
             recs = it->second;
         } else {
             recs = std::move(it->second);
             disk_records.erase(it);
         }
     }
+    if (once && !draw_once.claim(key, &st_once_wait_ns)) {   // (another draw read it: its variants are in the list by now)
+        st_once_waits++;
+        return;
+    }
+    if (!keep) readahead_why(key);   // ((Triforce) why the read-ahead had not read it, for the stall line)
     PROF_EXACT();   // (from disk: a mesh program's too)
-    program_cache_read(disk_in, &disk_mu, key, recs, variants);
+    const auto t0 = std::chrono::steady_clock::now();
+    auto t1 = t0;
+    if (once) {
+        const struct Done {   // (at this block's end, what was read in the list by then: the draws waiting for it go on)
+            uint64_t key;
+            ~Done() { draw_once.done(key); }
+        } done{key};
+        std::vector<std::unique_ptr<Program>> made;
+        const auto read = [&] {
+            const PackSkip skip;   // (on the thread replaying, as below)
+            program_cache_read(disk_in, &disk_mu, key, recs, made);
+            t1 = std::chrono::steady_clock::now();
+        };
+        if (draw_once.may_let_go()) {
+            draw_once.unlocked(read, &st_once_relock_ns);
+            st_once_unlocked++;
+        } else {
+            read();   // (a program's release waits for the picks: under the lock, as before)
+        }
+        bool listed;   // (the records read still listed: nobody took them meanwhile)
+        {
+            std::lock_guard lk(disk_mu);
+            auto it = disk_records.find(key);
+            listed = it != disk_records.end();
+            if (listed) {   // (the ones read go; one written since (the precompile lists what it keeps) stays)
+                std::erase_if(it->second, [&](const DiskRecord& d) {
+                    return std::any_of(recs.begin(), recs.end(), [&](const DiskRecord& r) { return r.at == d.at; });
+                });
+                if (it->second.empty()) disk_records.erase(it);
+            }
+        }
+        // (taken meanwhile by the precompile's load (program_cache_load_some), which puts its own in the list: ours go, unless
+        // the list is still empty, where the draw would translate the program again)
+        if (listed || variants.empty()) {
+            for (auto& p : made) variants.push_back(std::move(p));
+        } else {
+            readahead_drop(made);
+        }
+    } else {   // ((Triforce) a draw's own read, on the thread replaying, or a borrow that lets the program go: its modules stay unpacked)
+        const PackSkip skip;
+        program_cache_read(disk_in, &disk_mu, key, recs, variants);
+        t1 = std::chrono::steady_clock::now();
+    }
+    if (!keep && !recs.empty()) {   // (Triforce: a draw's own read; the worker reads on from it)
+        st_draw_reads++;
+        st_draw_read_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
+        readahead_ask(key, recs[0].at);
+        static std::atomic<int64_t> n{0};
+        if (++n % 500 == 0)
+            logf("vk: programs from the cache: %lld read by the draws themselves (%.0f ms in all), %lld read ahead and taken, %lld read "
+                 "ahead not taken yet (%lld dropped, %lld let go from a full shelf), %lld waits for one being read (%.1f ms in all); "
+                 "%lld chosen by the notes' order, the workers' reads %.0f ms in all (RX_VK_PROGRAM_READAHEAD=0: none ahead; "
+                 "RX_VK_PROGRAM_READAHEAD_NOTES=0: the file's order)",
+                 (long long)st_draw_reads.load(), st_draw_read_ns.load() / 1e6, (long long)st_ra_taken.load(),
+                 (long long)(st_ra_read.load() - st_ra_taken.load() - st_ra_let_go.load()), (long long)st_ra_dropped.load(),
+                 (long long)st_ra_let_go.load(), (long long)st_ra_waits.load(), st_ra_wait_ns.load() / 1e6,
+                 (long long)st_ra_by_notes.load(), st_ra_read_ns.load() / 1e6);
+    }
 }
+// ---- (Triforce) Inside the translation stamp again ----
 
 void translate_into(Program& p, const NvnState& s, const Code* vsc, const Code* fsc, const Code* csc,
                     const uint8_t color_types[8]) {
@@ -1913,7 +2842,10 @@ void translate_into(Program& p, const NvnState& s, const Code* vsc, const Code* 
             Stage st;
             st.nvn_stage = 5;
             st.info = t->program.info;
-            st.module = make_module(spirv);
+            {
+                const PackSkip skip;   // ((Triforce) a compute program keeps its module: no store for it)
+                st.module = make_module(spirv);
+            }
             kept.push_back(spirv);
             st.vk_stage = VK_SHADER_STAGE_COMPUTE_BIT;
             st.c1 = csc->c1;
@@ -2021,10 +2953,20 @@ void translate_into(Program& p, const NvnState& s, const Code* vsc, const Code* 
         if (!trial && logged++ < 30) logf("vk: program %016llx not translated: %s", (unsigned long long)p.key, e.what());
     }
     st_translate_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
+    program_pack(p);   // ((Triforce) RX_VK_SPV_PACK: before anyone else has it)
     p.ready.store(true, std::memory_order_release);
 }
 
 } // namespace
+
+/// (Triforce) The programs the draws read from the program cache themselves and their time, and those they took read ahead
+/// (program_cache_load), for the stall line (vk_replay.cpp status_tick)
+void program_cache_stats(int64_t* draw_reads, int64_t* draw_read_ns, int64_t* ahead_taken) {
+    *draw_reads = st_draw_reads.load(std::memory_order_relaxed), *draw_read_ns = st_draw_read_ns.load(std::memory_order_relaxed);
+    *ahead_taken = st_ra_taken.load(std::memory_order_relaxed);
+}
+/// (Triforce) The picks' waits for shader_mu, their code reads, and the programs translated where asked, for the stall line
+void program_pick_stats(int64_t* lock_ns, int64_t* codes_ns, int64_t* inline_n, int64_t* inline_ns);
 
 namespace {
 
@@ -2261,21 +3203,48 @@ void translate_mesh_into(Program& p, const NvnState& s, const Code* task, const 
         if (logged++ < 30) logf("vk: mesh program %016llx not translated: %s", (unsigned long long)p.key, e.what());
     }
     st_translate_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
+    program_pack(p);   // ((Triforce) RX_VK_SPV_PACK: before anyone else has it)
     p.ready.store(true, std::memory_order_release);
+}
+
+/// (Triforce) The stages a mesh pick takes from its program object's list: the header-only stage, the task, mesh and fragment
+/// stages, of those that lower (ok: a stage read as a head counts until its lowering says otherwise, codes_whole)
+struct MeshStages {
+    const Code *fs = nullptr, *prim = nullptr, *task = nullptr, *mesh = nullptr;
+    bool operator==(const MeshStages&) const = default;
+};
+MeshStages mesh_stages(const std::vector<Code>& cs) {
+    MeshStages m;
+    for (const Code& c : cs) {
+        if (!c.ok) continue;
+        if (c.header_only) m.prim = &c;
+        else if (c.stage == 6) m.task = &c;
+        else if (c.stage == 7) m.mesh = &c;
+        else if (c.stage == 1) m.fs = &c;
+    }
+    return m;
+}
+
+/// ((Triforce, shader_mu held by a pick) codes_of, the stages of a program object met for the first time read with the lock let
+/// go where the pick may let it go (program_read_once.h): the replay's other threads go on picking meanwhile. Two picks of the
+/// object at once each read it, and the first list put stands. RX_VK_STAGE_CODE_UNLOCKED=0: under the lock, as before
+const std::vector<Code>& codes_read(const NvnState& s) {
+    if (const auto it = codes.find(s.prog.serial); it != codes.end() && !it->second.empty()) return it->second;
+    if (!stage_unlocked() || !draw_once.may_let_go()) return codes_of(s);
+    std::vector<Code> read;
+    draw_once.unlocked([&] { read = stages_read(s); });
+    auto& v = codes[s.prog.serial];
+    if (v.empty()) v = std::move(read);
+    return v;
 }
 
 /// An NVN2 mesh program: the stages that write the internal stage buffer are its task (attribute writes only, when
 /// there are two) and mesh programs; a header-only stage, its per-primitive outputs (shader_lock held)
 const Program* mesh_program_locked(const NvnState& s, const uint8_t color_types[8]) {
     if (!dev.mesh_shader && !dev.mesh_fallback) return nullptr;
-    const std::vector<Code>& cs = codes_of(s);
-    const Code *fsc = nullptr, *prim = nullptr, *task = nullptr, *mesh = nullptr;
-    for (const Code& c : cs) {
-        if (c.header_only) prim = &c;
-        else if (c.stage == 6) task = &c;
-        else if (c.stage == 7) mesh = &c;
-        else if (c.stage == 1) fsc = &c;
-    }
+    const std::vector<Code>& cs = codes_read(s);
+    const MeshStages m = mesh_stages(cs);
+    const Code *fsc = m.fs, *prim = m.prim, *task = m.task, *mesh = m.mesh;
     static int logged;
     if (logged++ < 6) log_program_stages(s, "mesh draw");
     if (!mesh) return nullptr;
@@ -2292,6 +3261,10 @@ const Program* mesh_program_locked(const NvnState& s, const uint8_t color_types[
         if (p->failed) return nullptr;
         if (still_valid(s, *p)) return p.get();
     }
+    // ((Triforce) a variant to translate: its stages lowered first where they were read as heads (codes_whole). Should one of
+    // them not lower, this key is not the program's: picked again from the stages that do, the program it was before)
+    codes_whole(s);
+    if (!(mesh_stages(cs) == m)) return mesh_program_locked(s, color_types);
     miss_note(key, "mesh", mesh->key, fsc ? fsc->key : 0, s, color_types, variants.size());
     auto p = std::make_unique<Program>();
     p->key = key;
@@ -2381,7 +3354,12 @@ std::string program_textures(const NvnState& s, const Program& p) {
 std::string program_code_keys(const NvnState& s) {
     std::string out;
     if (!s.has_prog) return out;
-    for (const Code& c : codes_of(s)) {
+    // ((Triforce) under the shaders' lock, the stages read as heads lowered: the stages that lower, as before, codes_whole)
+    std::lock_guard lk(shader_mu);
+    const std::vector<Code>& cs = codes_of(s);
+    codes_whole(s);
+    for (const Code& c : cs) {
+        if (!c.ok) continue;
         char b[40];
         snprintf(b, sizeof b, " %u:%016llx", c.stage, (unsigned long long)c.key);
         out += b;
@@ -2392,8 +3370,11 @@ std::string program_code_keys(const NvnState& s) {
 /// (hookshot) the bound compute program's code key (0: none): what "does not lower" names, for a rejected dispatch
 uint64_t compute_code_key(const NvnState& s) {
     if (!s.has_prog) return 0;
-    for (const Code& c : codes_of(s))
-        if (c.stage == 5 && !c.header_only) return c.key;
+    std::lock_guard lk(shader_mu);   // ((Triforce) as program_code_keys)
+    const std::vector<Code>& cs = codes_of(s);
+    codes_whole(s);
+    for (const Code& c : cs)
+        if (c.ok && c.stage == 5 && !c.header_only) return c.key;
     return 0;
 }
 
@@ -2517,14 +3498,23 @@ const Program* program_for(const NvnState& s, ProgramKind kind, const uint8_t co
     return keep(picked);
 }
 
-const Program* program_pick(const NvnState& s, ProgramKind kind, const uint8_t color_types[8]) {
-    PROF_EXACT();   // (the picks' slow path: a translation, a cache read; PROF_PROGRAM samples the rest)
-    const bool compute = kind == ProgramKind::Compute;
-    std::lock_guard lk(shader_mu);
-    const std::vector<Code>& cs = codes_of(s);
-    const Code* stage_code[8]{};
+// (Triforce) For the stall line (vk_replay.cpp status_tick, program_pick_stats): the picks' waits for shader_mu, their reads of
+// the stages' code (codes_read: with the lock let go, its taking again too), and the programs translated where they were asked
+// (compute programs: a dispatch is never left out), with their times
+std::atomic<int64_t> st_pick_lock_ns{0}, st_pick_codes_ns{0}, st_pick_inline{0}, st_pick_inline_ns{0};
+namespace {
+/// (Triforce) The stages a graphics or compute pick takes from its program object's list, by NVN stage, of those that lower (ok:
+/// a stage read as a head counts until its lowering says otherwise, codes_whole)
+void pick_stages(const std::vector<Code>& cs, const Code* stage_code[8]) {
     for (const Code& c : cs)
-        if (!c.header_only) stage_code[c.stage] = &c;
+        if (c.ok && !c.header_only) stage_code[c.stage] = &c;
+}
+/// ((Triforce, shader_mu held) program_pick's choice among its program object's stages cs (codes_of), from the start again
+/// should a stage it took not lower)
+const Program* program_pick_locked(const NvnState& s, ProgramKind kind, const uint8_t color_types[8], const std::vector<Code>& cs) {
+    const bool compute = kind == ProgramKind::Compute;
+    const Code* stage_code[8]{};
+    pick_stages(cs, stage_code);
     if (compute ? !stage_code[5] : !stage_code[0]) return nullptr;
     if (!compute && (stage_code[2] || stage_code[3] || stage_code[4])) {   // (geometry/tessellation: not translated)
         static int logged;
@@ -2542,6 +3532,12 @@ const Program* program_pick(const NvnState& s, ProgramKind kind, const uint8_t c
         if (p->failed) return nullptr;
         if (still_valid(s, *p)) return p.get();
     }
+    // ((Triforce) a variant to translate: its stages lowered first where they were read as heads (codes_whole). Should one of
+    // them not lower, this key is not the program's: picked again from the stages that do, the program it was before)
+    codes_whole(s);
+    const Code* now[8]{};
+    pick_stages(cs, now);
+    if (std::memcmp(now, stage_code, sizeof now)) return program_pick_locked(s, kind, color_types, cs);
     miss_note(key, compute ? "compute" : "graphics", stage_code[compute ? 5 : 0]->key, stage_code[1] ? stage_code[1]->key : 0, s, color_types,
               variants.size());
     auto p = std::make_unique<Program>();
@@ -2552,7 +3548,11 @@ const Program* program_pick(const NvnState& s, ProgramKind kind, const uint8_t c
     variants.push_back(std::move(p));
     static const bool sync = getenv("RX_VK_SYNC_SHADERS") != nullptr;
     if (compute || sync) {   // (compute: dispatches are never left out, so they are translated where they are)
+        const auto t0 = std::chrono::steady_clock::now();
         translate_into(*raw, s, stage_code[0], stage_code[1], compute ? stage_code[5] : nullptr, color_types);
+        st_pick_inline.fetch_add(1, std::memory_order_relaxed);   // (Triforce: program_pick_stats)
+        st_pick_inline_ns.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count(),
+                                    std::memory_order_relaxed);
         return raw->failed ? nullptr : raw;
     }
     struct Job {
@@ -2569,6 +3569,19 @@ const Program* program_pick(const NvnState& s, ProgramKind kind, const uint8_t c
     jobs_push([job] { translate_into(*job->p, job->s, &job->vs, job->has_fs ? &job->fs : nullptr, nullptr, job->ct); }, false,
               &raw->ready);   // (as the mesh one: a waiting draw runs it, not every job queued before it)
     return raw;
+}
+} // namespace
+
+const Program* program_pick(const NvnState& s, ProgramKind kind, const uint8_t color_types[8]) {
+    PROF_EXACT();   // (the picks' slow path: a translation, a cache read; PROF_PROGRAM samples the rest)
+    const auto l0 = std::chrono::steady_clock::now();
+    std::lock_guard lk(shader_mu);
+    const auto l1 = std::chrono::steady_clock::now();
+    st_pick_lock_ns.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(l1 - l0).count(), std::memory_order_relaxed);
+    const std::vector<Code>& cs = codes_read(s);
+    st_pick_codes_ns.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - l1).count(),
+                               std::memory_order_relaxed);
+    return program_pick_locked(s, kind, color_types, cs);
 }
 
 void program_wait(const Program* p) {
@@ -2587,6 +3600,8 @@ bool key_listed(const char* hex, const char* var) {
     return false;
 }
 uint64_t program_cache_stamp() { return disk_stamp(); }
+// ---- (Triforce) Outside the translation stamp, to the next mark (nx2/build.py translation_text; the rule: program_carry.h): the
+// precompile's and the prepare's loads of kept records, which program_cache_read reads ----
 /// (the precompile, before the game: vk_draw.cpp) the kept compute programs and those named, ready, each given to fn. The rest of the
 /// game's programs stay on disk until a draw asks for one
 size_t program_cache_load_some(const std::unordered_set<uint64_t>& wanted, const std::function<void(Program&)>& fn, bool computes,
@@ -2639,6 +3654,17 @@ size_t program_cache_load_some(const std::unordered_set<uint64_t>& wanted, const
     return n;
 }
 
+/// (Triforce, test16) The pipeline notes' programs, one key a note in the notes' order (vk_draw.cpp precompile_run): the order the
+/// read-ahead reads in (program_readahead.h notes_order). RX_VK_PROGRAM_READAHEAD_NOTES=0: not used
+void program_readahead_notes(const std::vector<uint64_t>& note_programs) {
+    if (!readahead_notes() || note_programs.empty()) return;
+    auto order = program_readahead::notes_order(note_programs);
+    auto index = program_readahead::by_key(order);
+    std::lock_guard lk(ra_mu);
+    ra_note_order = std::move(order), ra_note_index = std::move(index);
+    logf("vk: programs read ahead in the pipeline notes' order: %zu programs named by %zu notes (RX_VK_PROGRAM_READAHEAD_NOTES=0: the "
+         "program cache's order)", ra_note_order.size(), note_programs.size());
+}
 /// (hookshot) Program key's kept variants made for fn, then let go (modules and layouts): the records stay for play
 void program_cache_borrow(uint64_t key, const std::function<void(Program&)>& fn) {
     std::vector<std::unique_ptr<Program>> variants;
@@ -2646,7 +3672,7 @@ void program_cache_borrow(uint64_t key, const std::function<void(Program&)>& fn)
     for (auto& p : variants) {
         fn(*p);
         for (Stage& st : p->stages)
-            if (st.module) vkDestroyShaderModule(dev.device, st.module, nullptr);
+            if (st.module) stage_module_destroy(st.module);
         if (p->layout) vkDestroyPipelineLayout(dev.device, p->layout, nullptr);
         if (p->set_layout) vkDestroyDescriptorSetLayout(dev.device, p->set_layout, nullptr);
     }
@@ -2674,6 +3700,7 @@ std::vector<uint64_t> program_cache_keys(std::vector<Program*>* loaded) {
             if (p->ready.load(std::memory_order_acquire) && !p->failed && !p->compute) loaded->push_back(p.get());
     return keys;
 }
+// ---- (Triforce) Inside the translation stamp again ----
 
 /// (hookshot, the prediction: vk_predict.cpp) every kept graphics program variant, read without making its modules
 void program_cache_each(const std::function<void(const KeptProgram&)>& fn) {
@@ -2739,8 +3766,7 @@ std::string beside_exe(const char* name) {
     return dir.substr(0, dir.find_last_of("\\/") + 1) + name;
 }
 Code stage_of_seed(const SeedStage& st) {
-    return parse_code(seed.blob.data() + st.control, std::vector<uint8_t>(seed.blob.begin() + (ptrdiff_t)st.code,
-                                                                          seed.blob.begin() + (ptrdiff_t)st.code + st.end));
+    return parse_code(seed.blob.data() + st.control, seed.blob.data() + st.code, st.end);
 }
 } // namespace
 
@@ -2862,6 +3888,7 @@ std::unique_ptr<Program> seed_program(size_t i, int inputs) {
 /// not translate); its key to *key_out
 std::unique_ptr<Program> seed_translate(const SeedStage* const by_stage[8], const uint32_t attributes[16], const uint8_t color_types[8],
                                         uint64_t* key_out) {
+    const PackSkip skip;   // ((Triforce) its callers let it go (prepare_run, state_list_prepare): its modules stay unpacked)
     // the key first, from what the stages say of themselves: a program kept already is only read back
     Code head[8];   // (the back end's Code is a large object only once parsed)
     for (int k = 0; k < 8; k++)
@@ -2971,7 +3998,7 @@ SeedVariants seed_compute(size_t i, size_t cap, const std::function<void(Program
     };
     const auto drop = [](Try& t) {
         for (Stage& st : t.p->stages)
-            if (st.module) vkDestroyShaderModule(dev.device, st.module, nullptr), st.module = VK_NULL_HANDLE;
+            if (st.module) stage_module_destroy(st.module), st.module = VK_NULL_HANDLE;
     };
     std::vector<Try> kept;
     kept.push_back(run({}));
@@ -3087,14 +4114,18 @@ const Program* seed_variant_of(const uint64_t code[3], bool mesh, const uint32_t
     struct Reset { ~Reset() { questions_in = nullptr, answers_in = nullptr; } } reset;
     if (mesh) translate_mesh_into(*p, *blank, by_stage[6] ? &code_of[6] : nullptr, code_of[7], nullptr, fs, color_types);
     else translate_into(*p, *blank, &code_of[0], fs, nullptr, color_types);
-    if (p->failed) return nullptr;
+    if (p->failed) {   // (upstream #2358: a failed variant's modules went nowhere; ours forget their note too)
+        for (Stage& st : p->stages)
+            if (st.module) stage_module_destroy(st.module);
+        return nullptr;
+    }
     std::lock_guard lk(shader_mu);
     auto& variants = programs[p->key];
     for (auto& v : variants)
         if (v->variant == p->variant && v->mesh == p->mesh && v->fallback == p->fallback && v->ready.load(std::memory_order_acquire) &&
             !v->failed) {
             for (Stage& st : p->stages)
-                if (st.module) vkDestroyShaderModule(dev.device, st.module, nullptr);
+                if (st.module) stage_module_destroy(st.module);
             return v.get();
         }
     variants.push_back(std::move(p));
@@ -3123,6 +4154,11 @@ void program_released(const nvn_prog* p) {
     if (!p) return;
     std::lock_guard lk(shader_mu);
     codes.erase(p->serial);
+}
+
+void program_pick_stats(int64_t* lock_ns, int64_t* codes_ns, int64_t* inline_n, int64_t* inline_ns) {
+    *lock_ns = st_pick_lock_ns.load(std::memory_order_relaxed), *codes_ns = st_pick_codes_ns.load(std::memory_order_relaxed);
+    *inline_n = st_pick_inline.load(std::memory_order_relaxed), *inline_ns = st_pick_inline_ns.load(std::memory_order_relaxed);
 }
 
 } // namespace mkwvk

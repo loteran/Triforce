@@ -64,14 +64,28 @@ struct Texture {
     VkImageType type = VK_IMAGE_TYPE_2D; VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT;
     uint32_t layers = 2; struct { uint64_t layer_size = 1536; } L;
     uint64_t gpu = 0;
+    bool bc1 = false;   // (kept as BC1: its bytes are read once, looked at, and that copy is staged)
 };
 struct { uint64_t offset = 0; } geo;
 auto level_geo(const Texture&, int) { return geo; }
 bool astc_ready() { return true; }
 std::vector<uint8_t> guest(8192, 0x5b);
+int guest_reads = 0;
 const uint8_t* guest_bytes(uint64_t at, uint64_t n, std::vector<uint8_t>&) {
-    require(at <= guest.size() && n <= guest.size() - at, "authored guest bounds"); return guest.data() + at;
+    require(at <= guest.size() && n <= guest.size() - at, "authored guest bounds"); guest_reads++; return guest.data() + at;
 }
+// (a BC1 texture's upload: what its layers' blocks are found to be, the bytes that were looked at, and its change to BC3)
+bool bc1_opaque = true;
+int bc1_retypes = 0;
+std::vector<uint8_t> looked_at;
+bool astc_levels_opaque(const Texture&, const uint8_t* layer, uint64_t, uint64_t tail, uint64_t) {
+    looked_at.insert(looked_at.end(), layer, layer + tail);
+    // (the game writes the layers looked at so far right after the look: what is staged must be what was seen)
+    std::fill(guest.begin(), guest.begin() + (ptrdiff_t)std::min<uint64_t>(guest.size(), looked_at.size()), (uint8_t)0xee);
+    return bc1_opaque;
+}
+bool bc1_retype(Texture& t, const char*) { t.bc1 = false, bc1_retypes++; return true; }
+const uint8_t* same_snap_read(const Texture&, uint64_t, uint64_t) { return nullptr; }   // ((Triforce) no checked re-upload under way)
 int64_t st_bytes = 0;
 struct { uint32_t w=8, tw=8, d=1; } g;
 Texture tex;
@@ -96,6 +110,24 @@ int run(int argc, char** argv) {
         Ranges dirty{{tex.L.layer_size, tex.L.layer_size * 2}};
         require(upload_astc_gpu(tex, tex.L.layer_size * tex.layers, &dirty), "dirty layer published");
         require(flushes == 3, "ASTC flushes each gathered allocation slice");
+    } else if (test == "bc1") {
+        // (opaque: each layer read from the game's memory once, and the bytes staged are the bytes looked at, though the
+        // memory changed right after)
+        tex.bc1 = true;
+        require(upload_astc_gpu(tex, tex.L.layer_size * tex.layers, nullptr), "a BC1 texture's layers published");
+        require(guest_reads == 2 && bc1_retypes == 0 && tex.bc1 && flushes == 1, "each layer read once, looked at, staged; still BC1");
+        const Arena& a = arenas.front();
+        require(looked_at.size() == tex.L.layer_size * 2 && std::all_of(looked_at.begin(), looked_at.end(), [](uint8_t b) { return b == 0x5b; }),
+                "the look saw the game's bytes of both layers");
+        require(!std::memcmp(a.mapped, looked_at.data(), looked_at.size()), "the bytes staged are the bytes looked at");
+    } else if (test == "bc1-alpha") {
+        // (a dirty layer with alpha: BC3 from now on, and every layer staged again, nothing staged for the BC1 image)
+        tex.bc1 = true, bc1_opaque = false;
+        Ranges dirty{{tex.L.layer_size, tex.L.layer_size * 2}};
+        require(upload_astc_gpu(tex, tex.L.layer_size * tex.layers, &dirty), "a BC1 texture with alpha published as BC3");
+        require(bc1_retypes == 1 && !tex.bc1, "made BC3 once");
+        require(guest_reads == 3 && flushes == 1 && arenas.size() == 1 && arenas.front().used == tex.L.layer_size * 2,
+                "the dirty layer read for the look, then both layers staged once, whole");
     } else if (test == "atom") {
         auto a = staging(17,16), b = staging(19,16);
         require(a.offset % 1024 == 0 && b.offset % 1024 == 0 && b.offset >= a.offset + 1024, "distinct noncoherent atoms");

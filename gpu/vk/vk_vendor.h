@@ -40,10 +40,17 @@ struct VendorFixes {
 };
 
 /// Which of the fixes the device needs (before the RX_VK_ switches: vendor_fixes_env)
+/// AMD's driver for RDNA 1 and 2 (RX 5000 and RX 6000 cards, and the integrated GPUs of those two generations): the branch
+/// whose driverInfo names the "AMD proprietary shader compiler", where the one for RDNA 3 and 4 names LLPC. The NaN tests by
+/// bits are for it (nan_bits), and on Windows the task + mesh draws through the compute fallback (vk_main.cpp)
+inline bool amd_older_compiler(const VendorFacts& f) {
+    return f.driver_id == VK_DRIVER_ID_AMD_PROPRIETARY && f.driver_info && std::strstr(f.driver_info, "proprietary shader compiler");
+}
+
 inline VendorFixes vendor_fixes(const VendorFacts& f) {
     VendorFixes x;
     x.fetch_bounds = f.vendor_id != 0x10DE;
-    x.nan_bits = f.driver_id == VK_DRIVER_ID_AMD_PROPRIETARY && f.driver_info && std::strstr(f.driver_info, "proprietary shader compiler");
+    x.nan_bits = amd_older_compiler(f);
     switch (f.driver_id) {
     case VK_DRIVER_ID_AMD_PROPRIETARY:
     case VK_DRIVER_ID_AMD_OPEN_SOURCE:

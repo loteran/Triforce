@@ -18,8 +18,12 @@ replay = (source/'gpu/vk/vk_replay.cpp').read_text()
 start = replay.index('void present_image(')
 # Read the complete top-level function; capture dependencies can grow its text.
 present = replay[start:replay.index('\n}', start) + 2]
+# ((Triforce) the present call is present_out's, on the presenting thread or the present thread: RX_VK_PRESENT_THREAD)
+out_start = replay.index('static void present_out(const PresentOut& o,', start)
+out = replay[out_start:replay.index('\n}', out_start) + 2]
+assert 'uint32_t index = o.index;' in out and 'const PresentOut out{index, smooth_mine' in present
 signal = re.search(r'    signal\.semaphore = [^;]+;', present)[0]
-wait = re.search(r'    pi\.pWaitSemaphores = [^;]+;', present)[0]
+wait = re.search(r'    pi\.pWaitSemaphores = [^;]+;', out)[0]
 acquire_wait = re.search(r'    waits\[0\]\.semaphore = [^;]+;', present)[0]
 assert 'acquire_timeout, f.acquired, VK_NULL_HANDLE, &index)' in present
 # Include the actual creation attempt: passing oldSwapchain retires it even on failure.
@@ -37,7 +41,9 @@ fixture = r'''
 #include <cstdio>
 #include <utility>
 #include <atomic>
+#include <chrono>
 #include <mutex>
+struct { std::atomic<int64_t> present_ns{0}; } stall_ct;   // (vk_replay.cpp: the stall line's count of the present's own time)
 using VkSemaphore=uint64_t; using VkImage=uint64_t; using VkSwapchainKHR=uint64_t; using VkResult=int;
 constexpr uint64_t VK_NULL_HANDLE=0;
 constexpr int VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO=1, VK_SUCCESS=0, VK_ERROR_FEATURE_NOT_PRESENT=-7;
@@ -47,7 +53,7 @@ struct Extent { uint32_t width,height; };
 struct Device { int device=1;uint64_t swapchain=0;int swap_format=0;Extent swap_extent{};bool swap_mutable=false;
     std::vector<VkImage> swap_images;std::vector<VkSemaphore> swap_rendered;
     std::atomic<uint64_t> swap_resize{0};std::mutex present_mu; } dev;
-struct { int hdr=0; } opts;   // (the Insert menu's HDR row: present_image remakes the swapchain when it changes)
+struct { int hdr=0, vsync=1; } opts;   // (the Insert menu's HDR and VSync rows: present_image remakes the swapchain when one changes)
 unsigned image_count=4, made=0, fail_at=0;uint64_t serial=1000;
 int query_result=0,data_result=0;uint64_t destroyed_swapchain=0;
 bool idle=false, bad_destroy=false; std::set<uint64_t> live,used;
@@ -68,7 +74,7 @@ void quiesce() {} void release() {} void note_failed(const char*,int) {} void de
 int create_swapchain(const CreateInfo&,uint64_t*) {return VK_ERROR_FEATURE_NOT_PRESENT;}
 int get_images(uint64_t,uint32_t*,uint64_t*) {return VK_ERROR_FEATURE_NOT_PRESENT;}
 }
-struct Reflex {uint64_t swapchain=0,swapchain_generation=0;bool latency=false,frame_marked=false;int mode=-1;std::mutex mu;} cached;
+struct Reflex {uint64_t swapchain=0,swapchain_generation=0;bool latency=false,frame_marked=false,shown_marked=false;int mode=-1;std::mutex mu;} cached;
 Reflex& rx(){return cached;}
 void reflex_swapchain_created(uint64_t sc) {cached.swapchain=sc;cached.latency=cached.frame_marked=true;cached.mode=1;}
 ''' + reset + r'''
@@ -120,6 +126,10 @@ bool create_swapchain(unsigned width,unsigned height,bool may_use_ffx=false) {
 }
 bool reflex_swapchain_stale() {return stale;}
 std::mutex present_image_mu;
+// ((Triforce) RX_VK_PRESENT_THREAD: the present handed over before out first, and the game's pictures' time; none here)
+int settles=0;
+void present_thread_settle() {++settles;}
+void present_note_game(int64_t) {}
 void present_begin() {
 ''' + begin + r'''
     if(!dev.swapchain || !chains.count(dev.swapchain) || retired.count(dev.swapchain))bad_chain=true;
@@ -204,6 +214,17 @@ int main() {
     if(acquires!=count || dev.swapchain!=active || !dev.swap_resize.load())return 27;
     preflight_fail=false;present_begin();
     if(acquires!=count+1 || !dev.swapchain || dev.swap_resize.load())return 28;
+    // The VSync row: the swapchain made again once for the change (its present mode), not again after, and retried when it fails.
+    active=dev.swapchain;count=acquires;present_begin();
+    if(acquires!=count+1 || dev.swapchain!=active)return 29;
+    opts.vsync=0;present_begin();
+    if(acquires!=count+2 || dev.swapchain==active || !dev.swapchain)return 30;
+    active=dev.swapchain;present_begin();
+    if(acquires!=count+3 || dev.swapchain!=active)return 31;
+    opts.vsync=1;preflight_fail=true;count=acquires;present_begin();
+    if(acquires!=count || dev.swapchain!=active || !dev.swap_resize.load())return 32;
+    preflight_fail=false;present_begin();
+    if(acquires!=count+1 || !dev.swapchain || dev.swapchain==active || dev.swap_resize.load())return 33;
     if(bad_destroy || bad_chain)return 8;
     reflex_swapchain_destroyed();
     if(cached.swapchain || cached.latency || cached.frame_marked || cached.mode!=-1)return 26;

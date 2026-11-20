@@ -7,6 +7,11 @@ image.bin nor its log's folder and closed with nothing on screen. activeCodePage
 every A function and the C runtime's narrow file functions UTF-8 for the whole process, its DLLs too (triforce_vk.dll,
 SDL2, FFmpeg). host/hos_main.c says so in a message box when the Windows is too old for it and the folder's name needs it.
 
+(Triforce) longPathAware: where Windows' own LongPathsEnabled is on (Windows 10 1607 and newer, a setting of the PC's), the A and
+W functions and the C runtime's file functions take paths of MAX_PATH (260) and more, for the files the game finds in a deep
+folder (the game's own nn::fs paths add the long-path prefix themselves, host/nn_fs.c fs_wide; host/hos_paths.h's and gpu/vk/vk_paths.h's
+probe too). Without that setting it changes nothing.
+
     python nx2/win_manifest.py [out.res]
 """
 import os
@@ -19,6 +24,7 @@ MANIFEST = b"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
   <application xmlns="urn:schemas-microsoft-com:asm.v3">
     <windowsSettings>
       <activeCodePage xmlns="http://schemas.microsoft.com/SMI/2019/WindowsSettings">UTF-8</activeCodePage>
+      <longPathAware xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">true</longPathAware>
     </windowsSettings>
   </application>
   <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">

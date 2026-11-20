@@ -681,7 +681,7 @@ void frame(const FrameArgs& a) {
     full_barrier(a.cmd);   // (the depth and motion were written earlier in the frame)
     ::mkwvk::rec::boundary(::mkwvk::rec::B_DIRECT);   // (ffxDispatch records into cmd itself: what this thread recorded through vk_work.h reaches cmd first)
     r = dispatch_ctx(&s.fg, &p.header);
-    note_work();   // (AMD's dispatches: full_barrier must not take the next barrier for a repeat of the one before them)
+    note_work(a.cmd);   // (AMD's dispatches: full_barrier must not take the next barrier for a repeat of the one before them)
     full_barrier(a.cmd);
     if (r != FFX_API_RETURN_OK) {
         note_failed("AMD's frame generation preparation was refused", (int)r);

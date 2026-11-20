@@ -23,7 +23,7 @@ def actual_build(source):
     nodes = [node for node in tree.body if isinstance(node, (ast.ClassDef, ast.FunctionDef)) and node.name in names]
     assert {node.name for node in nodes} == names
     scope = dict(os=os, threading=threading, time=time, COMPILER_MB=1500,
-                 free_mb=lambda: 1000000, rss_mb=lambda process: 0)
+                 free_mb=lambda: 1000000, rss_mb=lambda process: 0, MEM_LOG=False)   # (HOOKSHOT_MEM_LOG off: no peak sampled)
     exec(compile(ast.Module(body=nodes, type_ignores=[]), str(source), "exec"), scope)
     return scope
 

@@ -25,6 +25,7 @@ FIXTURE = r"""
 #include <mutex>
 #include <set>
 #include <unordered_map>
+#include <unordered_set>
 using VkPipeline = uint64_t;
 using VkPrimitiveTopology = int;
 #define VK_NULL_HANDLE 0
@@ -60,6 +61,9 @@ int run(bool feature) {
     // (the driver has it: made in the draw, and the same one after)
     const VkPipeline w = gpl_part(warm, s, at, 0, 1, 11, &k);
     CHECK(w && !k && gpl_part(warm, s, at, 0, 1, 11, &k) == w && !k);
+    // ((Triforce) one the warm made, found by a draw: the draw's from then on, tests/test_pipe_warm.py)
+    gpl_warm_only.insert(mix(11, 1));
+    CHECK(gpl_part(warm, s, at, 0, 1, 11, &k) == w && !k && gpl_warm_only.empty());
     // (the parts without shaders are made in the draw whatever the driver has)
     CHECK(gpl_part(cold, s, at, 0, 0, 20, nullptr) && gpl_part(cold, s, at, 0, 3, 23, nullptr));
     if (!feature) {   // (no pipelineCreationCacheControl: compiled in the draw, as before)
@@ -121,8 +125,12 @@ def check_source(draw):
         raise SystemExit("a cold library is not handed to a worker, or its job carries a flag a waiting draw would run")
     # (after the pipeline is ready, not before: the draw that waits for it runs this job itself, jobs_wait, and would be held
     # for as long as anything put before that takes)
+    # ((Triforce) the whole build first is now RX_VK_PIPE_FAST_WORKERS=0's job: by default the cold libraries come first and the
+    # link makes the entry ready, the whole build a job of its own that no draw waits for (gpu/vk/pipe_wait.h libs_first,
+    # tests/test_pipe_wait.py). This one keeps its order)
     job = between(draw, "    jobs_push([job] {\n        // (over a linked one", "}, false, &e->ready);")
-    if job.index("job->e->ready.store(true") > job.index("gpl_build_cold("):
+    # ((Triforce) the entry is made ready by gpl_rules::built, the whole build's rule: gpu/vk/gpl_rules.h, tests/test_gpl_rules.py)
+    if job.index("gpl_rules::built(*job->e") > job.index("gpl_build_cold("):
         raise SystemExit("the cold libraries are handed to the workers before the pipeline the draw waits for is ready")
     replay = (ROOT / "gpu/vk/vk_replay.cpp").read_text(encoding="utf-8")
     if "if (draw_stats4(&links, &link_ms, &lib_hits, &lib_cold, &lib_built, &lib_build_ms))" not in replay:

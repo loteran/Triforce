@@ -2,6 +2,7 @@
 // declarations, serializer, Reader, make_module and program_cache_load functions.
 // Info is a minimal stand-in with the cache's separately serialized containers;
 // this test covers module ownership, not Shader::Info layout or SPIR-V validity.
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstdarg>
@@ -55,6 +56,7 @@ struct Info {
     std::vector<std::vector<uint32_t>> handle_programs;
 };
 }
+#include "spv_store.h"   // (Triforce: the store a packed stage has in its module's place, gpu/vk; Stage names it)
 #include "cache_types.inc"
 
 struct { uintptr_t device = 123; } dev;
@@ -87,11 +89,61 @@ FILE* disk_idx = nullptr;
 std::mutex disk_mu;
 std::unordered_map<uint64_t, std::vector<DiskRecord>> disk_records;
 std::atomic<int64_t> st_cache_hits{0};
+// ((Triforce) vk_shader.cpp's count of programs translated again after a cache of other translations was thrown away, for the
+// log: none was here. tests/test_program_carry.py has the carry)
+void dropped_note(uint64_t) {}
 // (local, RenoDX port: vk_renodx.h's, which make_module asks for a fragment module's replacement. None here: every module
 // is the cache's own, so the counts below are of what the loader made)
 const std::vector<uint32_t>* renodx_replacement(uint32_t) { return nullptr; }
 #define PROF_EXACT()   // (vk_prof.h's exact-timing scope, since #989: nothing to time here)
+// (local, texture detail: vk_shader.cpp's note of which bindings a module reads by exact texel. Nothing to note here)
+void exact_note(VkShaderModule, const std::vector<uint32_t>&) {}
+// (Triforce, RX_VK_SPV_PACK: vk_shader.cpp's packing of a ready program's stages. Off here, as with RX_VK_SPV_PACK=0:
+// every stage keeps its module, which is what this test counts. tests/test_spv_store.py has the packing)
+void pack_note(VkShaderModule, const uint32_t*, size_t) {}
+void program_pack(Program&) {}
+struct PackSkip {
+    PackSkip() {}   // (a scope of its own, as vk_shader.cpp's: nothing to change here)
+};
+// (Triforce: the memory line's count of the modules alive, vk_shader.cpp. Counted here too: a module the loader made is
+// noted, and one a refused record made is forgotten as it is let go)
+std::map<VkShaderModule, size_t> noted;
+void module_note(VkShaderModule m, size_t words) {
+    if (m) noted[m] = words;
+}
+void stage_module_destroy(VkShaderModule m) {
+    CHECK(noted.erase(m) == 1);
+    vkDestroyShaderModule(dev.device, m, nullptr);
+}
+// (Triforce: the read-ahead of programs, vk_shader.cpp, off here: every record is read by the loader itself, what this test
+// counts. tests/test_program_readahead.py has the read-ahead)
+bool readahead_take(uint64_t, std::vector<std::unique_ptr<Program>>&) { return false; }
+void readahead_ask(uint64_t, int64_t) {}
+std::atomic<int64_t> st_draw_reads{0}, st_draw_read_ns{0}, st_ra_taken{0}, st_ra_read{0}, st_ra_dropped{0}, st_ra_waits{0},
+    st_ra_wait_ns{0}, st_ra_let_go{0}, st_ra_by_notes{0}, st_ra_read_ns{0};
+// ((Triforce) a draw's own read with the shaders' lock let go, program_read_once.h: the loader is called as a pick calls it,
+// shader_mu held (load below). tests/test_program_read_once.py has the threads; here what it reads is counted)
+#include "program_read_once.h"
+std::mutex shader_mu;
+mkwvk::program_read_once::Reads<std::mutex> draw_once(shader_mu);
+std::atomic<int64_t> st_once_waits{0}, st_once_wait_ns{0}, st_once_relock_ns{0}, st_once_unlocked{0};
+bool read_unlocked() { return true; }
+void readahead_drop(std::vector<std::unique_ptr<Program>>& variants) {   // (as vk_shader.cpp's: never here, nothing takes a record)
+    for (auto& p : variants)
+        for (auto& st : p->stages)
+            if (st.module) stage_module_destroy(st.module), st.module = VK_NULL_HANDLE;
+    variants.clear();
+}
+// ((Triforce) the sessions' order, program_order.h: off here; tests/test_program_order.py has it)
+bool order_on() { return false; }
+void order_note(uint64_t) {}
+void readahead_why(uint64_t) {}
+#include <chrono>
 #include "cache_functions.inc"
+void load(uint64_t key, std::vector<std::unique_ptr<Program>>& programs) {   // (as program_pick calls it)
+    std::lock_guard lk(shader_mu);
+    program_cache_load(key, programs);
+}
 
 void save(uint64_t key, bool empty_second = false, int bad_answer = 0) {
     Program program;
@@ -135,7 +187,7 @@ int main(int argc, char** argv) {
         save(9); // An independent key must also remain usable.
     }
     std::vector<std::unique_ptr<Program>> programs;
-    program_cache_load(7, programs);
+    load(7, programs);
     unsigned accepted = scenario == "valid" || scenario == "mixed" ? 1 : 0;
     CHECK(programs.size() == accepted && st_cache_hits == accepted);
     std::printf("%s: created=%u destroyed=%u accepted_modules=%u\n", scenario.c_str(), created, releases, accepted * 2);
@@ -147,9 +199,9 @@ int main(int argc, char** argv) {
     if (scenario == "valid") CHECK(created == 2 && releases == 0);
     if (scenario == "mixed") {
         CHECK(created == 3 && releases == 1);
-        program_cache_load(9, programs);
+        load(9, programs);
         CHECK(programs.size() == 2 && st_cache_hits == 2 && created == 5 && releases == 1);
-        program_cache_load(7, programs); // Consumed records cannot be cleaned up twice.
+        load(7, programs); // Consumed records cannot be cleaned up twice.
         CHECK(programs.size() == 2 && created == 5 && releases == 1);
     }
     for (const auto& p : programs) CHECK(p->ready.load() && p->stages.size() == 2);

@@ -44,6 +44,7 @@ FIXTURE = r"""
 #include <vector>
 static std::atomic<int> reports{0};
 static std::atomic<bool> report_done{false};
+void memory_trial_device_lost() {}   // (vk_memory.cpp: the memory handling on trial is marked failed)
 void checkpoints_report() {
     reports++;
     std::this_thread::sleep_for(std::chrono::milliseconds(200));   // (a slow report: the others must wait for it)
@@ -75,10 +76,27 @@ def main():
     stray = [s for s in sites if not re.search(r"== VK_ERROR_DEVICE_LOST\) device_lost\(\);", s)]
     if stray:
         raise SystemExit("FAIL: a device lost that does not end the process: " + "; ".join(stray))
-    # (the report is logf lines, which the host queues on Windows: replay_fatal writes the queue out before _Exit)
+    # (the report is logf lines, which the host queues on Windows: replay_fatal writes the queue out before the end)
     fatal = block(replay, "[[noreturn]] void replay_fatal(")
-    if "host->log_flush()" not in fatal or fatal.index("host->log_flush()") > fatal.index("std::_Exit("):
+    if "end_process(3);" not in fatal or "_Exit(" in fatal:
+        raise SystemExit("FAIL: replay_fatal does not end the process through end_process")
+    if "host->log_flush()" not in fatal or fatal.index("host->log_flush()") > fatal.index("end_process("):
         raise SystemExit("FAIL: replay_fatal ends the process without writing out the host's queued log")
+    # (on Windows the end is TerminateProcess: _Exit there is ExitProcess, which runs every library's detach, and one
+    # that faults or waits put a second crash after the report or held the process open. The recorder thread's fatal
+    # end and the host's hos_fatal end the same way)
+    end = block(replay, "[[noreturn]] void end_process(")
+    if "TerminateProcess(GetCurrentProcess(), (UINT)code);" not in end or end.index("TerminateProcess(") > end.index("std::_Exit("):
+        raise SystemExit("FAIL: end_process does not end the process with TerminateProcess on Windows")
+    recorder = (ROOT / "gpu" / "vk" / "vk_recorder.h").read_text(encoding="utf-8")
+    rec_fatal = block(recorder, "[[noreturn]] inline void recorder_fatal(")
+    if "g_end_process_hook(3)" not in rec_fatal or "g_end_process_hook = " not in replay:
+        raise SystemExit("FAIL: the recorder thread's fatal end does not go through end_process")
+    host_fatal = block((ROOT / "host" / "hos_thread.c").read_text(encoding="utf-8"), "void hos_fatal(")
+    # (the last one: the first is the end of a fatal error inside this thread's own report, which writes nothing more)
+    ends_with = "TerminateProcess(GetCurrentProcess(), 3);"
+    if ends_with not in host_fatal or host_fatal.index("fflush(stderr)") > host_fatal.rindex(ends_with):
+        raise SystemExit("FAIL: hos_fatal does not end the process with TerminateProcess, after its lines are written")
     backend = (ROOT / "host" / "rx_backend.c").read_text(encoding="utf-8")
     # (in MkwVkHost's order, right after gyro_status; later fields may follow it)
     if not re.search(r"hos_sdl_gyro_status,\s*hos_log_flush,", backend):

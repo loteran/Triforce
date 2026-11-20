@@ -3,12 +3,14 @@ and Kenney's Input Prompts (CC0, third_party/kenney_input).
 
     python -I nx2/prompt_assets.py --romfs <dir> --out <game folder>/prompts
 
-Writes <out>/<face>/External.bfotf for each face (switch, xbox, ps4, ps5, steamdeck). Every text in the game draws its button icons
+Writes <out>/<face>/External.bfotf for each face (switch, xbox, ps4, ps5, steamdeck, keyboard). Every text in the game draws its button icons
 from Font2/Scalable/External.*.bfotf (dialogue, the control hints, menus): A B X Y at U+E040..E043, L R ZL ZR at E044..E047, Plus
 and Minus at E04B and E04C, the stick presses at E056 and E057, the d-pad at E060..E063. Each written font has one icon per pad
 input at U+F700 + HOS_PAD_* (gpu/vk/vk_api.h), and each of those Switch buttons' code points in a cmap segment of its own: the
 game (host/prompts.c) points each one at the icon of the pad input bound to that button when it serves the font, so the icons
-follow the controls, changed ones too.
+follow the controls, changed ones too. (Triforce) The keyboard face (the keyboard and mouse; nx2/prompt_keys.py draws it, from
+nothing but a font of the repository's) has an icon per key that can be bound instead, at U+F700 + its key code, and what is
+said of a pad input below is a key code's there.
 
 The textures with button icons (the ocarina's notes, the letters on black, the controller in the pause menu) the same way, with
 Pillow, astc_encoder and texture2ddecoder: <out>/Common.bntx is the game's UI/Layout2Archive/Common bntx decompressed, and
@@ -59,8 +61,9 @@ SWITCH_ICON = {"south": 0xE041, "east": 0xE040, "west": 0xE043, "north": 0xE042,
 STATIC = {0xE049: "dpad", 0xE064: "dpad_vertical_outline", 0xE065: "dpad_horizontal_outline"}
 
 
-def zs_dictionary(romfs):
-    """zs.zsdic, out of Pack/ZsDic.pack.zs (a SARC, itself zstd without a dictionary)"""
+def zs_dictionary(romfs, which=b"zs.zsdic"):
+    """zs.zsdic (or another of its dictionaries: pack.zsdic for the packs), out of Pack/ZsDic.pack.zs (a SARC, itself zstd
+    without a dictionary)"""
     import zstandard
     with open(os.path.join(romfs, "Pack", "ZsDic.pack.zs"), "rb") as f:
         b = zstandard.ZstdDecompressor().decompressobj().decompress(f.read())
@@ -71,16 +74,25 @@ def zs_dictionary(romfs):
     for i in range(n):
         attr, start, end = struct.unpack_from("<III", b, hl + 12 + 16 * i + 4)
         o = names + (attr & 0xFFFFFF) * 4
-        if b[o:b.index(b"\0", o)] == b"zs.zsdic":
+        if b[o:b.index(b"\0", o)] == which:
             return b[data + start:data + end]
-    raise SystemExit("prompts: no zs.zsdic in Pack/ZsDic.pack.zs")
+    raise SystemExit("prompts: no %s in Pack/ZsDic.pack.zs" % which.decode())
 
 
 def read_zs(romfs, rel, dictionary):
+    """(Triforce, as NX2navi's tools/pad_prompts.py unpack) The file goes to the decompressor a piece at a time and the
+    pieces' outputs are joined once. Given the whole file in one call the library grows one bytes object by copying as the
+    output comes, and the textures (69 MB packed, 244 MB unpacked) took 20 s of this tool's 80 that way"""
     import zstandard
-    d = zstandard.ZstdDecompressor(dict_data=zstandard.ZstdCompressionDict(dictionary))
+    d = zstandard.ZstdDecompressor(dict_data=zstandard.ZstdCompressionDict(dictionary)).decompressobj()
     with open(os.path.join(romfs, rel), "rb") as f:
-        return d.decompressobj().decompress(f.read())
+        raw = f.read()
+    parts = []
+    for at in range(0, len(raw), 1 << 16):
+        parts.append(d.decompress(raw[at:at + (1 << 16)]))
+        if d.eof:
+            break
+    return b"".join(parts)
 
 
 def size_table(romfs, dictionary, game_size, font_size):
@@ -414,43 +426,56 @@ def face_layers(b, tex, face, otf):
     """this face's images, as layers (in textures.bin's order), each a hand-made one if nx2/prompt_faces/<face>/ has it"""
     from PIL import Image, ImageDraw
     import prompt_draw
-    icons = Icons(face, otf)
+    keys = bool(FACES.get(face, {}).get("keys"))   # ((Triforce) the keyboard and mouse: an icon per key code, no controller)
+    if keys:
+        import prompt_keys
+    icons = prompt_keys.Icons() if keys else Icons(face, otf)
+    # (what a Switch button can be on: its name in icons, its number in textures.bin, its name in a layer's)
+    inputs = [(vk, vk, "key%d" % vk) for vk in sorted(icons.code)] if keys else [(p, i, p) for i, p in enumerate(PADS)]
     layers = []
+    made = {}   # ((Triforce) an input's image is the same on every texture of one size: made once, and encoded once)
 
     def keep(sw, pad):   # (the Switch face's default controls: the game's own textures)
         return pad in icons.code and not (face == "switch" and DEFAULT[SW[sw]] == pad)
 
-    for name, sw in NOTES.items():
-        t = tex[name]
-        w, h = t[2], t[3]
-        for pad in PADS:
-            if not keep(sw, pad):
-                continue
+    def note(pad, w, h):
+        if ("note", pad, w, h) not in made:
             icon, shape, holes = icons.masks(pad, int(min(w, h) * 0.9))
             im = Image.new("RGBA", (w, h), (0, 0, 0, 0))
             o = ((w - icon.width) // 2, (h - icon.height) // 2)
             im.paste(Image.new("RGBA", icon.size, (255, 255, 255, 255)), o, shape)
             im.paste(Image.new("RGBA", icon.size, (0, 0, 0, 255)), o, holes)
-            layers.append(Layer(f"{name}.{pad}.png", name, SW[sw], PADS.index(pad), im))
-    for name, sw in LETTERS.items():
-        t = tex[name]
-        w, h = t[2], t[3]
-        for pad in PADS:
-            if not keep(sw, pad):
-                continue
+            made["note", pad, w, h] = im
+        return made["note", pad, w, h]
+
+    def letter_of(pad, w, h):
+        if ("letter", pad, w, h) not in made:
             icon, shape, holes = icons.masks(pad, int(min(w, h) * 0.9))
-            letter = holes if holes.getbbox() else icon   # (an icon with no letter in it: its shape)
+            # (an icon with no letter in it: its shape; a mouse's: the mouse, not what its outline leaves)
+            letter = holes if holes.getbbox() and pad not in getattr(icons, "plain", ()) else icon
             im = Image.new("L", (w, h), 0)
             im.paste(letter, ((w - letter.width) // 2, (h - letter.height) // 2))
-            layers.append(Layer(f"{name}.{pad}.png", name, SW[sw], PADS.index(pad), im))
+            made["letter", pad, w, h] = im
+        return made["letter", pad, w, h]
+
+    for name, sw in NOTES.items():
+        t = tex[name]
+        for pad, at, label in inputs:
+            if keep(sw, pad):
+                layers.append(Layer(f"{name}.{label}.png", name, SW[sw], at, note(pad, t[2], t[3])))
+    for name, sw in LETTERS.items():
+        t = tex[name]
+        for pad, at, label in inputs:
+            if keep(sw, pad):
+                layers.append(Layer(f"{name}.{label}.png", name, SW[sw], at, letter_of(pad, t[2], t[3])))
     own = None
-    if face != "switch":
+    if face != "switch" and not keys:   # ((Triforce) the keyboard has no picture: the page keeps the game's controller)
         hand = override(face, PICTURES[0] + ".png")
         own = Image.open(hand).convert("RGBA") if hand else prompt_draw.picture(
             face, decode(b, tex[PICTURES[0]]).convert("RGBA"), Icons("switch", otf))
     if own:
         layers += picture_layers(b, tex, own)
-    for name in PICTURES if face != "switch" and not own else ():
+    for name in PICTURES if face != "switch" and not own and not keys else ():
         t = tex[name]
         im = decode(b, t)
         px = im.load()
@@ -479,7 +504,7 @@ def face_layers(b, tex, face, otf):
 def face_textures(b, tex, layers):
     """textures.bin's entries for these layers: [(Switch button, pad input, runs)], Switch button 0xff for those always written"""
     from PIL import ImageChops
-    entries, made = [], {}
+    entries, made, encoded = [], {}, {}
     for layer in layers:
         t, im = tex[layer.texture], layer.im
         made[layer.name] = im
@@ -492,7 +517,13 @@ def face_textures(b, tex, layers):
                 x0, y0, x1, y1 = min(x0, bx0), min(y0, by0), max(x1, bx1), max(y1, by1)
             entries.append((layer.sw, layer.pad, runs(t, im, (x0, y0, x1, y1))))
         else:
-            entries.append((layer.sw, layer.pad, runs(t, im)))
+            # ((Triforce) the same image on another texture of that size and format, a note or a letter on another Switch
+            # button: the same blocks, at that texture's place. The notes were encoded six times over, the letters four)
+            same = (id(im), t[1], t[2], t[3], t[4])
+            if same not in encoded:
+                encoded[same] = (t[5], runs(t, im))
+            data, rs = encoded[same]
+            entries.append((layer.sw, layer.pad, [[off - data + t[5], piece] for off, piece in rs]))
     return entries
 
 
@@ -873,12 +904,15 @@ def hint_panes(blarc):
     return out or None
 
 
-def write_hint(path, otf, panes):
+def write_hint(path, otf, panes, names=None):
+    """(names: the glyph of each input's icon, in the inputs' order, None for a number that is no input: the pad inputs',
+    or the keyboard face's 256 key codes')"""
     from fontTools.ttLib import TTFont
     hmtx = TTFont(io.BytesIO(otf))["hmtx"]
+    names = names or [f"pad_{p}" for p in PADS]
     with open(path, "wb") as f:
-        f.write(b"HPHN" + struct.pack("<I", len(PADS)))
-        f.write(b"".join(struct.pack("<f", round(max(0, hmtx[f"pad_{p}"][0] - HINT_FITS) * HINT_SCALE)) for p in PADS))
+        f.write(b"HPHN" + struct.pack("<I", len(names)))
+        f.write(b"".join(struct.pack("<f", round(max(0, hmtx[n][0] - HINT_FITS) * HINT_SCALE) if n else 0.0) for n in names))
         f.write(struct.pack("<I", len(panes)) + b"".join(struct.pack("<IB3xf", at, slot, x) for at, slot, x in panes))
 
 
@@ -891,6 +925,152 @@ def dump(out, face, b, tex, layers):
         game = os.path.join(out, "game", layer.texture + ".png")
         if not os.path.exists(game):
             decode(b, tex[layer.texture]).save(game)
+
+
+# ---- the hearts, the item slot and the small map on a picture wider than 16:9 (in the same archive, four copies of each
+# layout). With the Insert menu's Ultrawide HUD row on Screen edges host/prompts.c moves these panes out to the picture's
+# sides (host/oot_wide_hud.h has the rule). They are moved in the layouts because a layout's projection cannot do it:
+# - PlayerStatus_00 hangs the hearts, the magic bar and the D-pad's shortcuts on a pane at the 16:9 grid's top left corner and
+#   the item slot on one at its top right: two sides in one layout;
+# - MapMenu_00 is the small map in the corner and the menu's whole-screen map in one layout, and the game sets a layout's
+#   projection once, not as the menu opens. The small map's own panes go out; its icons' layers (N_PatternFieldMini_01,
+#   N_PatternDungeonMini_01) are put at the small map's place by an animation's keys, which go out with them (layout_keys).
+# prompts/wide.bin: "HPWD", u32 count, then each: u32 offset (an x in prompts/Common.blarc), i8 side (-1 left, 1 right),
+# u8 0 x3, f32 the x
+HUD_SIDE_PANES = {
+    "PlayerStatus_00": {"N_ScaleL_00": -1, "N_ScaleR_00": 1, "N_VRS_00": 1, "N_SubItemBaseFishing_00": 1},
+    "MapMenu_00": {"N_VRS_00": 1, "N_MiniMapCap_00": 1, "N_Field_01": 1, "N_Dungeon_01": 1, "N_MiniMapReplace_00": 1,
+                   "P_MiniMapFrame_00": 1, "S_Floor_00": 1, "P_CapDungeon_00": 1},
+}
+HUD_CORNERS = {"N_ScaleL_00": -1920.0, "N_ScaleR_00": 1920.0}   # (the grid's corners: half its width out)
+
+
+def layout_keys(lay, xs):
+    """the offsets of the animation keys of a layout that put a pane at one of the places xs: a curve's values are an array (u64
+    offset of the floats, u32 count, u32 4, the floats) of (value, slope) pairs; taken when every slope is 0 and every value is
+    0 or one of xs, with one of xs among them. The float 8 bytes before the array, the curve's value past its last key, too"""
+    out = []
+    for o in range(0, len(lay) - 16, 8):
+        at, n, size = struct.unpack_from("<QII", lay, o)
+        if at != o + 16 or size != 4 or not 2 <= n <= 256 or n % 2 or at + 4 * n > len(lay):
+            continue
+        v = struct.unpack_from(f"<{n}f", lay, at)
+        if any(v[1::2]) or not any(k in xs for k in v[::2]) or any(k and k not in xs for k in v[::2]):
+            continue
+        out += [at + 8 * k for k in range(n // 2) if v[2 * k] in xs]
+        if o >= 8 and struct.unpack_from("<f", lay, o - 8)[0] in xs:
+            out.append(o - 8)
+    return out
+
+
+def wide_panes(blarc):
+    """what goes out to a wide picture's sides, in every copy: [(offset of an x, side, x)], or None when a layout is not the
+    one known: a pane missing, a corner pane not at the grid's corner, a place that two sides share, or one of the places held
+    somewhere else in the layout than in those panes and keys (something else the game would leave where it is)"""
+    out = []
+    for name, sides in HUD_SIDE_PANES.items():
+        copies = layout_copies(blarc, name)
+        if not copies:
+            return None
+        for a, z in copies:
+            lay = blarc[a:z]
+            panes = layout_panes(lay)
+            if any(p not in panes for p in sides):
+                return None
+            side_of, at = {}, {}
+            for p, side in sides.items():
+                x = struct.unpack_from("<f", lay, panes[p] + 0x1c)[0]
+                if x == 0.0 or HUD_CORNERS.get(p, x) != x or side_of.setdefault(x, side) != side:
+                    return None
+                at[panes[p] + 0x1c] = x
+            for o in layout_keys(lay, set(side_of)):
+                at[o] = struct.unpack_from("<f", lay, o)[0]
+            for x in side_of:
+                pat = struct.pack("<f", x)
+                if any(lay[o:o + 4] == pat and o not in at for o in range(0, len(lay) - 3, 4)):
+                    return None
+            out += [(a + o, side_of[x], x) for o, x in sorted(at.items())]
+    return out or None
+
+
+def write_wide(path, panes):
+    with open(path, "wb") as f:
+        f.write(b"HPWD" + struct.pack("<I", len(panes)))
+        for off, side, x in panes:
+            f.write(struct.pack("<Ib3xf", off, side, x))
+
+
+# ---- the camera's speed (the Insert menu's Camera speed row, host/prompts.c build_camera; NX2navi's camera speed setting, done
+# with the files the prompts already use). The game's Options offer five camera sensitivities; their turn rates are the array
+# StickSensitivity of Component/PlayerCameraParam/PlayerCamera.game__component__PlayerCameraParam.bgyml in
+# Pack/Actor/PlayerCamera.pack.zs (a SARC, zstd with pack.zsdic). A BYML array keeps its floats in the array itself, so the
+# host writes each times the row's factor over the old one and nothing else moves. prompts/PlayerCamera.pack is the game's
+# pack decompressed; prompts/camera.bin: "HPCM", u32 count, then each: u32 offset (a value in the pack), f32 the game's value
+CAMERA = "Pack/Actor/PlayerCamera.pack.zs"
+CAMERA_MEMBER = "Component/PlayerCameraParam/PlayerCamera.game__component__PlayerCameraParam.bgyml"
+CAMERA_KEY = "StickSensitivity"
+
+
+def sarc_member(b, name):
+    """(start, end) of the file `name` in the SARC b, or None"""
+    if b[:4] != b"SARC" or len(b) < 0x20:
+        return None
+    hl, = struct.unpack_from("<H", b, 4)
+    data, = struct.unpack_from("<I", b, 12)
+    n, = struct.unpack_from("<H", b, hl + 6)
+    names = hl + 12 + 16 * n + 8
+    for i in range(n):
+        attr, start, end = struct.unpack_from("<III", b, hl + 12 + 16 * i + 4)
+        o = names + (attr & 0xFFFFFF) * 4
+        if 0 <= o < len(b) and b[o:b.find(b"\0", o)] == name.encode():
+            return (data + start, data + end) if data + end <= len(b) and start <= end else None
+    return None
+
+
+def byml_floats(d, key):
+    """[(offset, value)] of the floats of the array `key` in the root dictionary of the BYML d (little-endian: "YB", u16
+    version, u32 keys' table, u32 strings' table, u32 root; a dictionary: 0xc1, u24 count, then (u24 key, u8 type, u32 value)
+    each; an array: 0xc0, u24 count, a type byte each, padded to 4, then the values; 0xd2 a float), or None"""
+    try:
+        if d[:2] != b"YB":
+            return None
+        keys, root = struct.unpack_from("<I", d, 4)[0], struct.unpack_from("<I", d, 12)[0]
+        kh, rh = struct.unpack_from("<I", d, keys)[0], struct.unpack_from("<I", d, root)[0]
+        if kh & 0xff != 0xc2 or rh & 0xff != 0xc1:
+            return None
+        for i in range(rh >> 8):
+            e, value = struct.unpack_from("<II", d, root + 4 + 8 * i)
+            if (e & 0xffffff) >= kh >> 8:
+                return None
+            at = keys + struct.unpack_from("<I", d, keys + 4 + 4 * (e & 0xffffff))[0]
+            if d[at:d.index(b"\0", at)] != key.encode():
+                continue
+            ah = struct.unpack_from("<I", d, value)[0]
+            count = ah >> 8
+            if e >> 24 != 0xc0 or ah & 0xff != 0xc0 or not 1 <= count <= 8 or set(d[value + 4:value + 4 + count]) != {0xd2}:
+                return None
+            vals = value + 4 + ((count + 3) & ~3)
+            return [(vals + 4 * j, struct.unpack_from("<f", d, vals + 4 * j)[0]) for j in range(count)]
+    except (struct.error, ValueError):
+        pass
+    return None
+
+
+def camera_speeds(pack):
+    """the camera's turn rates in the pack: [(offset in the pack, value)], or None when the pack is not the one known (no such
+    file or array in it, or a rate that is no speed)"""
+    at = sarc_member(pack, CAMERA_MEMBER)
+    floats = byml_floats(pack[at[0]:at[1]], CAMERA_KEY) if at else None
+    if not floats or any(not 0.05 <= v <= 50.0 for _, v in floats):
+        return None
+    return [(at[0] + o, v) for o, v in floats]
+
+
+def write_camera(path, speeds):
+    with open(path, "wb") as f:
+        f.write(b"HPCM" + struct.pack("<I", len(speeds)))
+        for off, v in speeds:
+            f.write(struct.pack("<If", off, v))
 
 
 def main():
@@ -927,10 +1107,23 @@ def main():
     for face in a.faces.split(","):
         d = os.path.join(a.out, face)
         os.makedirs(d, exist_ok=True)
-        plain = face_font(otf, face)
+        names = None
+        if FACES.get(face, {}).get("keys"):   # ((Triforce) the keyboard and mouse: its icons are drawn, nx2/prompt_keys.py)
+            try:
+                import prompt_keys
+                plain, binds = prompt_keys.game_font(otf)
+            except (Exception, SystemExit) as e:   # (tools without the labels' font, a game font it cannot take: the
+                # controllers' faces are made all the same, and the game shows its own icons for the keyboard)
+                print(f"prompts: {face} was not made ({e})", file=sys.stderr)
+                os.rmdir(d)
+                continue
+            prompt_keys.write_binds(os.path.join(d, "keys.bin"), binds)
+            names = prompt_keys.hint_names()
+        else:
+            plain = face_font(otf, face)
         font = wrap(key, plain)
         if hint:
-            write_hint(os.path.join(d, "hint.bin"), plain, hint)
+            write_hint(os.path.join(d, "hint.bin"), plain, hint, names)
         largest = max(largest, len(font))
         with open(os.path.join(d, "External.bfotf"), "wb") as f:
             f.write(font)
@@ -941,9 +1134,28 @@ def main():
                 dump(a.dump, face, textures, tex, layers)
         print(f"prompts: {face}", file=sys.stderr)
     ring = ring_entries(blarc)
-    if ring or hint:
+    wide = wide_panes(blarc)
+    if ring or hint or wide:
         with open(os.path.join(a.out, "Common.blarc"), "wb") as f:
             f.write(blarc)
+    if wide:
+        write_wide(os.path.join(a.out, "wide.bin"), wide)
+    else:
+        print("prompts: the hearts and the item slot stay in the middle of a wide picture (their layout is not the one known)",
+              file=sys.stderr)
+    speeds = None
+    try:
+        pack = read_zs(a.romfs, CAMERA, zs_dictionary(a.romfs, b"pack.zsdic"))
+        speeds = camera_speeds(pack)
+    except (Exception, SystemExit) as e:   # (a romfs without the pack, or one that does not decompress)
+        print(f"prompts: the camera's pack was not read ({e})", file=sys.stderr)
+    if speeds:
+        with open(os.path.join(a.out, "PlayerCamera.pack"), "wb") as f:
+            f.write(pack)
+        write_camera(os.path.join(a.out, "camera.bin"), speeds)
+        print("prompts: the camera's speeds " + " ".join("%.2f" % v for _, v in speeds), file=sys.stderr)
+    else:
+        print("prompts: the camera keeps the game's speed (its pack is not the one known)", file=sys.stderr)
     if ring:
         write_ring(os.path.join(a.out, "ring.bin"), ring)
         print("prompts: the Talk ring", file=sys.stderr)

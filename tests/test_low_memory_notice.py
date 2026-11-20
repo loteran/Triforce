@@ -54,14 +54,17 @@ static int MessageBoxA(void *w, const char *text, const char *caption, unsigned 
 int hos_sdl_load(void) { return 0; }
 @@CODE@@
 int main(void) {
+    /* ((Triforce, 11-18) no swap at all below 40 GB of memory says so too: 16384 + 0 and 32768 + 0 now; 65536 + 0 not) */
     static const unsigned long long cases[][3] = {
-        {8192, 0, 1}, {8192, 2047, 1}, {8192, 2048, 0}, {16384, 0, 0}, {10239, 0, 1}, {10240, 0, 0}};
+        {8192, 0, 1}, {8192, 2047, 1}, {8192, 2048, 0}, {16384, 0, 1}, {10239, 0, 1}, {10240, 1, 0}, {32768, 0, 1},
+        {32768, 1024, 0}, {65536, 0, 0}};
     char text[512];
     for (size_t i = 0; i < sizeof cases / sizeof *cases; i++) {
         const int got = memory_notice_text(cases[i][0], cases[i][1], text, sizeof text);
         printf("case %llu MB + %llu MB swap: %s\n", cases[i][0], cases[i][1], got ? "notice" : "none");
         if (got != (int)cases[i][2]) return printf("FAIL: wrong answer\n"), 1;
         if (got && (!strstr(text, "8.0 GB") && cases[i][0] == 8192)) return printf("FAIL: the text has no size: %s\n", text), 1;
+        if (got && cases[i][0] == 32768 && !strstr(text, "page file")) return printf("FAIL: no page file not named: %s\n", text), 1;
     }
     setenv("HOS_HEADLESS", "1", 1);
     memory_notice();

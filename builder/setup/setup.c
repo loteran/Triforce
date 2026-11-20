@@ -89,12 +89,21 @@ static void status(const wchar_t *fmt, ...) {
     PostMessageW(g_win, WM_STATUS, 0, 0);
 }
 
+/* (Triforce) the unfinished version's folder while one is put together, and the versions folder: what fail() undoes (undo_reuse) */
+static wchar_t g_part_dir[MAX_PATH], g_versions_dir[MAX_PATH];
+static int undo_reuse(const wchar_t *versions, const wchar_t *install);
+static void rmtree(const wchar_t *dir);
+static void setup_lock_release(void);
+
 static void fail(const wchar_t *fmt, ...) {
     wchar_t msg[1024];
     va_list ap;
     va_start(ap, fmt);
     vswprintf(msg, 1024, fmt, ap);
     va_end(ap);
+    /* ((Triforce) the installed version gets back the folders that were moved from it, and the unfinished one goes) */
+    if (g_part_dir[0] && undo_reuse(g_versions_dir, g_part_dir)) rmtree(g_part_dir);
+    setup_lock_release();   /* ((Triforce) undone: the next setup may begin) */
     if (g_headless) say_error(msg), ExitProcess(1);
     MessageBoxW(g_win, msg, L"Hookshot Builder setup", MB_OK | MB_ICONERROR);
     PostMessageW(g_win, WM_DONE, 1, 0);
@@ -318,6 +327,29 @@ static int part_folder(const Part *p, wchar_t *rel, int n) {
     return 1;
 }
 
+#define REUSED_NOTE L"reused.txt"
+/* ((Triforce) undo_reuse's note: rel added to <install>\reused.txt, the installed version's tag first when it is new; written
+   through to the disk. 0: it could not be written (the folder is then not moved) */
+static int reuse_note(const wchar_t *install, const char *was, const wchar_t *rel) {
+    wchar_t note[MAX_PATH];
+    char line[2 * MAX_PATH + 160];
+    swprintf(note, MAX_PATH, L"%ls\\" REUSED_NOTE, install);
+    const int fresh = GetFileAttributesW(note) == INVALID_FILE_ATTRIBUTES;
+    HANDLE f = CreateFileW(note, FILE_APPEND_DATA, 0, NULL, OPEN_ALWAYS, FILE_FLAG_WRITE_THROUGH, NULL);
+    if (f == INVALID_HANDLE_VALUE) return 0;
+    int n = fresh ? snprintf(line, sizeof line, "%s\n", was) : 0;
+    const int k = WideCharToMultiByte(CP_UTF8, 0, rel, -1, line + n, (int)sizeof line - n - 2, NULL, NULL);
+    DWORD put = 0;
+    int ok = k > 0;
+    if (ok) {
+        n += k - 1;
+        line[n++] = '\n';
+        ok = WriteFile(f, line, (DWORD)n, &put, NULL) && put == (DWORD)n && FlushFileBuffers(f);
+    }
+    CloseHandle(f);
+    return ok;
+}
+
 /* (players asked for less in %LOCALAPPDATA%: the downloaded zips are not kept beside the unpacked version any more. So that an update
    still downloads only what changed, a part whose checksum the installed version lists in its parts.txt (and whose folder it has)
    is moved over from it instead of downloaded: that version is deleted after the install anyway) */
@@ -343,7 +375,104 @@ static int reuse_part(const wchar_t *versions, const char *tag, const Part *p, c
     wcscpy(parent, to);
     wchar_t *slash = wcsrchr(parent, L'\\');
     if (slash) *slash = 0, mkdirs(parent);
+    /* ((Triforce) written down before it moves: the installed version is the rollback point, undo_reuse) */
+    if (!reuse_note(install, was, rel)) return 0;
     return MoveFileW(from, to) != 0;
+}
+
+/* (Triforce) The folders reuse_part moved from the installed version into the unfinished one (install), moved back: what a
+   failed, closed or cut-off setup leaves is the version that was installed, whole. Before, they stayed in <tag>.part, which
+   the next run deleted with them, and the version still installed had lost them. Each goes back only where the installed
+   version has none; the note (<tag>.part\reused.txt: the installed version's tag, then a folder a line) is removed once all
+   went back. 1: nothing is left to move back */
+static int undo_reuse(const wchar_t *versions, const wchar_t *install) {
+    wchar_t note[MAX_PATH];
+    swprintf(note, MAX_PATH, L"%ls\\" REUSED_NOTE, install);
+    HANDLE f = CreateFileW(note, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+    if (f == INVALID_HANDLE_VALUE) return 1;
+    char buf[8192];
+    DWORD got = 0;
+    ReadFile(f, buf, sizeof buf - 1, &got, NULL);
+    CloseHandle(f);
+    buf[got] = 0;
+    char *next = buf, *was = next_line(&next), *rel;
+    int ok = 1;
+    if (!was || !list_name_ok(was, 0)) return DeleteFileW(note), 1;   /* (no version named: nothing was moved yet) */
+    while ((rel = next_line(&next)) != NULL) {
+        if (!list_name_ok(rel, 1)) continue;
+        wchar_t wrel[MAX_PATH], from[MAX_PATH], back[MAX_PATH], parent[MAX_PATH];
+        MultiByteToWideChar(CP_UTF8, 0, rel, -1, wrel, MAX_PATH);
+        swprintf(from, MAX_PATH, L"%ls\\%ls", install, wrel);
+        swprintf(back, MAX_PATH, L"%ls\\%hs\\%ls", versions, was, wrel);
+        if (GetFileAttributesW(from) == INVALID_FILE_ATTRIBUTES || GetFileAttributesW(back) != INVALID_FILE_ATTRIBUTES) continue;
+        wcscpy(parent, back);
+        wchar_t *slash = wcsrchr(parent, L'\\');
+        if (slash) *slash = 0, mkdirs(parent);
+        if (!MoveFileW(from, back)) ok = 0;
+    }
+    if (ok) DeleteFileW(note);
+    return ok;
+}
+
+/* (Triforce) undo_reuse for every unfinished version (versions\*.part) that holds a note. Before, only the <tag>.part of the
+   release being set up now was undone: a setup of another release cut off before left the installed version's folders in its
+   own <tag>.part, and the installed version ran without them. Each is tried; 1: nothing is left to move back, 0: left names the
+   first folder whose folders could not all go back */
+static int undo_every_reuse(const wchar_t *versions, wchar_t *left, size_t cap) {
+    wchar_t pattern[MAX_PATH], dir[MAX_PATH], note[MAX_PATH];
+    WIN32_FIND_DATAW fd;
+    swprintf(pattern, MAX_PATH, L"%ls\\*", versions);
+    HANDLE h = FindFirstFileW(pattern, &fd);
+    if (h == INVALID_HANDLE_VALUE) return 1;
+    int ok = 1;
+    do {
+        const size_t n = wcslen(fd.cFileName);
+        if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || n < 6 || _wcsicmp(fd.cFileName + n - 5, L".part")) continue;
+        swprintf(dir, MAX_PATH, L"%ls\\%ls", versions, fd.cFileName);
+        swprintf(note, MAX_PATH, L"%ls\\" REUSED_NOTE, dir);
+        if (GetFileAttributesW(note) == INVALID_FILE_ATTRIBUTES || undo_reuse(versions, dir)) continue;
+        if (ok) wcsncpy(left, dir, cap - 1), left[cap - 1] = 0;
+        ok = 0;
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+    return ok;
+}
+
+/* (Triforce) One setup at a time for a setup folder (base), its sweep (undo_every_reuse) included. Two at once each undid the
+   other's <tag>.part: the second one's sweep gave the installed version back the folders the first had just moved over, and
+   the first finished without its Python. The lock is a named mutex (Windows lets go of it when its holder ends, however it
+   ends), named as setup_parts.lock_name and Reuse.cs LockName name it: Local\HookshotBuilder-Setup-<a 64-bit FNV-1a of the
+   folder's full path with '\' between its parts, none at its end, a to z in upper case>. Local\: this user's session */
+#define SETUP_LOCK_WAIT_MS 20000
+static HANDLE g_setup_lock;
+static void setup_lock_name(const wchar_t *base, wchar_t *name, size_t cap) {
+    wchar_t full[2 * MAX_PATH];
+    const DWORD got = GetFullPathNameW(base, 2 * MAX_PATH, full, NULL);
+    if (!got || got >= 2 * MAX_PATH) wcsncpy(full, base, 2 * MAX_PATH - 1), full[2 * MAX_PATH - 1] = 0;
+    size_t n = wcslen(full);
+    for (size_t i = 0; i < n; i++) if (full[i] == L'/') full[i] = L'\\';
+    while (n && full[n - 1] == L'\\') full[--n] = 0;
+    unsigned long long h = 14695981039346656037ULL;   /* (a name, not a secret) */
+    for (size_t i = 0; i < n; i++) {
+        const unsigned c = full[i] >= L'a' && full[i] <= L'z' ? full[i] - 32u : full[i];
+        h = (h ^ c) * 1099511628211ULL;
+    }
+    swprintf(name, cap, L"Local\\HookshotBuilder-Setup-%016llx", h);
+}
+/* 1: this setup holds base (or no lock can be made at all: nobody is refused), 0: another setup held it for wait_ms */
+static int setup_lock_take(const wchar_t *base, DWORD wait_ms) {
+    wchar_t name[96];
+    if (g_setup_lock) return 1;
+    setup_lock_name(base, name, 96);
+    HANDLE m = CreateMutexW(NULL, FALSE, name);
+    if (!m) return GetLastError() != ERROR_ACCESS_DENIED;   /* (it is there, and belongs to a setup run as administrator) */
+    const DWORD r = WaitForSingleObject(m, wait_ms);
+    if (r == WAIT_OBJECT_0 || r == WAIT_ABANDONED) return g_setup_lock = m, 1;   /* (abandoned: its holder ended, it is ours) */
+    CloseHandle(m);
+    return 0;
+}
+static void setup_lock_release(void) {
+    if (g_setup_lock) ReleaseMutex(g_setup_lock), CloseHandle(g_setup_lock), g_setup_lock = NULL;
 }
 
 /* The checksums of the parts this version holds in folders of their own (reuse_part reads them at the next update) */
@@ -536,6 +665,14 @@ static DWORD WINAPI work(LPVOID unused) {
         const wchar_t *tb = _wgetenv(L"HOOKSHOT_SETUP_BASE");
         if (tb && *tb) wcsncpy(base, tb, MAX_PATH - 1), base[MAX_PATH - 1] = 0;
     }
+    /* ((Triforce) this folder for this setup alone until the builder starts, its sweep included (setup_lock_take): another one
+       waits for it, a while) */
+    if (!setup_lock_take(base, 0)) {
+        status(L"Another Hookshot Builder setup is installing. Waiting for it to finish...");
+        if (!setup_lock_take(base, SETUP_LOCK_WAIT_MS))
+            fail(L"Another Hookshot Builder setup is installing into %ls right now. Wait for it to finish (or close it), then run the "
+                 L"setup again.", base);
+    }
     swprintf(downloads, MAX_PATH, L"%ls\\downloads", base);
     mkdirs(downloads);
 
@@ -618,12 +755,21 @@ static DWORD WINAPI work(LPVOID unused) {
     swprintf(exe, MAX_PATH, L"%ls\\%ls", install, wrun);
     for (wchar_t *q = exe; *q; q++) if (*q == L'/') *q = L'\\';
 
+    {   /* ((Triforce) a setup cut off before, of this release or another: what it moved over from the installed version goes
+           back first, before the installed version is looked at; a part folder whose folders could not all go back is kept, not
+           deleted with them) */
+        wchar_t left[MAX_PATH];
+        if (!undo_every_reuse(versions, left, MAX_PATH))
+            fail(L"The last setup could not be undone: %ls still holds folders of the installed version. Close every Hookshot window "
+                 L"and run the setup again.", left);
+    }
     if (repair || GetFileAttributesW(marker) == INVALID_FILE_ATTRIBUTES || GetFileAttributesW(exe) == INVALID_FILE_ATTRIBUTES) {
         /* (unpacked into <tag>.part and renamed once complete: a setup stopped half way never leaves a version that looks installed) */
         swprintf(install, MAX_PATH, L"%ls\\%ls.part", versions, wtag);
         rmtree(install);
         rmtree(final_dir);
         mkdirs(install);
+        wcscpy(g_versions_dir, versions), wcscpy(g_part_dir, install);   /* (fail() undoes from here on) */
         for (int i = 0; i < nparts; i++) {
             Part *p = &parts[i];
             wchar_t zip[MAX_PATH], wsha[65];
@@ -721,7 +867,13 @@ static DWORD WINAPI work(LPVOID unused) {
         if (GetFileAttributesW(staged_exe) == INVALID_FILE_ATTRIBUTES)
             fail(L"The builder is missing after unpacking (%ls). Your antivirus may have removed it: allow the folder %ls and run the setup again.", staged_exe, base);
         if (!MoveFileW(install, final_dir)) fail(L"Could not finish installing into %ls.", final_dir);
+        g_part_dir[0] = 0;   /* (installed: nothing to undo; the note goes) */
         wcscpy(install, final_dir);
+        {
+            wchar_t note[MAX_PATH];
+            swprintf(note, MAX_PATH, L"%ls\\" REUSED_NOTE, final_dir);
+            DeleteFileW(note);
+        }
         write_small(marker, tag);
         write_parts(install, parts, nparts);
     }
@@ -732,6 +884,7 @@ static DWORD WINAPI work(LPVOID unused) {
     }
     prune(versions, downloads, tag, parts, nparts);
     rmtree(downloads);   /* (installed: its zips are not kept; an update moves unchanged folders over instead, reuse_part) */
+    setup_lock_release();   /* ((Triforce) installed: the builder this starts may start a setup of its own) */
 
     status(L"Starting the Hookshot Builder...");
     wchar_t cmd[4096], dir[MAX_PATH];

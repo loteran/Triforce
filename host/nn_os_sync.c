@@ -719,6 +719,19 @@ static int logged_wait(Ctx *c, Obj *e, int64_t timeout_ns, int try_only, const c
                 (unsigned long long)e->key, (unsigned long long)c->x[30]);
         return r;
     }
+    {   /* (Triforce, 11-14) HOS_FT: a wait that blocked 0.2 ms or more, with its caller, at its end (nvn_native.c hos_ft_on) */
+        int hos_ft_on(void);
+        double hos_ft_ms(void);
+        if (!try_only && hos_ft_on()) {
+            const int64_t f0 = hos_now_ns();
+            const int r = event_wait(e, timeout_ns, try_only);
+            const int64_t took = hos_now_ns() - f0;
+            if (took >= 200000)
+                hos_log("ft %.3f waited %.2f ms on %s event %#llx (lr %#llx)", hos_ft_ms(), took / 1e6, what, (unsigned long long)e->key,
+                        (unsigned long long)c->x[30]);
+            return r;
+        }
+    }
     if (!on || try_only) return event_wait(e, timeout_ns, try_only);
     const int64_t t0 = hos_now_ns();
     const int r = event_wait(e, timeout_ns, try_only);
@@ -808,6 +821,11 @@ static void who_note_signal(Ctx *c, uint64_t key) {
 }
 HLE(_ZN2nn2os16SignalLightEventEPNS0_14LightEventTypeE) {
     who_note_signal(c, ARG(0));
+    {   /* (Triforce, 11-14) HOS_FT: every light event signalled */
+        int hos_ft_on(void);
+        double hos_ft_ms(void);
+        if (hos_ft_on()) hos_log("ft %.3f signal %#llx (lr %#llx)", hos_ft_ms(), (unsigned long long)ARG(0), (unsigned long long)c->x[30]);
+    }
     event_signal(obj(ARG(0), K_EVENT));
 }
 HLE(_ZN2nn2os15ClearLightEventEPNS0_14LightEventTypeE) { event_clear(obj(ARG(0), K_EVENT)); }
@@ -933,6 +951,11 @@ static void queue_trace(Obj *q, uint64_t v, const char *what) {
 /* mode: 0 send (back), 1 jam (front). try: do not block. Returns 1 if done. */
 static int queue_put(Obj *q, uint64_t v, int jam, int try_only) {
     queue_trace(q, v, jam ? "jam" : "send");
+    {   /* (Triforce, 11-14) HOS_FT: every message sent, by its queue */
+        int hos_ft_on(void);
+        double hos_ft_ms(void);
+        if (hos_ft_on()) hos_log("ft %.3f send queue %#llx value %#llx", hos_ft_ms(), (unsigned long long)q->key, (unsigned long long)v);
+    }
     AcquireSRWLockExclusive(&q->lk);
     while (q->qlen == q->qcap) {
         if (try_only) { ReleaseSRWLockExclusive(&q->lk); return 0; }
@@ -997,6 +1020,11 @@ HLE(_ZN2nn2os24ReceiveLightMessageQueueEPmPNS0_21LightMessageQueueTypeE) {
     uint64_t v;
     queue_get(obj(ARG(1), K_QUEUE), &v, 1, -1);
     G64(ARG(0)) = v;
+    {   /* (Triforce, 11-14) HOS_FT: a message taken (whose queue it is) */
+        int hos_ft_on(void);
+        double hos_ft_ms(void);
+        if (hos_ft_on()) hos_log("ft %.3f got queue %#llx value %#llx", hos_ft_ms(), (unsigned long long)ARG(1), (unsigned long long)v);
+    }
 }
 HLE(_ZN2nn2os27TryReceiveLightMessageQueueEPmPNS0_21LightMessageQueueTypeE) {
     uint64_t v;

@@ -44,6 +44,11 @@ struct Frame {
     bool reset = false;                     ///< no history: the first frame, a new size, or a gap of more than two frames
     float frame_ms = 16.667f;               ///< since the frame before's
     uint64_t frame = 0;                     ///< texture_frame_no() when prepared
+    // (Triforce, for NVIDIA DLSS frame generation, vk_dlssg.cpp: the depth's and the motion's images themselves (depth_image and
+    // motion_image above), and the camera's matrices as the game has them, row major, clip = M * position, without the jitter)
+    float projection[16]{};                 ///< view space to clip space
+    float clip_to_prev[16]{};               ///< this frame's clip space to the frame before's; the identity on a reset
+    float view[12]{};                       ///< the view matrix's three rows: the camera's axes and its translation
 };
 
 /// FSR 3.1 is asked for at all: its upscaler (the Upscaler row) or its frame interpolation (the Frame generation row), or NVIDIA

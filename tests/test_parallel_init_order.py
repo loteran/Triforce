@@ -18,6 +18,19 @@ buffer is recorded in order on the replay thread. When one cannot be ended, the 
 exit code 3) once every worker is done, with nothing that uses the lost images submitted, and no later work may run. The
 init pools' startup (init_pools_make) is run with each pool creation and allocation failing in turn.
 
+(Triforce, 11-17) A texture the segments sample, looked at first by a later segment's worker, was uploaded there and again by
+each earlier segment that sampled it (the twin), after the later one's upload in the queue. Now the upload goes into the init
+command buffer of the earliest segment still recorded (vk_texture.cpp UploadRedirect, cut with the upload command buffer
+state; gpu/vk/upload_earliest.h). The fixture's texture_look is texture_touch's steps that decide it (tests/test_upload_same.py
+reads them in the source): the "upload_" cases check that every draw sampling it comes after this submission's one upload in the
+queue, with a barrier between, that no twin is made, which command buffer the upload is in and the segment it notes, a worker
+closing its segment while another records into its init command buffer (each segment's own lock: another segment's end
+does not wait), an image and the BC3
+scratches made inside the upload (redirected or in the segment's own uploads), the worker's own upload command buffer given
+back, an upload read on the GPU left in its segment's uploads (the twin as before),
+the full barrier before an upload that is its init command buffer's first command, every order of four segments' workers and
+every set of them sampling it, and RX_VK_UPLOAD_EARLIEST=0 recording call for call what it did before.
+
 python -I -B tests/test_parallel_init_order.py --cxx clang++ --headers path/to/Vulkan-Headers/include
 """
 import argparse
@@ -32,7 +45,10 @@ RUN_ALL_ARGS = ["--cxx", "{cxx}", "--headers", "{vulkan_headers}"]
 
 ROOT = Path(__file__).resolve().parents[1]
 CASES = ("later_makes", "three", "scratch", "scratch2", "in_order", "serial", "close_race", "after_submit", "init_begin_fail",
-         "init_end_fail", "alloc_fail")
+         "init_end_fail", "alloc_fail", "own_uses", "own_all", "own_off", "upload_rules", "upload_later_first", "upload_three",
+         "upload_own", "upload_own_nested", "upload_close_race", "upload_end_other", "upload_nested", "upload_then_make", "upload_barrier",
+         "upload_gpu_route", "upload_random")
+OFF_CASES = ("upload_later_first", "upload_off", "upload_gpu_route", "upload_random")   # (with RX_VK_UPLOAD_EARLIEST=0: as before)
 
 
 def block(source, marker):
@@ -69,7 +85,12 @@ def main():
     if "// into GENERAL, and cleared" not in create or "Texture* p = tex.get();" not in create:
         raise SystemExit("create()'s initialization moved: update this test")
     jobs = cut(replay, "    struct Job {", "    seg_ms += std::chrono::duration")
-    have_seg_init = "std::mutex seg_init_mu;" in texture
+    have_seg_init = "struct SegInit {" in texture
+    if "struct UploadRedirect {" not in texture or "if (!want || tl_seg_index < 0 || tl_up_redirect) return;" not in texture:
+        raise SystemExit("FAIL: vk_texture.cpp has no UploadRedirect, or InitRedirect does not stand aside inside one")
+    for step in ("j->order = base + k;", "j->index = (int)k;", "texture_set_segment(j->order);", "texture_segment_worker(j->index);"):
+        if replay.count(step) != 1:   # (UploadRedirect's order: upload_earliest::order_of)
+            raise SystemExit("FAIL: replay_handle no longer numbers its segments' order as their index from base: " + step)
     exits = {"init_end_fail": 3} if have_seg_init else {}   # (replay_fatal ends the process)
     for step in ("record_segment(c, j->g);", "texture_begin_recording(j->r->upload, j->r->value);", "vkQueueSubmit2(",
                  "j->uploads = texture_uploads_recorded();", "par_pool.cv.notify_all();"):
@@ -83,7 +104,7 @@ def main():
     have_pools = "bool init_pools_make(" in replay
     if have_pools:   # (the last fallible step of replay_start: no later failure returns with them made)
         start = block(replay, "bool replay_start() {")
-        call = "if (par_threads() >= 2 && !init_pools_make(pi)) return false;"
+        call = "if (par_threads_max() >= 2 && !init_pools_make(pi)) return false;"
         if call not in start or start.index(call) < start.index("for (Frame& f : frames)") or                 "return false" in start[start.index(call) + len(call):]:
             raise SystemExit("FAIL: replay_start does not make the init pools last (a later failure would leave them made)")
     inc = {
@@ -92,6 +113,7 @@ def main():
         "init_scratch.inc": block(texture, "bool bc_scratch_layout("),
         "init_hooks.inc": "\n".join(hooks),
         "init_recording.inc": block(replay, "struct Recording {") + ";",
+        "init_parstats.inc": cut(replay, "struct ParStats {", "\nstruct Segment {"),   # (what the jobs time their parts in)
         "init_jobs.inc": jobs,
         "init_pools.inc": "\n".join(block(replay, m) for m in ("void init_pools_destroy() {", "bool init_pools_make(")) if have_pools else "",
         "init_fatal.inc": block(replay, "[[noreturn]] void replay_fatal(") if have_seg_init else "",
@@ -113,16 +135,25 @@ def main():
         if r.returncode:
             print(r.stdout + r.stderr)
             raise SystemExit("the fixture did not build")
-        for case in CASES:
-            r = subprocess.run([str(binary), case], capture_output=True, text=True, timeout=60)
+        env = {k: v for k, v in os.environ.items() if k != "RX_VK_UPLOAD_EARLIEST"}
+        runs = [(case, env, case) for case in CASES]
+        runs += [(case, dict(env, RX_VK_UPLOAD_EARLIEST="0"), case + " (RX_VK_UPLOAD_EARLIEST=0)") for case in OFF_CASES]
+        for case, case_env, label in runs:
+            try:
+                r = subprocess.run([str(binary), case], env=case_env, capture_output=True, text=True, timeout=90)
+            except subprocess.TimeoutExpired:
+                print(label + ": timed out")
+                failed.append(label)
+                continue
             print(r.stdout, end="", flush=True)
             print(r.stderr, end="", file=sys.stderr)
             if r.returncode != exits.get(case, 0) or "FAIL" in r.stdout:
-                failed.append(case)
+                failed.append(label)
     if failed:
         raise SystemExit("FAIL: new images' initialization order or the init pools' startup: " + ", ".join(failed))
     print("PASS: each new image is initialized once, before every use in queue order; serial calls are unchanged; "
-          "the init pools are all made or none")
+          "the init pools are all made or none; a texture the segments sample is uploaded once, in the earliest segment still "
+          "recorded, before every draw that samples it (RX_VK_UPLOAD_EARLIEST=0: as before, the twin)")
 
 
 if __name__ == "__main__":

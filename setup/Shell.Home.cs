@@ -34,6 +34,9 @@ sealed partial class Shell
         HomeGoButton.Click += (_, _) => homeGo?.Invoke();
         NewFolderLink.Click += (_, _) => { NewFolderLink.IsChecked = false; ShowSetup(); };
         InitSaves();
+        InitMods();
+        InitSteam();
+        InitSounds();
     }
 
     // ---- welcome back ----
@@ -50,7 +53,7 @@ sealed partial class Shell
         var built = hasGame ? BuiltVersion(folder!) : null;
         Program.Log("home: GameFolder=[" + (folder ?? "null") + "] exe=[" + (folder != null ? GameExe(folder) ?? "null" : "-") + "] built=[" + (built ?? "null") + "] tools=[" + (tools ?? "null") + "] latest=[" + (latest?.Tag ?? "null") + "]");
 
-        var setupNewer = latest != null && Program.Version != "dev" && latest.Tag != Program.Version && latest.SetupUrl != null;
+        var setupNewer = latest != null && SetupNewer(latest);
         var toolsNewer = latest != null && latest.Tag != tools;
         var gameBehind = hasGame && built != null && tools != null && built != tools;   // (new tools already here, game not rebuilt yet)
         var update = setupNewer || toolsNewer || gameBehind;
@@ -58,6 +61,7 @@ sealed partial class Shell
 
         HomeFill(hasGame, hasGame ? "Triforce " + (built ?? tools ?? "?") : null, folder, built, target, update, offline);
         ShowSavesLine();
+        LoadSounds();   // (the game folder may be another one, or its mods other ones: Shell.Sounds.cs)
         Show(HomePage);
         if (!update) stage.Gleam(450);
 
@@ -83,7 +87,7 @@ sealed partial class Shell
             var none = offline.Message.Contains("no Triforce release");
             NewsMark.Fill = Brush("TextFaint");
             NewsLine.Text = none ? "No release is published yet" : "Couldn't check for updates";
-            NewsDetail.Text = (none ? "" : "GitHub could not be reached. ") + (hasGame ? "You can play what you have." : "You can build with the tools you have.");
+            NewsDetail.Text = (none ? "" : "The Triforce site could not be reached. ") + (hasGame ? "You can play what you have." : "You can build with the tools you have.");
             NewsDetail.Foreground = Brush("TextDim");
         }
         else if (update)
@@ -123,6 +127,6 @@ sealed partial class Shell
             HomeGoButton.Content = hasGame ? "Play" : "Build my game";
             NotNowButton.Visibility = Visibility.Collapsed;
         }
-        NewFolderLink.Visibility = hasGame ? Visibility.Visible : Visibility.Collapsed;
+        NewFolderLink.Visibility = ModsButton.Visibility = SteamButton.Visibility = hasGame ? Visibility.Visible : Visibility.Collapsed;
     }
 }

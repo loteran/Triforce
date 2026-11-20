@@ -127,6 +127,16 @@ int main(void) {
         hd_rumble_encode(w, 100, o2);
         CHECK(!memcmp(out, o2, 4));
     }
+    /* the Rumble strength row's top, 300%%: the same top and the same balance (0.9 and 0.45 again), a plain factor under it */
+    { const float v[4] = {0.9f, 160.0f, 0.45f, 320.0f}; hd_rumble_encode(v, 300, out); CHECK(same(out, 0x00, 0x88 | 1, 0x40, 0x72)); }
+    { const float v[4] = {1.0f, 160.0f, 1.0f, 320.0f}; hd_rumble_encode(v, 300, out); CHECK(same(out, 0x00, 0xc8 | 1, 0x40, 0x72)); }
+    {
+        const float v[4] = {0.1f, 160.0f, 0.05f, 320.0f}, w[4] = {0.3f, 160.0f, 0.15f, 320.0f};
+        uint8_t o2[4];
+        hd_rumble_encode(v, 300, out);
+        hd_rumble_encode(w, 100, o2);
+        CHECK(!memcmp(out, o2, 4));
+    }
     /* the strength: 50%% of 0.459817 is 0.229908 (code 32 -> 0x40) */
     { const float v[4] = {0.459817f, 160.0f, 0.459817f, 320.0f}; hd_rumble_encode(v, 50, out); CHECK(same(out, 0x00, 0x41, 0x40, 0x50)); }
 

@@ -109,6 +109,31 @@ that only exists on that side does not stay mixed in with the new save.
 - **Backups.** The script keeps one for every copy. Delete old ones when you no longer need them.
 - Start each program once and save in it before the first copy, so that its save folder exists.
 
+## A save as one zip, from the game itself
+
+The System tab of the game's Options has **Export save**, **Export save for a bug report** and **Import a save**
+(`host/save_share.c`; the readme's *Export and import a save*). They move one zip, not a folder:
+
+```
+manifest.json   "format": "triforce-save", "format_version": 1, the game's title id, the Triforce version, the export time (UTC)
+save/           account.sav, option.sav, slot_00/ ... as above
+bug-report/     in a bug report: triforce_log.txt, triforce_log.1.txt, triforce_options.ini, triforce_hang.txt
+```
+
+- The export is the save the next start would load, read with no save in progress (`host/nn_fs.c` `hos_fs_save_read`):
+  a finished commit still waiting in `user/save-tx/<user id>/ready-<n>`, else `user/save/<user id>`. It goes to the
+  Downloads folder (`HOS_SAVE_EXPORT_DIR=<folder>`: there instead), or beside the game when that cannot be written.
+- The import takes the newest `.zip` of the game folder's `save-import` folder: this format or NX2navi's own
+  (`"format": "nx2navi-save"`, the same layout). It is checked whole first (`host/save_pack.c`: the manifest, every path
+  inside the save, no links, sizes, each file's CRC-32) and refused otherwise. Its save then waits in
+  `user/save-tx/<user id>/import` and the zip moves to `save-import/imported`.
+- The next start copies the save about to be replaced to `user/save-backup/<user id>/import-<UTC date>-<time>` (kept until
+  you delete it: the five rolling backups beside it are the saves' own), then makes the import the save
+  (`host/save_tx_share.h`). Choosing the row again before that start cancels it.
+- Triforce Setup's Convert saves, used after an import was left waiting, drops the waiting import: what was converted last
+  is the save.
+- With `HOS_SAVE_TX=0` the game writes its save in place, and nothing is exported or imported in that run.
+
 ## What was tested
 
 - Linux (Arch-based), Hookshot v2.0.5 and Lichii built from source on the same day.

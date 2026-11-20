@@ -13,9 +13,9 @@ python -I -B tests/test_recorder_sync.py --headers <Vulkan-Headers/include> [--c
    RX_VK_RECORDER=defer (step 1.5), against the fake's command buffer lifecycle: two command buffers recorded into interleaved,
    reset/begun/ended/submitted/waited for twice, a query read and a destruction, the caller's memory poisoned; a recording handed
    between two threads under the replay lock; a 2 KB soft budget; a 1 MB hard budget; the second chunk's allocation failing; a
-   parallel replay running (par_active). Each must log what the direct calls log, no command outside its command buffer's recording,
-   no exception out of a vkCmd*, no block lost. Run with RX_VK_RECORDER=defer (mode 2, logged once) and with RX_VK_PARALLEL=4 too
-   (refused: off, logged once).
+   parallel replay running (par_active); a parallel replay's segments (below). Each must log what the direct calls log, no command
+   outside its command buffer's recording, no exception out of a vkCmd*, no block lost. Run with RX_VK_RECORDER=defer (mode 2, logged
+   once) and with RX_VK_PARALLEL=4 too (the same: no longer refused).
    RX_VK_RECORDER=thread (step 2): the same frame and lifecycle with every vkCmd* run by a recorder thread, the fake driver slowed
    (1 us a call) so the recorder lags, and in the ordering scenarios the recorder held (50 ms) at each point the producer must wait
    for it (a recording's end, a submit while another command buffer records, the replay lock let go, a pool reset), so a missing
@@ -25,10 +25,16 @@ python -I -B tests/test_recorder_sync.py --headers <Vulkan-Headers/include> [--c
    thread; an 8 KB ring (backpressure); a packet bigger than its room (made directly, in order; again first in an empty ring); no
    memory for the ring; teardown with work queued (stop, join, lazy restart, vkDestroyDevice); par_active; >= 1e6 packets through a
    16 KB ring, twice, hashed against the direct stream. --throw: a driver call that throws on the recorder thread ends the process
-   (exit code 3, FATAL). Run with RX_VK_RECORDER=thread (mode 3, logged once) and with RX_VK_PARALLEL=4 (refused).
+   (exit code 3, FATAL). Run with RX_VK_RECORDER=thread (mode 3, logged once) and with RX_VK_PARALLEL=4 (the same).
+   (Triforce, 11-15) Beside a parallel replay's segments (vk_replay.cpp replay_handle), defer and thread: the part before them
+   through the ring, the segments begun and given their first timestamps through it and held in flight there, segments_begin,
+   par_active, two helper threads (no replay lock) recording theirs directly, then the producer its own, the segments ended and
+   submitted in order, the part after through the ring again: the direct log exactly, and the recorder thread makes no call while
+   par_active; then with the helpers and the producer at once, compared command buffer by command buffer, no violation.
 3. The test has teeth: vk_recorder.h with a copy left shallow (all of them, or only the descriptor writes' image infos), with the
    fallback's drain left out, with no drain before vkEndCommandBuffer, with the replay lock let go without a drain, with a throwing
-   allocation (exception safety broken), with the failure's drain left out, or with the parallel refusal left out, must fail it.
+   allocation (exception safety broken), with the failure's drain left out, or with nothing run before a parallel replay's segments
+   (segments_begin left empty, defer and thread), must fail it.
    Thread (each run with --only thread, so the recorder thread's checks alone catch it): no wait before vkEndCommandBuffer, before
    vkQueueSubmit2, at the replay lock's release, before vkResetCommandPool; no backpressure (the ring overwritten); no join at
    teardown; a packet bigger than its room written into the ring when the ring has more free; the recorder's exception swallowed
@@ -69,7 +75,8 @@ BOUNDARY_OK = {
 # (the names a boundary has: a new one in a vk_work.h file must be in RX_REC_BOUNDARIES)
 BOUNDARY_NAME = re.compile(r"\b(vk(?:Begin|End|Reset)\w*|vkQueue\w+|vkWait\w+|vkDeviceWaitIdle|vkDestroy\w+|vkFree\w+|"
                            r"vkGetQueryPoolResults|vkGetQueueCheckpointDataNV|vkGetDeviceFaultInfoEXT|vkGetSemaphoreCounterValue|"
-                           r"vkAcquireNextImageKHR|vma(?:Destroy|Free|Invalidate)\w*)\s*\(")
+                           # ((Triforce) vmaFreeStatsString frees a CPU string (RX_VK_RT_MAP's map, a lab switch): no GPU object)
+                           r"vkAcquireNextImageKHR|vma(?:Destroy|Free(?!StatsString)|Invalidate)\w*)\s*\(")
 
 
 def code(text):
@@ -85,6 +92,8 @@ def recorder_calls(text):
 
 
 B_DIRECT_STMT = "::mkwvk::rec::boundary(::mkwvk::rec::B_DIRECT);"
+# ((Triforce, P4) the boundaries whose arguments go through a counting macro of vk_work.h first: cmd_work.h work_begun, work_submitted)
+COUNTED_BOUNDARIES = {"vkBeginCommandBuffer": "RX_WORK_BEGUN", "vkQueueSubmit2": "RX_WORK_SUBMIT"}
 
 
 C_COMMENT_OR_STRING = re.compile(r'//[^\n]*|/\*.*?\*/|"(?:\\.|[^"\\\n])*"|\'(?:\\.|[^\'\\\n])*\'', re.S)
@@ -118,10 +127,11 @@ def direct_unbounded(text, fname="vk_menu.cpp", call=UI_RECORD_CALL):
 
 def opaque_unregistered(text, fname):
     """note_work() written out by hand marks commands vk_work.h did not see: each must follow a call this test knows
-    (OPAQUE_RECORD_CALL), so a new library recording into the command buffer has to be added here, with its boundary"""
+    (OPAQUE_RECORD_CALL), so a new library recording into the command buffer has to be added here, with its boundary.
+    ((Triforce, P4) note_work(cmd): counted in the command buffer the library recorded into, cmd_work.h)"""
     code = blank_comments(text)
     bad = []
-    for m in re.finditer(r"(?<![\w:])(?:::\s*mkwvk\s*::\s*)?note_work\s*\(\s*\)\s*;", code):
+    for m in re.finditer(r"(?<![\w:])(?:::\s*mkwvk\s*::\s*)?note_work\s*\([^;()]*\)\s*;", code):
         if not OPAQUE_RECORD_CALL.search(code[max(0, m.start() - 600):m.start()]):   # (in the few statements before it)
             bad.append("%s:%d: note_work() after a recording this test does not know: add it to OPAQUE_RECORD_CALL with a "
                        "B_DIRECT boundary" % (fname, code.count("\n", 0, m.start()) + 1))
@@ -140,7 +150,8 @@ def check_sources():
         problems.append("vk_work.h's macros and RX_REC_CALLS differ: only in vk_work.h %s, only in vk_recorder.h %s"
                         % (sorted(set(macros) - set(calls)), sorted(set(calls) - set(macros))))
     for f, body in macros.items():
-        if "::mkwvk::rec::rx_%s(__VA_ARGS__)" % f not in body:
+        # ((Triforce, P4) the commands that do GPU work pass their arguments through RX_WORK_ON, which counts the command buffer)
+        if "::mkwvk::rec::rx_%s(__VA_ARGS__)" % f not in body and "::mkwvk::rec::rx_%s(RX_WORK_ON(__VA_ARGS__))" % f not in body:
             problems.append("vk_work.h: %s does not call its packer: %s" % (f, body))
         if "::vkx::" in body:
             problems.append("vk_work.h: %s calls the driver directly" % f)
@@ -153,9 +164,12 @@ def check_sources():
     if not m:
         raise SystemExit("RX_REC_BOUNDARIES not found in vk_recorder.h")
     bounds = dict((f, k) for k, f in re.findall(r"\b([KM])\((\w+)\)", m.group(1)))
-    bmacros = dict(re.findall(r"#define (\w+)\(\.\.\.\) \(::mkwvk::rec::boundary\(::mkwvk::rec::B_\w+\), (::vkx::|::)\w+\(__VA_ARGS__\)\)", work))
+    # ((Triforce, P4) a begin and a submit pass their arguments through RX_WORK_BEGUN / RX_WORK_SUBMIT, which count them: cmd_work.h)
+    bmacros = dict(re.findall(r"#define (\w+)\(\.\.\.\) \(::mkwvk::rec::boundary\(::mkwvk::rec::B_\w+\), (::vkx::|::)\w+\("
+                              r"(?:RX_WORK_\w+\()?__VA_ARGS__\)?\)\)", work))
     for f, q in bmacros.items():
-        if "#define %s(...) (::mkwvk::rec::boundary(::mkwvk::rec::B_%s), %s%s(__VA_ARGS__))" % (f, f, q, f) not in work:
+        args = "%s(__VA_ARGS__)" % COUNTED_BOUNDARIES[f] if f in COUNTED_BOUNDARIES else "__VA_ARGS__"
+        if "#define %s(...) (::mkwvk::rec::boundary(::mkwvk::rec::B_%s), %s%s(%s))" % (f, f, q, f, args) not in work:
             problems.append("vk_work.h: %s's macro calls another function" % f)
     if set(bmacros) != set(bounds) or any(bmacros[f] != ("::vkx::" if k == "K" else "::") for f, k in bounds.items() if f in bmacros):
         problems.append("vk_work.h's boundary macros and RX_REC_BOUNDARIES differ: only in vk_work.h %s, only in vk_recorder.h %s"
@@ -232,8 +246,9 @@ def check_sources():
     # (and any other recording vk_work.h does not see must be registered: every hand-written note_work() follows a known one)
     for path in sorted(VK.glob("*.cpp")):
         problems += opaque_unregistered(path.read_text(encoding="utf-8"), path.name)
-    if not opaque_unregistered("void f() {\n    some_sdk_record(cmd);\n    note_work();\n}\n", "control.cpp"):
-        problems.append("the note_work() registry missed an unknown recording")
+    for control in ("note_work();", "note_work(cmd);", "::mkwvk::note_work( cmd );"):
+        if not opaque_unregistered("void f() {\n    some_sdk_record(cmd);\n    %s\n}\n" % control, "control.cpp"):
+            problems.append("the note_work() registry missed an unknown recording (%s)" % control)
     if problems:
         raise SystemExit("\n".join(problems))
     print("PASS sources: %d calls packed and %d boundaries drained, each with its vk_work.h macro; every call in the %d vk_work.h "
@@ -258,6 +273,7 @@ def build(cxx, headers, out, recorder_text, name, extra=(), work_text=None):
     d.mkdir()
     (d / "vk_loader.h").write_text(test_loader(), encoding="utf-8")
     (d / "vk_work.h").write_text(work_text or (VK / "vk_work.h").read_text(encoding="utf-8"), encoding="utf-8")
+    (d / "cmd_work.h").write_text((VK / "cmd_work.h").read_text(encoding="utf-8"), encoding="utf-8")   # ((Triforce, P4) vk_work.h's)
     (d / "vk_recorder.h").write_text(recorder_text, encoding="utf-8")
     exe = d / "recorder_sync_test.exe"
     cmd = [cxx, "-std=c++20", "-O2", "-Wall", "-Wextra", "-Werror", "-Wno-unused-function", "-Wno-missing-field-initializers", "-DVK_NO_PROTOTYPES",
@@ -290,10 +306,11 @@ ENV_RUNS = (
     (None, None, "env mode 0", ()),
     ("defer", None, "env mode 2", ("LOG: vk: RX_VK_RECORDER=defer:",)),
     ("defer", "1", "env mode 2", ("LOG: vk: RX_VK_RECORDER=defer:",)),
-    ("defer", "4", "env mode 0", ("LOG: vk: RX_VK_RECORDER=defer refused: RX_VK_PARALLEL=4",)),
+    # (Triforce, 11-15: beside the helper threads too, no longer refused: a parallel replay's segments make their calls directly)
+    ("defer", "4", "env mode 2", ("LOG: vk: RX_VK_RECORDER=defer:",)),
     ("thread", None, "env mode 3", ("LOG: vk: RX_VK_RECORDER=thread: vkCmd* packed",)),
     ("thread", "1", "env mode 3", ("LOG: vk: RX_VK_RECORDER=thread: vkCmd* packed",)),
-    ("thread", "4", "env mode 0", ("LOG: vk: RX_VK_RECORDER=thread refused: RX_VK_PARALLEL=4",)),
+    ("thread", "4", "env mode 3", ("LOG: vk: RX_VK_RECORDER=thread: vkCmd* packed",)),
 )
 
 
@@ -306,8 +323,8 @@ def env_run_ok(exe, env_mode, parallel, want, logs, show=True):
     for l in logs:   # (exactly once)
         ok = ok and sum(1 for x in lines if x.startswith(l)) == 1
     if not logs:
-        ok = ok and not any(x.startswith(("LOG: vk: RX_VK_RECORDER=defer", "LOG: vk: RX_VK_RECORDER=thread: vkCmd* packed",
-                                          "LOG: vk: RX_VK_RECORDER=thread refused")) for x in lines)
+        ok = ok and not any(x.startswith(("LOG: vk: RX_VK_RECORDER=defer", "LOG: vk: RX_VK_RECORDER=thread: vkCmd* packed")) for x in lines)
+    ok = ok and not any(" refused" in x for x in lines if x.startswith("LOG: vk: RX_VK_RECORDER="))   # (never refused now)
     return ok, r
 
 
@@ -329,8 +346,9 @@ def unordered_too(rec, f):
 
 def no_wait(work_h, f):
     """vk_work.h with f's boundary macro calling the driver at once (no drain, no wait)"""
-    return broken(work_h, "#define %s(...) (::mkwvk::rec::boundary(::mkwvk::rec::B_%s), ::vkx::%s(__VA_ARGS__))" % (f, f, f),
-                  "#define %s(...) (::vkx::%s(__VA_ARGS__))" % (f, f), f)
+    args = "%s(__VA_ARGS__)" % COUNTED_BOUNDARIES[f] if f in COUNTED_BOUNDARIES else "__VA_ARGS__"
+    return broken(work_h, "#define %s(...) (::mkwvk::rec::boundary(::mkwvk::rec::B_%s), ::vkx::%s(%s))" % (f, f, f, args),
+                  "#define %s(...) (::vkx::%s(%s))" % (f, f, args), f)
 
 
 EXIT_LINES = ("recorder parked in idle() holding sleep_mu: 1; ExitProcess", "DLL detach: the global destructors ran to the end")
@@ -344,6 +362,7 @@ def exit_test(cxx, headers, out, recorder_text, name):
     d.mkdir()
     (d / "vk_loader.h").write_text(test_loader(), encoding="utf-8")
     (d / "vk_work.h").write_text((VK / "vk_work.h").read_text(encoding="utf-8"), encoding="utf-8")
+    (d / "cmd_work.h").write_text((VK / "cmd_work.h").read_text(encoding="utf-8"), encoding="utf-8")   # ((Triforce, P4) vk_work.h's)
     (d / "vk_recorder.h").write_text(recorder_text, encoding="utf-8")
     src = str(ROOT / "tests" / "recorder_exit_test.cpp")
     flags = ["-std=c++20", "-O2", "-Wall", "-Wextra", "-Werror", "-DVK_NO_PROTOTYPES", "-D_CRT_SECURE_NO_WARNINGS"]
@@ -428,9 +447,9 @@ def main():
         ("defer: an allocation failure's call made before the held ones (no drain)",
          broken(rec, "            if (md == DEFER) drain();   // (what is held first", "            if (0) drain();   // (what is held first",
                 "failure drain"), work_h, (None, None)),
-        ("defer: the parallel refusal left out (RX_VK_PARALLEL=4)",
-         broken(rec, "        if (!parallel_configured()) return e[0] == 'd' ? DEFER : THREAD;", "        return e[0] == 'd' ? DEFER : THREAD;",
-                "parallel"), work_h, ("defer", "4")),
+        ("defer: nothing run before a parallel replay's segments (segments_begin left empty)",
+         broken(rec, "inline void segments_begin() { boundary(B_PAR); }", "inline void segments_begin() {}", "segments_begin"), work_h,
+         (None, None)),
         # (the recorder thread's: run with --only thread)
         ("thread: no wait before vkEndCommandBuffer", rec, no_wait(work_h, "vkEndCommandBuffer"), ("--only", None)),
         ("thread: no wait before vkQueueSubmit2", rec, no_wait(work_h, "vkQueueSubmit2"), ("--only", None)),
@@ -461,17 +480,13 @@ def main():
         ("thread: the calls of unordered() (%s) waiting after all" % ", ".join(unordered_calls(rec)),
          broken(rec, "        else if (unordered(k)) return;\n", "", "skip"), work_h, ("--only", None))
     ][:1 if unordered_calls(rec) else 0] + [
-        ("thread: the parallel refusal left out (RX_VK_PARALLEL=4)",
-         broken(rec, "        if (!parallel_configured()) return e[0] == 'd' ? DEFER : THREAD;", "        return e[0] == 'd' ? DEFER : THREAD;",
-                "parallel"), work_h, ("thread", "4")),
+        ("thread: the ring not run before a parallel replay's segments (segments_begin left empty)",
+         broken(rec, "inline void segments_begin() { boundary(B_PAR); }", "inline void segments_begin() {}", "segments_begin"), work_h,
+         ("--only", None)),
     ]
     for i, (what, text, wtext, (env_mode, parallel)) in enumerate(variants):
         exe_b = build(a.cxx, a.headers, out, text, "broken%d" % i, work_text=wtext)
-        if parallel:
-            refused = [e for e in ENV_RUNS if e[0] == env_mode and e[1] == "4"][0]
-            ok, r = env_run_ok(exe_b, env_mode, parallel, "env mode 0", refused[3], show=False)
-            caught = not ok
-        elif env_mode == "--only":
+        if env_mode == "--only":
             r = run(exe_b, None, "--only", "thread", timeout=120)
             caught = r.returncode != 0
         elif env_mode == "--throw":

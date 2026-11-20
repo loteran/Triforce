@@ -49,7 +49,7 @@ def main():
         cpp, exe = Path(temp) / "fixture.cpp", Path(temp) / "fixture.exe"
         cpp.write_text(fixture, encoding="utf-8")
         subprocess.run([a.cxx, "-std=c++20", "-O1", "-pthread", "-Wall", "-Wextra", "-Werror", "-Wno-missing-field-initializers",
-                        "-I" + str(a.headers), str(cpp), "-o", str(exe)], check=True)
+                        "-I" + str(a.headers), "-I" + str(a.source / "gpu" / "vk"), str(cpp), "-o", str(exe)], check=True)
         for cache in (["coherent", "noncoherent"] if a.cache == "all" else [a.cache]):
             for case in cases:
                 subprocess.run([str(exe), case, cache], check=True, timeout=20)

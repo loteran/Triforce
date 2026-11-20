@@ -13,6 +13,7 @@
    and hands it to the focus manager (*(screen+32)+96, its vtable +48), when the manager takes the player's input.
    HOS_MENU_TRACE=1: the focus changes, the screens and what the mouse does logged. */
 #include "hos.h"
+#include "guest_bounds.h"   /* ((Triforce) hos_range_ok: set_item_key's buffer) */
 /* (Triforce) The game's own Options screen (the layout SystemOption_00; the title's Options and the pause menu's are the one
    screen), by its vtable (HOS_MENU_TRACE in a headless run, 2026-11-10: the screen of 15 entries that starts to run when
    Options is chosen, from the title and from the pause menu alike, and stops with Back; L and R do nothing on it). While
@@ -150,7 +151,8 @@ static int set_item_key(Ctx *c, uint64_t screen, const char *key) {
     peek(screen + 840, &mode, 4);
     const size_t n = strlen(key);
     A64Fn fn = a64_lookup(0x833fda00ULL);
-    if (!fn || !buf || buf + n + 1 > HOS_GUEST_SPACE || room <= (int32_t)n || mode != 0) return 0;
+    /* ((Triforce) the buffer's end without buf + n + 1, which wrapped past 2^64 for a pointer read wrong) */
+    if (!fn || !buf || !hos_range_ok(buf, n + 1, HOS_GUEST_SPACE) || room <= (int32_t)n || mode != 0) return 0;
     memcpy(GP(buf), key, n + 1);
     const Ctx saved = *c;
     c->x[0] = screen, c->x[1] = screen + 760, c->x[30] = 0;
@@ -244,6 +246,15 @@ int hos_oot_options_front(void) {
     const LONG64 t = InterlockedCompareExchange64(&options_seen_ns, 0, 0);
     return t && (LONG64)hos_now_ns() - t < 200000000LL;
 }
+/* (Triforce) the renderer is told of the Options screen (its tabs over the header): HOS_OPTIONS_TABS=0 keeps it untold */
+static int options_tabs_on(void) {
+    static int tabs = -1;
+    if (tabs < 0) {
+        const char *e = getenv("HOS_OPTIONS_TABS");
+        tabs = !(e && *e == '0');
+    }
+    return tabs;
+}
 static volatile uint64_t hud_screen;
 static int map_floors(int *cur, int *top, int *bottom) {
     int32_t f[3];
@@ -311,14 +322,58 @@ static void list_boxes(Hit *h) {
     memcpy(h->rect, out, (size_t)h->n * sizeof *out);
 }
 
+/* (Triforce) The game's own Options screen (OPTIONS_SCREEN_VTABLE): its rows as the mouse takes them. The screen keeps a
+   widget for each row in one of three lists by the row's kind, as its focus handler (f_83423f00, the vtable's +0x170) and
+   its setup (f_83424450) walk them by the kind in the row's entry (+4: 0, 1, 2): +712 the count and +720 the widgets of
+   kind 0, +728 and +736 of kind 1, +696 and +704 of kind 2. A widget's button is f_80df5410(*(*(widget+24)+56),
+   *(widget+32)), as f_833eff40 and the focus handler find it: the one the focus handler is handed, the button of the
+   screen's list (its focus at +56). What a kind is, from their setups: kind 1's (f_833ef590) reads the row's count of values
+   (entry+16) and kind 0's (f_833eff50) does not: the two-choice toggles (On | Off) and the choices of more (< value >);
+   kind 2, the third look the screen has, the plates (amiibo, ZELDA NOTES; the screen's query f_83424580 asks whether the
+   focus is on one). (Read from the lifted code, not traced: HOS_MENU_TRACE logs the kind each click finds.) The value's
+   panel, in the layout's units (from the screen as shown, as gpu/vk/vk_menu.cpp draws its own rows like it: the list's
+   middle at x -730, the panel 804 wide with its middle 500 right of that): x -632 to 172, a toggle's halves meeting at
+   0.632 of it (x -124), a choice's arrows at its ends. The rows are shown from y 760 down to -960 (the header above, 200
+   units: our tabs over it; the guides below): a row laid out past that (scrolled away) is not pointed at */
+enum { OPT_KIND_NONE = -1, OPT_TOGGLE = 0, OPT_CHOICE = 1, OPT_PLATE = 2 };
+#define OPT_VALUE_X0 (-632.0f)
+#define OPT_VALUE_X1 172.0f
+#define OPT_TOGGLE_MEET (-124.0f)
+#define OPT_ROWS_TOP 760.0f
+#define OPT_ROWS_BOTTOM (-960.0f)
+#define OPT_HEADER_Y 880.0f
+static int options_screen(uint64_t screen) { return peek64(screen) == OPTIONS_SCREEN_VTABLE; }
+static int options_row_kind(Ctx *c, uint64_t screen, uint64_t button) {
+    static const struct { int at, kind; } lists[] = {{712, OPT_TOGGLE}, {728, OPT_CHOICE}, {696, OPT_PLATE}};
+    for (int l = 0; l < 3; l++) {
+        int32_t n = 0;
+        peek(screen + (uint64_t)lists[l].at, &n, 4);
+        const uint64_t widgets = peek64(screen + (uint64_t)lists[l].at + 8);
+        for (int i = 0; i < n && i < 64; i++) {
+            const uint64_t w = peek64(widgets + 8ull * (unsigned)i), holder = peek64(w + 24), pane = peek64(holder + 56);
+            if (w && pane && guest_call(c, 0x80df5410ULL, pane, peek64(w + 32), NULL, NULL) == button) return lists[l].kind;
+        }
+    }
+    return OPT_KIND_NONE;
+}
+/* the pad's press a click on an Options row is, at x (the layout's units): on a toggle's or a choice's value the left part
+   Left and the right part Right (a toggle's half is chosen so, a choice steps down or up; at an end the game does nothing);
+   on a plate, a value's name, or a row of no kind found, A */
+static const char *options_click(int kind, float x) {
+    if ((kind != OPT_TOGGLE && kind != OPT_CHOICE) || x < OPT_VALUE_X0 || x > OPT_VALUE_X1) return "A";
+    return x < (kind == OPT_TOGGLE ? OPT_TOGGLE_MEET : (OPT_VALUE_X0 + OPT_VALUE_X1) / 2) ? "LEFT" : "RIGHT";
+}
+
 static void hit_test(uint64_t screen, Hit *h) {
     h->n = 0, h->hit = 0;
     each_entry(screen, 400, shown_entry, h);
     list_boxes(h);
     if (h->y > -1080 && h->y < -960 && h->x >= 1600 && h->x < 1900) return;   /* (the "Back" prompt's: no button's) */
+    const int options = options_screen(screen);
     for (int i = 0; i < h->n; i++) {
         const Rect *r = &h->rect[i];
         if (h->x < r->x0 || h->x > r->x1 || h->y < r->y0 || h->y > r->y1) continue;
+        if (options && ((r->y0 + r->y1) / 2 > OPT_ROWS_TOP || (r->y0 + r->y1) / 2 < OPT_ROWS_BOTTOM)) continue;   /* (scrolled away) */
         const float area = (r->x1 - r->x0) * (r->y1 - r->y0);
         if (!h->hit || area < h->area) h->hit = h->button[i], h->area = area;   /* (the smallest: a slot inside a panel) */
     }
@@ -342,6 +397,7 @@ static void focus_entry(int i, uint64_t entry, uint64_t button, void *arg);   /*
    frame the lock is busy is passed, not waited for); the focus hook's writes take it too */
 static SRWLOCK mouse_lock = SRWLOCK_INIT;
 static void mouse_tick_locked(Ctx *c, uint64_t screen);
+static int mods_entry_hit(float x, float y);   /* ((Triforce) below: the Mods entry under a list's last button) */
 /* (mouse_owner: the thread in mouse_tick: the game's focus handler may run inside its setter) */
 static void mouse_tick(Ctx *c, uint64_t screen) {
     if (!TryAcquireSRWLockExclusive(&mouse_lock)) return;
@@ -501,8 +557,9 @@ static void mouse_tick_locked(Ctx *c, uint64_t screen) {
             const int step = wheel < 0 ? 1 : -1, want = (k < 3 ? k : 3) * step;
             /* (the rows in view: the screen's height, or Threads of Time's list frame, y -756 to 594 (from the page as
                shown): the game takes a row as shown once its centre is in it, and scrolls a focused row only that far) */
-            const int threads = peek64(screen) == 0x84c04a18ULL;
-            const float view_lo = threads ? -760.0f : -1080.0f, view_hi = threads ? 598.0f : 1080.0f;
+            const int threads = peek64(screen) == 0x84c04a18ULL, options = options_screen(screen);   /* ((Triforce) and the Options' list) */
+            const float view_lo = threads ? -760.0f : options ? OPT_ROWS_BOTTOM : -1080.0f;
+            const float view_hi = threads ? 598.0f : options ? OPT_ROWS_TOP : 1080.0f;
             int first = -1, last = -1;   /* (the rows shown: their first and last in the order) */
             for (int j = 0; j < n_rows; j++) {
                 const float cy = (hit.rect[order[j]].y0 + hit.rect[order[j]].y1) / 2;
@@ -542,6 +599,9 @@ static void mouse_tick_locked(Ctx *c, uint64_t screen) {
         if (cy >= scroll_lo && cy <= scroll_hi) refocus_ns = now;
     }
     if (refocus_ns && now >= refocus_ns) refocus_ns = 0, scroll_row = 0, moved = 1, asked = 0;
+    /* ((Triforce) the Options screen's header is our tabs' (gpu/vk/vk_menu.cpp draw_game_tab: the renderer reads the same
+       clicks through hos_mouse_pointer, display.c): neither pointed at nor clicked here) */
+    if (options_screen(screen) && options_tabs_on() && hit.y >= OPT_HEADER_Y) moved = 0, pressed &= ~(uint32_t)HOS_MOUSE_LEFT;
     if (moved || (pressed & HOS_MOUSE_LEFT)) hit_test(screen, &hit);
     else hit.hit = 0;
     /* hover: the focus to the button under the mouse, only as it moves (the pad keeps the focus it moved) */
@@ -697,6 +757,12 @@ static void mouse_tick_locked(Ctx *c, uint64_t screen) {
         if (tap[0]) hos_hid_tap(tap);
         if (trace) hos_log("menu: panel page %d click (%.0f, %.0f): %s", page, hit.x, hit.y, tap[0] ? tap : "-");
     }
+    /* ((Triforce) a click on the Mods entry under a list's last button: the renderer opens Mods; the game is not given it) */
+    if ((pressed & HOS_MOUSE_LEFT) && !hit.hit && mods_entry_hit(hit.x, hit.y)) {
+        rx_option_set(HOS_OPT_MODS_ENTER, 2);
+        pressed &= ~(uint32_t)HOS_MOUSE_LEFT;
+        if (trace) hos_log("menu: the Mods entry clicked (%.0f, %.0f)", hit.x, hit.y);
+    }
     /* The "Back" prompt at the bottom right (B), on every screen with one (the title's load list, the pause menu, the
        map; in the layout's units, measured from their screens): a click there off the buttons */
     if ((pressed & HOS_MOUSE_LEFT) && !hit.hit && hit.y > -1080 && hit.y < -960 && hit.x >= 1600 && hit.x < 1900) {
@@ -705,7 +771,17 @@ static void mouse_tick_locked(Ctx *c, uint64_t screen) {
     }
     /* a click: the button under it decided (A: after the focus has landed, at the next update, when it moved it), the
        right button back (B) */
-    if ((pressed & HOS_MOUSE_LEFT) && hit.hit) hos_hid_tap(just || hit.hit == asked ? "0.05:A/80" : "0:A/80");
+    /* ((Triforce) on the Options screen the press is by the row's kind and where on it: options_click) */
+    if ((pressed & HOS_MOUSE_LEFT) && hit.hit) {
+        const int kind = options_screen(screen) ? options_row_kind(c, screen, hit.hit) : OPT_KIND_NONE;
+        const char *press = options_click(kind, hit.x);
+        char tap[32];
+        snprintf(tap, sizeof tap, "%s:%s/80", just || hit.hit == asked ? "0.05" : "0", press);
+        hos_hid_tap(tap);
+        if (trace && options_screen(screen))
+            hos_log("menu: Options: a click (%.0f, %.0f) on a row of kind %d (0 toggle, 1 choice, 2 plate, -1 none found): %s",
+                    hit.x, hit.y, kind, tap);
+    }
     if (pressed & HOS_MOUSE_RIGHT) hos_hid_tap("0:B/80");
 }
 
@@ -737,10 +813,158 @@ static int button_rect(uint64_t button, Rect *r) {
     return 1;
 }
 
+/* ---- (Triforce) The Mods entry under a game list's last button: the pause menu's System page (Save, Load, Options,
+   Special Actions, Title Screen: its buttons left of the Basic Controls panel, x under 0) and the title's list (by its
+   screen's vtable). Each frame such a list runs the renderer is told its last button's box and whether the game's cursor
+   is on it (HOS_OPT_MODS_*, gpu/vk/vk_api.h); nn_hid.c then keeps Down from the game (hos_oot_mods_down) and the renderer
+   takes the cursor onto Mods. A click on the entry opens it (mouse_tick_locked) */
+#define TITLE_LIST_VTABLE 0x84c106e8ULL
+static volatile LONG64 mods_last_ns;   /* (the last frame a list's last button had the game's cursor) */
+static Rect mods_entry;                 /* (the entry's box, as the renderer draws it: under the last button by the pitch) */
+static volatile LONG64 mods_entry_ns;
+typedef struct { Rect r[16]; uint64_t b[16]; int n, pause; } ModsList;
+static void mods_list_entry(int i, uint64_t entry, uint64_t button, void *arg) {
+    (void)i, (void)entry;
+    ModsList *l = arg;
+    Rect r;
+    if (l->n >= 16 || !button_rect(button, &r)) return;
+    if (l->pause) {   /* (the System page's buttons, Pa_Button_*, in its left column; the other pages' slots are in the list too, off the screen) */
+        char name[32];
+        const float cx = (r.x0 + r.x1) / 2;
+        if (cx > 0 || cx < -1920 || strncmp(text_at(peek64(button + 0x18), name, sizeof name), "Pa_Button_", 10)) return;
+    }
+    l->r[l->n] = r, l->b[l->n++] = button;
+}
+int rx_option(int id, int otherwise);   /* rx_backend.c */
+/* While Mods has the cursor the game's last button is let go as the game itself lets a button go when its cursor moves on
+   (11-17, a workflow over the lift, its findings checked by skeptics; then the lab): the focus controller (the manager
+   *(*(screen+32)+96), its controllers at +40 and +48: +120 the current entry, +128 a move asked, not made) calls the old
+   button's "cursor left" (vtable+336, f_80afe540: an OFF event in the button's own queue at +58..+62, and the button linked
+   into its screen's update list, which plays its focus-out: +56 3 -> 2 -> 0) and the new one's "cursor entered" (vtable+328,
+   f_80aa9150: an ON event). The controller is left alone: its +120 stays on the last button, so the game's cursor is where it
+   was when Mods closes, and "cursor entered" then lights it again (the pause menu's own focus handler, f_802ed660, replays the
+   System option's look and help text with it). Raw writes of the state bytes do nothing: the events drive it.
+   Decided under seen_lock (mods_list_tick), done after it (hos_oot_menu_tick): ModsCall */
+static struct { uint64_t screen, button; int64_t since_ns; } mods_held;   /* (seen_lock) */
+typedef struct { int op; uint64_t screen, button; int title; } ModsCall;   /* (op 1 let go, 2 give back) */
+static int mods_button_vt(uint64_t vt) {   /* (the framework's button classes: setState f_80ad5310 at +248 in each) */
+    static const uint64_t v[] = {0x84c41280ULL, 0x84c416e8ULL, 0x84c42808ULL, 0x84c42990ULL, 0x84c42b00ULL,
+                                 0x84c42c90ULL, 0x84c42e08ULL, 0x84c42fb8ULL, 0x84c431c8ULL, 0x84c43338ULL};
+    for (int i = 0; i < 10; i++)
+        if (vt == v[i]) return 1;
+    return 0;
+}
+/* the button the game's cursor is on for this screen (0: none); *pending: a move asked of the controller and not made yet */
+static uint64_t mods_cursor_button(uint64_t screen, int *pending) {
+    const uint64_t mgr = peek64(peek64(screen + 32) + 96);
+    *pending = 0;
+    for (uint64_t k = 0; mgr && k < 2; k++) {
+        const uint64_t ctrl = peek64(mgr + 40 + 8 * k), e = ctrl ? peek64(ctrl + 120) : 0;
+        if (!e || peek64(e + 32) != screen) continue;
+        *pending = peek64(ctrl + 128) != 0;
+        return peek64(e + 24);
+    }
+    return 0;
+}
+#define PAUSE_SCREEN_VTABLE 0x84c0baa8ULL
+static void mods_call(Ctx *c, const ModsCall *m) {
+    const uint64_t b = m->button;
+    if (!m->op || !b || !mods_button_vt(peek64(b))) return;
+    uint8_t st = 0;
+    uint32_t fl = 0;
+    peek(b + 56, &st, 1), peek(b + 64, &fl, 4);
+    int called = 0;
+    if (m->op == 1 && (st == 1 || st == 3) && (fl & 0x2)) {
+        guest_call(c, peek64(peek64(b) + 336), b, 0, NULL, NULL), called = 1;
+        /* (the System page: its option's own "chosen" look rewound, as the game does to every option not focused, f_833ee800) */
+        if (!m->title && peek64(m->screen) == PAUSE_SCREEN_VTABLE) {
+            const uint64_t sys = peek64(m->screen + 800);
+            for (uint64_t k = 56; sys && k <= 88; k += 8) {
+                const uint64_t w = peek64(sys + k);
+                if (w && peek64(w + 96) == b && peek64(w + 72)) { guest_call(c, 0x833d90f0ULL, w, 0, NULL, NULL); break; }
+            }
+        }
+    } else if (m->op == 2 && (st == 0 || st == 2) && (fl & 0x11) == 0x11) {
+        guest_call(c, peek64(peek64(b) + 328), b, 0, NULL, NULL), called = 1;
+    }
+    if (trace) {
+        uint8_t st2 = 0;
+        peek(b + 56, &st2, 1);
+        hos_log("menu: mods entry: the game's last button %s (state %u -> %u, flags %#x)%s", m->op == 1 ? "let go" : "given back",
+                st, st2, fl, called ? "" : ": not called");
+    }
+}
+static void mods_list_tick(uint64_t screen, int title, ModsCall *call) {
+    ModsList l = {0};
+    l.pause = !title;
+    each_entry(screen, 400, mods_list_entry, &l);
+    if (l.n < 2) return;
+    int last = 0, above = -1;
+    for (int i = 1; i < l.n; i++)
+        if ((l.r[i].y0 + l.r[i].y1) < (l.r[last].y0 + l.r[last].y1)) last = i;
+    for (int i = 0; i < l.n; i++)
+        if (i != last && (above < 0 || (l.r[i].y0 + l.r[i].y1) < (l.r[above].y0 + l.r[above].y1))) above = i;
+    const Rect r = l.r[last];
+    const float pitch = (l.r[above].y0 + l.r[above].y1) / 2 - (r.y0 + r.y1) / 2;
+    if (!(pitch > 20 && pitch < 600)) return;
+    /* The button's state byte (+56) is its focus animation's: 0 none, 1 coming, 3 focused, 2 going. While Mods has the
+       cursor the game gets no input (nn_hid.c) and its last button is let go (mods_held, above) */
+    uint8_t state = 0;
+    peek(l.b[last] + 56, &state, 1);
+    const int64_t now = hos_now_ns();
+    {
+        const int sel = rx_option(HOS_OPT_MODS_SELECTED, 0) != 0;
+        int pending = 0;
+        const uint64_t cur = mods_cursor_button(screen, &pending), btn = l.b[last];
+        if (mods_held.button && (mods_held.screen != screen || mods_held.button != btn)) memset(&mods_held, 0, sizeof mods_held);
+        if (sel && !mods_held.button && (state == 1 || state == 3) && cur == btn && !pending) {
+            *call = (ModsCall){1, screen, btn, title};
+            mods_held.screen = screen, mods_held.button = btn, mods_held.since_ns = 0;
+        } else if (sel && mods_held.button) {
+            mods_held.since_ns = 0;
+            if ((state == 1 || state == 3) && cur == btn) *call = (ModsCall){1, screen, btn, title};   /* (lit again: again) */
+        } else if (!sel && mods_held.button) {
+            if (!mods_held.since_ns) mods_held.since_ns = now;
+            if (cur == btn && !pending) *call = (ModsCall){2, screen, btn, title}, memset(&mods_held, 0, sizeof mods_held);
+            else if (cur || now - mods_held.since_ns > 1000000000LL) memset(&mods_held, 0, sizeof mods_held);   /* (moved on) */
+        }
+    }
+    {   /* ((Triforce) 11-17, his picture: Continue opened the Load list over the title, whose list still runs, and "Mods" stayed
+           on it) The entry only while the game's cursor is on this list (its focus controller's entry is this screen's), or
+           Mods has the cursor */
+        int pend = 0;
+        if (!mods_cursor_button(screen, &pend) && !mods_held.button) return;
+    }
+    /* (coming or there; 2 is its focus going to another button. Let go for Mods, it is still the game's cursor's place) */
+    const int focused = state == 1 || state == 3 || (mods_held.button && mods_held.button == l.b[last]);
+    if (focused) InterlockedExchange64(&mods_last_ns, (LONG64)now);
+    mods_entry = (Rect){r.x0, r.y0 - pitch, r.x1, r.y1 - pitch};
+    InterlockedExchange64(&mods_entry_ns, (LONG64)now);
+    rx_option_set(HOS_OPT_MODS_X0, (int)r.x0), rx_option_set(HOS_OPT_MODS_X1, (int)r.x1);
+    rx_option_set(HOS_OPT_MODS_Y0, (int)r.y0), rx_option_set(HOS_OPT_MODS_Y1, (int)r.y1);
+    rx_option_set(HOS_OPT_MODS_PITCH, (int)pitch);
+    rx_option_set(HOS_OPT_MODS_LIST, HOS_MODS_LIST_SHOWN | (focused ? HOS_MODS_LIST_LAST_FOCUSED : 0) | (title ? HOS_MODS_LIST_TITLE : 0));
+    static unsigned logged;
+    if (trace && logged++ % 120 == 0)
+        hos_log("menu: mods entry: %s list of %d, last button (%.0f, %.0f)-(%.0f, %.0f), pitch %.0f, focused %d", title ? "the title's" : "System's",
+                l.n, r.x0, r.y0, r.x1, r.y1, pitch, focused);
+}
+/* nn_hid.c: the game's cursor is on a list's last button now (the frame before at most): its Down is the Mods entry's */
+int hos_oot_mods_down(void) {
+    const LONG64 t = InterlockedCompareExchange64(&mods_last_ns, 0, 0);
+    return t && (LONG64)hos_now_ns() - t < 80000000LL;
+}
+static int mods_entry_hit(float x, float y) {
+    const LONG64 t = InterlockedCompareExchange64(&mods_entry_ns, 0, 0);
+    return t && (LONG64)hos_now_ns() - t < 100000000LL && x >= mods_entry.x0 && x <= mods_entry.x1 && y >= mods_entry.y0 && y <= mods_entry.y1;
+}
+
 /* ---- The screens f_802f1380 runs for (the HUD's, the menus', the title's: each frame each). The mouse is for the one
    in front: of those that ran in the last 100 ms with a focused button shown (or one gone for under 0.5 s: the map's
-   list loses it for 6 to 24 frames as it moves), the one that came last (a dialog over the menu that opened it). Whether a screen has a focused button is looked at 10 times a second (each look reads its list) */
-typedef struct { uint64_t screen, vt; int64_t first_ns, seen_ns, lost_ns; int focus, running; unsigned n; } Seen;
+   list loses it for 6 to 24 frames as it moves), the one that came last (a dialog over the menu that opened it). Whether a screen has a focused button is looked at 10 times a second (each look reads its list).
+   (Triforce) The game's Options screen has the mouse with no focused button found as well: our tabs over its header take
+   the mouse (gpu/vk/vk_menu.cpp), and a screen the mouse is not freed for leaves it the camera's, captured and hidden */
+typedef struct { uint64_t screen, vt; int64_t first_ns, seen_ns, lost_ns; int focus, running, options; unsigned n; } Seen;
 static Seen seen[24];
 static SRWLOCK seen_lock = SRWLOCK_INIT;   /* (the screens' updates run on several of the game's threads at once) */
 
@@ -748,12 +972,16 @@ static void focus_entry(int i, uint64_t entry, uint64_t button, void *arg) {
     (void)i, (void)entry;
     uint8_t state = 0;
     Rect r;
-    if (!*(int *)arg && peek(button + 56, &state, 1) && state && button_rect(button, &r)) *(int *)arg = 1;
+    /* ((Triforce) a button let go while the Mods entry has the cursor still counts: the menu is there, mods_held) */
+    if (!*(int *)arg && peek(button + 56, &state, 1) && (state || button == mods_held.button) && button_rect(button, &r)) *(int *)arg = 1;
 }
 static Seen *screen_seen(uint64_t screen, int64_t now) {
     Seen *free_one = NULL;
     for (int i = 0; i < (int)(sizeof seen / sizeof *seen); i++) {
-        if (seen[i].screen == screen) return &seen[i];
+        /* ((Triforce) a screen's memory is another screen's later (the Load list's was the Options' in a traced run): another
+           vtable there is a new screen, which came last. Kept as the one before, it came first, under the screens it is over) */
+        if (seen[i].screen == screen && seen[i].vt == peek64(screen)) return &seen[i];
+        if (seen[i].screen == screen) { free_one = &seen[i]; break; }
         if (!free_one || seen[i].seen_ns < free_one->seen_ns) free_one = &seen[i];   /* (the one gone longest) */
     }
     memset(free_one, 0, sizeof *free_one);
@@ -781,15 +1009,15 @@ void hos_oot_menu_tick(Ctx *c, uint64_t screen) {
     me->seen_ns = now;
     /* (Triforce: the game's Options screen runs: the renderer's tabs over its header. Its vtable as it is now, not me->vt:
        a screen's memory is another screen's later, the Load list ran at the Options' address in the traced run) */
-    if (peek64(screen) == OPTIONS_SCREEN_VTABLE) {
-        static int tabs = -1;
-        if (tabs < 0) {
-            const char *e = getenv("HOS_OPTIONS_TABS");
-            tabs = !(e && *e == '0');
-        }
+    me->options = options_screen(screen);
+    if (me->options) {
         InterlockedExchange64(&options_seen_ns, (LONG64)now);
-        if (tabs) rx_option_set(HOS_OPT_GAME_OPTIONS, 1);
+        if (options_tabs_on()) rx_option_set(HOS_OPT_GAME_OPTIONS, 1);
     }
+    /* ((Triforce) the Mods entry: the pause menu's System page, the title's list; its call into the game after the lock) */
+    ModsCall mods_now = {0};
+    if (peek64(screen) == TITLE_LIST_VTABLE) mods_list_tick(screen, 1, &mods_now);
+    else if (screen == pause_screen_now() && page_now == 3) mods_list_tick(screen, 0, &mods_now);
     for (int i = 0; i < (int)(sizeof seen / sizeof *seen); i++)   /* (a screen with no update for 200 ms has stopped) */
         if (seen[i].running && now - seen[i].seen_ns > 200000000) {
             seen[i].running = 0;
@@ -817,7 +1045,7 @@ void hos_oot_menu_tick(Ctx *c, uint64_t screen) {
     }
     const Seen *front = NULL;
     for (int i = 0; i < (int)(sizeof seen / sizeof *seen); i++)
-        if (seen[i].screen && (seen[i].focus || now - seen[i].lost_ns < 500000000 || panel_page_vt(seen[i].vt) >= 0) &&
+        if (seen[i].screen && (seen[i].focus || now - seen[i].lost_ns < 500000000 || panel_page_vt(seen[i].vt) >= 0 || seen[i].options) &&
             seen[i].running && now - seen[i].seen_ns < 100000000 &&
             (!front || seen[i].first_ns > front->first_ns))   /* (its focus gone for under 0.5 s: a list's moment between rows) */
             front = &seen[i];
@@ -831,6 +1059,7 @@ void hos_oot_menu_tick(Ctx *c, uint64_t screen) {
     const int gone = !front && none_since && now - none_since > 50000000;
     none_since = front ? 0 : none_since ? none_since : now;
     ReleaseSRWLockExclusive(&seen_lock);
+    mods_call(c, &mods_now);
     if (gone) hos_mouse_game_menu_gone();
     if (mine) mouse_tick(c, screen);
     if (screen == pause_screen_now()) InterlockedIncrement(&ticks);
@@ -864,4 +1093,8 @@ int hos_oot_options_front(void) {
     const int64_t t = __atomic_load_n(&options_seen_ns, __ATOMIC_RELAXED);
     return t && hos_now_ns() - t < 200000000LL;
 }
+/* ((Triforce, 11-18) the Mods entry under the game's lists is the Windows half's (mods_list_tick): here no list's last button
+   has the cursor, so nn_hid.c never keeps a Down from the game. Without it every Linux build of v0.5.0 stopped at the link,
+   "undefined reference to hos_oot_mods_down" (#bug-tracker, 11-18). tests/test_oot_menu_linux_half.py) */
+int hos_oot_mods_down(void) { return 0; }
 #endif

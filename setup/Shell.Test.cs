@@ -5,6 +5,8 @@
 //                                  real flows in an off-screen window; it carries on in the Setup that an install or a self-update
 //                                  starts (the place in the list is kept beside the file). Pictures and script.log go to
 //                                  TRIFORCE_UI_SHOTS. Used with TRIFORCE_TEST_ROOT (Setup.cs), which keeps the install in one folder.
+//   TRIFORCE_SOUND_LOG=<file>      such a run makes no sound; with this, each sound a player's Setup would have played is a line
+//                                  in that file (Sound.cs NotedPlayer)
 using System;
 using System.Collections.Generic;
 using System.IO;
@@ -67,7 +69,7 @@ sealed partial class Shell
             Show(FetchPage);
             stage.All(false);
             FetchUnknown(true);
-            FetchState("Gathering the stones", "Asking GitHub for the newest Triforce.", "Checking for updates");
+            FetchState("Gathering the stones", "Asking for the newest Triforce.", "Checking for updates");
             FetchCancel.Content = "Cancel";
             await Shot(dir, "02-gather-checking");
 
@@ -78,7 +80,7 @@ sealed partial class Shell
 
             stage.All(false);
             FetchUnknown(false);
-            FetchTitle.Text = "GitHub could not be reached";
+            FetchTitle.Text = "The Triforce site could not be reached";
             FetchNote.Text = "Check your internet connection, then try again.";
             FetchNote.Foreground = Brush("Bad");
             FetchStep.Text = "";
@@ -160,6 +162,12 @@ sealed partial class Shell
             rows["read"].Done(); rows["lift"].Done(); rows["compile"].Begin(); rows["compile"].Progress(0.41);
             SetButtons(cancel: true);
             await Shot(dir, "13-build");
+            // ((Triforce, 11-18) the shaders' step after the folder: its own row and bar, and the note that says what it is)
+            rows["compile"].Done(); rows["finish"].Done(); rows["shaders"].Begin(); rows["shaders"].Progress(0.37);
+            BuildNote.Text = T(S.ShadersNote) + "  " + T(S.Elapsed) + ": 1 h 17 min";
+            await Shot(dir, "13b-build-shaders");
+            foreach (var r in rows.Values) r.Reset();
+            rows["read"].Done(); rows["lift"].Done(); rows["compile"].Begin(); rows["compile"].Progress(0.41);
 
             Log.Text = string.Join("\n", new[]
             {
@@ -191,7 +199,7 @@ sealed partial class Shell
             BuildTitle.Text = T(S.Stopped);
             BuildNote.Text = "The compiler stopped at sa/gen/code_041.c (exit code 1). See the details.";
             BuildNote.Foreground = Brush("Bad");
-            SetButtons(back: true);
+            SetButtons(back: true, report: true);
             await Shot(dir, "17-build-stopped");
             BuildNote.Foreground = Brush("Text");
 
@@ -221,6 +229,47 @@ sealed partial class Shell
             SavesTarget.Text = "";
             SavesGo.IsEnabled = false;
             await Shot(dir, "19-saves-none");
+
+            // mods: a list with mods that share files, one off, one whose code waits for a build; and none yet
+            Mod Sample(string folder, int files, int patches, int cheats, params string[] shared)
+            {
+                var (off, number, name) = Mods.Parse(folder);
+                var m = new Mod { Path = game + @"\mods\" + folder, Rel = folder, Top = folder, Folder = folder, Name = name, Number = number, On = !off, Patches = patches, Cheats = cheats };
+                m.Files.AddRange(shared);
+                for (var i = shared.Length; i < files; i++) m.Files.Add(folder.ToLowerInvariant() + "/" + i);
+                return m;
+            }
+            var sample = new List<Mod>
+            {
+                Sample("01-Clearer water", 38, 0, 0), Sample("02-Greener fields", 1204, 0, 0, "pack/actor/grass.pack.zs", "pack/actor/tree.pack.zs"),
+                Sample("03-Tall grass", 212, 0, 0, "pack/actor/grass.pack.zs", "pack/actor/tree.pack.zs"), Sample("-04-Night sky", 16, 0, 0),
+                Sample("05-Sixty frames", 0, 2, 1),
+            };
+            Show(ModsPage);
+            ModsFill(sample, sample[2].Path, null);
+            ModsInfo.Text = ModWords(sample[2]);
+            ModsBuild.Visibility = Visibility.Visible;
+            await Shot(dir, "20-mods");
+            ModsFill(sample, sample[4].Path, "Sixty frames was added: 2 code patch files, 1 cheat file. Its code patches and cheats take effect once the game is built again.");
+            ModsBuild.Visibility = Visibility.Visible;
+            await Shot(dir, "21-mods-added");
+            ModsFill(new List<Mod>(), null, @"No mods yet. Add a mod takes a .zip, .7z or .rar file; or put a mod's folder (the one that holds romfs) into " + game + @"\mods yourself.");
+            await Shot(dir, "22-mods-none");
+            ModsFill(sample, sample[0].Path, "The archive holds a path that leaves its own folder (..): \"../../Windows/evil.dll\". Nothing was unpacked.", true);
+            await Shot(dir, "23-mods-refused");
+
+            // Add to Steam: the question, and Steam running
+            HomeFill(true, "Triforce v1.1.0", game, "v1.1.0", "v1.1.0", false, null);
+            Show(HomePage);
+            Ask("Add Triforce to Link's Steam library? Steam then starts the game itself, without Setup.", "Add to Steam", T(S.Back), () => { });
+            await Shot(dir, "24-steam-ask");
+            HideAsk();
+            Tell(Steam.CloseFirst);
+            await Shot(dir, "25-steam-close-first");
+            HideAsk();
+            // (and the shortcut's pictures as they would be written into Steam's grid folder, in steam\: drawn, never fetched)
+            Directory.CreateDirectory(System.IO.Path.Combine(dir, "steam"));
+            foreach (var picture in SteamArt.Make()) File.WriteAllBytes(System.IO.Path.Combine(dir, "steam", picture.Key + ".png"), picture.Value);
         }
         catch (Exception e)
         {
@@ -289,6 +338,7 @@ sealed partial class Shell
                     case "text": Part<TextBox>(a).Text = b; break;
                     case "pick": FolderPicker.Answers.Enqueue(a + (b.Length > 0 ? " " + b : "")); break;
                     case "select": SaveList.SelectedIndex = int.Parse(a); break;
+                    case "mod": ModList.SelectedIndex = int.Parse(a); break;   // mod <n>: the mod picked on the Mods page (pick <file>: the archive Add a mod takes)
                     case "sleep": await Task.Delay(int.Parse(a)); break;
                     case "shot": await Shot(scriptShots!, a, 700); break;
                     case "frames":   // frames <name> <count> <ms apart>: what is on screen now and at each step after (to look at motion)

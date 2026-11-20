@@ -1,0 +1,20 @@
+#version 450
+// (Triforce) SMAA pass 3 (gpu/vk/vk_aa.cpp): neighbourhood blending of the tone mapped picture by the weights, in linear light
+// (as SMAA asks of a picture read through an sRGB view), stored into the game's target as its raw RGB9E5 words of the square
+// root (aa_common.glsl). After NX2navi's shaders/smaa_blend.comp.
+#extension GL_GOOGLE_include_directive : require
+#include "smaa_setup.glsl"
+#include "aa_common.glsl"
+layout(binding = 0) uniform sampler2D color;     // (the picture the game's pass samples, linear filtering)
+layout(binding = 1) uniform sampler2D weights;   // (linear filtering)
+layout(binding = 2, r32ui) uniform writeonly uimage2D dst;
+
+void main() {
+    ivec2 p;
+    vec2 uv;
+    if (!smaa_pixel(p, uv)) return;
+    vec4 offset;
+    SMAANeighborhoodBlendingVS(uv, offset);
+    vec3 c = SMAANeighborhoodBlendingPS(uv, offset, color, weights).rgb;
+    imageStore(dst, p, uvec4(aa_pack_rgb9e5(aa_encode(c)), 0u, 0u, 0u));
+}

@@ -72,6 +72,7 @@ void memory_note_gpu_write(uint64_t gpu, uint64_t size);
 bool memory_rb_refresh(VkCommandBuffer up);
 #include "rb_bufferref.inc"
 std::mutex pools_mu;
+struct WriteGen { uint64_t v = 0; };   // (a stand-in for gpu/vk/write_gen.h's: Pool keeps one, nothing here reads it)
 #include "rb_pool.inc"
 std::map<uint64_t, Pool> imported;
 uint64_t mirror_epoch = 0;

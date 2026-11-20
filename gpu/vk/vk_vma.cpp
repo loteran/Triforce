@@ -5,9 +5,12 @@
 #define VMA_STATIC_VULKAN_FUNCTIONS 0
 #define VMA_DYNAMIC_VULKAN_FUNCTIONS 1
 #include "vk_internal.h"
+#include "vk_paths.h"   // (game_module_path: RX_VK_RT_MAP's files beside the game)
 #include <vk_mem_alloc.h>
 #include <algorithm>
 #include <atomic>
+#include <chrono>
+#include <cstdio>
 #include <condition_variable>
 #include <cstdlib>
 #include <deque>
@@ -91,6 +94,7 @@ const uint64_t kImageBlock = (getenv("RX_VK_IMAGE_BLOCK_MB") ? (uint64_t)std::ma
 // image made there then took 30-70 ms (RTX 5070). RX_VK_TARGET_BLOCKS=0: in the textures' blocks, as before
 VmaPool target_image_pool = VK_NULL_HANDLE;
 bool target_pool_tried = false;
+uint32_t target_pool_type = 0;   // (its memory type, for the small targets' pool)
 size_t target_floor_blocks = 0;
 // (Triforce, 11-12) RX_VK_TARGET_BLOCK_MB=<n>, 16 and up: the size of the render targets' blocks alone (the textures' and the
 // other images' stay at RX_VK_IMAGE_BLOCK_MB)
@@ -99,6 +103,48 @@ uint64_t target_block() {
     return b;
 }
 bool target_floor_kept() { return target_floor_blocks != 0; }
+// ---- (Triforce, 11-16, low-end cards) the small render targets in small blocks of their own ----
+// The render targets' 128 MB blocks were half empty on every card (12 GB: 1280 held / 624 used; an 8 GB card played here:
+// 1152 / 513; 6 GB: 896 / 498), and smaller blocks for all of them did not help (32 MB: 800 / 377). The allocator's map
+// (RX_VK_RT_MAP) said why: the game's small targets that live for minutes (twenty 260x260 mipmapped ones, 0.3 MB each,
+// 170-230 s old; 640x360 ones) sit scattered through the big blocks, so a block is kept for two of them (0.6 MB in 128 MB)
+// or for ten (10 MB in 128 MB) once the large transient targets beside them are gone. Here a target of at most
+// RX_VK_SMALL_TARGET_PX pixels x layers (300,000: up to ~640x400) goes to a pool of 16 MB blocks (RX_VK_SMALL_TARGET_MB),
+// where what it keeps alive is 16 MB, not 128. RX_VK_SMALL_TARGETS=0: in the targets' blocks, as before
+// (11-16, later: OFF by default. Lab, 8 GB card played here: 2 of 5 tours with it ended in a crash near Death Mountain
+// Trail, a lost GPU and then a fault in the game's own code reading a wild pointer, and the floor below did not stop the
+// second; 0 crashes in ~60 runs without it, 0 in 6 runs on a 6 GB card and 3 on 12 GB with it. Cause not found.
+// RX_VK_SMALL_TARGETS=1: on, for the lab)
+bool small_target(const VkImageCreateInfo& ci) {
+    static const bool off = !(getenv("RX_VK_SMALL_TARGETS") && atoi(getenv("RX_VK_SMALL_TARGETS")));
+    static const uint64_t px = getenv("RX_VK_SMALL_TARGET_PX") ? (uint64_t)std::max(0, atoi(getenv("RX_VK_SMALL_TARGET_PX"))) : 300000;
+    return !off && (uint64_t)ci.extent.width * ci.extent.height * std::max(1u, ci.extent.depth) * std::max(1u, ci.arrayLayers) <= px;
+}
+VmaPool small_target_pool = VK_NULL_HANDLE;
+bool small_target_pool_tried = false;
+VmaPool target_images_pool();
+VmaPool small_targets_pool() {
+    if (small_target_pool_tried) return small_target_pool;
+    small_target_pool_tried = true;
+    if (!target_images_pool()) return VK_NULL_HANDLE;   // (the targets' pool's memory type: target_pool_type)
+    VmaPoolCreateInfo pi{};
+    pi.memoryTypeIndex = target_pool_type;
+    pi.blockSize = (getenv("RX_VK_SMALL_TARGET_MB") ? (uint64_t)std::max(4, atoi(getenv("RX_VK_SMALL_TARGET_MB"))) : 16u) << 20;
+    // (and a floor of blocks never given back, RX_VK_SMALL_TARGET_KEEP (8 = 128 MB): a tour on an 8 GB card played here lost
+    // the GPU at a scene change on the first build with this pool, the only device loss in ~60 lab runs that week. Suspect,
+    // not shown: a 16 MB block emptied is really freed where a 128 MB targets' block seldom empties, so a GPU read of a target
+    // just destroyed faults instead of reading memory still allocated. The tour holds 9 of these blocks: under the floor
+    // nothing is freed, as in the targets' pool before)
+    pi.minBlockCount = (size_t)(getenv("RX_VK_SMALL_TARGET_KEEP") ? std::max(0, atoi(getenv("RX_VK_SMALL_TARGET_KEEP"))) : 8);
+    if (vmaCreatePool(vma, &pi, &small_target_pool) != VK_SUCCESS) {
+        pi.minBlockCount = 0;
+        if (vmaCreatePool(vma, &pi, &small_target_pool) != VK_SUCCESS) small_target_pool = VK_NULL_HANDLE;
+    }
+    logf("vk: small render targets (up to %s pixels) from blocks of %llu MB of their own (RX_VK_SMALL_TARGETS=0: not)%s",
+         getenv("RX_VK_SMALL_TARGET_PX") ? getenv("RX_VK_SMALL_TARGET_PX") : "300000", (unsigned long long)(pi.blockSize >> 20),
+         small_target_pool ? "" : ": not made");
+    return small_target_pool;
+}
 VmaPool images_pool();
 VmaPool target_images_pool() {
     if (target_pool_tried) return target_image_pool;
@@ -119,6 +165,7 @@ VmaPool target_images_pool() {
     if (vmaFindMemoryTypeIndexForImageInfo(vma, &rep, &ai, &type) != VK_SUCCESS) return VK_NULL_HANDLE;
     VmaPoolCreateInfo pi{};
     pi.memoryTypeIndex = type;
+    target_pool_type = type;
     pi.blockSize = target_block();
     // (Triforce, 11-11) A floor of blocks the pool keeps for the session (RX_VK_TARGET_FLOOR_MB; 0: none, as before). While the
     // camera moves the game makes its transient targets at new sizes all the time (a player's session: up to 6733 new images in
@@ -249,6 +296,12 @@ bool image_compact_pass_end(uint64_t* freed_bytes, uint32_t* freed_blocks) {
 
 bool create_image_inner(const VkImageCreateInfo& ci, VkImage& image, VmaAllocation& allocation, bool dedicated, bool target, bool textures);
 thread_local int create_image_path = 0;   // (the last create_image_inner: 0 its pool or a dedicated one, 1 the pool refused, 2 system memory)
+// (Triforce) Every image made and its time, render targets apart, for the stall line (vk_replay.cpp status_tick: vma_image_stats)
+std::atomic<int64_t> st_images_made{0}, st_images_ns{0}, st_targets_made{0}, st_targets_ns{0};
+void vma_image_stats(int64_t* images, int64_t* images_ns, int64_t* targets, int64_t* targets_ns) {
+    *images = st_images_made.load(std::memory_order_relaxed), *images_ns = st_images_ns.load(std::memory_order_relaxed);
+    *targets = st_targets_made.load(std::memory_order_relaxed), *targets_ns = st_targets_ns.load(std::memory_order_relaxed);
+}
 /// (Triforce) An image that takes over 3 ms to make: what it was, how long, and whether its pool took a new block for it (60
 /// lines). A player's session had frames of 50 to 150 ms in play that were all "texture lookups", 24 render targets made in one
 bool create_image(const VkImageCreateInfo& ci, VkImage& image, VmaAllocation& allocation, bool dedicated, bool target, bool textures) {
@@ -264,6 +317,8 @@ bool create_image(const VkImageCreateInfo& ci, VkImage& image, VmaAllocation& al
     create_image_path = 0;
     const bool ok = create_image_inner(ci, image, allocation, dedicated, target, textures);
     const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    (target ? st_targets_made : st_images_made).fetch_add(1, std::memory_order_relaxed);   // (Triforce: vma_image_stats)
+    (target ? st_targets_ns : st_images_ns).fetch_add((int64_t)(ms * 1e6), std::memory_order_relaxed);
     {   // (each 600 target images: how many the pool refused, and what it holds)
         static std::atomic<int64_t> targets{0}, refused{0}, new_blocks{0};
         if (target) {
@@ -411,7 +466,21 @@ void vma_blocks_ahead_check() {
         if (VmaAllocation r = a->held.exchange(nullptr)) vmaFreeMemory(vma, r), st_ahead_back++;
     }
 }
+bool create_image_inner_(const VkImageCreateInfo& ci, VkImage& image, VmaAllocation& allocation, bool dedicated, bool target, bool textures);
+int rt_map_every();
 bool create_image_inner(const VkImageCreateInfo& ci, VkImage& image, VmaAllocation& allocation, bool dedicated, bool target, bool textures) {
+    const bool ok = create_image_inner_(ci, image, allocation, dedicated, target, textures);
+    if (ok && rt_map_every() && allocation) {   // (RX_VK_RT_MAP: each image named, the time it was made in ms since the start)
+        static const auto t0 = std::chrono::steady_clock::now();
+        char name[96];
+        snprintf(name, sizeof name, "%s %ux%u f%d m%u l%u t%lld", target ? "rt" : textures ? "tex" : "img", ci.extent.width,
+                 ci.extent.height, (int)ci.format, ci.mipLevels, ci.arrayLayers,
+                 (long long)std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count());
+        vmaSetAllocationName(vma, allocation, name);
+    }
+    return ok;
+}
+bool create_image_inner_(const VkImageCreateInfo& ci, VkImage& image, VmaAllocation& allocation, bool dedicated, bool target, bool textures) {
     VmaAllocationCreateInfo ai{};
     ai.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
     // (in VRAM or not at all: an image VMA puts in system memory when VRAM is full is read over PCIe every frame,
@@ -424,8 +493,11 @@ bool create_image_inner(const VkImageCreateInfo& ci, VkImage& image, VmaAllocati
         if (vmaCreateImage(vma, &ci, &dai, &image, &allocation, nullptr) == VK_SUCCESS) return true;
     }
     static const bool no_pool = getenv("RX_VK_NO_IMAGE_POOL") != nullptr;
+    VmaPool small = VK_NULL_HANDLE;   // (Triforce, 11-16: a small render target in blocks of its own size: small_targets_pool)
+    if (target && !no_pool && small_target(ci)) small = small_targets_pool();
     if (VmaPool pool = no_pool ? VK_NULL_HANDLE
                        : textures && textures_pool() ? textures_pool()
+                       : small ? small
                        : target && target_images_pool() ? target_images_pool() : images_pool()) {
         VmaAllocationCreateInfo pai = ai;
         pai.pool = pool;
@@ -585,17 +657,52 @@ void vma_piece_free(VmaAllocation allocation) {
 }
 /// (every heap: what VMA has in blocks and allocations there, what the process uses of it, its budget; one line)
 /// The image pools: their blocks, the images in them, and the free ranges between them (every 600 presents, with the heaps)
+// (Triforce, 11-16, a lab tool) RX_VK_RT_MAP=<n>: every n-th call (one a 600 presents) the allocator's whole map, every block
+// and what sits where, written beside the game as triforce_vma_map_<k>.json (vmaBuildStatsString); the render targets'
+// images carry a name "rt WxH f<format> m<mips> l<layers> p<present made>", so a reader (perf\lowend\rtmap.py) can say what
+// keeps the targets' half-empty blocks
+int rt_map_every() {
+    static const int n = getenv("RX_VK_RT_MAP") ? std::max(1, atoi(getenv("RX_VK_RT_MAP"))) : 0;
+    return n;
+}
 void vma_log_image_blocks() {
-    for (VmaPool pool : {image_pool, target_image_pool, texture_pool}) {
+    if (const int every = rt_map_every()) {
+        static int calls = 0, k = 0;
+        if (++calls % every == 0) {
+            char* s = nullptr;
+            vmaBuildStatsString(vma, &s, VK_TRUE);
+            if (s) {
+                char path[MAX_PATH + 64];
+                DWORD n = game_module_path(path, MAX_PATH);
+                while (n && path[n - 1] != '\\' && path[n - 1] != '/') n--;   // (the folder: the exe's name cut off)
+                snprintf(path + n, sizeof path - n, "triforce_vma_map_%d.json", k++);
+                if (FILE* f = fopen(path, "wb")) fputs(s, f), fclose(f);
+                vmaFreeStatsString(vma, s);
+                logf("vk: lab: the allocator's map written to %s (RX_VK_RT_MAP)", path);
+            }
+        }
+    }
+    for (VmaPool pool : {image_pool, target_image_pool, texture_pool, small_target_pool}) {
         if (!pool) continue;
         VmaDetailedStatistics d{};
         vmaCalculatePoolStatistics(vma, pool, &d);
         logf("vk: image blocks%s: %u blocks %llu MB, %u images %llu MB; %u free ranges, the largest %llu MB",
-             pool == target_image_pool ? " (render targets)" : pool == texture_pool ? " (textures, compacted)" : "", d.statistics.blockCount,
+             pool == target_image_pool ? " (render targets)" : pool == texture_pool ? " (textures, compacted)"
+             : pool == small_target_pool ? " (small targets)" : "", d.statistics.blockCount,
              (unsigned long long)(d.statistics.blockBytes >> 20), d.statistics.allocationCount,
              (unsigned long long)(d.statistics.allocationBytes >> 20), d.unusedRangeCount,
              (unsigned long long)(d.unusedRangeSizeMax >> 20));
     }
+}
+/// (Triforce, the memory line: mem_parts.h) the bytes of VMA's blocks in the heaps that are not the device's: RAM
+int64_t vma_system_blocks() {
+    if (!vma) return -1;
+    VmaBudget b[VK_MAX_MEMORY_HEAPS]{};
+    vmaGetHeapBudgets(vma, b);
+    int64_t n = 0;
+    for (uint32_t h = 0; h < dev.memory.memoryHeapCount; h++)
+        if (!(dev.memory.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)) n += (int64_t)b[h].statistics.blockBytes;
+    return n;
 }
 void vma_log_heaps() {
     VmaBudget b[VK_MAX_MEMORY_HEAPS]{};

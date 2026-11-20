@@ -45,13 +45,14 @@ def main():
         enqueue = "void framelog_enqueue(std::vector<uint8_t> rec) {\n" + collect[begin:]
     fixture = (ROOT / "tests/framelog_sink_test.cpp").read_text(encoding="utf-8")
     fixture = fixture.replace("/* DROP */", drop).replace("/* WRITER */", writer).replace("/* ENQUEUE */", enqueue).replace("/* READY */", ready)
+    fixture = '#include "file_writers.h"\n' + fixture   # ((Triforce, handoff §8) the writer's Writing: the standard library alone)
     cases = ["healthy", "image", "buffer0", "buffer1", "buffer2", "map0", "map1", "map2", "file", "thread",
              "write1", "write3", "flush1", "flush3", "queue"]
     with tempfile.TemporaryDirectory(prefix="framelog-sink-") as temp:
         cpp, exe = Path(temp) / "fixture.cpp", Path(temp) / "fixture.exe"
         cpp.write_text(fixture, encoding="utf-8")
         subprocess.run([a.cxx, "-std=c++20", "-O1", "-Wall", "-Wextra", "-Werror", "-Wno-missing-field-initializers",
-                        "-pthread", "-I" + str(a.headers), str(cpp), "-o", str(exe)], check=True)
+                        "-pthread", "-I" + str(a.headers), "-I" + str(ROOT / "gpu/vk"), str(cpp), "-o", str(exe)], check=True)
         for case in ([a.case] if a.case else cases):
             subprocess.run([str(exe), case], check=True, timeout=15)
 

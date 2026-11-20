@@ -2,49 +2,51 @@
 // barrier recorded right after another one on the same command buffer with nothing in between: the second orders nothing the first
 // did not. Include this header AFTER the file's other includes: it turns the calls below into a count and the call (a header
 // included after it that names one of them with a '(' after it would be changed too).
+// ((Triforce, P4) The count is the command buffer's own now (cmd_work.h, after NX2navi's per-context state): each macro counts its
+// command in the state of the command buffer its first argument names (RX_WORK_ON: that argument is read once), a begin starts that
+// state afresh and a submit is counted for what crosses command buffers (work_between). RX_VK_BARRIER_CONTEXT=0: the one count of
+// every thread's commands, as before)
 #pragma once
 
 #include <atomic>
 
 #include "vk_loader.h"
 #include "vk_recorder.h"   // (RX_VK_RECORDER: each macro below calls its packer, which calls the driver directly when the recorder is off)
+#include "cmd_work.h"      // ((Triforce) note_work, work_begun, work_submitted)
 
-namespace mkwvk {
-extern std::atomic<uint64_t> work_epoch;   // (vk_texture.cpp)
-inline void note_work() {
-    // (an add, not a load and a store: a thread preempted between the two would store a stale count over another thread's, which could
-    // make the count equal the one a barrier was recorded at with work recorded since, and the next barrier is left out for it)
-    work_epoch.fetch_add(1, std::memory_order_relaxed);
-}
-} // namespace mkwvk
+// ((Triforce) the command buffer, the first argument, counted as it is passed on: work_on returns it. __VA_OPT__: a call with no
+// argument after it, vkCmdEndRendering's)
+#define RX_WORK_ON(cmd, ...) ::mkwvk::work_on(cmd) __VA_OPT__(, ) __VA_ARGS__
+#define RX_WORK_BEGUN(cmd, ...) ::mkwvk::work_begun(cmd), __VA_ARGS__
+#define RX_WORK_SUBMIT(queue, ...) ::mkwvk::work_submitted(queue), __VA_ARGS__
 
-#define vkCmdPipelineBarrier2(...) (::mkwvk::note_work(), ::mkwvk::rec::rx_vkCmdPipelineBarrier2(__VA_ARGS__))
-#define vkCmdBeginRendering(...) (::mkwvk::note_work(), ::mkwvk::rec::rx_vkCmdBeginRendering(__VA_ARGS__))
-#define vkCmdEndRendering(...) (::mkwvk::note_work(), ::mkwvk::rec::rx_vkCmdEndRendering(__VA_ARGS__))
-#define vkCmdDraw(...) (::mkwvk::note_work(), ::mkwvk::rec::rx_vkCmdDraw(__VA_ARGS__))
-#define vkCmdDrawIndexed(...) (::mkwvk::note_work(), ::mkwvk::rec::rx_vkCmdDrawIndexed(__VA_ARGS__))
-#define vkCmdDrawIndirect(...) (::mkwvk::note_work(), ::mkwvk::rec::rx_vkCmdDrawIndirect(__VA_ARGS__))
-#define vkCmdDrawIndexedIndirect(...) (::mkwvk::note_work(), ::mkwvk::rec::rx_vkCmdDrawIndexedIndirect(__VA_ARGS__))
-#define vkCmdDrawIndirectCount(...) (::mkwvk::note_work(), ::mkwvk::rec::rx_vkCmdDrawIndirectCount(__VA_ARGS__))
-#define vkCmdDrawIndexedIndirectCount(...) (::mkwvk::note_work(), ::mkwvk::rec::rx_vkCmdDrawIndexedIndirectCount(__VA_ARGS__))
-#define vkCmdDrawMeshTasksEXT(...) (::mkwvk::note_work(), ::mkwvk::rec::rx_vkCmdDrawMeshTasksEXT(__VA_ARGS__))
-#define vkCmdDrawMeshTasksIndirectEXT(...) (::mkwvk::note_work(), ::mkwvk::rec::rx_vkCmdDrawMeshTasksIndirectEXT(__VA_ARGS__))
-#define vkCmdDrawMeshTasksIndirectCountEXT(...) (::mkwvk::note_work(), ::mkwvk::rec::rx_vkCmdDrawMeshTasksIndirectCountEXT(__VA_ARGS__))
-#define vkCmdDispatch(...) (::mkwvk::note_work(), ::mkwvk::rec::rx_vkCmdDispatch(__VA_ARGS__))
-#define vkCmdDispatchIndirect(...) (::mkwvk::note_work(), ::mkwvk::rec::rx_vkCmdDispatchIndirect(__VA_ARGS__))
-#define vkCmdCopyBuffer(...) (::mkwvk::note_work(), ::mkwvk::rec::rx_vkCmdCopyBuffer(__VA_ARGS__))
-#define vkCmdCopyBufferToImage(...) (::mkwvk::note_work(), ::mkwvk::rec::rx_vkCmdCopyBufferToImage(__VA_ARGS__))
-#define vkCmdCopyImageToBuffer(...) (::mkwvk::note_work(), ::mkwvk::rec::rx_vkCmdCopyImageToBuffer(__VA_ARGS__))
-#define vkCmdCopyImage(...) (::mkwvk::note_work(), ::mkwvk::rec::rx_vkCmdCopyImage(__VA_ARGS__))
-#define vkCmdBlitImage(...) (::mkwvk::note_work(), ::mkwvk::rec::rx_vkCmdBlitImage(__VA_ARGS__))
-#define vkCmdResolveImage(...) (::mkwvk::note_work(), ::mkwvk::rec::rx_vkCmdResolveImage(__VA_ARGS__))
-#define vkCmdClearColorImage(...) (::mkwvk::note_work(), ::mkwvk::rec::rx_vkCmdClearColorImage(__VA_ARGS__))
-#define vkCmdClearDepthStencilImage(...) (::mkwvk::note_work(), ::mkwvk::rec::rx_vkCmdClearDepthStencilImage(__VA_ARGS__))
-#define vkCmdClearAttachments(...) (::mkwvk::note_work(), ::mkwvk::rec::rx_vkCmdClearAttachments(__VA_ARGS__))
-#define vkCmdFillBuffer(...) (::mkwvk::note_work(), ::mkwvk::rec::rx_vkCmdFillBuffer(__VA_ARGS__))
-#define vkCmdUpdateBuffer(...) (::mkwvk::note_work(), ::mkwvk::rec::rx_vkCmdUpdateBuffer(__VA_ARGS__))
-#define vkCmdBeginQuery(...) (::mkwvk::note_work(), ::mkwvk::rec::rx_vkCmdBeginQuery(__VA_ARGS__))
-#define vkCmdEndQuery(...) (::mkwvk::note_work(), ::mkwvk::rec::rx_vkCmdEndQuery(__VA_ARGS__))
+#define vkCmdPipelineBarrier2(...) (::mkwvk::rec::rx_vkCmdPipelineBarrier2(RX_WORK_ON(__VA_ARGS__)))
+#define vkCmdBeginRendering(...) (::mkwvk::rec::rx_vkCmdBeginRendering(RX_WORK_ON(__VA_ARGS__)))
+#define vkCmdEndRendering(...) (::mkwvk::rec::rx_vkCmdEndRendering(RX_WORK_ON(__VA_ARGS__)))
+#define vkCmdDraw(...) (::mkwvk::rec::rx_vkCmdDraw(RX_WORK_ON(__VA_ARGS__)))
+#define vkCmdDrawIndexed(...) (::mkwvk::rec::rx_vkCmdDrawIndexed(RX_WORK_ON(__VA_ARGS__)))
+#define vkCmdDrawIndirect(...) (::mkwvk::rec::rx_vkCmdDrawIndirect(RX_WORK_ON(__VA_ARGS__)))
+#define vkCmdDrawIndexedIndirect(...) (::mkwvk::rec::rx_vkCmdDrawIndexedIndirect(RX_WORK_ON(__VA_ARGS__)))
+#define vkCmdDrawIndirectCount(...) (::mkwvk::rec::rx_vkCmdDrawIndirectCount(RX_WORK_ON(__VA_ARGS__)))
+#define vkCmdDrawIndexedIndirectCount(...) (::mkwvk::rec::rx_vkCmdDrawIndexedIndirectCount(RX_WORK_ON(__VA_ARGS__)))
+#define vkCmdDrawMeshTasksEXT(...) (::mkwvk::rec::rx_vkCmdDrawMeshTasksEXT(RX_WORK_ON(__VA_ARGS__)))
+#define vkCmdDrawMeshTasksIndirectEXT(...) (::mkwvk::rec::rx_vkCmdDrawMeshTasksIndirectEXT(RX_WORK_ON(__VA_ARGS__)))
+#define vkCmdDrawMeshTasksIndirectCountEXT(...) (::mkwvk::rec::rx_vkCmdDrawMeshTasksIndirectCountEXT(RX_WORK_ON(__VA_ARGS__)))
+#define vkCmdDispatch(...) (::mkwvk::rec::rx_vkCmdDispatch(RX_WORK_ON(__VA_ARGS__)))
+#define vkCmdDispatchIndirect(...) (::mkwvk::rec::rx_vkCmdDispatchIndirect(RX_WORK_ON(__VA_ARGS__)))
+#define vkCmdCopyBuffer(...) (::mkwvk::rec::rx_vkCmdCopyBuffer(RX_WORK_ON(__VA_ARGS__)))
+#define vkCmdCopyBufferToImage(...) (::mkwvk::rec::rx_vkCmdCopyBufferToImage(RX_WORK_ON(__VA_ARGS__)))
+#define vkCmdCopyImageToBuffer(...) (::mkwvk::rec::rx_vkCmdCopyImageToBuffer(RX_WORK_ON(__VA_ARGS__)))
+#define vkCmdCopyImage(...) (::mkwvk::rec::rx_vkCmdCopyImage(RX_WORK_ON(__VA_ARGS__)))
+#define vkCmdBlitImage(...) (::mkwvk::rec::rx_vkCmdBlitImage(RX_WORK_ON(__VA_ARGS__)))
+#define vkCmdResolveImage(...) (::mkwvk::rec::rx_vkCmdResolveImage(RX_WORK_ON(__VA_ARGS__)))
+#define vkCmdClearColorImage(...) (::mkwvk::rec::rx_vkCmdClearColorImage(RX_WORK_ON(__VA_ARGS__)))
+#define vkCmdClearDepthStencilImage(...) (::mkwvk::rec::rx_vkCmdClearDepthStencilImage(RX_WORK_ON(__VA_ARGS__)))
+#define vkCmdClearAttachments(...) (::mkwvk::rec::rx_vkCmdClearAttachments(RX_WORK_ON(__VA_ARGS__)))
+#define vkCmdFillBuffer(...) (::mkwvk::rec::rx_vkCmdFillBuffer(RX_WORK_ON(__VA_ARGS__)))
+#define vkCmdUpdateBuffer(...) (::mkwvk::rec::rx_vkCmdUpdateBuffer(RX_WORK_ON(__VA_ARGS__)))
+#define vkCmdBeginQuery(...) (::mkwvk::rec::rx_vkCmdBeginQuery(RX_WORK_ON(__VA_ARGS__)))
+#define vkCmdEndQuery(...) (::mkwvk::rec::rx_vkCmdEndQuery(RX_WORK_ON(__VA_ARGS__)))
 
 // (RX_VK_RECORDER) the calls that set state, bind or mark: not work (no count), but in the command buffer in order with the work, so
 // through the recorder too
@@ -54,6 +56,7 @@ inline void note_work() {
 #define vkCmdBindVertexBuffers2(...) (::mkwvk::rec::rx_vkCmdBindVertexBuffers2(__VA_ARGS__))
 #define vkCmdPushConstants(...) (::mkwvk::rec::rx_vkCmdPushConstants(__VA_ARGS__))
 #define vkCmdPushDescriptorSetKHR(...) (::mkwvk::rec::rx_vkCmdPushDescriptorSetKHR(__VA_ARGS__))
+#define vkCmdPushDescriptorSetWithTemplateKHR(...) (::mkwvk::rec::rx_vkCmdPushDescriptorSetWithTemplateKHR(__VA_ARGS__))
 #define vkCmdSetViewport(...) (::mkwvk::rec::rx_vkCmdSetViewport(__VA_ARGS__))
 #define vkCmdSetScissor(...) (::mkwvk::rec::rx_vkCmdSetScissor(__VA_ARGS__))
 #define vkCmdSetViewportWithCount(...) (::mkwvk::rec::rx_vkCmdSetViewportWithCount(__VA_ARGS__))
@@ -91,11 +94,11 @@ inline void note_work() {
 // or let go of what recorded commands use: the thread's held packets reach the driver first (rec::boundary(): a relaxed load and
 // a branch unless deferred; RX_VK_RECORDER=thread: the replay lock's holder waits for the recorder thread to run all it put in its ring;
 // the kind is for the recorder's stats line). RX_REC_BOUNDARIES in vk_recorder.h lists them
-#define vkBeginCommandBuffer(...) (::mkwvk::rec::boundary(::mkwvk::rec::B_vkBeginCommandBuffer), ::vkx::vkBeginCommandBuffer(__VA_ARGS__))
+#define vkBeginCommandBuffer(...) (::mkwvk::rec::boundary(::mkwvk::rec::B_vkBeginCommandBuffer), ::vkx::vkBeginCommandBuffer(RX_WORK_BEGUN(__VA_ARGS__)))
 #define vkEndCommandBuffer(...) (::mkwvk::rec::boundary(::mkwvk::rec::B_vkEndCommandBuffer), ::vkx::vkEndCommandBuffer(__VA_ARGS__))
 #define vkResetCommandPool(...) (::mkwvk::rec::boundary(::mkwvk::rec::B_vkResetCommandPool), ::vkx::vkResetCommandPool(__VA_ARGS__))
 #define vkDestroyCommandPool(...) (::mkwvk::rec::boundary(::mkwvk::rec::B_vkDestroyCommandPool), ::vkx::vkDestroyCommandPool(__VA_ARGS__))
-#define vkQueueSubmit2(...) (::mkwvk::rec::boundary(::mkwvk::rec::B_vkQueueSubmit2), ::vkx::vkQueueSubmit2(__VA_ARGS__))
+#define vkQueueSubmit2(...) (::mkwvk::rec::boundary(::mkwvk::rec::B_vkQueueSubmit2), ::vkx::vkQueueSubmit2(RX_WORK_SUBMIT(__VA_ARGS__)))
 #define vkQueueWaitIdle(...) (::mkwvk::rec::boundary(::mkwvk::rec::B_vkQueueWaitIdle), ::vkx::vkQueueWaitIdle(__VA_ARGS__))
 #define vkQueueBindSparse(...) (::mkwvk::rec::boundary(::mkwvk::rec::B_vkQueueBindSparse), ::vkx::vkQueueBindSparse(__VA_ARGS__))
 #define vkQueuePresentKHR(...) (::mkwvk::rec::boundary(::mkwvk::rec::B_vkQueuePresentKHR), ::vkx::vkQueuePresentKHR(__VA_ARGS__))

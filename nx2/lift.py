@@ -181,11 +181,14 @@ def main():
         if not a.no_polls:
             poll.install()
         gen = os.path.join(out_dir, "gen")
+        # ((Triforce) setup: what the emit's spawned processes do to the lifter's class before they emit, as this one did above)
         files = chunks.write(L, gen, os.path.join(a.work, "image"), a.rechunk and not a.standalone,
-                             counters=[] if a.no_polls else [poll.stats])
+                             counters=[] if a.no_polls else [poll.stats], setup=[] if a.no_polls else [poll.install])
         import oot_patches
         main_build = next((m["build_id"] for m in meta["modules"] if m["name"] == "main"), "")
-        chunks.edit_c(gen, L.stats, a.standalone and main_build == oot_patches.LIFE_BUILD_ID, whole=not a.max_func)
+        # ((Triforce) wait=False: where the emit's processes were spawned they share the page marks while the files below are
+        # written, which read none of the C; marks_done() waits for them before the report says their counts)
+        chunks.edit_c(gen, L.stats, a.standalone and main_build == oot_patches.LIFE_BUILD_ID, whole=not a.max_func, wait=False)
         a64_rtgen.write(gen)
         if a.standalone:
             start, exit_ = standalone.write_image_c(gen, img, meta, a.exefs)
@@ -194,6 +197,7 @@ def main():
             nvn = standalone.nvn_exports(nso.load_exefs(a.exefs))
             standalone.write_nvn_exports(gen, nvn)
             print("standalone: nvn2_exports.c (%d sdk NVN functions routed to host/nvn2.c)" % len(nvn))
+        chunks.marks_done()
         L.report()
         print("interrupt polls: %d loop headers in %d functions" % (poll.stats["polls"], poll.stats["functions"]))
         print("wrote %d code files to %s (%.0fs)" % (len(files), gen, time.time() - t0))

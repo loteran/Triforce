@@ -2,6 +2,10 @@
 
 The real draw decision block is extracted intact. Publication and final resource writes are CPU witnesses,
 not a claim about GPU output, timing, or a reproduced game failure.
+
+(Triforce) vk_draw.cpp's own wait counters are compiled in with it (note_wait, draw_stats3, draw_wait_split: the performance
+overlay's Pipeline waits and Shader waits): the fake waits take a millisecond each, and a pipeline's must come out in
+draw_wait_split's pipe_us, a translation's in its shader_us, both in draw_stats3's waits and wait_ms.
 """
 import argparse
 import os
@@ -18,7 +22,9 @@ FIXTURE = r"""
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <thread>
 #include <vector>
+#include "pipe_wait.h"
 #define PROF_EXACT() ((void)0)
 #define PROF_HOT(x) ((void)0)
 #define SKIP_HERE() return
@@ -29,8 +35,12 @@ struct Info {
     std::vector<Desc> storage_buffers_descriptors, image_buffer_descriptors, image_descriptors;
 };
 struct Stage { Info info; };
-int scans, early_reads, translation_waits, pipeline_waits, draws, output, st_waits, st_pending_skips;
-double st_wait_ms;
+int scans, early_reads, translation_waits, pipeline_waits, draws, output, st_pending_skips;
+// ((Triforce) the performance overlay's two wait counters, vk_draw.cpp's own (note_wait, draw_stats3, draw_wait_split): each
+// wait the block makes is counted into the one of its kind, a pipeline's (the default WaitAll path too) into Pipeline waits,
+// a translation's into Shader waits)
+@WAIT_COUNTERS@
+@WAIT_READERS@
 // Instrument only fixture iteration: reject inspecting ordinary stages before acquire-ready publication.
 struct Stages {
     std::atomic<bool>* ready;
@@ -74,10 +84,24 @@ void publish() {
     current->ready.store(true, std::memory_order_release);
 }
 void jobs_wait(const std::atomic<bool>& ready) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));   // ((Triforce) a wait of its time: at least 1000 us counted)
     if (&ready == &current->ready) { ++translation_waits; publish(); }
     else { ++pipeline_waits; pipe_entry.ready.store(true, std::memory_order_release); }
 }
 bool targets_persistent(const Targets& at) { return at.persistent; }
+// ((Triforce) pipe_wait.h's rules (tests/test_pipe_wait.py) with their defaults: a draw of these cases is no full-screen one,
+// and its pass is kept exactly where its targets hold an earlier frame)
+void left_out_pending() {}
+const pipe_wait::Rules& pipe_rules() { static const pipe_wait::Rules r; return r; }
+bool pipe_skip_new() { return true; }
+bool pass_kept(const Targets& at, bool) { return at.persistent; }
+bool full_screen_draw(NvnState&, const Targets&, const DrawArgs&) { return false; }
+bool hold_takes_frame() { return false; }
+uint64_t texture_frame_no() { return 1; }
+pipe_wait::Pool& pipe_pool() { static pipe_wait::Pool p(50 * pipe_wait::kMs); return p; }
+pipe_wait::Pool& pipe_last() { static pipe_wait::Pool p(40 * pipe_wait::kMs); return p; }
+bool pipe_wait_for(const std::atomic<bool>&, int64_t) { std::abort(); }
+int64_t st_pipe_new_waits, st_pipe_full_waits, st_pipe_full_held, st_pipe_full_left;
 bool exposure_log_on() { return false; }
 void exposure_note(NvnState&, const Program&) {}
 void ensure_layout(Program&) {}
@@ -96,6 +120,9 @@ int failures;
 void check(bool ok, const char* label) { if (!ok) { ++failures; std::printf("FAIL %s\n", label); } }
 void scenario(int kind, bool translated, bool pipeline_hot, bool persistent) {
     scans = early_reads = translation_waits = pipeline_waits = draws = output = st_pending_skips = 0;
+    int64_t skips0, waits0, pipe0, shader0, skips1, waits1, pipe1, shader1;
+    double ms0, ms1;
+    draw_stats3(&skips0, &waits0, &ms0), draw_wait_split(&pipe0, &shader0);
     Program p; current = &p; effect = kind;
     if (translated) publish();
     pipe_entry.ready.store(pipeline_hot, std::memory_order_release);
@@ -104,6 +131,7 @@ void scenario(int kind, bool translated, bool pipeline_hot, bool persistent) {
     const bool skip_unknown = legacy && !translated && persistent;
     const bool should_draw = !skip_unknown && (pipeline_hot || force || !persistent || kind != 0);
     decision(&p, {persistent});
+    draw_stats3(&skips1, &waits1, &ms1), draw_wait_split(&pipe1, &shader1);
     char label[120];
     std::snprintf(label, sizeof label, "kind%d translated%d hot%d persistent%d force%d", kind, translated, pipeline_hot, persistent, force);
     const int before = failures;
@@ -113,6 +141,12 @@ void scenario(int kind, bool translated, bool pipeline_hot, bool persistent) {
     check(translation_waits == int(!translated && !skip_unknown), "translation wait mode");
     if (pipeline_hot || force || !persistent || skip_unknown) check(scans == 0, "unnecessary classification");
     check(pipeline_waits == int(!pipeline_hot && should_draw), "pending pipeline must publish before draw");
+    // ((Triforce) each wait in the counter of its kind, by draw_wait_split's outputs, and with the waits of draw_stats3)
+    check(pipeline_waits ? pipe1 - pipe0 >= 1000 * pipeline_waits : pipe1 == pipe0, "a pipeline's wait is not in pipe_us (Pipeline waits) alone");
+    check(translation_waits ? shader1 - shader0 >= 1000 * translation_waits : shader1 == shader0,
+          "a translation's wait is not in shader_us (Shader waits) alone");
+    check(waits1 - waits0 == pipeline_waits + translation_waits && ms1 - ms0 >= (pipeline_waits + translation_waits) * 1.0 &&
+          ms1 - ms0 >= ((pipe1 - pipe0) + (shader1 - shader0)) / 1000.0 - 1e-9, "a wait is not counted with draw_stats3's waits and wait_ms");
     std::printf("%s %s draws%d skips%d scans%d twait%d pwait%d\n", failures == before ? "PASS" : "RED", label,
                 draws, st_pending_skips, scans, translation_waits, pipeline_waits);
 }
@@ -140,13 +174,18 @@ def main():
         helper_end = src.index("enum class FallbackRole", helper_start)
         start = src.index("    static const bool always_wait =", src.index("void draw(VkCommandBuffer"))
         end = src.index("    cur_program = &p;", start)
+        counters_start = src.index("std::atomic<int64_t> st_waits{0}, st_wait_us{0};")
+        counters_end = src.index("bool depth_aspect(VkFormat f)", counters_start)
+        readers_start = src.index("void draw_stats3(int64_t* pending_skips, int64_t* waits, double* wait_ms) {")
+        readers_end = src.index("bool draw_stats4(", readers_start)
     except ValueError:
         raise SystemExit("draw readiness block changed; update this test's extraction anchors") from None
-    fixture = FIXTURE.replace("@WRITES_MEMORY@", src[helper_start:helper_end]).replace("@BLOCK@", src[start:end])
+    fixture = (FIXTURE.replace("@WRITES_MEMORY@", src[helper_start:helper_end]).replace("@BLOCK@", src[start:end])
+               .replace("@WAIT_COUNTERS@", src[counters_start:counters_end]).replace("@WAIT_READERS@", src[readers_start:readers_end]))
     with tempfile.TemporaryDirectory(prefix="draw-side-effects-") as tmp:
         cpp, exe = Path(tmp) / "test.cpp", Path(tmp) / "test"
         cpp.write_text(fixture, encoding="utf-8")
-        subprocess.run([args.cxx, "-std=c++20", "-Wall", "-Wextra", "-Wno-unused-variable",
+        subprocess.run([args.cxx, "-std=c++20", "-Wall", "-Wextra", "-Wno-unused-variable", "-I", str(args.source / "gpu/vk"),
                         str(cpp), "-o", str(exe)], check=True, timeout=60)
         failed = False
         for mode in (None, "0", "1", "2"):
@@ -164,7 +203,8 @@ def main():
                 print("fixture failed or did not finish all 23 cases\n" + result.stdout + result.stderr)
         if failed:
             raise SystemExit(1)
-    print("PASS: unknown translations wait by default; mode 2 restores their old skip; translated writers wait; hot draws do not scan stages")
+    print("PASS: unknown translations wait by default; mode 2 restores their old skip; translated writers wait; hot draws do not scan stages;"
+          " each wait in its counter (Pipeline waits, Shader waits)")
 
 
 if __name__ == "__main__":

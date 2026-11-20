@@ -5,6 +5,9 @@ Asked for under the compile-required flag, the driver answers from a cache it is
 nothing and let go was cold again at its first draw. So parts 1 and 2 are built into the cache, the cache exists before the
 warm pass's workers start (the start that only warms had not made it), what is compiled counts towards a save, and the
 warmed stamp is not written before the file holds the libraries.
+(Triforce) One exception, on purpose and checked here: a cache that is over the file's bound with the libraries in it
+(gpu/vk/pcache_bound.h) is not written at all, and the pass then counts as done with a line in the log that says so, where
+it would otherwise be made again at every start and never kept. That way out stands before the save, not after it.
 python -I -B tests/test_gpl_library_cache.py
 """
 from pathlib import Path
@@ -22,9 +25,12 @@ def main():
     build = between(draw, "VkPrimitiveTopology topo, int part, bool* cold) {", "\n}\n")
     for line, why in (
             ("const bool lib_cached = (part == 1 || part == 2) && gpl_libs_cached();", "only the two shader libraries are kept"),
-            ("const VkPipelineCache cache = lib_cached || (part < 0 && !driver_cache_only) ? pcache : VK_NULL_HANDLE;",
+            ("const VkPipelineCache wanted = lib_cached || (part < 0 && !driver_cache_only) ? pcache : VK_NULL_HANDLE;",
              "the libraries are not built into the pipeline cache"),
-            ("VkResult r = guarded_graphics(cache, &ci, &pl);", "pipeline creation bypasses the chosen cache"),
+            # ((Triforce) through the cache's gate, held over the creation: none once it is let go for the RAM, pcache_gate.h)
+            ("const PcacheUse use(pcache_door, wanted);", "the creation does not hold the cache's gate"),
+            ("const VkPipelineCache cache = use.cache;", "the creation does not take the cache the gate gives"),
+            ("VkResult r = cached_graphics(cache, &ci, &pl);", "pipeline creation bypasses the chosen cache"),
             ("pcache_built_since_save += lib_cached && !cold;", "a compiled library does not count towards a save")):
         if line not in build:
             raise SystemExit(why)
@@ -32,6 +38,11 @@ def main():
     if "pcache_init();" not in warm or warm.index("pcache_init();") > warm.index("std::thread"):
         raise SystemExit("the warm pass's workers start before the pipeline cache is there")
     saved = warm.index("const bool saved = pcache_saved_now();")
+    over = warm.find("!pcache_bound::within(held, pcache_bound_bytes)) {")
+    if over < 0 or over > saved or "over the bound of" not in warm[over:saved] or warm[over:saved].count("return true;") != 1 or \
+            "return true;" in warm[:over]:
+        raise SystemExit("the warm pass is taken for done without its libraries on disk, other than for a cache over the bound "
+                         "and with a log line that says so")
     if "if (!saved) return false;" not in warm[saved:] or warm.index("return true;", saved) < warm.index("if (!saved) return false;"):
         raise SystemExit("a warm pass whose libraries are not on disk is taken for done")
     prep = between(draw, "bool prepare_run(", "\n}\n")

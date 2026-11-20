@@ -245,6 +245,11 @@ static int mouse_stick(int32_t *rx, int32_t *ry, int pointing) {
            read after a pause starts afresh) */
         const int64_t ticks = next_tick ? (now - next_tick) / MOUSE_TICK_NS + 1 : 1;
         double ox = look_x, oy = look_y;
+        if (!pointing) {   /* (Triforce: the Camera speed row is the stick's; the game multiplies this deflection by it too) */
+            double hos_camera_speed(void);   /* (host/prompts.c) */
+            const double cam = hos_camera_speed();
+            ox /= cam, oy /= cam;
+        }
         const double shown_length = sqrt(ox * ox + oy * oy);
         if (shown_length > 1) ox /= shown_length, oy /= shown_length;
         shown[0] = (int32_t)lround(ox * 32767);
@@ -263,6 +268,28 @@ static int mouse_stick(int32_t *rx, int32_t *ry, int pointing) {
    host/posix/display_sdl.c). tests/test_alt_enter.py */
 static int kmap_down(int vk, int (*down)(int)) { return down(vk) && !(vk == VK_RETURN && down(VK_MENU)); }
 
+#ifndef __EMSCRIPTEN__
+/* (Triforce) The program whose window is in front, for game_in_front's log line: its file's name alone, never its folder
+   (a user's name) or the window's title (a document's or a page's name). "?" where Windows does not say.
+   tests/test_input_background.py has its own */
+static void front_program(DWORD pid, char *name, int size) {
+    snprintf(name, (size_t)size, "?");
+#ifdef _WIN32
+    HANDLE p = pid ? OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid) : NULL;
+    if (!p) return;
+    char path[MAX_PATH];
+    DWORD n = sizeof path;
+    if (QueryFullProcessImageNameA(p, 0, path, &n)) {
+        const char *base = strrchr(path, '\\');
+        snprintf(name, (size_t)size, "%s", base ? base + 1 : path);
+    }
+    CloseHandle(p);
+#else
+    (void)pid;
+#endif
+}
+#endif
+
 static int game_in_front(void) {
     DWORD pid = 0;
     HWND w = GetForegroundWindow();
@@ -270,8 +297,21 @@ static int game_in_front(void) {
     int front = pid == GetCurrentProcessId();
 #ifndef __EMSCRIPTEN__
     static int last_normal_was_us = 1, was_front = 1;
+    static int64_t none_since, changed_ns;
+    const int64_t now = hos_now_ns();
+    /* (Triforce) No window in front at all: Windows answers so for a moment while the window in front changes, and a
+       notification or an overlay coming and going is such a change. Taken as "not in front", each such moment let every
+       button go and centred the sticks for a read, with the game still in front: a held shield dropped, a run stopped.
+       The answer before it stands for a quarter of a second of that; longer (a locked PC) is not in front */
+    if (!w) {
+        if (!none_since) none_since = now;
+        if (now - none_since < 250000000LL) return was_front;
+    } else {
+        none_since = 0;
+    }
+    LONG_PTR ex = 0;
     if (w && !front) {
-        const LONG_PTR ex = GetWindowLongPtrA(w, GWL_EXSTYLE);
+        ex = GetWindowLongPtrA(w, GWL_EXSTYLE);
         const int overlay = (ex & (WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE)) != 0;
         if (overlay && last_normal_was_us) front = 1;
         else last_normal_was_us = 0;
@@ -279,10 +319,17 @@ static int game_in_front(void) {
         last_normal_was_us = 1;
     }
     if (front != was_front) {
-        char cls[64] = "";
+        /* (Triforce) for a report of a controller that "disconnects": which program took the front (its file's name and its
+           window's extended styles, by which an overlay is told from a window), and for how long the game was behind it:
+           the controllers do not count all that time unless Controller in background is on */
+        char cls[64] = "", program[64];
         if (w) GetClassNameA(w, cls, sizeof cls);
-        hos_log("hid: game window %s (foreground window: process %lu, class \"%s\")", front ? "in front" : "not in front",
-                (unsigned long)pid, cls);
+        front_program(pid, program, sizeof program);
+        hos_log("hid: game window %s (foreground window: process %lu, class \"%s\", program %s, styles %#lx)%s",
+                front ? "in front" : "not in front", (unsigned long)pid, cls, program, (unsigned long)ex,
+                front ? "" : ": the controllers do not count until it is in front again, unless Controller in background is on");
+        if (front && changed_ns) hos_log("hid: the game window was not in front for %.1f s", (now - changed_ns) / 1e9);
+        changed_ns = now;
         was_front = front;
     }
 #endif
@@ -361,6 +408,11 @@ static void live_input(void) {
                 if (!strncmp(line, "!flasharm", 9)) rx_flash_dark_arm();
                 extern volatile int hos_oot_live_action;   /* host/hos_main.c: "!cheat <action>", as the Cheats page sends */
                 if (!strncmp(line, "!cheat ", 7)) __atomic_store_n(&hos_oot_live_action, atoi(line + 7), __ATOMIC_RELAXED);
+                /* ((Triforce) "!type <text>": typed into the menu as the keyboard's characters would be (host/display.c; ASCII; "\b"
+                   a Backspace), for the Mods screen's search in test runs, which have no window to type into) */
+                if (!strncmp(line, "!type ", 6) && rx_option(HOS_OPT_TEXT_WANTED, 0))
+                    for (const char *t = line + 6; *t && *t != '\r' && *t != '\n'; t++)
+                        rx_option_set(HOS_OPT_TEXT_CHAR, t[0] == '\\' && t[1] == 'b' ? (t++, 8) : (unsigned char)*t);
                 void hos_oot_live_crawl(const char *line);   /* host/hos_main.c: "!banc", "!pos", "!hold", "!where" (the pipeline crawl) */
                 if (!strncmp(line, "!banc ", 6) || !strncmp(line, "!give ", 6) || !strncmp(line, "!items", 6) || !strncmp(line, "!pos ", 5) || !strncmp(line, "!hold ", 6) ||
                     !strncmp(line, "!where", 6))
@@ -616,6 +668,22 @@ int32_t hos_stick_axis(int16_t v, int zone) {
     const int32_t a = v < -32767 ? -32767 : v, t = cut[(unsigned)zone < 6 ? zone : 0];
     return (a > t || a < -t) ? a : 0;
 }
+/* (Triforce, after NX2navi's lstick_deadzone and rstick_deadzone) A stick's own dead zone, the Insert menu's "Left stick
+   dead zone" and "Right stick dead zone" (stick 0 the left, 1 the right): -1 none of its own, "As Stick dead zone", the
+   default; else 0 to 50, percent of an axis's travel. The option is one more than the row's value, so that 0, which is
+   also what an option table that does not know the rows answers, is none of its own. */
+int hos_stick_own(int stick) {
+    const int v = rx_option(stick ? HOS_OPT_RSTICK_ZONE : HOS_OPT_LSTICK_ZONE, 0) - 1;
+    return v < 0 ? -1 : v > 50 ? 50 : v;
+}
+/* An axis cut at its stick's dead zone: the stick's own (own, percent: 5 cuts where the Stick dead zone row's 5% does)
+   or, when it has none (-1), the menu's Stick dead zone (zone), which is hos_stick_axis as it was. Per axis and with no
+   rescaling of the travel left, as that row: the game's own dead zone still follows. 0 cuts nothing. */
+int32_t hos_stick_axis_own(int16_t v, int zone, int own) {
+    if (own < 0) return hos_stick_axis(v, zone);
+    const int32_t a = v < -32767 ? -32767 : v, t = ((own > 50 ? 50 : own) * 32767 + 50) / 100;
+    return (a > t || a < -t) ? a : 0;
+}
 
 static void pads_read(uint64_t *buttons, int32_t stick[4]) {
     static int64_t next_read, retry[XUSER_MAX_COUNT];
@@ -691,7 +759,8 @@ static void pads_read(uint64_t *buttons, int32_t stick[4]) {
             int32_t v[4];
             int rx_option(int id, int otherwise);
             const int zone = rx_option(11, 0);   /* (the menu's Stick dead zone) */
-            for (int i = 0; i < 4; i++) v[i] = hos_stick_axis(thumb[i], zone);
+            const int own[2] = {hos_stick_own(0), hos_stick_own(1)};   /* ((Triforce) each stick's own, -1 none) */
+            for (int i = 0; i < 4; i++) v[i] = hos_stick_axis_own(thumb[i], zone, own[i >> 1]);
             if (rx_option(16, 0)) v[2] = -v[2];
             if (rx_option(17, 0)) v[3] = -v[3];
             stick_max(s, v);
@@ -728,7 +797,17 @@ static void pads_read(uint64_t *buttons, int32_t stick[4]) {
             }
         }
     }
-    InterlockedExchange(&pad_raw_now, (LONG)raw);
+    {   /* ((Triforce) 11-17) the menus' pad bits also say where the left stick is pushed, past half its travel (vk_api.h
+           HOS_PAD_LS_*): the overlay's lists move by the stick as the game's do. Not the game's: raw itself is unchanged */
+        uint64_t menu = raw;
+        if (s[1] > 16384) menu |= 1ULL << HOS_PAD_LS_UP;
+        if (s[1] < -16384) menu |= 1ULL << HOS_PAD_LS_DOWN;
+        if (s[0] < -16384) menu |= 1ULL << HOS_PAD_LS_LEFT;
+        if (s[0] > 16384) menu |= 1ULL << HOS_PAD_LS_RIGHT;
+        if (s[3] > 16384) menu |= 1ULL << HOS_PAD_RS_UP;
+        if (s[3] < -16384) menu |= 1ULL << HOS_PAD_RS_DOWN;
+        InterlockedExchange(&pad_raw_now, (LONG)menu);
+    }
     /* Back and Start together open the Insert menu (gpu/vk/vk_menu.cpp, for pads whose Home button the system
        keeps): they reach the game only one at a time */
     const uint64_t chord = 1ULL << HOS_PAD_BACK | 1ULL << HOS_PAD_START;
@@ -741,6 +820,25 @@ static void pads_read(uint64_t *buttons, int32_t stick[4]) {
     memcpy(cached_stick, s, sizeof s);
     *buttons |= b;
     stick_max(stick, s);
+}
+
+/* (Triforce) Whether XInput has a controller now, for the Button prompts row's Auto (host/prompts.c auto_face), which asks
+   once, at the game's start, and only when SDL names none: a controller read through XInput alone (HOS_NO_SDL=1, or no
+   SDL beside the game) keeps the game's own icons, and only a PC with no controller at all gets the keys' */
+int hos_xinput_connected(void) {
+    XInputGetStateFn get = xinput_get;
+#ifdef _WIN32   /* (as pads_read: System32's) */
+    if (!get) {
+        HMODULE x = LoadLibraryExA("xinput1_4.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
+        if (!x) x = LoadLibraryExA("xinput9_1_0.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
+        if (x) get = (XInputGetStateFn)GetProcAddress(x, "XInputGetState");
+    }
+#endif
+    for (DWORD p = 0; get && p < XUSER_MAX_COUNT; p++) {
+        XINPUT_STATE xs;
+        if (get(p, &xs) == ERROR_SUCCESS) return 1;
+    }
+    return 0;
 }
 
 /* Whether the controllers count while another window is in front: HOS_INPUT_BACKGROUND=1 or 0 decides when it is set,
@@ -763,16 +861,47 @@ static void mouse_buttons_arm(int captured) {   /* (once a read) */
     static const int vks[5] = {VK_LBUTTON, VK_RBUTTON, VK_MBUTTON, VK_XBUTTON1, VK_XBUTTON2};
     for (int i = 0; i < 5; i++) mouse_armed[i] = captured && (mouse_armed[i] || !key(vks[i]));
 }
+/* (Triforce, after NX2navi's walk_key) The walk key's code, 0 none: the Insert menu's Walk key row, set at each read
+   (read_input, walk_key_code). While a key is the walk key it is no control's key: Shift, by default B's, would press B
+   with every walking step. What the Controls page binds it to is not touched, and counts again once the row is Off or
+   on another key */
+static int walk_vk;
 /* whether a control's key is down: a key always (kmap_down: not Enter with Alt), a mouse button only with mouse (captured
-   and armed) */
+   and armed); the walk key never */
 static int bound_down(int i, int mouse) {
     for (int k = 0; k < 2; k++) {
         const int vk = (int)key_bind[i][k];
-        if (vk <= 0) continue;
+        if (vk <= 0 || vk == walk_vk) continue;
         const int m = mouse_vk_slot(vk);
         if (m >= 0 ? mouse && mouse_armed[m] && key(vk) : kmap_down(key_bind[i][k], key)) return 1;
     }
     return 0;
+}
+
+/* (Triforce, after NX2navi's walk_key and walk_scale) A key is down or up, so the movement keys push the left stick all
+   the way and on the keyboard alone Link always runs. The walk key, while held with them, makes it a part of the way.
+   The Insert menu's Walk key row's values, in its order: Off, then Caps Lock (no control's key by default), Shift (B's),
+   Ctrl (the left stick press's) and Tab (one of Plus's). Alt is not among them: Windows takes an Alt let go alone for
+   its window menu, and beeps at a key pressed with it (host/display.c hands both on to it) */
+static int walk_key_code(int row) {
+    static const int codes[] = {0, VK_CAPITAL, VK_SHIFT, VK_CONTROL, VK_TAB};
+    return row > 0 && row < (int)(sizeof codes / sizeof *codes) ? codes[row] : 0;
+}
+/* The movement keys' left stick (keys[0] and keys[1], each -32767, 0 or 32767) while the walk key is held: percent, the
+   Walk scale row's, of all the way, 20 to 90 (0 or less, as from an option table that does not know the row: 51, the
+   row's default). Two keys at once push a diagonal: each axis then gets the scale over the square root of 2, so the
+   stick is as far from its centre as with one key, the same walk in all eight directions (unscaled, two keys are the
+   corner of the square, past the stick's round edge, as before). The camera's keys (keys[2], keys[3]) stay: a walk is
+   the left stick's */
+static void walk_keys(int32_t keys[4], int percent) {
+    if (percent <= 0) percent = 51;
+    if (percent < 20) percent = 20;
+    if (percent > 90) percent = 90;
+    const int both = keys[0] && keys[1];
+    for (int k = 0; k < 2; k++) {
+        keys[k] = keys[k] * percent / 100;
+        if (both) keys[k] = keys[k] * 46341 / 65536;   /* (65536 over the square root of 2) */
+    }
 }
 
 static uint64_t flight_input;
@@ -822,6 +951,7 @@ static int flight_jump_shortcut(uint64_t *buttons, int mode, int menu_open, int 
 static void read_input(uint64_t *buttons, int32_t stick[4]) {
     *buttons = 0;
     memset(stick, 0, 4 * sizeof *stick);
+    void hos_mouse_native_stick(int held);
     scripted_input(buttons, stick);
     /* A scripted run (a test) takes no input from the player's devices until 5 s after its last press (a variable
        left set in a shell no longer leaves the game without controls), and otherwise the pads count only
@@ -849,7 +979,7 @@ static void read_input(uint64_t *buttons, int32_t stick[4]) {
         return;
     }
     {   /* (Triforce) The options' tabs inside the game's own Options screen (host/oot_menu.c, gpu/vk/vk_menu.cpp): one of
-           our tabs left with Back (the gamepad input B is bound to, or Esc) is the game's Back as well, as in its own
+           our tabs left with Back (the gamepad input B is bound to, Esc, or the mouse's right button) is the game's Back as well, as in its own
            menus one Back leaves the screen from any tab. The press itself never reaches the game (below), so B is
            tapped for it. A tab left with L or R is the game's own tab: no tap */
         int hos_oot_options_front(void);
@@ -857,7 +987,8 @@ static void read_input(uint64_t *buttons, int32_t stick[4]) {
         const int open = rx_option(1, 0);
         if (was_open && !open && hos_oot_options_front()) {
             const int b = hos_binding(HOS_BIND_PAD, HOS_SW_B, 0);
-            if ((b >= 0 && b < HOS_PAD_N && ((uint32_t)pad_raw_now >> b & 1)) || (GetAsyncKeyState(VK_ESCAPE) & 0x8000))
+            if ((b >= 0 && b < HOS_PAD_N && ((uint32_t)pad_raw_now >> b & 1)) || (GetAsyncKeyState(VK_ESCAPE) & 0x8000) ||
+                (GetAsyncKeyState(VK_RBUTTON) & 0x8000))
                 hos_hid_tap("0:B/80");
         }
         was_open = open;
@@ -879,20 +1010,26 @@ static void read_input(uint64_t *buttons, int32_t stick[4]) {
             player_used();
     }
     binds_load();   /* (the keys: key_default's, or triforce_options.ini's; the mouse's buttons once its capture is known) */
+    walk_vk = walk_key_code(rx_option(HOS_OPT_WALK_KEY, 0));   /* ((Triforce) before the keys are read: it is none of theirs) */
     for (int i = 0; i < HOS_SW_N; i++)
         if (bound_down(i, 0)) *buttons |= 1ULL << i, player_used();
     int32_t mouse[4] = {0};
     /* the mouse's motion: the camera itself (mouse_native.c) with the menu's Mouse camera on Native, else the right
-       stick; also the stick while the player camera does not run (the pause menu, other cameras: mouse_native.c) */
+       stick; also the stick while the game does not give the camera free control (a menu, a lock-on, the pause menu,
+       other cameras: mouse_native.c) and while a button it takes the stick for is held: ZR (the bow's aim), L (the
+       item wheel) or R, where the mouse points as it does in As the stick */
     static const char *native_env;
     static int native_looked;
     if (!native_looked) native_looked = 1, native_env = getenv("HOS_MOUSE_NATIVE");
     const int native = native_env ? atoi(native_env) != 0 : rx_option(6, 0);
     int hos_mouse_native(void);
+    void hos_mouse_native_free(int free);
+    const uint64_t game_stick = (1ULL << B_ZR) | (1ULL << B_L) | (1ULL << B_R);
     int captured = 0, as_stick = !native;
     if (native) {
         mouse_setup();
         mouse_sens_keys();
+        hos_mouse_native_free(!(*buttons & game_stick));
         captured = hos_mouse_native();
         if (captured < 0) captured = 0, as_stick = 1;
     }
@@ -907,16 +1044,22 @@ static void read_input(uint64_t *buttons, int32_t stick[4]) {
     /* (the left stick's and the camera's keys: WASD and the arrows or IJKL by default) */
     const int cx = bound_down(HOS_KEY_CAM_RIGHT, captured) - bound_down(HOS_KEY_CAM_LEFT, captured),
               cy = bound_down(HOS_KEY_CAM_UP, captured) - bound_down(HOS_KEY_CAM_DOWN, captured);
-    const int32_t keys[4] = {(bound_down(HOS_KEY_MOVE_RIGHT, captured) - bound_down(HOS_KEY_MOVE_LEFT, captured)) * 32767,
-                             (bound_down(HOS_KEY_MOVE_UP, captured) - bound_down(HOS_KEY_MOVE_DOWN, captured)) * 32767,
-                             cx * 32767, cy * 32767};
+    int32_t keys[4] = {(bound_down(HOS_KEY_MOVE_RIGHT, captured) - bound_down(HOS_KEY_MOVE_LEFT, captured)) * 32767,
+                       (bound_down(HOS_KEY_MOVE_UP, captured) - bound_down(HOS_KEY_MOVE_DOWN, captured)) * 32767,
+                       cx * 32767, cy * 32767};
+    /* ((Triforce) the walk key held: the movement keys push the left stick a part of the way. The keys' alone: a
+       controller's stick and the scripted presses are as they are) */
+    if (walk_vk && key(walk_vk)) walk_keys(keys, rx_option(HOS_OPT_WALK_SCALE, 51));
     stick_max(stick, keys);
-    if (keys[0] || keys[1] || keys[2] || keys[3]) player_used();
+    /* (hookshot, mouse_native.c) the keys and the pads are the right stick too: while they turn the camera, its angles are
+       the native mouse's new start, so the two do not undo each other */
+    hos_mouse_native_stick(stick[2] != 0 || stick[3] != 0);
 }
 
 static void vibration_send(uint64_t handle, uint64_t value);
 volatile int64_t hos_hid_last_read;
 
+volatile uint64_t hos_npad_buttons;   /* (Triforce) the buttons of the last state the game was given: host/mod_cheats.c */
 /* GetNpadStates(State* out, int count, unsigned int const& npadId): the latest state first */
 static void npad_states(Ctx *c) {
     uint64_t out = ARG(0);
@@ -942,8 +1085,65 @@ static void npad_states(Ctx *c) {
                     (unsigned long long)c->x[30]);
         }
     }
+    {   /* (Triforce) the Scan amiibo page's choice is taken here, whatever the game shows (host/nn_nfp.c) */
+        void hos_amiibo_poll(void);
+        hos_amiibo_poll();
+    }
     if (connected) {
         read_input(&buttons, stick);
+        {   /* (Triforce) the Mods entry under a game list's last button (host/oot_menu.c, gpu/vk/vk_menu.cpp): while the
+               game's cursor is on that last button and our menu is shut, Down (the D-pad's, or the left stick held down)
+               is the entry's, not the game's: the renderer takes the cursor onto Mods at its first frame */
+            int hos_oot_mods_down(void);
+            static int was_down;
+            /* (a press only: the Down that brought the game's cursor onto the last button, still held, is not one) */
+            const int down = (int)(buttons >> B_DOWN & 1) || stick[1] < -16000;
+            if (!rx_option(1, 0) && hos_oot_mods_down() && down) {
+                buttons &= ~(1ULL << B_DOWN);
+                stick[1] = 0;
+                if (!was_down) rx_option_set(HOS_OPT_MODS_ENTER, 1);
+            }
+            was_down = down;
+            /* While the Mods entry or its screen has the cursor the game gets no input (a pad's is the menu's already,
+               above, and the keys' too, key()). What is left is a test's scripted presses: they go to the menu as a pad's
+               would (HOS_OPT_MODS_PRESS), not to the game. Buttons held as the cursor goes back to the game are not the
+               game's until let go (the Up that left Mods does not move the game's cursor too) */
+            static uint64_t prev, held_over;
+            static int sel_was, stick_over;
+            const int sel = rx_option(HOS_OPT_MODS_SELECTED, 0) != 0;
+            if (sel) {
+                static const struct { int bit, press; } map[] = {{B_UP, HOS_MODS_PRESS_UP}, {B_DOWN, HOS_MODS_PRESS_DOWN},
+                    {B_LEFT, HOS_MODS_PRESS_LEFT}, {B_RIGHT, HOS_MODS_PRESS_RIGHT}, {B_A, HOS_MODS_PRESS_A}, {B_B, HOS_MODS_PRESS_B},
+                    {B_L, HOS_MODS_PRESS_L}, {B_R, HOS_MODS_PRESS_R}};
+                const uint64_t fresh = buttons & ~prev;
+                int bits = 0;
+                for (int i = 0; i < (int)(sizeof map / sizeof *map); i++)
+                    if (fresh >> map[i].bit & 1) bits |= map[i].press;
+                {   /* ((Triforce) 11-17) and the left stick pushed past half its travel, as the D-pad */
+                    static int stick_was;
+                    const int dir = stick[1] > 16384 ? HOS_MODS_PRESS_UP : stick[1] < -16384 ? HOS_MODS_PRESS_DOWN
+                                  : stick[0] < -16384 ? HOS_MODS_PRESS_LEFT : stick[0] > 16384 ? HOS_MODS_PRESS_RIGHT : 0;
+                    if (dir && dir != stick_was) bits |= dir;
+                    stick_was = dir;
+                }
+                if (bits) rx_option_set(HOS_OPT_MODS_PRESS, bits);
+                prev = buttons;
+                buttons = 0;
+                memset(stick, 0, 4 * sizeof *stick);
+            } else {
+                if (sel_was) held_over = prev, stick_over = 1;
+                held_over &= buttons;
+                buttons &= ~held_over;
+                if (stick_over && stick[0] > -12000 && stick[0] < 12000 && stick[1] > -12000 && stick[1] < 12000) stick_over = 0;
+                if (stick_over) stick[0] = stick[1] = 0;
+                prev = 0;
+            }
+            sel_was = sel;
+        }
+        {   /* (Triforce) the sprint button's press is its own while Link plays (host/oot_sprint.c) */
+            void hos_oot_sprint_pad(uint64_t *buttons);
+            hos_oot_sprint_pad(&buttons);
+        }
         uint64_t axes = 0;
         uint64_t flight = 0;
         int height = 0;
@@ -971,6 +1171,8 @@ static void npad_states(Ctx *c) {
     if (connected) buttons = hos_title_input(buttons);
     uint64_t hos_frame_step_buttons(uint64_t buttons);   /* nn_vi.c: the frame step of the wheel and quick menus */
     if (connected) buttons = hos_frame_step_buttons(buttons);
+    /* (Triforce) the buttons the game is given, for the mods' cheats that run while buttons are held (host/mod_cheats.c) */
+    if (connected) __atomic_store_n(&hos_npad_buttons, buttons, __ATOMIC_RELAXED);
     int64_t s = ++sampling;
     for (int i = 0; i < count; i++) {
         uint64_t e = out + (uint64_t)i * STATE_SIZE;

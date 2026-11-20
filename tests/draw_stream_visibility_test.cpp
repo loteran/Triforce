@@ -18,6 +18,7 @@
 #include <unordered_map>
 #include <utility>
 #include <vector>
+#include "barrier_rules.h"
 static void require(bool ok,const char* why) { if(!ok) { std::fprintf(stderr,"FAIL: %s\n",why); std::exit(1); } }
 struct Allocation { std::vector<uint8_t> cpu,visible; };
 using VmaAllocation=Allocation*;
@@ -66,6 +67,7 @@ std::unordered_map<int,int>& handle_hits() { static std::unordered_map<int,int> 
 struct BankCache { uint64_t at=0; };
 std::array<std::array<BankCache,2>,2>& bank_cache() { static std::array<std::array<BankCache,2>,2> b;return b; }
 void make_dummies() {}
+thread_local uint64_t desc_rec=0;   // (vk_draw.cpp: the recording the kept descriptors are of)
 /* FLUSH */
 /* BEGIN */
 struct Recording { int slot;VkCommandBuffer cmd,upload,init; VkFence fence;uint64_t value=1,batch=0;bool submitted=false; };
@@ -82,10 +84,17 @@ uint64_t rec_seq=0;
 std::mutex rec_map_mu;
 std::multimap<uint64_t,uint64_t> value_rec;
 std::set<uint64_t> rec_open_values;
-struct { std::vector<VkCommandBufferSubmitInfo> cbs;uint64_t signal=0,rec=0;bool any_signal=false; } pend;
+struct { std::vector<VkCommandBufferSubmitInfo> cbs;uint64_t signal=0,rec=0;bool any_signal=false;size_t recs=0; } pend;
 uint64_t batch_next=0;std::chrono::steady_clock::time_point pend_since;
 bool batch=false;bool batch_on() { return batch; }
-int flush_reason=0;constexpr int FR_CAP=1;
+namespace barrier_rules = mkwvk::barrier_rules;   // (the held submits' rule, gpu/vk/barrier_rules.h: RX_VK_BATCH=1 here)
+barrier_rules::Batch batch_way() { return batch ? barrier_rules::Batch::Hold : barrier_rules::Batch::Off; }
+int submit_depth=0;
+int flush_reason=0;constexpr int FR_OTHER=0,FR_CAP=1;
+bool event_writes_held(VkCommandBuffer) { return false; }   // (no event's write held: RX_VK_EVENT_BARRIER's, not this test's)
+void split_part_submitted(VkCommandBuffer,bool) {}   // (RX_VK_SPLIT_BARRIER's count)
+void end_pass(VkCommandBuffer) { require(false,"a pass ended at a submit"); }
+void full_barrier(VkCommandBuffer,const char*) { require(false,"a barrier at a submit"); }
 void device_lost() { require(false,"unexpected device loss"); }
 #define PROF(x) ((void)0)
 VKAPI_ATTR VkResult VKAPI_CALL vkQueueSubmit2(VkQueue,uint32_t count,const VkSubmitInfo2* submits,VkFence) {

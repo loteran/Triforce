@@ -1,0 +1,27 @@
+#version 450
+// (Triforce) The game's SMAA composition replaced (gpu/vk/vk_aa.cpp, the Insert menu's Anti-aliasing row): mode 0 stores the
+// tone mapped picture as it is (Off), mode 1 smooths its edges first (FXAA: aa_fxaa.glsl). Input: the picture the game's pass
+// samples, linear. Output: the target's raw RGB9E5 words of the square root of each channel (aa_common.glsl), through an
+// R32_UINT view. After NX2navi's shaders/aa_post.comp.
+#extension GL_GOOGLE_include_directive : require
+
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(binding = 0) uniform sampler2D src;
+layout(binding = 1, r32ui) uniform writeonly uimage2D dst;
+layout(push_constant) uniform Push {
+    vec2 inv;     // (1 / size)
+    ivec2 size;   // (the target's size)
+    int mode;     // (0 the picture as it is, 1 FXAA)
+} pc;
+
+#include "aa_common.glsl"
+vec3 aa_at(vec2 uv) { return aa_encode(textureLod(src, uv, 0.0).rgb); }
+#include "aa_fxaa.glsl"
+
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x >= pc.size.x || p.y >= pc.size.y) return;
+    vec2 uv = (vec2(p) + 0.5) * pc.inv;
+    vec3 c = pc.mode == 1 ? aa_fxaa(uv, pc.inv) : aa_encode(texelFetch(src, p, 0).rgb);
+    imageStore(dst, p, uvec4(aa_pack_rgb9e5(c), 0u, 0u, 0u));
+}

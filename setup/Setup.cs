@@ -46,9 +46,33 @@ static class Program
     [STAThread]
     static int Main(string[] args)
     {
+        // ((Triforce) Long paths. The manifest's longPathAware (build.ps1) is not enough for .NET Framework's own path checks: an
+        // exe that csc builds has no TargetFramework attribute, is taken as written for 4.0, and keeps the legacy path handling
+        // that refuses 260 characters and more (PathTooLongException, in a test with Windows' LongPathsEnabled on). These two
+        // switches are what 4.6.2 and newer default to; they must be set before any path is looked at (Install's fields below:
+        // System.IO keeps the first value it reads). TRIFORCE_LEGACY_PATHS=1: as before)
+        if (Environment.GetEnvironmentVariable("TRIFORCE_LEGACY_PATHS") != "1")
+        {
+            AppContext.SetSwitch("Switch.System.IO.UseLegacyPathHandling", false);
+            AppContext.SetSwitch("Switch.System.IO.BlockLongPaths", false);
+        }
         try { ServicePointManager.SecurityProtocol |= SecurityProtocolType.Tls12; } catch (Exception) { }
         Install.NoWrites = args.Contains("--snapshot");
-        if (args.Contains("--uninstall")) return Install.Uninstall(args.Contains("--quiet")) ? 0 : 1;
+        // (one Setup at a time for an install, Guard.cs Instance: the folder Setup works in names the lock)
+        var home = Install.InstalledDir ?? Install.SelfDir;
+        if (args.Contains("--uninstall"))
+        {
+            // (not under a Setup that is open: its tools and its build's work folder would go while it uses them)
+            if (!Instance.Take(home, Install.TestRoot))
+            {
+                Log("not uninstalled: Triforce Setup is open for " + home);
+                Instance.CallForward(home, Install.TestRoot);
+                if (!args.Contains("--quiet"))
+                    MessageBox.Show("Triforce Setup is open. Close it, then uninstall again.", "Uninstall Triforce", MessageBoxButton.OK, MessageBoxImage.Information);
+                return 1;
+            }
+            return Install.Uninstall(args.Contains("--quiet")) ? 0 : 1;
+        }
         // (silent install: --install-to <folder> [--no-desktop] [--no-startmenu]; the installed Setup then starts as usual)
         var to = Array.IndexOf(args, "--install-to");
         if (to >= 0 && to + 1 < args.Length)
@@ -76,6 +100,7 @@ static class Program
         var cv = Array.IndexOf(args, "--convert-saves");
         if (cv >= 0 && cv + 2 < args.Length)
         {
+            if (!Instance.Take(home, Install.TestRoot)) { Log("convert-saves: not done, Triforce Setup is open for " + home); return 1; }
             var b = Saves.Copy(args[cv + 1], args[cv + 2], Path.Combine(Install.SelfDir, "save-backups"), "test");
             Log("convert-saves " + args[cv + 1] + " -> " + args[cv + 2] + ", backup " + (b ?? "none"));
             return 0;
@@ -115,6 +140,27 @@ static class Program
         {
             try { Directory.CreateDirectory(unattended!); File.AppendAllText(Path.Combine(unattended!, "error.txt"), e + Environment.NewLine); } catch (Exception) { }
         }
+        // (a second start for the same install must not fetch, build, update or convert saves beside the first: it asks the
+        // first one's window to the front and ends. --snapshot only draws the pages, reading and writing nothing of an install)
+        if (shots < 0)
+            for (var tries = 0; !Instance.Take(home, Install.TestRoot); tries++)
+            {
+                if (Instance.CallForward(home, Install.TestRoot))
+                {
+                    Log("Triforce Setup is already open for " + home + ": its window was asked to the front, and this start ends");
+                    return 0;
+                }
+                // (nobody to ask: the first one is only just starting or closing. In a moment it can be asked, or the folder is free)
+                if (tries >= 30)
+                {
+                    Log("Triforce Setup is already running for " + home + " and does not answer: this start ends");
+                    if (unattended == null)
+                        MessageBox.Show("Triforce Setup is already running, but its window could not be brought to the front.\n\nClose it (in Task Manager: TriforceSetup.exe) and start Triforce again.",
+                            "Triforce Setup", MessageBoxButton.OK, MessageBoxImage.Information);
+                    return 1;
+                }
+                Thread.Sleep(100);
+            }
         var app = new Application { ShutdownMode = ShutdownMode.OnMainWindowClose };
         app.DispatcherUnhandledException += (_, e) =>
         {
@@ -125,6 +171,8 @@ static class Program
         Shell w;
         try { w = new Shell(args); }
         catch (Exception e) when (unattended != null) { Report(e); return 3; }
+        Instance.Listen(() => w.Window.Dispatcher.BeginInvoke(new Action(w.ComeForward)));
+        w.Window.Closed += (_, _) => Instance.Release();   // (a start just after closing finds the folder free)
         return app.Run(w.Window);
     }
 
@@ -247,8 +295,10 @@ static class Install
         if (!Allowed(dir)) throw new InvalidOperationException(TestOnly);
         Directory.CreateDirectory(dir);
         var exe = Path.Combine(dir, Program.SetupAsset);
+        // ((Triforce) through <exe>.partial, renamed into place once complete: a copy cut off in the middle left a Setup that does
+        // not start under the name every shortcut starts. Guard.cs Partial)
         if (!string.Equals(Path.GetFullPath(exe), Path.GetFullPath(Self), StringComparison.OrdinalIgnoreCase))
-            File.Copy(Self, exe, true);
+            Partial.CopyFile(Self, exe);
         Write(UninstallKey, "DisplayName", Program.AppName);
         Write(UninstallKey, "DisplayIcon", exe + ",0");
         Write(UninstallKey, "DisplayVersion", Program.Version);
@@ -359,36 +409,7 @@ sealed class Release
             }
         return r;
     }
-
-    /// A file downloaded with progress (0..1) into place (a .part file until complete)
-    public static async Task Download(HttpClient http, string url, string file, long size, Action<double, long> progress, CancellationToken token)
-    {
-        var part = file + ".part";
-        using (var response = await http.GetAsync(url, HttpCompletionOption.ResponseHeadersRead, token))
-        {
-            response.EnsureSuccessStatusCode();
-            var total = response.Content.Headers.ContentLength ?? size;
-            using var from = await response.Content.ReadAsStreamAsync();
-            using var to = File.Create(part);
-            var buffer = new byte[1 << 20];
-            long have = 0;
-            var shown = DateTime.MinValue;
-            for (int n; (n = await from.ReadAsync(buffer, 0, buffer.Length, token)) > 0;)
-            {
-                await to.WriteAsync(buffer, 0, n, token);
-                have += n;
-                if (DateTime.UtcNow - shown > TimeSpan.FromMilliseconds(150))
-                {
-                    shown = DateTime.UtcNow;
-                    progress(total > 0 ? Math.Min(1.0, (double)have / total) : 0, have);
-                }
-            }
-            if (total > 0 && have != total) throw new IOException("The download ended early (" + (have >> 20) + " of " + (total >> 20) + " MB).");
-            progress(1, have);
-        }
-        if (File.Exists(file)) File.Delete(file);
-        File.Move(part, file);
-    }
+    // (its files are fetched by Guard.cs's Download: through a .part file a cut download goes on from, checked against the size listed here)
 }
 
 /// The Triforce tools beside the installed Setup: nx2/make_game.py and its own Python.
@@ -426,37 +447,78 @@ sealed class Tools
         return null;
     }
 
+    /// What an unpacking that was cut off left behind (Setup closed in the middle of it): a tools.part of up to a gigabyte that is
+    /// never used and stood in the way of the next try's room, and a tools.old whose removal failed
+    public static void Sweep()
+    {
+        try { if (Directory.Exists(Folder + ".part")) Directory.Delete(Folder + ".part", true); } catch (Exception) { }
+        // ((Triforce) Setup closed between the two moves of Unpack: the tools that were there are the rollback point, and go back)
+        try { if (!Directory.Exists(Folder) && Directory.Exists(Folder + ".old")) Directory.Move(Folder + ".old", Folder); } catch (Exception) { }
+        try { if (Directory.Exists(Folder) && Directory.Exists(Folder + ".old")) Directory.Delete(Folder + ".old", true); } catch (Exception) { }
+    }
+
     /// Unpacks Triforce-Tools.zip as the tools folder (the old one replaced only once the new one is complete)
     public static void Unpack(string zip, string tag, Action<double> progress)
     {
         var target = Folder;
         var part = target + ".part";
         if (Directory.Exists(part)) Directory.Delete(part, true);
-        Directory.CreateDirectory(part);
-        using (var z = ZipFile.OpenRead(zip))
+        try
         {
-            // (the zip holds tools/... or the tools' contents at its root)
-            // (and zips packed on Windows may say tools\... instead)
-            var prefix = z.Entries.All(e => e.FullName.Replace('\\', '/').StartsWith("tools/", StringComparison.OrdinalIgnoreCase)) ? "tools/" : "";
-            var full = Path.GetFullPath(part) + Path.DirectorySeparatorChar;
-            for (var i = 0; i < z.Entries.Count; i++)
+            using (var z = ZipFile.OpenRead(zip))
             {
-                var e = z.Entries[i];
-                var name = e.FullName.Replace('\\', '/').Substring(prefix.Length);
-                if (name.Length == 0) continue;
-                var dest = Path.GetFullPath(Path.Combine(part, name));
-                if (!dest.StartsWith(full, StringComparison.OrdinalIgnoreCase)) continue;   // (no paths out of the folder)
-                if (name.EndsWith("/")) { Directory.CreateDirectory(dest); continue; }
-                Directory.CreateDirectory(Path.GetDirectoryName(dest)!);
-                e.ExtractToFile(dest, true);
-                if ((i & 15) == 0) progress((double)i / z.Entries.Count);
+                // (room for all of it, asked before the first file: the zip says what each one unpacks to, and 4 KB are counted for
+                // each on top, since a file takes whole clusters. The tools there now stay until the new ones are complete, so they
+                // make no room. Guard.cs Space)
+                var bytes = z.Entries.Sum(e => e.Length) + z.Entries.Count * 4096L;
+                if (Space.Problem("the Triforce tools", bytes, Space.Free(part), Space.Disk(part)) is { } none) throw new NoRoomException(none);
+                Directory.CreateDirectory(part);
+                // (the zip holds tools/... or the tools' contents at its root)
+                // (and zips packed on Windows may say tools\... instead)
+                var prefix = z.Entries.All(e => e.FullName.Replace('\\', '/').StartsWith("tools/", StringComparison.OrdinalIgnoreCase)) ? "tools/" : "";
+                // ((Triforce) every name is checked before the first file is written, as a mod's archive's are (Mods.Unsafe): a
+                // name Windows keeps for a device (NUL, COM1, con.txt), a colon (a hidden stream, a drive's letter), a name that
+                // ends in a dot or a space (Windows drops them: the file lands under another name), a path out of the folder.
+                // Such a zip is refused whole: a name was only skipped when it left the folder, and the others were written)
+                foreach (var e in z.Entries)
+                {
+                    var name = e.FullName.Replace('\\', '/').Substring(prefix.Length);
+                    if (name.Length > 0 && Mods.Unsafe(name, true) is { } why)
+                        throw new InvalidDataException("The tools' zip holds " + why + " (\"" + (name.Length > 120 ? name.Substring(0, 117) + "..." : name) + "\"): it was not unpacked.");
+                }
+                var full = Path.GetFullPath(part) + Path.DirectorySeparatorChar;
+                for (var i = 0; i < z.Entries.Count; i++)
+                {
+                    var e = z.Entries[i];
+                    var name = e.FullName.Replace('\\', '/').Substring(prefix.Length);
+                    if (name.Length == 0) continue;
+                    var dest = Path.GetFullPath(Path.Combine(part, name));
+                    if (!dest.StartsWith(full, StringComparison.OrdinalIgnoreCase)) continue;   // (no paths out of the folder)
+                    if (name.EndsWith("/")) { Directory.CreateDirectory(dest); continue; }
+                    Directory.CreateDirectory(Path.GetDirectoryName(dest)!);
+                    e.ExtractToFile(dest, true);
+                    if ((i & 15) == 0) progress((double)i / z.Entries.Count);
+                }
             }
+            File.WriteAllText(Path.Combine(part, "version.txt"), tag + "\n");
         }
-        File.WriteAllText(Path.Combine(part, "version.txt"), tag + "\n");
+        catch (Exception)
+        {
+            // (half a tools folder, a gigabyte of it, is of no use and stood in the way of the next try's room)
+            try { if (Directory.Exists(part)) Directory.Delete(part, true); } catch (Exception) { }
+            throw;
+        }
         var old = target + ".old";
         if (Directory.Exists(old)) Directory.Delete(old, true);
         if (Directory.Exists(target)) Directory.Move(target, old);
-        Directory.Move(part, target);
+        try { Directory.Move(part, target); }
+        catch (Exception)
+        {
+            // ((Triforce) the tools that were there go back: a move that failed (a virus scanner holding the new folder) left no
+            // tools folder at all, and the next start found no tools)
+            try { if (!Directory.Exists(target) && Directory.Exists(old)) Directory.Move(old, target); } catch (Exception) { }
+            throw;
+        }
         try { if (Directory.Exists(old)) Directory.Delete(old, true); } catch (Exception) { }
         progress(1);
     }
@@ -531,6 +593,9 @@ sealed class Runner
                     var i = args.IndexOf(name);
                     if (i >= 0 && i + 1 < args.Count && !Install.Allowed(args[i + 1])) { Finished?.Invoke(Install.TestOnly); return; }
                 }
+                // (and it works in its own build folder, the one its uninstall removes. Left to itself make_game.py works in the PC's
+                // real one, %LOCALAPPDATA%\Triforce\build, and begins by stopping whatever build runs there)
+                if (Install.TestRoot != null && !args.Contains("--work")) args.AddRange(new[] { "--work", Path.Combine(Install.TestRoot, "build") });
                 using var p = Process.Start(Info(tools, args, ngxSdk))!;
                 process = p;
                 p.ErrorDataReceived += (_, e) => { if (e.Data != null) Line?.Invoke(e.Data); };

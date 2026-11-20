@@ -33,10 +33,12 @@ def main():
     source = (ROOT / "gpu" / "vk" / "vk_replay.cpp").read_text(encoding="utf-8")
     handles = block(source, "bool handles_unchanged(")
     bufs = block(source, "bool buf_unchanged(")
-    before(source, "case NOP_BIND_TEX:", "case NOP_STENCIL:", "handles_unchanged(", "s.bind_gen++")
-    before(source, "case NOP_BIND_UBO:", "case NOP_BIND_TEX:", "buf_unchanged(", "s.bind_gen++")
-    before(source, "case NOP_BIND_BUFS:", "case NOP_BIND_UBO:", "buf_unchanged(", "s.bind_gen++")
-    before(source, "case NOP_BIND_PROGRAM:", "case NOP_BIND_STATE:", "std::memcmp(&s.prog", "s.bind_gen++")
+    # ((Triforce) in the replay's walk: other functions list the same ops, mesh_run_kind and gate_kind)
+    walk = block(source, "void replay(VkCommandBuffer& cmd, NvnState& s, const uint8_t* p, const uint8_t* end = nullptr) {")
+    before(walk, "case NOP_BIND_TEX:", "case NOP_STENCIL:", "handles_unchanged(", "s.bind_gen++")
+    before(walk, "case NOP_BIND_UBO:", "case NOP_BIND_TEX:", "buf_unchanged(", "s.bind_gen++")
+    before(walk, "case NOP_BIND_BUFS:", "case NOP_BIND_UBO:", "buf_unchanged(", "s.bind_gen++")
+    before(walk, "case NOP_BIND_PROGRAM:", "case NOP_BIND_STATE:", "std::memcmp(&s.prog", "s.bind_gen++")
     fixture = f'''#include <cstdint>
 #include <cstdio>
 #include <cstdlib>

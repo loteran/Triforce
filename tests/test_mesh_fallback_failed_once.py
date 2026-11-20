@@ -34,7 +34,9 @@ def main():
     create = body.index("guarded_compute(")
     if check < 0 or not lock < check < create:
         raise SystemExit("a program that failed is compiled again: the check must come under the lock, before guarded_compute")
-    failure = block(body, "&made[i]); r != VK_SUCCESS) {")
+    # ((Triforce) a stage whose module could not be made, vk_shader.h StageModule, is a failure like one the driver reports:
+    # the same block remembers it)
+    failure = block(body, "si.module ? guarded_compute(pcache_use().cache, &ci, &made[i]) : VK_ERROR_UNKNOWN; r != VK_SUCCESS) {")
     if "failed.insert({p.key, p.variant});" not in failure:
         raise SystemExit("a failed compute pipeline is not remembered")
     if failure.index("failed.insert") > failure.index("return false;"):

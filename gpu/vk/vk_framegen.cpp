@@ -11,6 +11,8 @@
 // Where it cannot run, at 2x AMD FSR 3.1 frame generation through AMD's own FidelityFX library makes them (vk_ffx_fg.h, framegen_engine.h):
 // its swapchain presents the made frame itself, so none of the steps above run for it and the display thread shows nothing;
 // framegen_engine_tick switches the swapchain, with the display thread drained, when the choice changes.
+// (Triforce) Unless RX_VK_FRAMEGEN_FINE=0, the vectors of 2. are only the start (fine_vectors): one per 8x8 pixels, to a
+// fraction of a pixel (fg_half, fg_fine_flow, fg_fine_pick), and 3. picks one motion per pixel (fg_fine_synth).
 // Recorded into the present's own recording, after the game's work; the display thread shows the made frames and
 // then the game's, evenly over the game's recent frame time, about one frame behind the game. Loading hitches
 // (frames over 100 ms apart) are not interpolated.
@@ -26,17 +28,25 @@
 #include <cmath>
 
 #include "vk_framegen.h"
+#include "framegen_rows.h"    // (Triforce: the Frame generation row's values, AMD FSR 4 among them)
+#include "vk_dlssg.h"
 #include "vk_ffx_fg.h"   // (AMD FSR 3.1 frame generation through AMD's library, and its swapchain)
 #include "vk_fsr3_inputs.h"   // (AMD FSR 3.1 frame interpolation's depth and motion)
 #include "vk_fsr3fi.h"
+#include "vk_fsr4.h"          // (Triforce: AMD FSR 4's frame generation, fsr4fg)
 #include "vk_dlss.h"   // (dlss_fg_why: why DLSS Frame Generation is not the one making the frames)
 #include "vk_menu.h"
 #include "vk_ngxfg.h"   // (NVIDIA DLSS Frame Generation)
+#include "vk_pace.h"           // (Triforce: whether RivaTuner holds the frames this thread presents)
 #include "vk_present_rect.h"
 #include "vk_texture.h"
 
 #include "shaders/fg_copy_comp_spv.h"
+#include "shaders/fg_fine_flow_comp_spv.h"
+#include "shaders/fg_fine_pick_comp_spv.h"
+#include "shaders/fg_fine_synth_comp_spv.h"
 #include "shaders/fg_flow_comp_spv.h"
+#include "shaders/fg_half_comp_spv.h"
 #include "shaders/fg_luma_comp_spv.h"
 #include "shaders/fg_median_comp_spv.h"
 #include "shaders/fg_scale_comp_spv.h"
@@ -53,6 +63,7 @@
 namespace mkwvk {
 int display_refresh_mhz();   // (vk_main.cpp: the window's display, mHz; outside the unnamed namespace, where it is defined)
 extern std::atomic<uint32_t> present_kind;   // (vk_replay.cpp: the frame log's)
+extern std::atomic<bool> present_native_pq;  // (vk_replay.cpp: the game's picture is HDR10 codes, HDR Native)
 namespace {
 
 constexpr int kMaxMult = 8;   // (up to 8x: players asked; the made frames are allocated for the multiplier chosen only)
@@ -76,6 +87,12 @@ struct Job {
     OutSet* set;
     int64_t at;
     uint64_t value;   // (the recording that makes its frames)
+    // ((Triforce) set null: the held picture of the hold of the last picture, shown once: framegen_queue_held)
+    VkImage held = VK_NULL_HANDLE;
+    VkImageView held_view = VK_NULL_HANDLE;
+    uint32_t held_w = 0, held_h = 0;
+    int crop[4] = {0, 0, 0, 0};
+    bool has_crop = false;
 };
 struct Pipe {
     VkDescriptorSetLayout set = VK_NULL_HANDLE;
@@ -88,8 +105,10 @@ struct State {
     std::atomic<bool> failed{false};   // also read by Reflex's game-thread eligibility check
     uint32_t w = 0, h = 0;
     Pipe copy, luma, flow, median, synth;
+    Pipe half, fine_flow, fine_pick, fine_synth;   // ((Triforce) the fine vectors: fine_vectors(); null in the old way)
     VkSampler nearest = VK_NULL_HANDLE, linear = VK_NULL_HANDLE;
     Img frames[2], lumas[2], flows[2];
+    Img halfs[2], fines[2];   // ((Triforce) the fine vectors': each frame's half-size luma; the vectors, made and picked)
     OutSet sets[3];   // (one shown, one waiting its place on the line, one being made: the pacer never holds the game back)
     int cur = 0, next_set = 0;
     bool have_prev = false;
@@ -127,6 +146,22 @@ int64_t now_ns() {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
+// (Triforce) The fine vectors (shaders/fg_fine_*.comp), the way the frames are made unless RX_VK_FRAMEGEN_FINE=0. The old
+// way (fg_flow, fg_median, fg_synth) moved each pixel by a blend of the vectors of the four 16x16 blocks around it, each a
+// whole number of quarter-size texels, 4 pixels: a straight line moving 6 pixels was moved 4 by some blocks and 8 by others
+// and came out bent and broken, where the two frames disagreed a pixel took the nearer frame unmoved beside its moved
+// neighbours, and a pixel alike in both frames was taken as still, so a thin line moving over a plain surface was not
+// drawn at all between the game's frames ("frame gen makes straight line geometry look much worse", the owner, on 4K and
+// ultrawide, where a block is 64 screen pixels). tests/test_framegen_lines.py measures both ways on moving lines. Read once
+bool fine_vectors() {
+    static const bool on = !getenv("RX_VK_FRAMEGEN_FINE") || atoi(getenv("RX_VK_FRAMEGEN_FINE")) != 0;
+    return on;
+}
+// (how much the coarse search's vector must earn its length, fg_flow.comp's BIAS: 1 in the old way; the fine vectors'
+// blocks try the coarse vectors of the blocks around on their own pixels, and less of a pull to none found the motion
+// of a plain surface more often. tests/test_framegen_lines.py runs with this value)
+constexpr float kFineBias = 0.3f;
+
 // (hookshot) Frame generation's Auto (the menu's 1): a frame for each refresh of the display, no more. Each game frame
 // is given the display's refreshes that fall between it and the game's frame before (on the game's own timeline, a
 // refresh period apart), and each of them a frame made at its place between the two: 45 fps on a 60 Hz display makes one
@@ -139,6 +174,7 @@ int auto_cap() {
     return std::clamp(hz > 0 ? (hz + 29) / 30 : 2, 2, 4);
 }
 int multiplier() {   // (the Insert menu; 1 Auto (its most); the game's frames alone at 0)
+    if (opts.framegen == framegen_rows::FSR4) return 2;   // (Triforce: AMD FSR 4, the row's last choice: one made frame)
     return opts.framegen == 1 ? auto_cap() : std::clamp(opts.framegen, 1, kMaxMult);
 }
 /// Auto: the display's refreshes in the game frame's interval (last, now], next the first not given a frame yet (moved
@@ -215,7 +251,8 @@ bool make_pipe(Pipe& p, const uint32_t* code, size_t bytes, std::initializer_lis
 
 // The optional interpolation is disabled after setup fails: retain none of its unused setup objects.
 void drop_setup() {
-    for (Pipe* p : {&fg.copy, &fg.luma, &fg.flow, &fg.median, &fg.synth}) drop_pipe(*p);
+    for (Pipe* p : {&fg.copy, &fg.luma, &fg.flow, &fg.median, &fg.synth, &fg.half, &fg.fine_flow, &fg.fine_pick, &fg.fine_synth})
+        drop_pipe(*p);
     if (fg.nearest) vkDestroySampler(dev.device, fg.nearest, nullptr);
     if (fg.linear) vkDestroySampler(dev.device, fg.linear, nullptr);
     fg.nearest = fg.linear = VK_NULL_HANDLE;
@@ -229,13 +266,21 @@ bool init() {
     if (!dev.push_descriptor || !vkCmdPushDescriptorSetKHR) return false;
     const VkDescriptorType S = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, I = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
     const int radius = getenv("RX_VK_FRAMEGEN_RADIUS") ? std::clamp(atoi(getenv("RX_VK_FRAMEGEN_RADIUS")), 1, 16) : 8;
-    const VkSpecializationMapEntry me{0, 0, 4};
-    const VkSpecializationInfo spec{1, &me, 4, &radius};
+    const bool fine = fine_vectors();
+    const struct { int radius; float bias; } sc{radius, fine ? kFineBias : 1.0f};   // (fg_flow.comp's RADIUS and BIAS)
+    const VkSpecializationMapEntry me[2] = {{0, 0, 4}, {1, 4, 4}};
+    const VkSpecializationInfo spec{2, me, sizeof sc, &sc};
     if (!make_pipe(fg.copy, FG_COPY_COMP_SPV, sizeof FG_COPY_COMP_SPV, {S, I}, 16) ||
         !make_pipe(fg.luma, FG_LUMA_COMP_SPV, sizeof FG_LUMA_COMP_SPV, {S, I}, 0) ||
         !make_pipe(fg.flow, FG_FLOW_COMP_SPV, sizeof FG_FLOW_COMP_SPV, {S, S, I}, 0, &spec) ||
-        !make_pipe(fg.median, FG_MEDIAN_COMP_SPV, sizeof FG_MEDIAN_COMP_SPV, {S, I}, 0) ||
-        !make_pipe(fg.synth, FG_SYNTH_COMP_SPV, sizeof FG_SYNTH_COMP_SPV, {S, S, S, I}, 4))
+        !make_pipe(fg.median, FG_MEDIAN_COMP_SPV, sizeof FG_MEDIAN_COMP_SPV, {S, I}, 0))
+        return undo();
+    // ((Triforce) the fine vectors' passes in place of fg_synth's, or fg_synth's alone in the old way)
+    if (fine ? !make_pipe(fg.half, FG_HALF_COMP_SPV, sizeof FG_HALF_COMP_SPV, {S, I}, 0) ||
+                   !make_pipe(fg.fine_flow, FG_FINE_FLOW_COMP_SPV, sizeof FG_FINE_FLOW_COMP_SPV, {S, S, S, S, I, S, S}, 0) ||
+                   !make_pipe(fg.fine_pick, FG_FINE_PICK_COMP_SPV, sizeof FG_FINE_PICK_COMP_SPV, {S, S, S, I}, 0) ||
+                   !make_pipe(fg.fine_synth, FG_FINE_SYNTH_COMP_SPV, sizeof FG_FINE_SYNTH_COMP_SPV, {S, S, S, I}, 4)
+             : !make_pipe(fg.synth, FG_SYNTH_COMP_SPV, sizeof FG_SYNTH_COMP_SPV, {S, S, S, I}, 4))
         return undo();
     VkSamplerCreateInfo si{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
     si.addressModeU = si.addressModeV = si.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
@@ -255,6 +300,8 @@ bool init() {
              (display_refresh_mhz() + 500) / 1000, multiplier());
     else
         logf("vk: frame interpolation ready: %dx the game's frames (made from its last two, shown evenly)", multiplier());
+    logf("vk: frame interpolation: %s", fine ? "fine vectors, one per 8x8 pixels (RX_VK_FRAMEGEN_FINE=0: the old 16x16 blocks)"
+                                             : "the old vectors, one per 16x16 pixels (RX_VK_FRAMEGEN_FINE=0)");
     return true;
 }
 
@@ -334,6 +381,7 @@ void to_general(VkCommandBuffer cmd, VkImage image) {
 void drop_size() {
     for (int i = 0; i < 2; i++) {
         drop_img(fg.frames[i]), drop_img(fg.lumas[i]), drop_img(fg.flows[i]);
+        drop_img(fg.halfs[i]), drop_img(fg.fines[i]);
     }
     for (OutSet& set : fg.sets)
         for (Img& t : set.frame) drop_img(t);
@@ -362,6 +410,10 @@ bool ensure_size(VkCommandBuffer cmd, uint32_t w, uint32_t h) {
         ok = ok && make_img(fg.frames[i], w, h, VK_FORMAT_R8G8B8A8_UNORM, rw | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
         ok = ok && make_img(fg.lumas[i], qw, qh, VK_FORMAT_R16_SFLOAT, rw);
         ok = ok && make_img(fg.flows[i], cw, ch, VK_FORMAT_R16G16B16A16_SFLOAT, rw);
+        if (fine_vectors()) {   // ((Triforce) the fine vectors': half-size luma, a vector per 8x8 pixels)
+            ok = ok && make_img(fg.halfs[i], (w + 1) / 2, (h + 1) / 2, VK_FORMAT_R16_SFLOAT, rw);
+            ok = ok && make_img(fg.fines[i], (w + 7) / 8, (h + 7) / 8, VK_FORMAT_R16G16B16A16_SFLOAT, rw);
+        }
     }
     const int mult = multiplier();
     for (OutSet& set : fg.sets)
@@ -379,6 +431,7 @@ bool ensure_size(VkCommandBuffer cmd, uint32_t w, uint32_t h) {
     fg.w = w, fg.h = h, fg.mult = mult;
     for (int i = 0; i < 2; i++) {
         to_general(cmd, fg.frames[i].image), to_general(cmd, fg.lumas[i].image), to_general(cmd, fg.flows[i].image);
+        if (fg.halfs[i].image) to_general(cmd, fg.halfs[i].image), to_general(cmd, fg.fines[i].image);
     }
     for (OutSet& set : fg.sets)
         for (Img& t : set.frame)
@@ -409,6 +462,37 @@ void pass(VkCommandBuffer cmd, const Pipe& p, std::initializer_list<std::pair<Vk
     full_barrier(cmd);
 }
 
+/// The vectors from the frame before (prev) to this one (cur), w x h: one per 16x16 pixels (fg_flow, fg_median: flows[1]),
+/// and (Triforce) with the fine vectors one per 8x8 from those (fg_fine_flow, then fg_fine_pick twice: fines[0])
+void make_vectors(VkCommandBuffer cmd, int prev, int cur, uint32_t w, uint32_t h) {
+    const uint32_t qw = (w + 3) / 4, qh = (h + 3) / 4, cw = (qw + 3) / 4, ch = (qh + 3) / 4;
+    pass(cmd, fg.flow, {{fg.lumas[prev].view, fg.nearest}, {fg.lumas[cur].view, fg.nearest}, {fg.flows[0].view, VK_NULL_HANDLE}},
+         cw, ch);
+    pass(cmd, fg.median, {{fg.flows[0].view, fg.nearest}, {fg.flows[1].view, VK_NULL_HANDLE}}, cw, ch);
+    if (!fg.fine_flow.pipe) return;
+    const uint32_t fw = (w + 7) / 8, fh = (h + 7) / 8;
+    pass(cmd, fg.fine_flow, {{fg.halfs[prev].view, fg.nearest}, {fg.halfs[cur].view, fg.nearest}, {fg.flows[1].view, fg.nearest},
+                             {fg.flows[0].view, fg.nearest}, {fg.fines[0].view, VK_NULL_HANDLE},
+                             {fg.frames[prev].view, fg.linear}, {fg.frames[cur].view, fg.linear}},
+         fw, fh);
+    for (int i = 0; i < 2; i++)
+        pass(cmd, fg.fine_pick, {{fg.frames[prev].view, fg.linear}, {fg.frames[cur].view, fg.linear},
+                                 {fg.fines[i].view, fg.nearest}, {fg.fines[i ^ 1].view, VK_NULL_HANDLE}},
+             fw, fh);
+}
+
+/// The frame at t between the frame before and this one into out, w x h, from make_vectors' vectors
+void make_frame(VkCommandBuffer cmd, int prev, int cur, const Img& out, float t, uint32_t w, uint32_t h) {
+    if (fg.fine_synth.pipe)
+        pass(cmd, fg.fine_synth, {{fg.frames[prev].view, fg.linear}, {fg.frames[cur].view, fg.linear},
+                                  {fg.fines[0].view, fg.nearest}, {out.view, VK_NULL_HANDLE}},
+             w, h, &t, 4);
+    else
+        pass(cmd, fg.synth, {{fg.frames[prev].view, fg.linear}, {fg.frames[cur].view, fg.linear},
+                             {fg.flows[1].view, fg.nearest}, {out.view, VK_NULL_HANDLE}},
+             w, h, &t, 4);
+}
+
 // (hookshot) The display thread's wait for a frame's time, on a high-resolution timer. sleep_for rests on the system timer,
 // whose 1 ms (timeBeginPeriod) Windows 11 does not keep for a process whose window it takes as unseen: with the presents
 // no longer blocking (a present queue of their own) the thread slept before most frames and woke up to 20 ms after their time.
@@ -437,6 +521,17 @@ void display_main() {
             fg.cv.wait(lk, [] { return !fg.jobs.empty(); });
             j = fg.jobs.front();
             fg.jobs.pop_front();
+            // (Triforce) framegen_record waits for this while RivaTuner holds the presents: the next frame is recorded while
+            // this one's are shown, not after them
+            if (pace::display_yields()) fg.cv.notify_all();
+        }
+        if (!j.set) {
+            // (Triforce) the held picture again (the hold of the last picture), after the frames before it: no made frame, not a
+            // game frame for the counter, and the frames' spacing measured afresh after it
+            present_kind.store(0);
+            present_image(j.held, j.held_w, j.held_h, j.has_crop ? j.crop : nullptr, j.held_view);
+            last_at = 0;
+            continue;
         }
         if (last_at) {
             const int64_t d = j.at - last_at;
@@ -454,7 +549,10 @@ void display_main() {
         // was the stutter, whatever the frame rate. Every frame now has its place on an even line, the recent frame time
         // apart, a frame early waiting for it: never more than one game frame behind what the game handed over, and a line
         // that has fallen behind what came starts again from now. RX_VK_PACE=0: as they come.
-        const bool pace = opts.pace != 0;
+        // (Triforce) Not while RivaTuner Statistics Server holds these presents (vk_pace.cpp, pace_rule.h): its limiter spaces
+        // them, and this pacer, which spaces them by the game's frame time as it measures it, would be measuring RivaTuner's
+        // own spacing and could only fall behind it. Each frame then goes to its present at once, where RivaTuner holds it
+        const bool pace = opts.pace != 0 && !pace::display_yields();
         const bool timed = j.set->shown >= 0;   // (Auto: each frame at its own refresh's time)
         const int shown = timed ? j.set->shown : j.set->made + 1;
         const int64_t step = interval / std::max(shown, 1);
@@ -494,9 +592,12 @@ bool framegen_wanted(int menu_value, int allow) {
     return allow && menu_value >= 1;   // (1: Auto)
 }
 
+int framegen_multiplier() { return !framegen_on() ? 0 : opts.framegen == 1 ? -1 : multiplier(); }
+
 bool framegen_on() {
     static const int allow = !getenv("RX_VK_FRAMEGEN") || atoi(getenv("RX_VK_FRAMEGEN")) != 0;
-    return framegen_wanted(opts.framegen, allow) && !dev.offscreen && !fg.failed;
+    // (Triforce: not beside NVIDIA DLSS frame generation, whose frames go in at the present itself: vk_dlssg.cpp)
+    return framegen_wanted(opts.framegen, allow) && !dev.offscreen && !fg.failed && !dlssg::active();
 }
 
 /// The engine that makes the made frames for a Frame generation row value, from what is live now (framegen_engine.h's order); no side
@@ -525,8 +626,13 @@ std::atomic<bool> wide_possible{false};   // (a margin and the setting on: vk_re
 WideSides wide_sides() {
     WideSides w;
     if (!host || !host->wide_menus) return w;
-    // (KEEP_VTABLES 1 and 3: the pause and map menus. 0, the item wheel's background, and 2, the fades, keep covering the whole picture)
-    constexpr uint32_t kMenus = 0xa;
+    // (KEEP_VTABLES 1: the pause and system menus' background. 0, the item wheel's background, and 2 and 3, the event and
+    // the loading fade, keep covering the whole picture.
+    // (Triforce) This was 0xa: bit 3 was taken for a menu's, and it is the loading fade (host/oot_wide_hud.h's table). So
+    // with the row on Centred a loading fade covered the middle 16:9 alone: the picture showed at its left and right while
+    // a place loaded, sharp while the world was still drawn under the fade and out of focus after. A fade is one colour and
+    // has to cover the whole picture, as NX2navi's widescreen keeps both fades whole at every setting)
+    constexpr uint32_t kMenus = 0x2;
     const float margin = host->wide_menus(opts.wide_menus ? 0xfu & ~kMenus : 0xfu);
     extern std::atomic<int64_t> world_drawn_at;
     extern int64_t presents_now;
@@ -798,6 +904,37 @@ bool dlssg_frames(VkCommandBuffer cmd, OutSet& set, const int* slots, int count,
 
 }  // namespace
 
+/// (Triforce) The made frame of the row's AMD FSR 4, by AMD's frame generation library (vk_fsr4.h fsr4fg) from this frame's
+/// picture and the scene's depth, motion and camera (vk_fsr3_inputs.h, as FSR 3.1's above). MADE: it is in set.frame[0].
+/// SKIP: the library was given the frame as a new history (the first frame, a gap, a camera cut) and no frame is to be made
+/// between two pictures that do not follow each other. OWN: it did not take the present (no scene in it, not available,
+/// failed), which leaves the set to the interpolation below, as a 2x. blend: the frame before is there to make a frame from
+framegen_rows::Made fsr4_frame(VkCommandBuffer cmd, OutSet& set, int cur, uint32_t uw, uint32_t uh, uint64_t sequence, bool blend) {
+    if (!fsr4fg::frames_wanted()) return framegen_rows::OWN;
+    fsr3_inputs::Frame f;
+    if (!fsr3_inputs::take(f) || !f.depth_image || !f.motion_image) return framegen_rows::OWN;
+    fsr4fg::Inputs in;
+    in.color = fg.frames[cur].image;   // (R8G8B8A8_UNORM: ensure_size)
+    in.width = uw, in.height = uh;
+    in.pq = present_native_pq.load(std::memory_order_relaxed);
+    in.peak_nits = (float)std::clamp(opts.hdr_peak, 400, 10000);
+    in.depth = f.depth_image, in.motion = f.motion_image;
+    in.render_width = f.width, in.render_height = f.height;
+    in.jitter[0] = f.jitter[0], in.jitter[1] = f.jitter[1];
+    in.near_plane = f.camera.near_plane, in.far_plane = f.camera.far_plane, in.fov_y = f.camera.fov_y;
+    std::memcpy(in.view, f.view, sizeof in.view);
+    in.frame_ms = f.frame_ms;
+    in.reset = f.reset || !blend;
+    in.sequence = sequence;
+    const framegen_rows::Made made = fsr4fg::generate(cmd, in);
+    const VkImage image = made == framegen_rows::MADE ? fsr4fg::made_image() : VK_NULL_HANDLE;
+    if (made != framegen_rows::MADE || !image) return made == framegen_rows::SKIP ? framegen_rows::SKIP : framegen_rows::OWN;
+    const VkImageCopy c{{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0},
+                        {uw, uh, 1}};
+    vkCmdCopyImage(cmd, image, VK_IMAGE_LAYOUT_GENERAL, set.frame[0].image, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
+    return framegen_rows::MADE;
+}
+
 bool framegen_record(VkCommandBuffer cmd, VkImageView src, uint32_t sw, uint32_t sh, const int crop[4]) {
     const PresentSourceRect source = present_source_rect(sw, sh, crop);
     const int x0 = (int)source.x, y0 = (int)source.y, w = (int)source.w, h = (int)source.h;
@@ -814,7 +951,10 @@ bool framegen_record(VkCommandBuffer cmd, VkImageView src, uint32_t sw, uint32_t
     OutSet* set;
     {
         std::unique_lock lk(fg.mu);
-        fg.cv.wait(lk, [] { return !fg.sets[fg.next_set].busy; });
+        // (Triforce) While RivaTuner holds the presents, this wait is what holds the game: the display thread takes the
+        // game's frames at the cap, and a frame is recorded only once the one before has been taken up, so the game runs
+        // one frame ahead of what is shown, as with the game's own wait, not three (a set shown, one waiting, one made)
+        fg.cv.wait(lk, [] { return !fg.sets[fg.next_set].busy && (!pace::display_yields() || fg.jobs.empty()); });
         set = &fg.sets[fg.next_set];
         set->busy = true;
         fg.next_set = (fg.next_set + 1) % 3;
@@ -824,11 +964,13 @@ bool framegen_record(VkCommandBuffer cmd, VkImageView src, uint32_t sw, uint32_t
     static uint64_t sequence = 0;
     sequence++;
     const uint32_t uw = (uint32_t)w, uh = (uint32_t)h;
-    const uint32_t qw = (uw + 3) / 4, qh = (uh + 3) / 4, cw = (qw + 3) / 4, ch = (qh + 3) / 4;
+    const uint32_t qw = (uw + 3) / 4, qh = (uh + 3) / 4;
     full_barrier(cmd);
     const int32_t pc[4] = {x0, y0, w, h};
     pass(cmd, fg.copy, {{src, fg.nearest}, {fg.frames[cur].view, VK_NULL_HANDLE}}, uw, uh, pc, sizeof pc);
     pass(cmd, fg.luma, {{fg.frames[cur].view, fg.nearest}, {fg.lumas[cur].view, VK_NULL_HANDLE}}, qw, qh);
+    if (fg.half.pipe)   // ((Triforce) the fine vectors' half-size luma)
+        pass(cmd, fg.half, {{fg.frames[cur].view, fg.nearest}, {fg.halfs[cur].view, VK_NULL_HANDLE}}, (uw + 1) / 2, (uh + 1) / 2);
     set->made = 0;
     set->shown = -1;
     if (opts.framegen == 1) {   // (Auto: a frame for each of the display's refreshes, at its own time)
@@ -877,15 +1019,8 @@ bool framegen_record(VkCommandBuffer cmd, VkImageView src, uint32_t sw, uint32_t
                                VK_IMAGE_LAYOUT_GENERAL, 1, &c);
                 continue;
             }
-            if (!flow) {
-                flow = true;
-                pass(cmd, fg.flow, {{fg.lumas[prev].view, fg.nearest}, {fg.lumas[cur].view, fg.nearest},
-                                    {fg.flows[0].view, VK_NULL_HANDLE}}, cw, ch);
-                pass(cmd, fg.median, {{fg.flows[0].view, fg.nearest}, {fg.flows[1].view, VK_NULL_HANDLE}}, cw, ch);
-            }
-            pass(cmd, fg.synth, {{fg.frames[prev].view, fg.linear}, {fg.frames[cur].view, fg.linear},
-                                 {fg.flows[1].view, fg.nearest}, {set->frame[k].view, VK_NULL_HANDLE}},
-                 uw, uh, &t[k], 4);
+            if (!flow) flow = true, make_vectors(cmd, prev, cur, uw, uh);
+            make_frame(cmd, prev, cur, set->frame[k], t[k], uw, uh);
         }
         set->shown = n;
         set->made = n > 0 && !set->game[n - 1] ? n : std::max(0, n - 1);   // (for framegen_made_image: any made)
@@ -916,17 +1051,19 @@ bool framegen_record(VkCommandBuffer cmd, VkImageView src, uint32_t sw, uint32_t
     }
     // (hookshot) At 2x, AMD FSR 3.1's frame interpolation where it runs; it makes the midpoint only, so 3x and more (and Auto,
     // above) stay with the interpolation below, as does any present it does not take
-    if (set->made == 0 && !only_nvidia && blend && m == 2 && fsr3fi::frames_wanted()) set->made = fsr3fi_frame(cmd, *set, cur, uw, uh, sequence);
-    if (set->made == 0 && !only_nvidia && blend && m > 1) {
-        pass(cmd, fg.flow, {{fg.lumas[prev].view, fg.nearest}, {fg.lumas[cur].view, fg.nearest},
-                            {fg.flows[0].view, VK_NULL_HANDLE}}, cw, ch);
-        pass(cmd, fg.median, {{fg.flows[0].view, fg.nearest}, {fg.flows[1].view, VK_NULL_HANDLE}}, cw, ch);
-        for (int k = 1; k < m; k++) {
-            const float t = (float)k / (float)m;
-            pass(cmd, fg.synth, {{fg.frames[prev].view, fg.linear}, {fg.frames[cur].view, fg.linear},
-                                 {fg.flows[1].view, fg.nearest}, {set->frame[k - 1].view, VK_NULL_HANDLE}},
-                 uw, uh, &t, 4);
-        }
+    // (Triforce) The row's AMD FSR 4 (Windows only: AMD's library makes that one frame where it can). It is given every frame, one
+    // with nothing before it too (its history starts there); at a new history it makes none and none is blended in its place
+    // (RX_VK_FRAMEGEN_VENDOR=nvidia: nothing but DLSS Frame Generation makes frames, so none is made below either)
+    bool none = only_nvidia;
+    if (opts.framegen == framegen_rows::FSR4) {
+        const framegen_rows::Made by_fsr4 = fsr4_frame(cmd, *set, cur, uw, uh, sequence, blend);
+        set->made = blend && by_fsr4 == framegen_rows::MADE ? 1 : 0;
+        none = none || by_fsr4 == framegen_rows::SKIP;
+    }
+    if (set->made == 0 && !none && blend && m == 2 && fsr3fi::frames_wanted()) set->made = fsr3fi_frame(cmd, *set, cur, uw, uh, sequence);
+    if (set->made == 0 && !none && blend && m > 1) {
+        make_vectors(cmd, prev, cur, uw, uh);
+        for (int k = 1; k < m; k++) make_frame(cmd, prev, cur, set->frame[k - 1], (float)k / (float)m, uw, uh);
         set->made = m - 1;
     }
     const VkImageCopy c{{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0},
@@ -947,6 +1084,27 @@ void framegen_queue(uint64_t value) {
     fg.jobs.push_back({fg.recorded, fg.recorded_at, value});
     fg.recorded = nullptr;
     fg.cv.notify_all();
+}
+
+void framegen_queue_held(VkImage image, VkImageView view, uint32_t w, uint32_t h, const int crop[4]) {
+    if (!image || !fg.thread_started) return;   // (no display thread yet: nothing of the game's was shown through it)
+    std::lock_guard lk(fg.mu);
+    int waiting = 0;
+    for (const Job& j : fg.jobs) waiting += !j.set;
+    if (waiting >= 2) return;   // (the display thread behind: the picture it will show is the same one)
+    Job j{nullptr, now_ns(), 0};
+    j.held = image, j.held_view = view, j.held_w = w, j.held_h = h;
+    if (crop) std::memcpy(j.crop, crop, sizeof j.crop), j.has_crop = true;
+    fg.jobs.push_back(j);
+    fg.cv.notify_all();
+}
+
+void framegen_new_history() {
+    // (blend comes out false at the next framegen_record, as after a gap: no frame between this one and the one before the
+    // hold, the Auto timeline started at it, AMD FSR 4 given it as a new history; FSR 3.1, not called then, finds a gap in the
+    // presents' sequence after it. The game's frame time is measured afresh)
+    fg.have_prev = false;
+    fg.last_at = 0;
 }
 
 /// Each present (vk_replay.cpp): ultrawide's menu setting to the game's side, and the sides to treat now
@@ -995,5 +1153,12 @@ void framegen_engine_tick() {
         ffxfg::set_target(want);
     }
 }
+/// (Triforce) Each present (vk_replay.cpp), outside framegen_record's recording: what frame generation holds and no longer
+/// uses is let go (AMD FSR 4's context once the row has left it, or after its failure: vk_fsr4.h)
+void framegen_present_tick() { fsr4fg::present_tick(); }
+
+/// (Triforce) The process is about to exit (HOS_OPT_EXITING, host/hos_relaunch.c): AMD's frame generation library is not
+/// called from here on (vk_fsr4.h fsr4fg::exiting; framegen_rows.h teardown says why that is all there is to do)
+void framegen_exiting() { fsr4fg::exiting(); }
 
 } // namespace mkwvk

@@ -28,7 +28,9 @@ def main():
             raise SystemExit("the menu lost a mouse row: " + row)
     if "id == 7 ? opts.mouse_sens" not in replay or "id == 8 ? opts.mouse_invert" not in replay:
         raise SystemExit("options 7 and 8 do not reach the host")
-    if "t.option_set = menu_option_set" not in replay or "void (*option_set)(int id, int value);" not in api:
+    sets = "t.option_set = menu_option_set" in replay or ("t.option_set = [](int id, int value) {" in replay
+                                                          and "        menu_option_set(id, value);" in replay)
+    if not sets or "void (*option_set)(int id, int value);" not in api:
         raise SystemExit("the host cannot change the menu's sensitivity")
     if "vk->option_set(id, value)" not in backend:
         raise SystemExit("rx_option_set does not reach the renderer")

@@ -97,7 +97,7 @@ $cscArgs = @('/nologo', '/target:winexe', '/langversion:latest', '/nullable:enab
              "/out:$exe", "/win32icon:$gen\triforce.ico", "/win32manifest:$gen\app.manifest", '/nowarn:CS8618,CS8632,CS1701,CS1702')
 $cscArgs += $refs | ForEach-Object { "/reference:$_" }
 $cscArgs += "/resource:$here\Main.xaml,Main.xaml", "/resource:$gen\triforce.png,triforce.png", "/resource:$gen\icon.png,icon.png"
-$cscArgs += "$here\Setup.cs", "$here\Shell.cs", "$here\Shell.Home.cs", "$here\Shell.Saves.cs", "$here\Shell.Test.cs", "$here\Stage.cs", "$here\Art.cs", "$here\Look.cs", "$here\Saves.cs", "$here\Strings.cs", "$gen\AssemblyInfo.cs"
+$cscArgs += "$here\Setup.cs", "$here\Guard.cs", "$here\Shell.cs", "$here\Shell.Home.cs", "$here\Shell.Saves.cs", "$here\Shell.Mods.cs", "$here\Shell.Steam.cs", "$here\Shell.Sounds.cs", "$here\Shell.Test.cs", "$here\Stage.cs", "$here\Art.cs", "$here\Look.cs", "$here\Saves.cs", "$here\Mods.cs", "$here\Steam.cs", "$here\SteamArt.cs", "$here\Sound.cs", "$here\Strings.cs", "$gen\AssemblyInfo.cs"
 & $csc @cscArgs
 if ($LASTEXITCODE -ne 0) { throw "csc failed ($LASTEXITCODE)" }
 "built $exe ($Version, {0:N0} KB)" -f ((Get-Item $exe).Length / 1KB)

@@ -15,10 +15,15 @@
 //
 // Not ported: the anti-aliasing and reconstruction shaders (Hookshot's own upscalers stand where they would go), the local
 // exposure and SDR scene permutations, and the RGBA16F scene target the addon asks the game for.
+//
+// (Triforce) RenoDRT and the gamma correction, which NX2navi's HDR has and RenoDX's mod does not: the scene shaders and the
+// encoder are compiled together with Triforce's own gpu/vk/shaders/renodx_glue (scripts/renodx_shaders.py GLUE), which reads
+// what the mod's settings have no place for from binding 5 of the same set (Extra below). fill_settings maps the rows.
 // RX_VK_RENODX=0: off, the game's own shaders. RX_VK_RENODX_TRACE=1: every 1200th frame's draws by fragment module.
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -48,13 +53,18 @@ struct Injection {
     float adaptation_target, adaptation_min_stops, adaptation_max_stops;
 };
 static_assert(sizeof(Injection) == 17 * sizeof(float));
+// (Triforce: renodx_glue/triforce_settings.slangi TriforceSettings, 6 floats, scalar layout; set 1 binding 5)
+struct Extra {
+    float gamma_correction, highlight_saturation, blowout, flare, hue_correction, color_grade_strength;
+};
+static_assert(sizeof(Extra) == 6 * sizeof(float));
 
 constexpr size_t kShaders = sizeof RENODX_SHADERS / sizeof RENODX_SHADERS[0];
 // (a draw's part in the eye adaptation, which picks its constants: renodx_spv.h's kinds 1 the fog, 2 the scene)
 enum { kPlain = 0, kFog = 1, kMeter = 2, kKinds = 3 };
 constexpr uint32_t kRing = 8;   // (frames of constants kept apart; even, so a frame's images follow from its place in the ring)
 constexpr uint64_t kSlot = 256;   // (a uniform range's place: a multiple of any minUniformBufferOffsetAlignment)
-constexpr uint64_t kInjectionAt = 0, kAaAt = kSlot, kSeedAt = 2 * kSlot, kAdaptationAt = 4 * kSlot;
+constexpr uint64_t kInjectionAt = 0, kAaAt = kSlot, kSeedAt = 2 * kSlot, kExtraAt = 3 * kSlot, kAdaptationAt = 4 * kSlot;
 constexpr uint64_t kBufferSize = kAdaptationAt + kRing * kKinds * kSlot;
 constexpr uint32_t kGenerations = 1048576u;   // (shared.h RENODX_ADAPTATION_GENERATION_COUNT)
 
@@ -82,31 +92,66 @@ bool enabled() {   // (Triforce, 11-13: the RenoDX HDR row as it was at the star
     return renodx_chosen();
 }
 std::atomic<int> replaced_modules{0};   // (modules of the game's that RenoDX's took the place of, this run)
-bool adapting() { return opts.rdx_tonemap && opts.rdx_midgray == 2; }
+bool adapting() { return opts.rdx_tonemap == 1 && opts.rdx_midgray == 2; }   // (PsychoV35's alone: RenoDRT, 2, reads none of it)
 
-/// The settings from the Insert menu's rows, parsed as addon.cpp parses its own (0 to 100 with 50 neutral is 0 to 2), and the
-/// constants of frame f's draws (delta: the time since the frame before)
-void write_settings(uint64_t f, float delta_seconds) {
-    Injection in{};
-    in.tone_map_type = opts.rdx_tonemap ? 9.0f : 0.0f;   // (RENODX_TONE_MAP_TYPE_PSYCHOV35, _VANILLA)
+/// (Triforce) The peak a tone mapper is given, in whites, when the encoder shows the picture as a display of gamma g would
+/// (renodx_glue/triforce_output.slangi): the value that correction brings to `peak`. The correction is the sRGB code of a
+/// value raised to g, so this is the code that display shows as `peak` (the power undone), decoded as sRGB. NX2navi's HDR and
+/// RenoDX's own RenoDRT give their tone mappers the peak the same way
+float peak_before_gamma(float peak, float g) {
+    const float code = std::pow(peak, 1.0f / g);
+    return code <= 0.04045f ? code / 12.92f : std::pow((code + 0.055f) / 1.055f, 2.4f);
+}
+
+/// The settings from the Insert menu's rows, parsed as addon.cpp parses its own (0 to 100 with 50 neutral is 0 to 2).
+/// (Triforce) ex: what the glue reads, parsed as NX2navi parses the same rows (runtime/vk_hdr.c): divided, so that a row at
+/// its neutral value gives exactly the 1 or 0 that leaves the picture alone. With the new rows as they are out of the box,
+/// `in` is what it was before them for Vanilla and PsychoV35 (tests/test_renodx_rows.py)
+void fill_settings(Injection& in, Extra& ex) {
+    // (RENODX_TONE_MAP_TYPE_PSYCHOV35, _VANILLA; Triforce: 3 is RenoDX's own number for RenoDRT, which the glue takes)
+    in.tone_map_type = opts.rdx_tonemap == 2 ? 3.0f : opts.rdx_tonemap ? 9.0f : 0.0f;
     in.peak_white_nits = (float)opts.hdr_peak;
     in.diffuse_white_nits = (float)opts.hdr_white;
     in.graphics_white_nits = (float)opts.rdx_ui_white;
+    // (Triforce) the gamma correction is the encoder's, on the finished picture with the menus' white at 1: the tone mappers
+    // aim at what it brings to the peak, so that the brightest light still lands on the display's peak. Taken against the
+    // menus' white for that reason; NX2navi takes it against the picture's white, the same number while the two whites are
+    // equal, as they are out of the box there and here
+    if (opts.rdx_gamma == 1 || opts.rdx_gamma == 2)
+        in.peak_white_nits = in.graphics_white_nits * peak_before_gamma(std::max(in.peak_white_nits / in.graphics_white_nits, 1.0f),
+                                                                        opts.rdx_gamma == 1 ? 2.2f : 2.4f);
     in.tone_map_highlights = opts.rdx_highlights * 0.02f, in.tone_map_shadows = opts.rdx_shadows * 0.02f;
     in.tone_map_contrast = opts.rdx_contrast * 0.02f, in.tone_map_saturation = opts.rdx_saturation * 0.02f;
-    in.tone_map_cone_contrast = 1.0f;
+    in.tone_map_cone_contrast = opts.rdx_tone_slope / 50.0f;   // (Triforce: the Tone slope row; it was 1)
     in.bloom_strength = opts.rdx_bloom * 0.02f;
-    in.custom_hue_clip = 0.5f;
-    // (midgray: 0 the render's, 1 vanilla's, 16 the eye adaptation's; 2: match the tone slope; the colour space in bits 2 and 3)
+    in.custom_hue_clip = opts.rdx_hue_clip / 100.0f;   // (Triforce: the Hue clip row; it was 0.5)
+    // (midgray: 0 the render's, 1 vanilla's, 16 the eye adaptation's; 2: match the tone slope (Triforce: its row; it was
+    // always set); the colour space in bits 2 and 3)
     const uint32_t midgray = opts.rdx_midgray == 2 ? 16u : opts.rdx_midgray == 1 ? 1u : 0u;
-    const uint32_t flags = midgray | 2u | ((uint32_t)std::clamp(opts.rdx_space, 0, 2) << 2);
+    const uint32_t flags = midgray | (opts.rdx_match_slope ? 2u : 0u) | ((uint32_t)std::clamp(opts.rdx_space, 0, 2) << 2);
     std::memcpy(&in.custom_flags, &flags, sizeof flags);
-    in.local_exposure = 0.0f;
+    // (the game's local exposure, where a scene shader has it: RenoDX's shaders take none of it with PsychoV35, and Vanilla
+    // has had none here. Triforce: RenoDRT takes the game's own, 1: its picture starts from what the game feeds its curve)
+    in.local_exposure = opts.rdx_tonemap == 2 ? 1.0f : 0.0f;
     in.tone_map_exposure = opts.rdx_exposure * 0.01f;
     in.adaptation_target = 0.18f, in.adaptation_min_stops = -4.0f, in.adaptation_max_stops = 2.0f;
+    ex.gamma_correction = opts.rdx_gamma == 1 ? 1.0f : opts.rdx_gamma == 2 ? 2.0f : 0.0f;
+    ex.highlight_saturation = opts.rdx_highlight_sat / 50.0f;
+    ex.blowout = opts.rdx_blowout / 100.0f;
+    ex.flare = opts.rdx_flare / 50.0f;
+    ex.hue_correction = opts.rdx_hue / 100.0f;
+    ex.color_grade_strength = opts.rdx_grade / 100.0f;
+}
+
+/// The settings as fill_settings has them, and the constants of frame f's draws (delta: the time since the frame before)
+void write_settings(uint64_t f, float delta_seconds) {
+    Injection in{};
+    Extra ex{};
+    fill_settings(in, ex);
     const float aa[2] = {1.0f, 0.0f};   // (AA strength, reconstruction: native)
     uint8_t* m = (uint8_t*)st.mapped;
     std::memcpy(m + kInjectionAt, &in, sizeof in);
+    std::memcpy(m + kExtraAt, &ex, sizeof ex);
     std::memcpy(m + kAaAt, aa, sizeof aa);
     for (int kind = 0; kind < kKinds; kind++) {   // (adaptation.slangi: delta_seconds, generation, capture_fov, meter_draw)
         const float adaptation[4] = {delta_seconds, (float)(f % kGenerations), kind == kFog ? 1.0f : 0.0f, kind == kMeter ? 1.0f : 0.0f};
@@ -167,18 +212,19 @@ bool seed_images() {
 
 bool make() {
     const VkShaderStageFlags stages = VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT;
-    const VkDescriptorSetLayoutBinding bindings[5] = {
+    const VkDescriptorSetLayoutBinding bindings[6] = {
         {0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, stages, nullptr},
         {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, stages, nullptr},
         {2, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, stages, nullptr},
         {3, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, stages, nullptr},
         {4, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, stages, nullptr},
+        {5, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, stages, nullptr},   // (Triforce: the glue's settings, Extra)
     };
     VkDescriptorSetLayoutCreateInfo li{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-    li.bindingCount = 5, li.pBindings = bindings;
+    li.bindingCount = 6, li.pBindings = bindings;
     if (vkCreateDescriptorSetLayout(dev.device, &li, nullptr, &st.layout) != VK_SUCCESS) return false;
     constexpr uint32_t kSets = kRing * kKinds;
-    const VkDescriptorPoolSize sizes[2] = {{VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 2 * kSets}, {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 3 * kSets}};
+    const VkDescriptorPoolSize sizes[2] = {{VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 2 * kSets}, {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 4 * kSets}};
     VkDescriptorPoolCreateInfo pi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     pi.maxSets = kSets, pi.poolSizeCount = 2, pi.pPoolSizes = sizes;
     if (vkCreateDescriptorPool(dev.device, &pi, nullptr, &st.pool) != VK_SUCCESS) return false;
@@ -211,17 +257,18 @@ bool make() {
             // (the image the frame before wrote, then the one this frame writes)
             const VkDescriptorImageInfo images[2] = {{VK_NULL_HANDLE, st.views[ring & 1], VK_IMAGE_LAYOUT_GENERAL},
                                                      {VK_NULL_HANDLE, st.views[(ring & 1) ^ 1], VK_IMAGE_LAYOUT_GENERAL}};
-            const VkDescriptorBufferInfo buffers[3] = {{st.buffer, kAdaptationAt + (ring * kKinds + kind) * kSlot, 16},
+            const VkDescriptorBufferInfo buffers[4] = {{st.buffer, kAdaptationAt + (ring * kKinds + kind) * kSlot, 16},
                                                        {st.buffer, kAaAt, 8},
-                                                       {st.buffer, kInjectionAt, sizeof(Injection)}};
-            VkWriteDescriptorSet w[5];
-            for (uint32_t i = 0; i < 5; i++) {
+                                                       {st.buffer, kInjectionAt, sizeof(Injection)},
+                                                       {st.buffer, kExtraAt, sizeof(Extra)}};
+            VkWriteDescriptorSet w[6];
+            for (uint32_t i = 0; i < 6; i++) {
                 w[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
                 w[i].dstSet = st.sets[ring][kind], w[i].dstBinding = i, w[i].descriptorCount = 1;
                 if (i < 2) w[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, w[i].pImageInfo = &images[i];
                 else w[i].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, w[i].pBufferInfo = &buffers[i - 2];
             }
-            vkUpdateDescriptorSets(dev.device, 5, w, 0, nullptr);
+            vkUpdateDescriptorSets(dev.device, 6, w, 0, nullptr);
         }
     }
     return true;
@@ -235,6 +282,11 @@ bool ready() {
         logf(st.ok ? "vk: RenoDX: its settings and state made (set 1); peak %d nits, paper white %d nits"
                    : "vk: RenoDX: its settings could not be made: the replaced shaders read nothing there",
              opts.hdr_peak, opts.hdr_white);
+#ifndef RENODX_SPV_GLUE
+        // (Triforce) a renodx_spv.h from before the glue, given to nx2/build.py by hand: make_game.py makes it again
+        logf("vk: RenoDX: this build's shaders are from before RenoDRT and the gamma correction (scripts/renodx_shaders.py "
+             "makes them again): RenoDRT draws as PsychoV35, and the gamma correction and RenoDRT's rows change nothing");
+#endif
     }
     return st.ok;
 }

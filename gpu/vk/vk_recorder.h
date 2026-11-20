@@ -8,14 +8,14 @@
 //   RX_VK_RECORDER unset / anything else: off, the calls go straight to the driver as before (one relaxed load and a branch a call)
 //   RX_VK_RECORDER=sync: each call packed, then run at once on the same thread, in the same order: the same calls with the same
 //                        values, made from the packet's copies (the proof that the copies are complete and exact)
-//   RX_VK_RECORDER=defer: (step 1.5, serial replay only) the packets held in the thread's arena and run at drain(), in order, on the
+//   RX_VK_RECORDER=defer: (step 1.5) the packets held in the thread's arena and run at drain(), in order, on the
 //                        same thread; the caller reuses its memory in between, as it will once a recorder thread runs them. Drained
 //                        before every call of RX_REC_BOUNDARIES (vk_work.h: command buffer begin/end/reset, submits, presents, waits,
 //                        query and fault reads, every destruction), when vk_replay.cpp's replay_mu is let go (DrainingMutex), before
 //                        a fallback, at the soft byte budget, and when the arena has no memory (then the call is made directly).
-//                        Refused (off, logged once) with RX_VK_PARALLEL>=2; while par_active, packets run at once.
+//                        While par_active (a parallel replay's segments), packets run at once; drained at segments_begin.
 //                        RX_VK_RECORDER_POISON=1: the arena filled with 0xCD after each drain. tests/test_recorder_sync.py
-//   RX_VK_RECORDER=thread: (step 2, serial replay only) the thread that holds vk_replay.cpp's replay_mu is the producer: its packets
+//   RX_VK_RECORDER=thread: (step 2) the thread that holds vk_replay.cpp's replay_mu is the producer: its packets
 //                        go into one bounded ring (Recorder, below) and a recorder thread runs them, in order, while the replay goes
 //                        on. Before every call of RX_REC_BOUNDARIES on the producer (but those of unordered()), and when it lets
 //                        replay_mu go, it waits until
@@ -24,7 +24,10 @@
 //                        replay_mu make their calls directly (after the recorder has run what was published, should it be busy:
 //                        counted and logged once). The ring full: the producer waits (backpressure); a packet bigger than the room
 //                        it is given, or no ring: the producer waits until the recorder is idle, then makes the call directly.
-//                        Refused (off, logged once) with RX_VK_PARALLEL>=2. RX_VK_RECORDER_RING_MB (default 8),
+//                        (Triforce, 11-15) Beside the parallel replay's helper threads too (it was refused with RX_VK_PARALLEL>=2,
+//                        which only the switch, not the Debug row, refused): their segments' calls are made directly, the
+//                        producer's too while par_active, after segments_begin has run all it put in the ring (below), so the
+//                        recorder is idle while any segment records. RX_VK_RECORDER_RING_MB (default 8),
 //                        RX_VK_RECORDER_POISON=1 (each packet filled with 0xCD once run), RX_VK_RECORDER_STATS=0 (no 10 s stats
 //                        line), RX_VK_RECORDER_SPIN_US (the recorder's spin with nothing to run, before it sleeps: default adaptive 20-200)
 //
@@ -74,7 +77,7 @@ extern std::atomic<bool> par_active;   // (vk_replay.cpp: a parallel replay's se
     A(vkCmdClearColorImage) A(vkCmdClearDepthStencilImage) A(vkCmdClearAttachments) V(vkCmdFillBuffer) A(vkCmdUpdateBuffer)          \
     V(vkCmdBeginQuery) V(vkCmdEndQuery)                                                                                            \
     V(vkCmdBindPipeline) A(vkCmdBindDescriptorSets) V(vkCmdBindIndexBuffer) A(vkCmdBindVertexBuffers2) A(vkCmdPushConstants)        \
-    A(vkCmdPushDescriptorSetKHR)                                                                                                   \
+    A(vkCmdPushDescriptorSetKHR) A(vkCmdPushDescriptorSetWithTemplateKHR)                                                          \
     A(vkCmdSetViewport) A(vkCmdSetScissor) A(vkCmdSetViewportWithCount) A(vkCmdSetScissorWithCount) A(vkCmdSetBlendConstants)       \
     V(vkCmdSetStencilReference) V(vkCmdSetStencilCompareMask) V(vkCmdSetStencilWriteMask) V(vkCmdSetStencilOp) V(vkCmdSetDepthBias) \
     V(vkCmdSetDepthBiasEnable) V(vkCmdSetLineWidth) V(vkCmdSetDepthBoundsTestEnable) V(vkCmdSetCullMode) V(vkCmdSetFrontFace)       \
@@ -160,27 +163,23 @@ inline uint64_t g_spin_ns = 0;
 constexpr uint64_t kSpinLo = 20000, kSpinHi = 200000;
 inline bool g_stats_log = true;   // (RX_VK_RECORDER_STATS=0: no stats line every 10 s)
 
-/// RX_VK_PARALLEL as vk_replay.cpp's par_threads() reads it: 2 or more, segments of one command buffer recorded on several threads
-inline bool parallel_configured() {
-    const char* p = getenv("RX_VK_PARALLEL");
-    return p && atoi(p) >= 2;
-}
-/// RX_VK_RECORDER: sync; defer, thread (serial only: refused, off, with RX_VK_PARALLEL); anything else, or unset, off
-inline int mode_from_env(bool* refused) {
+/// RX_VK_RECORDER: sync, defer, thread; anything else, or unset, off. (Triforce, 11-15) defer and thread are no longer refused with
+/// RX_VK_PARALLEL>=2: a parallel replay's segments make their calls directly, after segments_begin (tests/test_recorder_sync.py)
+/// (Triforce, 11-16) Unset: thread on an NVIDIA card with 12 logical processors or more (set by vk_main.cpp once the device is
+/// known, before any command is recorded), else off. Lab, his settings (1440p, RTX 4070 SUPER, i7-13700K): Market +11%, Hyrule
+/// Field +6.4%, no flicker; at the default Auto resolution no change; with the game held to 8 logical processors -10% (the
+/// recorder needs a core of its own). NX2navi has its recorder on by default on NVIDIA too. RX_VK_RECORDER=off: off
+inline bool g_auto_thread = false;
+inline int mode_from_env() {
     const char* e = getenv("RX_VK_RECORDER");
-    *refused = false;
-    if (!e) return OFF;
+    if (!e) return g_auto_thread ? THREAD : OFF;
     if (!strcmp(e, "sync")) return SYNC;
-    if (!strcmp(e, "defer") || !strcmp(e, "thread")) {
-        if (!parallel_configured()) return e[0] == 'd' ? DEFER : THREAD;
-        *refused = true;
-        return OFF;
-    }
+    if (!strcmp(e, "defer")) return DEFER;
+    if (!strcmp(e, "thread")) return THREAD;
     return OFF;
 }
 inline int mode_init() {
-    bool refused;
-    const int m = mode_from_env(&refused);
+    const int m = mode_from_env();
     const char* p = getenv("RX_VK_RECORDER_POISON");
     g_poison.store((m == DEFER || m == THREAD) && p && atoi(p) != 0, std::memory_order_relaxed);
     if (m == THREAD) {
@@ -191,18 +190,16 @@ inline int mode_init() {
     }
     int was = -1;
     if (!g_mode.compare_exchange_strong(was, m, std::memory_order_relaxed)) return was;   // (another thread read it first)
-    if (refused)   // (once: the thread that set the mode)
-        ::mkwvk::logf("vk: RX_VK_RECORDER=%s refused: RX_VK_PARALLEL=%s records a command buffer on several threads (deferred "
-                      "packets are the recording thread's own); the recorder is off",
-                      getenv("RX_VK_RECORDER"), getenv("RX_VK_PARALLEL"));
-    else if (m == DEFER)
+    if (m == DEFER)   // (once: the thread that set the mode)
         ::mkwvk::logf("vk: RX_VK_RECORDER=defer: vkCmd* packed and held, drained in order at each command buffer begin, end and "
-                      "reset, submit, wait, readback, destruction and replay lock release (serial replay only)%s",
+                      "reset, submit, wait, readback, destruction and replay lock release (a parallel replay's segments: made "
+                      "directly)%s",
                       g_poison.load(std::memory_order_relaxed) ? "; the arena poisoned after each drain" : "");
     else if (m == THREAD)
         ::mkwvk::logf("vk: RX_VK_RECORDER=thread: vkCmd* packed on the replay thread and run in order by a recorder thread; the "
                       "replay waits for it at each command buffer begin, end and reset, submit, wait, readback, destruction and "
-                      "replay lock release (serial replay only); ring %zu KB, spin %s%llu us%s",
+                      "replay lock release (a parallel replay's segments: made directly, the recorder idle); ring %zu KB, spin "
+                      "%s%llu us%s",
                       g_ring_bytes >> 10, g_spin_ns ? "" : "adaptive 20-", (unsigned long long)(g_spin_ns ? g_spin_ns / 1000 : 200),
                       g_poison.load(std::memory_order_relaxed) ? "; packets poisoned once run" : "");
     return m;
@@ -312,6 +309,8 @@ inline uint64_t now_ns() {
 }
 /// (set by vk_replay.cpp: the recorder thread's name and priority, which need windows.h)
 inline void (*g_thread_start_hook)() = nullptr;
+/// (set by vk_replay.cpp: its end_process, which on Windows ends the process without running every library's detach)
+inline void (*g_end_process_hook)(int) = nullptr;
 #ifdef RX_REC_TEST_HOOKS
 inline void (*g_test_idle_locked)() = nullptr;   // (tests: called in idle() with sleep_mu held)
 #endif
@@ -321,6 +320,7 @@ inline void (*g_test_idle_locked)() = nullptr;   // (tests: called in idle() wit
     ::mkwvk::logf("vk: FATAL: RX_VK_RECORDER=thread: the recorder thread: %s", why);
     std::fprintf(stderr, "vk: FATAL: RX_VK_RECORDER=thread: the recorder thread: %s\n", why);
     std::fflush(stderr);
+    if (g_end_process_hook) g_end_process_hook(3);
     std::_Exit(3);
 }
 
@@ -341,6 +341,8 @@ struct Recorder {
     std::atomic<uint64_t> wait_n[B_COUNT]{}, wait_ns[B_COUNT]{}, wait_max[B_COUNT]{};
     std::atomic<uint64_t> spin_ns{0}, sleeps{0}, short_sleeps{0};   // (the recorder idle: time spun, sleeps, those under 200 us)
     std::atomic<uint64_t> packets{0}, busy_ns{0}, starts{0}, direct{0};   // (direct: packets that did not fit, made directly)
+    // (Triforce, 11-15) the same as the stats line's, never reset: the frame statistics take a frame's share (totals())
+    std::atomic<uint64_t> all_packets{0}, all_busy_ns{0}, all_waits{0}, all_wait_ns{0};
     std::mutex life_mu, sleep_mu;
     std::condition_variable sleep_cv;
     std::thread th;
@@ -374,6 +376,7 @@ struct Recorder {
     bool idle_at(uint64_t target) const { return R.load(std::memory_order_acquire) >= target; }
     void note_wait(Bound k, uint64_t ns) {   // (a wait's count, time and longest, for the stats line)
         wait_n[k].fetch_add(1, std::memory_order_relaxed), wait_ns[k].fetch_add(ns, std::memory_order_relaxed);
+        all_waits.fetch_add(1, std::memory_order_relaxed), all_wait_ns.fetch_add(ns, std::memory_order_relaxed);
         uint64_t m = wait_max[k].load(std::memory_order_relaxed);
         while (ns > m && !wait_max[k].compare_exchange_weak(m, ns, std::memory_order_relaxed)) {}
     }
@@ -554,8 +557,11 @@ inline void Recorder::loop() {
     const bool poison = g_poison.load(std::memory_order_relaxed);
     for (;;) {
         if (r == seen && (seen = W.load(std::memory_order_acquire)) == r) {
-            if (busy0) busy_ns.fetch_add(now_ns() - busy0, std::memory_order_relaxed), busy0 = 0;
-            if (n) packets.fetch_add(n, std::memory_order_relaxed), n = 0;
+            if (busy0) {
+                const uint64_t busy = now_ns() - busy0;
+                busy_ns.fetch_add(busy, std::memory_order_relaxed), all_busy_ns.fetch_add(busy, std::memory_order_relaxed), busy0 = 0;
+            }
+            if (n) packets.fetch_add(n, std::memory_order_relaxed), all_packets.fetch_add(n, std::memory_order_relaxed), n = 0;
             if (!idle(r, seen, last_log)) return;
             continue;
         }
@@ -635,6 +641,14 @@ inline void boundary(Bound k) {
         else if (Recorder* g = t_prod) g->wait_idle(k);
     }
 }
+
+/// (Triforce, 11-15) Just before a parallel replay's segments start (vk_replay.cpp replay_handle, before par_active): what this
+/// thread holds (DEFER) or put in the ring (THREAD) reaches the driver first. The segments' command buffers already have commands of
+/// the producer's in them (their timestamps), and the helper threads record into them directly: a helper's own wait before a direct
+/// call (settle, foreign_wait) sees only what was published, and up to g_publish_bytes may not be. While par_active every call is
+/// made directly (Enc), the producer's too, so the ring stays empty until par_active is let go. tests/test_recorder_sync.py: the
+/// segments scenario, and this left out
+inline void segments_begin() { boundary(B_PAR); }
 
 /// A std::mutex whose unlock drains the thread's held packets first (vk_replay.cpp's replay_mu): what a thread recorded into the
 /// replay's command buffers reaches the driver before another thread may record into them. THREAD: the holder is the ring's
@@ -1062,6 +1076,26 @@ RX_REC_PACKER void pk_vkCmdPushDescriptorSetKHR(VkCommandBuffer cb, VkPipelineBi
            [&] { ::vkx::vkCmdPushDescriptorSetKHR(cb, bp, layout, set, n, w); });
 }
 inline constexpr auto& rx_vkCmdPushDescriptorSetKHR = Route<::vkx::vkCmdPushDescriptorSetKHR, pk_vkCmdPushDescriptorSetKHR>::call;
+
+/// (Triforce) vkCmdPushDescriptorSetWithTemplateKHR reads its data by the template's entries, which the call does not carry: its
+/// caller says how many bytes the next such call on its thread reads (vk_draw.cpp push_write_template), and the packer copies that
+/// many. A call it was not told of (0) is not packed: what is held goes first, then the call is made directly (fallback), in order.
+/// (Told only while the recorder is on: with it off the call goes straight to the driver and nothing would take the count)
+inline thread_local size_t t_template_bytes = 0;
+inline void push_template_bytes(size_t n) {
+    if (mode() != OFF) t_template_bytes = n;
+}
+RX_REC_PACKER void pk_vkCmdPushDescriptorSetWithTemplateKHR(VkCommandBuffer cb, VkDescriptorUpdateTemplate tpl, VkPipelineLayout layout,
+                                                            uint32_t set, const void* data) {
+    const size_t bytes = t_template_bytes;
+    t_template_bytes = 0;
+    if (!bytes) return fallback([&] { ::vkx::vkCmdPushDescriptorSetWithTemplateKHR(cb, tpl, layout, set, data); });
+    Enc e;
+    const void* d = e.dup_bytes(data, bytes);   // (no memory: emit makes the direct call)
+    e.emit(OP_vkCmdPushDescriptorSetWithTemplateKHR, [=] { ::vkx::vkCmdPushDescriptorSetWithTemplateKHR(cb, tpl, layout, set, d); },
+           [&] { ::vkx::vkCmdPushDescriptorSetWithTemplateKHR(cb, tpl, layout, set, data); });
+}
+inline constexpr auto& rx_vkCmdPushDescriptorSetWithTemplateKHR = Route<::vkx::vkCmdPushDescriptorSetWithTemplateKHR, pk_vkCmdPushDescriptorSetWithTemplateKHR>::call;
 
 RX_REC_PACKER void pk_vkCmdSetViewport(VkCommandBuffer cb, uint32_t first, uint32_t n, const VkViewport* v) {
     Enc e;

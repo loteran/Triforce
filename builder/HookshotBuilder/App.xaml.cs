@@ -10,7 +10,21 @@ public partial class App : Application
     // Why it stopped is one "error <text>" line on stdout (the stream a launcher reads) and again on stderr
     protected override void OnStartup(StartupEventArgs e)
     {
-        if (e.Args.Length > 0 && e.Args[0] == "--cli")
+        var cli = e.Args.Length > 0 && e.Args[0] == "--cli";
+        // ((Triforce) one builder at a time for its tools, Instance.cs: asked before any build or window)
+        if (Tools.Find() is { } tools && !Instance.Take(tools.Root))
+        {
+            if (cli)
+            {
+                var said = "error " + Instance.Refusal(tools.Root).Replace("\n\n", " ");
+                Console.Out.WriteLine(said);
+                Console.Error.WriteLine(said);
+            }
+            else MessageBox.Show(Instance.Refusal(tools.Root), "Hookshot Builder", MessageBoxButton.OK, MessageBoxImage.Information);
+            Environment.Exit(1);
+            return;
+        }
+        if (cli)
         {
             Environment.Exit(Cli(e.Args.Skip(1).ToList()));
             return;

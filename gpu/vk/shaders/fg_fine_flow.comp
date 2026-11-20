@@ -1,0 +1,103 @@
+#version 450
+// (Triforce) The fine vectors (vk_framegen.cpp, RX_VK_FRAMEGEN_FINE, on by default): one per 8x8 pixels, to a fraction of a
+// pixel. The old way's vectors (fg_flow.comp, fg_median.comp) are one per 16x16 pixels in whole steps of 4 pixels, and
+// fg_synth.comp moved each pixel by a blend of the four around it: a straight line moving 6 pixels was moved 4 by some
+// blocks and 8 by others and came out bent and broken, where the two frames did not agree it took a frame unmoved, and a
+// thin line was not drawn at all (tests/test_framegen_lines.py measures it). For each block of 8x8 pixels:
+//   1. the coarse vectors (fg_flow.comp, here asked to be less sure of no motion) of the 3x3 coarse blocks around it, its
+//      own before the median, and none are tried on its window, 16x16 pixels of half-size luma (fg_half.comp: 8x8 texels,
+//      so the windows of neighbouring blocks overlap); the best is kept (a block on the edge of a moving object takes the
+//      motion its own pixels follow), a little cost for each texel away from its coarse block's vector keeping a window of
+//      no detail (sky, a flat wall), which matches any vector as well, on the motion around it;
+//   2. it is moved a texel at a time while that matches better;
+//   3. placed between texels at the minimum of a parabola through the costs either side;
+//   4. and refined on the frames themselves, at full size: one step of Lucas-Kanade over 12x12 pixels (the block and 2
+//      around), kept only when it matches better. A line alone in a window (no detail along it) cannot tell its motion
+//      along itself: the step is held back there (the gradients' sum regularized), and fg_fine_pick.comp settles it.
+// Output: xy the vector in pixels (where the frame before's pixel at the block went), z the window's mean difference.
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(binding = 0) uniform sampler2D la;       // (half-size luma, the frame before)
+layout(binding = 1) uniform sampler2D lb;       // (this frame's)
+layout(binding = 2) uniform sampler2D coarse;   // (fg_median.comp's vectors, pixels)
+layout(binding = 3) uniform sampler2D raw;      // (fg_flow.comp's, before the median)
+layout(binding = 4, rgba16f) uniform writeonly image2D fine;
+layout(binding = 5) uniform sampler2D fa;       // (the frame before, the linear sampler)
+layout(binding = 6) uniform sampler2D fb;       // (this frame)
+
+float pa[64];   // (the window in the frame before)
+ivec2 c0;       // (its first texel)
+ivec2 lm;
+ivec2 vc;       // (the coarse vector of the block, texels)
+ivec2 fmax;
+vec2 finv;
+
+float sad(ivec2 v) {
+    float s = 0.0;
+    for (int i = 0; i < 64; i++)
+        s += abs(pa[i] - texelFetch(lb, clamp(c0 + ivec2(i % 8, i / 8) + v, ivec2(0), lm), 0).r);
+    return s / 64.0;
+}
+float cost(ivec2 v) { return sad(v) + 0.002 * float(abs(v.x - vc.x) + abs(v.y - vc.y)); }
+ivec2 texels(vec2 px) { return ivec2(round(px * 0.5)); }
+float fit(float l, float c, float r) {   // (the parabola's minimum, -0.5 to 0.5 texels from the middle one)
+    const float d = l + r - 2.0 * c;
+    return d > 1e-6 ? clamp(0.5 * (l - r) / d, -0.5, 0.5) : 0.0;
+}
+float luma_a(ivec2 q) { return dot(texelFetch(fa, clamp(q, ivec2(0), fmax), 0).rgb, vec3(0.299, 0.587, 0.114)); }
+float luma_b(vec2 p) { return dot(textureLod(fb, p * finv, 0.0).rgb, vec3(0.299, 0.587, 0.114)); }
+
+void main() {
+    const ivec2 g = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(g, imageSize(fine)))) return;
+    lm = textureSize(la, 0) - 1;
+    c0 = g * 4 - 2;
+    for (int i = 0; i < 64; i++) pa[i] = texelFetch(la, clamp(c0 + ivec2(i % 8, i / 8), ivec2(0), lm), 0).r;
+    const ivec2 cm = textureSize(coarse, 0) - 1;
+    const ivec2 cb = (g * 8 + 4) / 16;   // (the coarse block holding this block's middle)
+    vc = texels(texelFetch(coarse, clamp(cb, ivec2(0), cm), 0).xy);
+    ivec2 bv = ivec2(0);
+    float best = cost(bv);
+    for (int i = 0; i < 10; i++) {
+        const ivec2 v = i < 9 ? texels(texelFetch(coarse, clamp(cb + ivec2(i % 3 - 1, i / 3 - 1), ivec2(0), cm), 0).xy)
+                              : texels(texelFetch(raw, clamp(cb, ivec2(0), cm), 0).xy);
+        const float c = cost(v);
+        if (c < best) best = c, bv = v;
+    }
+    for (int it = 0; it < 4; it++) {
+        ivec2 to = bv;
+        float tb = best;
+        for (int i = 0; i < 9; i++) {
+            if (i == 4) continue;
+            const ivec2 v = bv + ivec2(i % 3 - 1, i / 3 - 1);
+            const float c = cost(v);
+            if (c < tb) tb = c, to = v;
+        }
+        if (to == bv) break;
+        bv = to, best = tb;
+    }
+    const float s0 = sad(bv);
+    const vec2 start = (vec2(bv) + vec2(fit(sad(bv - ivec2(1, 0)), s0, sad(bv + ivec2(1, 0))),
+                                        fit(sad(bv - ivec2(0, 1)), s0, sad(bv + ivec2(0, 1))))) * 2.0;
+    // (4. above: the squared difference at the start and the step's sums, then the difference after the step)
+    fmax = textureSize(fa, 0) - 1;
+    finv = 1.0 / vec2(textureSize(fb, 0));
+    const ivec2 q0 = g * 8 - 2;
+    float h11 = 0.0, h12 = 0.0, h22 = 0.0, b1 = 0.0, b2 = 0.0, e0 = 0.0;
+    for (int i = 0; i < 144; i++) {
+        const ivec2 q = q0 + ivec2(i % 12, i / 12);
+        const float r = luma_b(vec2(q) + 0.5 + start) - luma_a(q);
+        const float gx = 0.5 * (luma_a(q + ivec2(1, 0)) - luma_a(q - ivec2(1, 0)));
+        const float gy = 0.5 * (luma_a(q + ivec2(0, 1)) - luma_a(q - ivec2(0, 1)));
+        e0 += r * r, h11 += gx * gx, h12 += gx * gy, h22 += gy * gy, b1 += gx * r, b2 += gy * r;
+    }
+    const float eps = 1e-3 + 0.02 * (h11 + h22);
+    const float d11 = h11 + eps, d22 = h22 + eps;
+    const vec2 v = start - clamp(vec2(d22 * b1 - h12 * b2, d11 * b2 - h12 * b1) / (d11 * d22 - h12 * h12), -1.0, 1.0);
+    float e1 = 0.0;
+    for (int i = 0; i < 144; i++) {
+        const ivec2 q = q0 + ivec2(i % 12, i / 12);
+        const float r = luma_b(vec2(q) + 0.5 + v) - luma_a(q);
+        e1 += r * r;
+    }
+    imageStore(fine, g, vec4(e1 < e0 ? v : start, s0, 1.0));
+}

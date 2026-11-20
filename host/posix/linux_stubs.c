@@ -8,7 +8,7 @@
 #include "../../gpu/vk/vk_api.h"
 
 typedef void (*mf_av1_picture_fn)(void *user, const uint8_t *y, const uint8_t *uv, int w, int h, int stride, int64_t pts);
-void *mf_av1_open(int w, int h) { (void)w, (void)h; return NULL; }
+void *mf_av1_open(int w, int h, int tell) { (void)w, (void)h, (void)tell; return NULL; }
 void mf_av1_decode(void *m, const uint8_t *data, size_t n, int64_t pts, mf_av1_picture_fn fn, void *user) {
     (void)m, (void)data, (void)n, (void)pts, (void)fn, (void)user;
 }

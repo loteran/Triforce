@@ -58,11 +58,13 @@ def main():
     body = body[body.index("{")+1:-1]
     announce = "void announce(std::shared_ptr<std::vector<uint8_t>> px,std::string path,long long at_present){" + body + "}"
     code = code.replace("/* PNG */", actual).replace("/* ANNOUNCE */", announce)
+    code = '#include "file_writers.h"\n' + code   # ((Triforce, handoff §8) write_png's Writing: the standard library alone)
     cases = ["healthy", "invalid", "bounded-report", "open-failure", "close-failure", "publish-failure", "cleanup-failure", "collisions", "collision-limit", "parallel", "same-target", "announce-success", "announce-failure"] + ["write-" + str(i) for i in range(1, 13)]
     with tempfile.TemporaryDirectory(prefix="png-publication-") as temp:
         cpp, exe = Path(temp)/"fixture.cpp", Path(temp)/"fixture.exe"
         cpp.write_text(code, encoding="utf-8")
-        subprocess.run([args.cxx, "-std=c++20", "-O1", "-pthread", "-Wall", "-Wextra", "-Werror", str(cpp), "-o", str(exe)], check=True)
+        subprocess.run([args.cxx, "-std=c++20", "-O1", "-pthread", "-Wall", "-Wextra", "-Werror", "-I" + str(ROOT / "gpu/vk"), str(cpp),
+                        "-o", str(exe)], check=True)
         for case in cases:
             output = Path(temp)/case
             output.mkdir()

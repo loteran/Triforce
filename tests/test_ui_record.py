@@ -40,14 +40,24 @@ def main():
 #include <string>
 #include <vector>
 #define CHECK(x) do { if (!(x)) { std::fprintf(stderr, "FAIL:%d %s\n", __LINE__, #x); std::exit(1); } } while (0)
+#include <algorithm>
 enum { ImTextureStatus_OK, ImTextureStatus_Destroyed, ImTextureStatus_WantCreate };
 bool can_make = true;
 void logf(const char*, ...) {}
 struct ImTextureData { int Status; };
-struct ImDrawData { std::vector<ImTextureData*>* Textures; };
+template <typename T> struct ImVector : std::vector<T> {
+    bool contains(const T& v) const { return std::find(this->begin(), this->end(), v) != this->end(); }
+};
+struct ImTextureRef { ImTextureData* _TexData = nullptr; };
+struct ImDrawCmd { ImTextureRef TexRef; unsigned ElemCount; };
+struct ImDrawList { std::vector<ImDrawCmd> CmdBuffer; };
+struct ImDrawData { std::vector<ImTextureData*>* Textures; std::vector<ImDrawList*> CmdLists; };
+ImTextureData font_tex{ImTextureStatus_OK};
+struct FontAtlas { ImTextureData* TexData = &font_tex; ImTextureRef TexRef{&font_tex}; } font_atlas;
+struct Io { FontAtlas* Fonts = &font_atlas; } io;
 std::string calls;
 ImDrawData draw_data;
-namespace ImGui { void Render() { calls += "R"; } ImDrawData* GetDrawData() { return &draw_data; } }
+namespace ImGui { void Render() { calls += "R"; } ImDrawData* GetDrawData() { return &draw_data; } Io& GetIO() { return io; } }
 void ImGui_ImplVulkan_RenderDrawData(ImDrawData* dd, VkCommandBuffer) { CHECK(dd->Textures == nullptr); calls += "D"; }
 struct { std::vector<VkImageView> swap_views; std::vector<VkImage> swap_images; bool hdr = false; } dev;
 int64_t presents = 0;
@@ -113,16 +123,29 @@ int main() {
     record(cmd, 2, 640, 360);
     record(cmd, 7, 640, 360);
     CHECK(calls == "RrRr" && barriers.empty());
-    // (a texture that could not be made: nothing drawn that frame, no barrier, no pass; made the next frame, all as before)
+    // ((Triforce) a picture that could not be made: the frame drawn without it, its draws left out and bound to the font
+    // atlas; the other draws as they were. Made the next frame, all as before)
     ImTextureData failed{ImTextureStatus_WantCreate}, gone{ImTextureStatus_Destroyed};
     std::vector<ImTextureData*> more = {&failed, &gone};
+    ImDrawList list;
+    list.CmdBuffer = {{{&failed}, 6}, {{&logo}, 12}};
+    draw_data.CmdLists = {&list};
     calls.clear(), barriers.clear(), can_make = false, draw_data.Textures = &more;
     record(cmd, 0, 640, 360);
-    CHECK(calls == "RrU" && barriers.empty() && draw_data.Textures == nullptr);
+    CHECK(calls == "RrUB[D]B" && draw_data.Textures == nullptr);
+    CHECK(list.CmdBuffer[0].ElemCount == 0 && list.CmdBuffer[0].TexRef._TexData == &font_tex);
+    CHECK(list.CmdBuffer[1].ElemCount == 12 && list.CmdBuffer[1].TexRef._TexData == &logo);
     calls.clear(), can_make = true, draw_data.Textures = &more;
     record(cmd, 0, 640, 360);
     CHECK(calls == "RrUB[D]B");
-    std::printf("PASS: the overlays' pass: textures, barrier in, load and store, barrier out, nothing while a texture is missing\n");
+    // (the font atlas that could not be made: nothing drawn that frame, no barrier, no pass)
+    font_tex.Status = ImTextureStatus_WantCreate;
+    std::vector<ImTextureData*> atlas_only = {&font_tex};
+    calls.clear(), barriers.clear(), can_make = false, draw_data.Textures = &atlas_only;
+    record(cmd, 0, 640, 360);
+    CHECK(calls == "RrU" && barriers.empty() && draw_data.Textures == nullptr);
+    std::printf("PASS: the overlays' pass: textures, barrier in, load and store, barrier out; a missing picture's draws left out, "
+                "nothing while the font atlas is missing\n");
 }
 '''
     with tempfile.TemporaryDirectory(prefix="ui-record-") as tmp:

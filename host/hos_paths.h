@@ -14,6 +14,44 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+#include <stdlib.h>
+
+/* (Triforce) Long paths. The probe for image.bin below is the one Win32 path these helpers make. A path of MAX_PATH and more
+   goes to GetFileAttributesW with "\\?\" in front ("\\?\UNC\" for \\server\share), which takes it whatever Windows' own
+   LongPathsEnabled says; GetFileAttributesA does not past MAX_PATH (only when the manifest's longPathAware, nx2/win_manifest.py,
+   meets LongPathsEnabled). The probe was a MAX_PATH buffer: a folder of 250 characters and more, whose bin\Triforce.exe a
+   caller with a larger buffer had (discord_rpc.c's 1024), was taken for its bin folder. The path given back has no "\\?\": its
+   callers add names with '/', which "\\?\" would keep as they are, and show it in messages and the log. path: a whole wide path,
+   n its length. 1: there is a file or folder of that name */
+static inline int hos_path_there_w(const wchar_t *path, size_t n) {
+    const int already = path[0] == L'\\' && path[1] == L'\\' && (path[2] == L'?' || path[2] == L'.');
+    const int unc = !already && path[0] == L'\\' && path[1] == L'\\';
+    const int drive = path[0] && path[1] == L':' && (path[2] == L'\\' || path[2] == L'/');
+    if (n < MAX_PATH - 1 || already || !(unc || drive)) return GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES;
+    wchar_t *w = (wchar_t *)malloc((n + 9) * sizeof *w);
+    if (!w) return 0;
+    wcscpy(w, unc ? L"\\\\?\\UNC" : L"\\\\?\\");
+    size_t at = wcslen(w);
+    for (size_t i = unc ? 1 : 0; i < n; i++) w[at++] = path[i] == L'/' ? L'\\' : path[i];
+    w[at] = 0;
+    const int there = GetFileAttributesW(w) != INVALID_FILE_ATTRIBUTES;
+    free(w);
+    return there;
+}
+
+/* (the A helper's probe: a short one as it always was, through the A function; a long one as UTF-8, the process's code page
+   with the manifest's activeCodePage, made wide) */
+static inline int hos_path_there_a(const char *path) {
+    const size_t n = strlen(path);
+    if (n < MAX_PATH - 1) return GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES;
+    const int wn = MultiByteToWideChar(CP_UTF8, 0, path, -1, NULL, 0);
+    if (wn <= 0) return 0;
+    wchar_t *w = (wchar_t *)malloc((size_t)wn * sizeof *w);
+    if (!w) return 0;
+    const int there = MultiByteToWideChar(CP_UTF8, 0, path, -1, w, wn) > 0 && hos_path_there_w(w, wcslen(w));
+    free(w);
+    return there;
+}
 
 static inline DWORD hos_game_path_a(char *buf, DWORD size) {
     DWORD n = GetModuleFileNameA(NULL, buf, size);
@@ -25,12 +63,14 @@ static inline DWORD hos_game_path_a(char *buf, DWORD size) {
     char *bin = dir;
     while (bin > buf && bin[-1] != '\\' && bin[-1] != '/') bin--;
     if (dir - bin != 3 || _strnicmp(bin, "bin", 3) != 0) return n;
-    char probe[MAX_PATH + 16];
     const size_t root = (size_t)(bin - buf);   /* (the folder, with its separator) */
-    if (root + 10 >= sizeof probe) return n;
+    char *probe = (char *)malloc(root + 10);   /* ((Triforce) as long as the folder's path is: hos_path_there_w) */
+    if (!probe) return n;
     memcpy(probe, buf, root);
     strcpy(probe + root, "image.bin");
-    if (GetFileAttributesA(probe) == INVALID_FILE_ATTRIBUTES) return n;
+    const int there = hos_path_there_a(probe);
+    free(probe);
+    if (!there) return n;
     memmove(buf + root, name, strlen(name) + 1);   /* (folder\Triforce.exe) */
     return (DWORD)strlen(buf);
 }
@@ -45,12 +85,14 @@ static inline DWORD hos_game_path_w(wchar_t *buf, DWORD size) {
     wchar_t *bin = dir;
     while (bin > buf && bin[-1] != L'\\' && bin[-1] != L'/') bin--;
     if (dir - bin != 3 || _wcsnicmp(bin, L"bin", 3) != 0) return n;
-    wchar_t probe[MAX_PATH + 16];
     const size_t root = (size_t)(bin - buf);
-    if (root + 10 >= sizeof probe / sizeof probe[0]) return n;
+    wchar_t *probe = (wchar_t *)malloc((root + 10) * sizeof *probe);   /* ((Triforce) hos_path_there_w) */
+    if (!probe) return n;
     wmemcpy(probe, buf, root);
     wcscpy(probe + root, L"image.bin");
-    if (GetFileAttributesW(probe) == INVALID_FILE_ATTRIBUTES) return n;
+    const int there = hos_path_there_w(probe, root + 9);
+    free(probe);
+    if (!there) return n;
     wmemmove(buf + root, name, wcslen(name) + 1);
     return (DWORD)wcslen(buf);
 }

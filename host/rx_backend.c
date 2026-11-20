@@ -69,6 +69,21 @@ int hos_gpu_guest_ranges(uint64_t (*out)[2], int max);
 /* The soft write watch's marks (rt/a64.h A64_MARK, hos_mark_written) over the GPU-visible ranges, read and cleared:
    the Vulkan back end's own collection (gpu/render's rx_collect_written works only with the WebGPU renderer started).
    One consumer: with Vulkan the WebGPU renderer never runs. */
+#ifdef A64_MARK_ONE
+/* A64_MARK_ONE (build.py RX_MARK_ONE=1): lifted code marks the page of a store's first byte alone, so a mark says "this
+   page and the next may have been written" (a store is at most 4 KB long: rt/a64.h, the lift's mark groups). */
+static int page_collected(uint64_t page) {   /* is the page in a range some collection reads (and so clears its mark)? */
+    static uint64_t (*all)[2];
+    static SRWLOCK mu = SRWLOCK_INIT;
+    int in = 0;
+    AcquireSRWLockExclusive(&mu);
+    if (!all) all = malloc(sizeof *all * 4096);
+    const int n = hos_gpu_guest_ranges(all, 4096);
+    for (int i = 0; i < n && !in; i++) in = page >= all[i][0] >> 12 && page < (all[i][1] + 4095) >> 12;
+    ReleaseSRWLockExclusive(&mu);
+    return in;
+}
+#endif
 static int64_t collect_in(const uint64_t (*ranges)[2], int nranges, uint32_t **pages) {
     size_t n = 0, cap = 4096;
     uint32_t *out = malloc(cap * sizeof *out);
@@ -76,6 +91,46 @@ static int64_t collect_in(const uint64_t (*ranges)[2], int nranges, uint32_t **p
         const uint64_t lo = ranges[r][0], hi = ranges[r][1] < hos_guest_size() ? ranges[r][1] : hos_guest_size();
         uint64_t p1 = (hi + 4095) >> 12;
         if (p1 > A64_DIRTY_PAGES) p1 = A64_DIRTY_PAGES;
+#ifdef A64_MARK_ONE
+        /* carry: the page before was marked, so this one may be written too. Into the range's first page from the page
+           before it: that mark is another collection's to clear, or nobody's (then it is cleared here: it would say so at
+           every collection). Out of the range's last page: marked on for whoever collects the page after. */
+        uint64_t p = lo >> 12;
+        int carry = 0;
+        if (p > 0 && p <= p1 && __atomic_load_n(&a64_dirty[p - 1], __ATOMIC_RELAXED)) {
+            carry = 1;
+            if (!page_collected(p - 1)) __atomic_exchange_n(&a64_dirty[p - 1], 0, __ATOMIC_ACQUIRE);
+        }
+        while (p < p1) {
+            if (!carry) {
+                if (!(p & 31) && p + 32 <= p1) {   /* (32 pages at a time while none is marked) */
+                    uint64_t w[4];
+                    memcpy(w, &a64_dirty[p], 32);
+                    if (!(w[0] | w[1] | w[2] | w[3])) {
+                        p += 32;
+                        continue;
+                    }
+                }
+                if (!(p & 7) && p + 8 <= p1) {   /* (eight pages a load while none is marked) */
+                    uint64_t w;
+                    memcpy(&w, &a64_dirty[p], 8);
+                    if (!w) {
+                        p += 8;
+                        continue;
+                    }
+                }
+            }
+            const int marked = __atomic_load_n(&a64_dirty[p], __ATOMIC_RELAXED) && __atomic_exchange_n(&a64_dirty[p], 0, __ATOMIC_ACQUIRE);
+            if (marked || carry) {
+                if (n == cap) out = realloc(out, (cap *= 2) * sizeof *out);
+                out[n++] = (uint32_t)p;
+            }
+            carry = marked;
+            p++;
+        }
+        if (carry && p1 < A64_DIRTY_PAGES) __atomic_store_n(&a64_dirty[p1], 1, __ATOMIC_RELEASE);
+        continue;
+#endif
         for (uint64_t p = lo >> 12; p < p1;) {
             if (!(p & 31) && p + 32 <= p1) {   /* (32 pages at a time while none is marked) */
                 uint64_t w[4];
@@ -240,6 +295,28 @@ static void flush_early(void) {
     ReleaseSRWLockExclusive(&early_lock);
 }
 
+/* (Triforce) The lazy write-back (the Debug tab's row, gpu/vk/vk_memory.cpp): pages of guest memory may have no access while
+   the GPU's newest bytes for them are in VRAM. The CPU's own touch faults and the renderer pays it first, but the kernel,
+   handed such a page by ReadFile, WriteFile and the like, fails or reads old bytes, with no fault. So every host call that
+   gives guest memory to the kernel, or changes guest pages' state (a commit, a discard, a decommit), calls
+   hos_guest_io_begin with the range first and hos_guest_io_end with what it returned after it: what is owed there is copied
+   down, and no page is protected until the end. With the row off, or without the Vulkan back end, both return at once.
+   tests/test_lazy_wb_host.py finds the kernel calls in host/ that do neither. */
+static int (*volatile lazy_io_begin)(const void *, uint64_t);   /* (the back end's mkwvk_lazy_io_begin, once it runs) */
+static void (*volatile lazy_io_end)(int);
+int hos_guest_io_begin(const void *p, uint64_t n) {
+    int (*begin)(const void *, uint64_t) = lazy_io_begin;
+    if (!begin || !n) return 0;
+    const int away = hos_vcore_away();   /* (it may wait for the GPU: no virtual core held meanwhile, as rx_guest_imported) */
+    const int held = begin(p, n);
+    if (away) hos_vcore_back();
+    return held;
+}
+void hos_guest_io_end(int held) {
+    void (*end)(int) = lazy_io_end;
+    if (held && end) end(held);
+}
+
 /* dll: mkw_vk.dll (our Vulkan back end) or mkw_eden.dll (Eden's renderer driven natively, gpu/eden): one export */
 static const MkwVkRenderer *load_vulkan(const char *dll) {
     char path[MAX_PATH];
@@ -270,6 +347,10 @@ int rx_start(void *hwnd) {
         const MkwVkRenderer *r = load_vulkan(dll);
         if (r && r->start(hwnd)) {
             vk = r;
+            /* (Triforce: the lazy write-back's two calls, hos_guest_io_begin above; a back end without them has none) */
+            lazy_io_end = (void (*)(int))(void *)GetProcAddress(vk_module, "mkwvk_lazy_io_end");
+            if (lazy_io_end)
+                lazy_io_begin = (int (*)(const void *, uint64_t))(void *)GetProcAddress(vk_module, "mkwvk_lazy_io_begin");
             hos_log("rx: renderer: %s (%s)", eden ? "Eden's" : "Vulkan", dll);
             flush_early();
             return 1;
@@ -430,7 +511,14 @@ void rx_nvn_write_texels(const nvn_tex *t, unsigned level, unsigned layer0, cons
 void rx_nvn_invalidate(uint64_t gpu, uint64_t size) {
     /* The callback can wait for replay or GPU write-back: let another guest thread use this core meanwhile. */
     const int away = hos_vcore_away();
+    int hos_ft_on(void);
+    double hos_ft_ms(void);
+    const int ft = hos_ft_on();   /* (Triforce, 11-14: a readback that waited 0.2 ms or more, nvn_native.c HOS_FT) */
+    const int64_t t0 = ft ? hos_now_ns() : 0;
     vk ? vk->nvn_invalidate(gpu, size) : wgr_nvn_invalidate(gpu, size);
+    if (ft && hos_now_ns() - t0 >= 200000)
+        hos_log("ft %.3f readback %#llx +%#llx waited %.2f ms", hos_ft_ms(), (unsigned long long)gpu, (unsigned long long)size,
+                (hos_now_ns() - t0) / 1e6);
     if (away) hos_vcore_back();
 }
 int rx_guest_imported(uint64_t lo, uint64_t hi) {
@@ -439,6 +527,38 @@ int rx_guest_imported(uint64_t lo, uint64_t hi) {
     const int r = vk && vk->guest_imported ? vk->guest_imported(lo, hi) : 0;
     if (away) hos_vcore_back();
     return r;
+}
+/* (Triforce) The census's give-back (hos_mem.c census_offer): release(lo, hi) is run by the Vulkan back end with its import
+   locks held, and only where no import holds the pages (its mkwvk_guest_release, found by name: MkwVkHost and MkwVkRenderer
+   stay as they are), so that none can lock them between the question and the decommit. 1: given back, 0: not (an import holds
+   them, or release refused), -2: a back end without the export (nothing given back). Without the Vulkan back end nothing
+   imports guest memory (rx_guest_imported's answer then), and release runs at once */
+int rx_guest_release(uint64_t lo, uint64_t hi, int (*release)(uint64_t lo, uint64_t hi)) {
+    if (!vk) return release(lo, hi) ? 1 : 0;
+    static int (*volatile fn)(uint64_t, uint64_t, int (*)(uint64_t, uint64_t));
+    static volatile int looked;
+    if (!looked) {
+        fn = (int (*)(uint64_t, uint64_t, int (*)(uint64_t, uint64_t)))(void *)GetProcAddress(vk_module, "mkwvk_guest_release");
+        looked = 1;
+    }
+    if (!fn) return -2;
+    const int away = hos_vcore_away();   /* (as rx_guest_imported: the back end's pool lock) */
+    const int r = fn(lo, hi, release);
+    if (away) hos_vcore_back();
+    return r == 1 ? 1 : 0;
+}
+/* (Triforce) The census's second line (mkw_glue.c census_main): the Vulkan back end's big holders of memory, as text (its
+   mkwvk_memory_holders, found by name). Its length, 0 when there is none */
+int rx_memory_holders(char *out, size_t n) {
+    if (!vk || !n) return 0;
+    static int (*volatile fn)(char *, size_t);
+    static volatile int looked;
+    if (!looked) {
+        fn = (int (*)(char *, size_t))(void *)GetProcAddress(vk_module, "mkwvk_memory_holders");
+        looked = 1;
+    }
+    out[0] = 0;
+    return fn ? fn(out, n) : 0;
 }
 /* (nvn_native.c: the CPU set an event's value) in order with the submits, for the GPU's waits on it */
 int rx_option(int id, int otherwise) { return vk && vk->option ? vk->option(id) : otherwise; }

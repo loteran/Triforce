@@ -19,6 +19,7 @@
    own procs (program builders, native images, sparse tile layouts, recording modes). The SDK's exports reach the
    same functions as the proc table (nvn2_dispatch, from gen/nvn2_exports.c). */
 #include "hos.h"
+#include "guest_bounds.h"   /* ((Triforce) hos_span_ok: the game's first and count checked without an int overflow) */
 #include "../gpu/render/rx_nvn.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -366,10 +367,59 @@ NV(nvnMemoryPoolGetBufferAddress) {
     if (no_pool(c, "buffer address")) { RET(0); return; }
     RET(((const nvn_pool *)P(0))->gpu);
 }
-NV(nvnMemoryPoolFlushMappedRange) {}   /* CPU writes are seen through write watch */
+/* (Triforce, 11-14, diagnostics) HOS_FT=<present>: a frame trace. From that present of the game's on, for HOS_FT_N presents (8),
+   every line "ft <ms> ..." in the log carries the clock (ms, QueryPerformanceCounter's, the last 100 s of it): the game's
+   submits, presents, acquires, event polls and blocking sync waits here; its threads' light events waited for 0.2 ms or more,
+   every light event signalled and every message sent (nn_os_sync.c); readbacks that waited (rx_backend.c). The renderer writes
+   its own lines by the same clock (RX_VK_FT, vk_replay.cpp). What a frame's cycle waits for, link by link */
+int hos_ft_on(void) {
+    static long long from = -2, n = 8;
+    extern volatile LONG64 hos_present_count;   /* display.c */
+    if (from == -2) {
+        const char *e = getenv("HOS_FT"), *k = getenv("HOS_FT_N");
+        if (k) n = atoll(k);
+        from = e ? atoll(e) : -1;
+    }
+    return from >= 0 && hos_present_count >= from && hos_present_count < from + n;
+}
+double hos_ft_ms(void) { return (double)(hos_now_ns() % 100000000000LL) / 1e6; }
+
+/* (Triforce, 11-14, diagnostics) HOS_NVN_LOG_FLUSH=<n>: the game's own marks of who owns a mapped range: FlushMappedRange (the
+   CPU wrote it: the GPU may read it from here on) and InvalidateMappedRange (the CPU is about to read what the GPU wrote). n calls
+   of both kinds logged in the order they come, from HOS_NVN_LOG_FLUSH_AFTER_S seconds (150) after the first one, and a count of
+   each every 5 s. What a replay behind the game needs to know is here: which ranges the game hands over, and when in its frame */
+static void flush_note(Ctx *c, int kind, uint64_t gpu, uint64_t size) {
+    static int want = -1, after_s = 150;
+    static volatile LONG logged;
+    static volatile LONG64 n[2], bytes[2], first, last;
+    if (want < 0) {
+        const char *a = getenv("HOS_NVN_LOG_FLUSH_AFTER_S");
+        if (a) after_s = atoi(a);
+        want = getenv("HOS_NVN_LOG_FLUSH") ? atoi(getenv("HOS_NVN_LOG_FLUSH")) : 0;
+    }
+    if (!want) return;
+    const int64_t now = hos_now_ns();
+    if (!first) InterlockedCompareExchange64(&first, now, 0);
+    InterlockedIncrement64(&n[kind]);
+    InterlockedAdd64(&bytes[kind], (LONG64)size);
+    if (now - first >= after_s * 1000000000LL && logged < want && InterlockedIncrement(&logged) <= want)
+        hos_log("nvn: %s %#llx +%#llx (lr %#llx)", kind ? "invalidate" : "flush", (unsigned long long)gpu, (unsigned long long)size,
+                (unsigned long long)c->x[30]);
+    const int64_t l = last;
+    if (now - l >= 5000000000LL && InterlockedCompareExchange64(&last, now, l) == l && l)
+        hos_log("nvn: mapped ranges in 5 s: %lld flushed (%lld KB), %lld invalidated (%lld KB)",
+                (long long)InterlockedExchange64(&n[0], 0), (long long)(InterlockedExchange64(&bytes[0], 0) >> 10),
+                (long long)InterlockedExchange64(&n[1], 0), (long long)(InterlockedExchange64(&bytes[1], 0) >> 10));
+    else if (!l) InterlockedCompareExchange64(&last, now, 0);
+}
+NV(nvnMemoryPoolFlushMappedRange) {   /* CPU writes are seen through write watch */
+    const nvn_pool *o = (const nvn_pool *)P(0);
+    if (o) flush_note(c, 0, o->gpu + U64(1), U64(2));
+}
 NV(nvnMemoryPoolInvalidateMappedRange) {   /* the CPU is about to read what the GPU wrote */
     if (no_pool(c, "invalidate mapped range")) return;
     const nvn_pool *o = (const nvn_pool *)P(0);
+    flush_note(c, 1, o->gpu + U64(1), U64(2));
     if ((int64_t)U64(1) >= 0) rx_nvn_invalidate(o->gpu + U64(1), U64(2));
 }
 NV(nvnMemoryPoolSetDebugLabel) {}
@@ -497,9 +547,13 @@ NV(nvnBufferGetAddress) {
 NV(nvnBufferGetMemoryPool) { RETP(((const nvn_buffer *)P(0))->pool); }
 NV(nvnBufferGetMemoryOffset) { RET((uint64_t)((const nvn_buffer *)P(0))->off); }
 NV(nvnBufferGetSize) { RET(((const nvn_buffer *)P(0))->size); }
-NV(nvnBufferFlushMappedRange) {}
+NV(nvnBufferFlushMappedRange) {
+    const nvn_buffer *o = (const nvn_buffer *)P(0);
+    if (o && o->pool) flush_note(c, 0, POOL(o->pool)->gpu + (uint64_t)o->off + U64(1), U64(2));
+}
 NV(nvnBufferInvalidateMappedRange) {
     const nvn_buffer *o = (const nvn_buffer *)P(0);
+    if (o->pool) flush_note(c, 1, POOL(o->pool)->gpu + (uint64_t)o->off + U64(1), U64(2));
     if (o->pool) rx_nvn_invalidate(POOL(o->pool)->gpu + (uint64_t)o->off + U64(1), U64(2));
 }
 NV(nvnBufferSetDebugLabel) {}
@@ -1001,10 +1055,14 @@ static void dump_stage(uint64_t code, uint64_t ctl) {
     MEMORY_BASIC_INFORMATION mbi;
     while (n < 0x10000 && VirtualQuery(GP(code + n), &mbi, sizeof mbi) && mbi.State == MEM_COMMIT) n += 0x1000;
     FILE *f = fopen(path, "wb");
+    int io = hos_guest_io_begin(GP(code), n);   /* (Triforce: the kernel reads guest memory here: rx_backend.c) */
     if (f) { fwrite(GP(code), 1, (size_t)n, f); fclose(f); }
+    hos_guest_io_end(io);
     snprintf(path, sizeof path, "%s/%010llx.ctl", dir, (unsigned long long)code);
     f = fopen(path, "wb");
+    io = hos_guest_io_begin(GP(ctl), 0x800);
     if (f) { fwrite(GP(ctl), 1, 0x800, f); fclose(f); }
+    hos_guest_io_end(io);
 }
 static int set_shaders(nvn_prog *o, int n, const uint8_t *sd, int stride) {
     if (n < 0 || n > 6) return 0;
@@ -1106,7 +1164,11 @@ NV(nvnSyncWait) {
     if (block < 0) block = getenv("HOS_NVN_SYNC_BLOCK") != NULL;
     const int away = hos_vcore_away();
     const int64_t t0 = hos_now_ns();
+    const int ft = hos_ft_on();
+    if (ft) hos_log("ft %.3f syncwait> fence %llu timeout %llu (lr %#llx)", hos_ft_ms(), (unsigned long long)s->fence,
+                    (unsigned long long)U64(1), (unsigned long long)c->x[30]);
     const int ok = rx_nvn_wait(s->fence, block ? ~0ull >> 1 : U64(1));
+    if (ft) hos_log("ft %.3f syncwait< %d", hos_ft_ms(), ok);
     wait_note(ok ? 0 : 1, t0);
     if (away) hos_vcore_back();
     RET(ok ? NVN_SYNC_WAIT_RESULT_CONDITION_SATISFIED : NVN_SYNC_WAIT_RESULT_TIMEOUT_EXPIRED);
@@ -1138,8 +1200,10 @@ NV(nvnEventGetValue) {
         if (nowait < 0) nowait = getenv("HOS_PRESENT_NOWAIT") && atoi(getenv("HOS_PRESENT_NOWAIT")) != 0;
         if (nowait && (c->x[30] == 0x805904a0 || c->x[30] == 0x80590530)) { RET(1); return; }
     }
-    uint32_t v = 0; nvn_gpu_read(((const nvn_event *)P(0))->gpu, &v, 4); RET(v);
-    if (sync_log()) hos_log("nvn: EventGetValue %p = %u (lr %#llx)", P(0), v, (unsigned long long)c->x[30]);
+    const uint64_t ev_gpu = ((const nvn_event *)P(0))->gpu;   /* (before RET: it writes x0) */
+    uint32_t v = 0; nvn_gpu_read(ev_gpu, &v, 4); RET(v);
+    if (sync_log()) hos_log("nvn: EventGetValue %#llx = %u (lr %#llx)", (unsigned long long)ev_gpu, v, (unsigned long long)c->x[30]);
+    if (hos_ft_on()) hos_log("ft %.3f eventget %#llx = %u (lr %#llx)", hos_ft_ms(), (unsigned long long)ev_gpu, v, (unsigned long long)c->x[30]);
 }
 NV(nvnEventSignal) {
     const nvn_event *e = (const nvn_event *)P(0);
@@ -1859,7 +1923,7 @@ NV(nvnCommandBufferClearDepthStencil) {
 }
 NV(nvnCommandBufferSetViewports) {
     const int first = I(1), n = I(2);
-    if (n < 0 || first < 0 || first + n > 16) die("SetViewports %d+%d", first, n);
+    if (!hos_span_ok(first, n, 16)) die("SetViewports %d+%d", first, n);   /* ((Triforce) first + n in an int wrapped) */
     nvn_p_viewports *r = REC(CB(P(0)), NOP_VIEWPORTS, nvn_p_viewports);
     r->first = first, r->n = n;
     memcpy(r->v, PN(3, 16 * (size_t)n), 16 * (size_t)n);
@@ -1951,7 +2015,7 @@ NV(nvnCommandBufferBindVertexStreamState) {
     hw_fix(o, 4 * (16 + (uint64_t)n));
 }
 static void bind_vbufs(nvn_cmd *o, int first, int n, const NVNbufferRange *rg) {
-    if (n < 0 || first < 0 || first + n > 16) die("BindVertexBuffers %d+%d", first, n);
+    if (!hos_span_ok(first, n, 16)) die("BindVertexBuffers %d+%d", first, n);   /* ((Triforce) as SetViewports) */
     nvn_p_bind_vbuf *r = RECN(o, NOP_BIND_VBUF, nvn_p_bind_vbuf, r, n);
     r->first = first, r->n = n;
     memcpy(r->r, rg, sizeof *rg * (size_t)n);
@@ -2375,7 +2439,10 @@ NV(nvnQueueSubmitCommands) {
            core is given up for it, as Present and AcquireTexture do, so the game's other threads run on it meanwhile.
            Nothing in the replay runs guest code or needs the core) */
         const int away = hos_vcore_away();
+        const int ft = hos_ft_on();
+        if (ft) hos_log("ft %.3f submit> queue %p, %d handles (lr %#llx)", hos_ft_ms(), (void *)q, n, (unsigned long long)c->x[30]);
         rx_nvn_submit_q(h, n, (uint64_t)(uintptr_t)q);
+        if (ft) hos_log("ft %.3f submit< queue %p", hos_ft_ms(), (void *)q);
         if (away) hos_vcore_back();
         return;
     }
@@ -2475,7 +2542,10 @@ NV(nvnWindowAcquireTexture) {
     *(int *)P(2) = o->active ? o->next++ % o->active : 0;
     {
         const int away = hos_vcore_away();
+        const int ft = hos_ft_on();
+        if (ft) hos_log("ft %.3f acquire>", hos_ft_ms());
         hos_vi_native_acquire(o->active ? o->active : o->ntex);
+        if (ft) hos_log("ft %.3f acquire<", hos_ft_ms());
         if (away) hos_vcore_back();
     }
     /* the acquire sync: this texture is no longer read by the display path (presents copy it in GPU order) */
@@ -2489,13 +2559,18 @@ NV(nvnQueuePresentTexture) {
     held_flush();   /* (a present flushes the queue) */
     {
         const int away = hos_vcore_away();
+        const int ft = hos_ft_on();
+        if (ft) hos_log("ft %.3f present> (lr %#llx)", hos_ft_ms(), (unsigned long long)c->x[30]);
         rx_nvn_present(win_tex(o, i), o->crop);
+        if (ft) hos_log("ft %.3f present<", hos_ft_ms());
         if (away) hos_vcore_back();
     }
     o->presents++;
     extern volatile LONG64 hos_present_count;   /* display.c */
     InterlockedIncrement64(&hos_present_count);
     hos_vi_native_presented();
+    void hos_mod_cheats_frame(void);   /* (Triforce) mod_cheats.c: the mods' cheat files, once a game frame; nothing without one */
+    hos_mod_cheats_frame();
 }
 
 /* ---- NVN2 (mkw-recomp): what the Switch 2's NVN adds, as MKW uses it ---- */

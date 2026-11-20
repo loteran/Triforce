@@ -13,8 +13,15 @@
 
 namespace mkwvk {
 
-/// buffer <-> texture level (nvn_p_copy_bt); to_image: buffer to texture, else texture to buffer
-void copy_b2t(VkCommandBuffer cmd, NvnState& s, const nvn_p_copy_bt& p, bool to_image);
+/// buffer <-> texture level (nvn_p_copy_bt); to_image: buffer to texture, else texture to buffer. cpu_done (Triforce): a
+/// parallel replay's worker after its dry pass, which made the copies the CPU makes (dry_copy_b2t): not made again
+void copy_b2t(VkCommandBuffer cmd, NvnState& s, const nvn_p_copy_bt& p, bool to_image, bool cpu_done = false);
+/// (Triforce) The parallel replay's dry pass, in stream order on the replay thread: the destination of a buffer-to-texture
+/// copy, of a texture-to-texture copy and of a texture clear looked up as the copy will look it up and marked as written
+/// by the GPU, before any segment's worker records (vk_xfer.cpp, "the parallel replay's dry pass")
+void dry_copy_b2t(NvnState& s, const nvn_p_copy_bt& p);
+void dry_copy_t2t(const nvn_p_copy_tt& p);
+void dry_clear_tex(const nvn_p_clear_tex& p);
 /// texture level -> texture level (nvn_p_copy_tt): copy, blit when scaled or converting, resolve when multisampled
 void copy_t2t(VkCommandBuffer cmd, NvnState& s, const nvn_p_copy_tt& p);
 /// a whole level to a value (nvn_p_clear_tex)

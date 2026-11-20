@@ -4,7 +4,9 @@ The engine's rate is a whole number of display intervals, 60 at most, and it put
 rate raised, every frame above 60 fps still stepped 1/60 s. nx2/oot_patches.py puts the host's measured frame time
 (hos_frame_seconds_bits) at the engine's two step divides, and host/nn_vi.c realtime_step publishes it while the cap is above
 60 and the hook is in the build. At a cap of 60 the bits stay 0 and the lifted code runs as shipped; a game version whose
-code differs keeps its own code and the build goes on with a warning.
+code differs keeps its own code and the build goes on with a warning. With HOS_STEP_STEADY=1 (host/step_steady.h,
+tests/test_step_steady.py) the frames' jittered times at a cap of 120 give exactly its period, and at 60 the engine's rate
+stays 60.
 
 python -I -B tests/test_frame_rate_cap_step.py [--cc gcc]
 """
@@ -49,13 +51,17 @@ FIXTURE = r'''#define _CRT_SECURE_NO_WARNINGS
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "step_steady.h"
 #define CHECK(x) do { if (!(x)) { fprintf(stderr, "FAIL:%d %s\n", __LINE__, #x); exit(1); } } while (0)
+static int64_t pace_period_ns;   /* (the period the presents are paced by: hos_vi_native_presented) */
 static uint8_t guest[0x4000];
 #define GP(a) ((void *)(guest + (a)))
 #define MOD 0x1000u
 static void hos_log(const char *fmt, ...) { (void)fmt; }
 int rx_option(int id, int otherwise) { (void)id; return otherwise; }
 int hos_ini_option(const char *key, int otherwise) { (void)key; return otherwise; }
+enum { HOS_OPT_DISPLAY_CAP = 60 };   /* (gpu/vk/vk_api.h: Monitor's rate, tests/test_fps_cap_monitor.py) */
+static volatile long long presents;
 volatile uint64_t hos_gfx_module = MOD;
 volatile int hos_fixed_resolution, hos_dynres_runs;
 volatile uint32_t hos_fixed_scale_bits;
@@ -107,6 +113,15 @@ int main(int argc, char **argv) {
             if (*rate == 40) { recovered = 1; break; }
         }
         CHECK(recovered && lifted_step(60.0f, (float)*rate) == 1.5f);
+    } else if (!strcmp(mode, "steady 120")) {   /* (HOS_STEP_STEADY=1: jittered frames at the cap give its period exactly) */
+        pace_period_ns = 1000000000LL / 120;
+        frames(60, 1.0 / 120);
+        for (int i = 0; i < 2000; i++) CHECK(frames(1, (1.0 + (i % 3 - 1) * 0.012) / 120) == (float)(pace_period_ns / 1e9));   /* (the period in whole ns) */
+        CHECK(*rate == 60 && *limit == 120);
+    } else if (!strcmp(mode, "steady 60")) {   /* (and at 60 the engine's rate stays 60) */
+        pace_period_ns = 1000000000LL / 60;
+        frames(60, 1.0 / 60);
+        for (int i = 0; i < 2000; i++) CHECK(frames(1, (1.0 + (i % 3 - 1) * 0.012) / 60) == 0.0f && *rate == 60);
     } else {   /* (HOS_FPS_STEP=0, or a lift without the hook: the rate up to the cap, as before) */
         CHECK(frames(10, 1.0 / 120) == 0.0f && *rate == 120 && *limit == 120);
         CHECK(lifted_step(60.0f, 60.0f) == 1.0f);
@@ -166,19 +181,23 @@ def main():
               "a second run left one divide's hook from the first")
 
     vi = (ROOT / "host" / "nn_vi.c").read_text(encoding="utf-8")
-    host = "\n".join(block(vi, m) for m in ("static float text_scale(", "static int fps_max(void) {", "static int realtime_rate(", "static void realtime_step("))
+    host = "\n".join(block(vi, m) for m in ("static float text_scale(", "static int fps_cap_of(", "static int fps_max(void) {", "static int realtime_rate(",
+                                                "static void realtime_step("))
     fixture = FIXTURE.replace("@HOST@", host).replace("@HOOK@", "\n".join(oot_patches.STEP_HOOK.split("\n")[:2]))
     with tempfile.TemporaryDirectory(prefix="cap-step-") as tmp:
         c = Path(tmp) / "fixture.c"
         exe = Path(tmp) / "fixture.exe"
         c.write_text(fixture, encoding="utf-8")
-        subprocess.run([a.cc, "-std=c11", "-Wall", "-Wextra", "-Werror", str(c), "-o", str(exe)], check=True)
-        for mode, cap, step in (("cap 120", "120", None), ("cap 60", None, None), ("step off", "120", "0"), ("no hook", "120", None)):
+        subprocess.run([a.cc, "-std=c11", "-Wall", "-Wextra", "-Werror", "-I", str(ROOT / "host"), str(c), "-o", str(exe), "-lm"],
+                       check=True)
+        for mode, cap, step in (("cap 120", "120", None), ("cap 60", None, None), ("step off", "120", "0"), ("no hook", "120", None),
+                                ("steady 120", "120", None), ("steady 60", None, None)):
             env = {k: v for k, v in os.environ.items() if not k.startswith("HOS_")}
             if cap:
                 env["HOS_FPS_MAX"] = cap
             if step:
                 env["HOS_FPS_STEP"] = step
+            env["HOS_STEP_STEADY"] = "1" if mode.startswith("steady") else "0"   # (on by default since 11-15: the old modes ask for the old step)
             subprocess.run([str(exe), mode], env=env, check=True)
 
 

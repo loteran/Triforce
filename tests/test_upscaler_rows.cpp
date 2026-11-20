@@ -88,7 +88,7 @@ int main() {
         using ur::FSR4_AA;
         const unsigned every = ur::bit(GAME) | ur::dlss_bits(true) | ur::bit(FSR3) | ur::fsr4_bits(true);
         const unsigned fsr4 = ur::bit(GAME) | ur::fsr4_bits(true);
-        CHECK("FSR 4 after FSR 3.1", FSR4 == 4 && FSR4_AA == 5 && ur::kUpscalers == 6);
+        CHECK("FSR 4 after FSR 3.1", FSR4 == 4 && FSR4_AA == 5);
         CHECK("upscaler steps through all six", ur::step_upscaler(FSR3, 1, every) == FSR4 &&
                                                   ur::step_upscaler(FSR4, 1, every) == FSR4_AA &&
                                                   ur::step_upscaler(FSR4_AA, 1, every) == GAME &&
@@ -111,8 +111,45 @@ int main() {
         CHECK("FSR 4's native AA does not step", ur::step(FSR4_AA, 3, 1) == 3 && ur::snap(FSR4_AA, 5) == 5);
         CHECK("the model row waits with FSR 4", ur::model_fixed(FSR4, false) && ur::model_fixed(FSR4_AA, false));
     }
+    // AMD FSR 3.1's native AA: the value after the ones saved before, shown after FSR 3.1, the 3D at full size
+    {
+        using ur::FSR3;
+        using ur::FSR3_AA;
+        using ur::FSR4;
+        using ur::FSR4_AA;
+        const unsigned every = ur::bit(GAME) | ur::dlss_bits(true) | ur::fsr3_bits(true) | ur::fsr4_bits(true);
+        const unsigned fsr3 = ur::bit(GAME) | ur::fsr3_bits(true);
+        CHECK("FSR 3.1's native AA after FSR 4's", FSR3_AA == 6 && ur::kUpscalers == 7);
+        CHECK("FSR 3.1's two run together", ur::fsr3_bits(true) == (ur::bit(FSR3) | ur::bit(FSR3_AA)) && ur::fsr3_bits(false) == 0u);
+        // the row's order: each engine's native AA after it
+        const int order[] = {GAME, DLSS, DLAA, FSR3, FSR3_AA, FSR4, FSR4_AA};
+        for (int i = 0; i < 7; i++) {
+            CHECK("the row's order, Right", ur::step_upscaler(order[i], 1, every) == order[(i + 1) % 7]);
+            CHECK("the row's order, Left", ur::step_upscaler(order[i], -1, every) == order[(i + 6) % 7]);
+        }
+        unsigned seen = 0;
+        for (int v : ur::kOrder) seen |= ur::bit(v);
+        CHECK("every value has its place in the order", seen == (1u << ur::kUpscalers) - 1 && ur::kOrder[0] == GAME);
+        CHECK("with FSR 3.1 alone", ur::step_upscaler(GAME, 1, fsr3) == FSR3 && ur::step_upscaler(FSR3, 1, fsr3) == FSR3_AA &&
+                                        ur::step_upscaler(FSR3_AA, 1, fsr3) == GAME && ur::step_upscaler(GAME, -1, fsr3) == FSR3_AA &&
+                                        ur::step_upscaler(FSR3_AA, -1, fsr3) == FSR3 && !ur::upscaler_fixed(fsr3));
+        CHECK("a saved FSR 3.1 native AA where it cannot run steps as the game's own",
+              ur::step_upscaler(FSR3_AA, 1, ur::bit(GAME) | ur::dlss_bits(true)) == DLSS &&
+              ur::step_upscaler(FSR3_AA, -1, ur::bit(GAME) | ur::fsr4_bits(true)) == FSR4_AA &&
+              ur::step_upscaler(FSR3_AA, 1, ur::bit(GAME)) == GAME);
+        CHECK("FSR 3.1's engine", ur::is_fsr3(FSR3) && ur::is_fsr3(FSR3_AA) && !ur::is_fsr3(FSR4) && !ur::is_fsr3(FSR4_AA) &&
+                                      !ur::is_fsr3(DLAA) && !ur::is_fsr3(GAME) && !ur::is_fsr4(FSR3_AA) && !ur::is_dlss(FSR3_AA));
+        CHECK("FSR 3.1's native AA is at full scale", ur::full_scale(FSR3_AA) && ur::resolution_fixed(FSR3_AA) &&
+                                                          !ur::scales_by_mode(FSR3_AA) && !ur::full_scale(FSR3));
+        CHECK("FSR 3.1's native AA does not step", ur::step(FSR3_AA, 3, 1) == 3 && ur::step(FSR3_AA, 0, -1) == 0 &&
+                                                       ur::snap(FSR3_AA, 5) == 5 && ur::snap(FSR3_AA, 0) == 0);
+        CHECK("the model row waits with FSR 3.1's native AA", ur::model_fixed(FSR3_AA, false));
+        // (from Native AA back to FSR 3.1: the Render resolution comes back as one of its modes)
+        CHECK("back to FSR 3.1's modes", ur::snap(FSR3, 1) == 3 && ur::snap(FSR3, 4) == 4);
+    }
     CHECK("upscaler fixed where DLSS cannot run", ur::upscaler_fixed(false) && !ur::upscaler_fixed(true));
     CHECK("render resolution fixed at full scale only", ur::resolution_fixed(DLAA) && ur::resolution_fixed(ur::FSR4_AA) &&
+                                                             ur::resolution_fixed(ur::FSR3_AA) && !ur::resolution_fixed(ur::FSR3) &&
                                                              !ur::resolution_fixed(DLSS) && !ur::resolution_fixed(ur::FSR4) &&
                                                              !ur::resolution_fixed(GAME));
     // the Window scaling filter: needed only when the window is not the picture's size (unknown: needed)

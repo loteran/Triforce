@@ -13,6 +13,8 @@
 #include <cstdlib>
 #include <atomic>
 #include <cstring>
+#include <filesystem>   // ((Triforce) folder_files: the Debug tab's name pages)
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -58,6 +60,8 @@ std::string romfs_dir() {
 game_font::Reader& font_reader(bool* ok) {
     static game_font::Reader reader;
     static bool opened = false, open = false;
+    static std::mutex mu;   // ((Triforce) the button icons are read on a thread of their own: load_glyphs)
+    std::lock_guard lk(mu);
     if (!opened) opened = true, open = reader.open(romfs_dir());
     *ok = open;
     return reader;
@@ -109,13 +113,19 @@ void load_fonts() {
     if (!(off && *off == '0')) fonts_.menu = game_font("CetraDisplayPro-Regular"), fonts_.number = game_font("NinDev-Number", false);
 }
 
-// ---- (Triforce) the game's button icons: its "External" font, as the game was served it this run ----
-bool glyphs_wanted = false, glyphs_tried = false;
-void load_glyphs() {
-    glyphs_tried = true;
+// ---- (Triforce) the game's button icons: its "External" font, as the game was served it this run. Read and unpacked on a
+// thread of its own (read_glyphs: on the presenting thread, at the menu's first frame, it was part of what held the first open
+// of the options), made a font of the atlas at the next begin (load_glyphs). The reader's dictionary is read-only, shared
+// with the menu fonts' reads ----
+std::atomic<int> glyphs_state{0};   // (0 not asked, 1 being read, 2 read, 3 made a font or found none)
+std::vector<unsigned char> glyph_bytes;   // (read_glyphs's, until load_glyphs takes them: glyphs_state orders the two)
+const char* glyph_from = "the game's own";
+void read_glyphs() {
     std::vector<unsigned char> font;
     const char* from = "the game's own";
-    if (host && host->prompt_face && host->prompt_face() >= 0) {   // (host/prompts.c: prompts/External.bfotf.zs, no dictionary)
+    // (host/prompts.c: prompts/External.bfotf.zs, no dictionary. (Triforce) Not the keyboard and mouse face's: these icons
+    // show while a controller is the menu's last input, and that face's are keys; the menu draws its own caps for the keys)
+    if (host && host->prompt_face && host->prompt_face() >= 0 && host->prompt_face() != HOS_PROMPT_KEYBOARD) {
         char exe[MAX_PATH];
         const DWORD n = game_module_path(exe, MAX_PATH);
         std::string dir(exe, n);
@@ -129,12 +139,18 @@ void load_glyphs() {
         game_font::Reader& reader = font_reader(&open);
         if (open) font = reader.read("External", false);
     }
-    if (font.empty()) {
+    glyph_bytes = std::move(font), glyph_from = from;
+    glyphs_state.store(2, std::memory_order_release);
+}
+void load_glyphs() {
+    glyphs_state.store(3, std::memory_order_relaxed);
+    if (glyph_bytes.empty()) {
         logf("vk: ui: no button icons (the game's files have no External font): the prompts name the buttons");
         return;
     }
-    fonts_.glyph = add_font(font, "External");
-    logf("vk: ui: the button icons: %s", from);
+    fonts_.glyph = add_font(glyph_bytes, "External");
+    std::vector<unsigned char>().swap(glyph_bytes);
+    logf("vk: ui: the button icons: %s", glyph_from);
 }
 
 // ---- (Triforce) the game's menu textures (vk_game_tex.h): read and decoded on a thread of its own, made ImGui textures at
@@ -330,7 +346,13 @@ void update_texture(VkCommandBuffer cmd, ImTextureData* tex) {
     VkBuffer buf = VK_NULL_HANDLE;
     VmaAllocation buf_alloc = nullptr;
     void* map = nullptr;
-    if (!size || !create_buffer(size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, true, buf, buf_alloc, &map)) return;
+    static int fails = 0;   // ((Triforce) why a texture could not be made, the first few times)
+    auto why = [&](const char* step) {
+        if (++fails <= 8) logf("vk: ui: texture %dx%d (status %d, %s) not made: %s", tex->Width, tex->Height, (int)tex->Status,
+                               create ? "new" : "an update", step);
+    };
+    if (!size) return why("no size");
+    if (!create_buffer(size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, true, buf, buf_alloc, &map)) return why("its staging buffer");
     if (create) {
         Tex made;
         VkImageCreateInfo ci{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
@@ -355,6 +377,7 @@ void update_texture(VkCommandBuffer cmd, ImTextureData* tex) {
         }
         if (ok) ok = (made.set = ImGui_ImplVulkan_AddTexture(made.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)) != VK_NULL_HANDLE;
         if (!ok) {   // (nothing recorded uses them yet)
+            why(!made.image ? "its image" : !made.view ? "its view" : "its descriptor set");
             if (made.view) vkDestroyImageView(dev.device, made.view, nullptr);
             if (made.image) destroy_image(made.image, made.alloc);
             destroy_buffer(buf, buf_alloc);
@@ -415,7 +438,9 @@ bool init() {
     ii.Device = dev.device;
     ii.QueueFamily = dev.queue_family;
     ii.Queue = dev.queue;   // (for the backend's own uploads, never used here: update_texture)
-    ii.DescriptorPoolSize = 64;   // (the backend's own pool: the textures' descriptor sets: the glyphs, the logo, the game's menu skin)
+    // (the backend's own pool: the textures' descriptor sets: the glyphs, the logo, the game's menu skin; (Triforce) the Mods
+    // screen's pictures and the Salesman. 64 ran out at the fifth page of mods, 11-17: every overlay then waited on it)
+    ii.DescriptorPoolSize = 1024;
     ii.MinImageCount = 2;
     ii.ImageCount = 4;            // (its vertex buffers in turn: one more than the three frames present_image keeps in flight)
     ii.UseDynamicRendering = true;
@@ -476,7 +501,7 @@ bool begin(uint32_t w, uint32_t h) {
     io.DeltaTime = last && now > last ? std::min((float)((now - last) / 1e9), 0.25f) : 1.0f / 60.0f;
     last = now;
     if (art_state.load(std::memory_order_acquire) == 2) art_make();
-    if (glyphs_wanted && !glyphs_tried) load_glyphs();
+    if (glyphs_state.load(std::memory_order_acquire) == 2) load_glyphs();
     ImGui_ImplVulkan_NewFrame();
     ImGui::NewFrame();
     bake_some();
@@ -489,7 +514,36 @@ const Art* art(const char* name) {
         if (n.name == name) return &n.art;
     return nullptr;
 }
-void want_glyphs() { glyphs_wanted = true; }
+void want_glyphs() {
+    int none = 0;
+    if (glyphs_state.compare_exchange_strong(none, 1)) std::thread(read_glyphs).detach();
+}
+std::vector<std::string> folder_files(const std::string& dir, const char* ending) {
+    std::vector<std::string> names;
+    const size_t len = strlen(ending);
+    std::error_code ec;
+    const std::filesystem::path path(std::u8string((const char8_t*)dir.data(), dir.size()));
+    for (std::filesystem::directory_iterator it(path, ec), end; !ec && it != end; it.increment(ec)) {
+        if (!it->is_regular_file(ec)) continue;
+        const std::u8string u8 = it->path().filename().u8string();
+        std::string name((const char*)u8.data(), u8.size());
+        if (name.size() <= len) continue;
+        bool same = true;   // (the ending whatever its case: .BIN is .bin)
+        for (size_t i = 0; same && i < len; i++) same = tolower((unsigned char)name[name.size() - len + i]) == tolower((unsigned char)ending[i]);
+        if (same) names.push_back(std::move(name));
+    }
+    std::sort(names.begin(), names.end());
+    return names;
+}
+bool game_files(const char* folder, const char* ending,
+                const std::function<void(const std::string& name, const std::vector<unsigned char>& bytes)>& each) {
+    game_font::Reader reader;   // (its own: the fonts' is the presenting thread's)
+    if (!reader.open(romfs_dir())) return false;
+    std::vector<unsigned char> bytes;
+    for (const std::string& name : folder_files(reader.romfs + folder, ending))
+        if (reader.read_packed((std::string(folder) + "/" + name).c_str(), bytes)) each(name, bytes);
+    return true;
+}
 void prebake(const float* px, int n) {
     if (!ready) return;
     to_bake.clear(), kept.clear(), baked_sizes.clear();   // (the sizes of the unit now only)
@@ -519,18 +573,29 @@ void record_to(VkCommandBuffer cmd, VkImage image, VkImageView view, uint32_t w,
     if (srgb_target) linearize(dd);
     else if (dev.hdr) hdr10(dd);   // (the overlays at the paper white, not at the display's peak with the wrong primaries)
     if (!image || !view) return;
-    bool textures_ok = true;   // (a texture that could not be made has no descriptor: draws that sample it must not be recorded)
+    // (a texture that could not be made has no descriptor: draws that sample it must not be recorded. (Triforce, 11-17) Those
+    // draws alone are left out, not the frame's overlays: one picture of the Mods screen that could not be made hid every
+    // overlay, the menus and the Mods entry under the game's list with them. The font atlas missing leaves the frame out)
+    ImVector<ImTextureData*> missing;
+    bool atlas_missing = false;
     if (dd->Textures)
         for (ImTextureData* tex : *dd->Textures) {
             if (tex->Status == ImTextureStatus_OK || tex->Status == ImTextureStatus_Destroyed) continue;
             update_texture(cmd, tex);
-            if (tex->Status != ImTextureStatus_OK && tex->Status != ImTextureStatus_Destroyed) textures_ok = false;
+            if (tex->Status != ImTextureStatus_OK && tex->Status != ImTextureStatus_Destroyed) {
+                missing.push_back(tex);
+                atlas_missing |= tex == ImGui::GetIO().Fonts->TexData;
+            }
         }
     dd->Textures = nullptr;   // (done above: the backend's own upload would wait on the queue)
-    if (!textures_ok) {   // (this frame's overlays left out; the texture is asked for again next frame)
+    if (!missing.empty()) {   // (asked for again next frame)
         static bool told = false;
-        if (!told) told = true, logf("vk: ui: a texture could not be made (out of memory?): the overlays wait for it");
-        return;
+        if (!told) told = true, logf("vk: ui: a texture could not be made (out of memory?): %s", atlas_missing ? "the overlays wait for it" : "its pictures left out");
+        if (atlas_missing) return;
+        for (ImDrawList* list : dd->CmdLists)
+            for (ImDrawCmd& dc : list->CmdBuffer)
+                if (dc.TexRef._TexData && missing.contains(dc.TexRef._TexData))
+                    dc.ElemCount = 0, dc.TexRef = ImGui::GetIO().Fonts->TexRef;   // (nothing drawn; a descriptor that is there bound)
     }
     layout(cmd, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
            VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,

@@ -33,8 +33,8 @@
 //
 // The Insert menu's Upscaler row (opts.dlss, upscaler_rows.h) chooses the engine; RX_VK_DLSS=1 / 2 (DLSS, DLAA) or
 // RX_VK_FSR4=1 / 2 (FSR 4, its native anti-aliasing) over it, and =0 takes that engine out for the run. AMD FSR 3.1
-// (vk_fsr3.cpp, the row's value 3 or RX_VK_FSR=1) has inputs of its own (vk_fsr3_inputs.cpp): while it upscales, this chain
-// stands aside.
+// (vk_fsr3.cpp, the row's value 3, 6 for its Native AA, or RX_VK_FSR=1 / 2) has inputs of its own (vk_fsr3_inputs.cpp):
+// while it upscales, this chain stands aside.
 // RX_VK_DLSS_DEBUG=motion: the motion vectors shown instead of the picture (|x|, |y| over 16 px as red and green, the actors'
 // in it); =characters: a grey picture, blue where a draw moves by itself (not as the camera moves what is there: a still
 // character is grey), brighter the further apart, up to 8 px; =alternate: every other frame the game's own upscale (a test's reference beside the engine's). (The names are
@@ -56,6 +56,7 @@
 #include "dlss_actor.h"
 #include "dlss_checks.h"
 #include "dlss_math.h"
+#include "stream_order.h"
 #include "upscaler_rows.h"
 #include "vk_dlss.h"
 #include "vk_hudless.h"
@@ -82,6 +83,7 @@
 namespace mkwvk {
 
 namespace ur = upscaler_rows;
+bool present_held_last();   // ((Triforce) vk_replay.cpp: the last present held its frame, the hold of the last picture)
 
 namespace {
 int env_switch(const char* name) {   // (-1: unset)
@@ -121,7 +123,8 @@ bool temporal_wanted() { return temporal_mode() != ur::GAME; }
 namespace {
 bool pre_wanted(int mode);   // (below: the engine, or AMD FSR 3.1, before the game's bloom and tone mapping)
 }
-bool temporal_full_scale() { return ur::full_scale(temporal_mode()); }
+// (AMD FSR 3.1's Native AA too, which is not an engine of this chain: vk_fsr3.cpp fsr3_native)
+bool temporal_full_scale() { return ur::full_scale(temporal_mode()) || fsr3_native(); }
 
 namespace {
 
@@ -143,7 +146,10 @@ struct Camera {
     VkFormat format = VK_FORMAT_UNDEFINED;   // (the scene's colour target's: for the log)
     const Texture* color = nullptr;          // (the scene's colour target itself: temporal_pre_tonemap draws into it)
     Texture* depth = nullptr;
-    uint64_t depth_gen = 0;   // (texture_destroy_generation when taken: a depth texture destroyed since is not used)
+    // (the two textures' creation numbers and texture_destroyed_count when taken: one destroyed since is not used. It was
+    // texture_destroy_generation, which any texture's end changes: there_still)
+    uint32_t color_id = 0, depth_id = 0;
+    uint64_t noted = 0;
     uint64_t frame = 0;       // (texture_frame_no when taken)
     bool valid = false;
 };
@@ -202,7 +208,8 @@ struct State {
     const Texture* pre_final = nullptr;
     bool pre_direct = false;
     Texture* pre_out = nullptr;
-    uint64_t pre_out_gen = 0;
+    uint32_t pre_out_id = 0;   // (its creation number and texture_destroyed_count when noted: there_still)
+    uint64_t pre_out_noted = 0;
     const Texture* pre_scene = nullptr;
     uint64_t pre_late = 0, pre_drawn = 0, pre_missed = 0;
     int pre_miss_run = 0;   // (frames in a row without the point)
@@ -474,6 +481,13 @@ bool make_pipelines(bool hdr) {
     return true;
 }
 
+/// A texture kept from an earlier draw is the same one still: it was not destroyed since it was noted (its creation number
+/// and texture_destroyed_count then). texture_destroy_generation was asked before, which any texture's end changes: on a
+/// card whose video memory is full the cache lets textures go in most frames, and each of those frames lost the engine
+/// or its picture at the output's size
+bool there_still(uint32_t id, uint64_t noted) { return !texture_destroyed_since(id, noted); }
+bool there_still(const Camera& cam) { return there_still(cam.color_id, cam.noted) && there_still(cam.depth_id, cam.noted); }
+
 /// A view of a depth texture's depth alone, for sampling (made once per image); of a colour texture, its colour (the
 /// scene's target, sampled and written by temporal_pre_tonemap)
 VkImageView depth_view(Texture* t) {
@@ -717,6 +731,10 @@ int actor_motion(VkCommandBuffer cmd, const Camera& cam, const float* before, co
     } timed{s};
     std::vector<State::Skin> skins = std::move(s.skins);
     s.skins.clear();
+    // (Triforce: noted by the parallel replay's threads in the order they recorded them: in stream order again, each named by
+    // its place among its model's draws in it, as on the replay thread alone. stream_order.h renumber)
+    stream_order::renumber(skins, [](const State::Skin& k) { return k.k.stream_pos; },
+                           [](State::Skin& k) -> uint64_t& { return k.key; });
     std::unordered_map<uint64_t, State::Pose> old = std::move(s.poses);
     s.poses.clear();
     if (motion_mode() != kMotionBones || skins.empty() || !make_actor_pipeline()) return 0;
@@ -840,6 +858,9 @@ std::vector<State::Captured> take_captures() {
     State& s = st();
     std::vector<State::Captured> c = std::move(s.captured);
     s.captured.clear(), s.captured_models.clear();
+    // (Triforce: in stream order and named again, as the skinned draws are in actor_motion)
+    stream_order::renumber(c, [](const State::Captured& k) { return k.k.stream_pos; },
+                           [](State::Captured& k) -> uint64_t& { return k.key; });
     s.capture_bytes_peak = std::max(s.capture_bytes_peak, s.capture_used);
     s.capture_at = (s.capture_at + 1) % kCaptureBuffers;
     s.capture_used = 0;
@@ -1142,7 +1163,8 @@ void temporal_note_scene_draw(const Texture* color0, uint32_t width, uint32_t he
     const bool plain = std::isfinite(n) && n > 0.0f && p11 > 0.0f && (!std::isfinite(f) || f > n);
     k.near_z = plain ? n : 0.0f, k.far_z = plain ? (std::isfinite(f) ? f : 1e9f) : 0.0f;
     k.fov_y = plain ? 2.0f * std::atan(1.0f / p11) : 0.0f;
-    k.width = width, k.height = height, k.format = color0->format, k.color = color0, k.depth = depth, k.depth_gen = texture_destroy_generation(), k.frame = now;
+    k.width = width, k.height = height, k.format = color0->format, k.color = color0, k.depth = depth, k.frame = now;
+    k.color_id = color0->id, k.depth_id = depth->id, k.noted = texture_destroyed_count();
     k.valid = true;
 }
 
@@ -1435,7 +1457,7 @@ bool pre_dispatch(VkCommandBuffer cmd, int mode, Texture* in, VkImageView in_vie
         const bool direct = s.pre_direct && out && out == s.pre_out;
         Texture* final = const_cast<Texture*>(s.pre_final);
         s.pre_pending = false, s.pre_candidate = {}, s.pre_final = nullptr, s.pre_direct = false;
-        if (out && !out_level) s.pre_out = out, s.pre_out_gen = texture_destroy_generation();
+        if (out && !out_level) s.pre_out = out, s.pre_out_id = out->id, s.pre_out_noted = texture_destroyed_count();
         if (out && temporal_scene_format(out->format)) note_output(out, out_level);
         return direct || pre_copy(cmd, final, in, in_view, out, out_view, out_level);
     }
@@ -1539,7 +1561,7 @@ bool temporal_upscale(VkCommandBuffer cmd, uint64_t key, bool known, Texture* in
     s.asked = texture_frame_no(), s.holding = true;   // (not after a failure: what it holds is let go, temporal_idle)
     if (!in || !in_view || !out || !out_view) return fail("no input or output view");
     if (!cam.valid || texture_frame_no() - cam.frame > 1) return fail("no scene camera this frame");
-    if (cam.depth_gen != texture_destroy_generation()) return fail("the scene depth may be gone");
+    if (!there_still(cam)) return fail("the scene's colour or depth is gone");
     const uint32_t rw = in->width, rh = in->height;
     const uint32_t ow = std::max(1u, out->width >> out_level), oh = std::max(1u, out->height >> out_level);
     if (rw != cam.width || rh != cam.height) return fail("the input is not the scene's size");
@@ -1625,7 +1647,9 @@ bool chain(VkCommandBuffer cmd, int mode, Engine& engine, const Camera& cam, con
 
     const uint64_t now = texture_frame_no();
     const uint64_t last = s.last_frame;
-    const bool reset = !last || now - last > 2;
+    // (Triforce, the hold of the last picture: vk_replay.cpp do_present) and after a present that held its frame: what was drawn
+    // while new textures were still owed (the dummy in their place) is not carried into the picture shown after the hold
+    const bool reset = !last || now - last > 2 || present_held_last();
     struct {
         float reproject[16];
         float jitter[2];
@@ -1789,12 +1813,32 @@ bool temporal_pre_point(const Texture* color0, uint64_t program, bool* late) {
         return false;
     }
     if (!s.cam.valid || !s.cam.color || texture_frame_no() - s.cam.frame > 1) return false;
-    if (color0 == s.cam.color) return s.pre_candidate = {}, false;   // (the scene still being drawn)
-    const State::PrePoint here{program, color0->format, color0->width, color0->height};
-    if (!s.pre_candidate.program) s.pre_candidate = here;
-    // (the point only as the first draw after the scene's last: a frame whose first is another (the point learnt from a
-    // frame without the bloom, whose first was the tone mapping) is left to the dispatch, which learns this frame's)
-    return here == s.pre_key && s.pre_candidate == here;
+    // (a draw into the scene: the scene still being drawn. The point only as the first draw after the scene's last: a frame
+    // whose first is another (the point learnt from a frame without the bloom, whose first was the tone mapping) is left to
+    // the dispatch, which learns this frame's. Triforce: the rule is stream_order.h's, which the dry pass asks the same way)
+    return stream_order::pre_point_step(s.pre_candidate, s.pre_key, color0 == s.cam.color, [&] {
+        return State::PrePoint{program, color0->format, color0->width, color0->height};
+    });
+}
+
+bool temporal_pre_point_dry(const Texture* color0, uint64_t (*program)(void*), void* ctx) {
+    if (!color0 || !pre_wanted(temporal_mode())) return false;
+    State& s = st();
+    std::lock_guard lk(s.mu);
+    // (pending: the caller records such a command buffer on the replay thread alone, before it gets here; and the rest as
+    // temporal_pre_point, without its log of late draws, which only a pending frame has)
+    if (s.pre_pending) return false;
+    if (!s.cam.valid || !s.cam.color || texture_frame_no() - s.cam.frame > 1) return false;
+    return stream_order::pre_point_step(s.pre_candidate, s.pre_key, color0 == s.cam.color, [&] {
+        return State::PrePoint{program(ctx), color0->format, color0->width, color0->height};
+    });
+}
+
+bool temporal_pre_pending() {
+    if (!pre_wanted(temporal_mode())) return false;
+    State& s = st();
+    std::lock_guard lk(s.mu);
+    return s.pre_pending;
 }
 
 Texture* temporal_pre_tonemap(VkCommandBuffer cmd) {
@@ -1808,7 +1852,7 @@ Texture* temporal_pre_tonemap(VkCommandBuffer cmd) {
     const bool f3 = !ur::is_dlss(mode) && !ur::is_fsr4(mode) && mode != ur::FSR3;
     Engine* const engine = f3 ? nullptr : &engine_of(mode);
     // (anything unexpected: nothing here, and the upscale's dispatch draws as before, on the tone mapped picture)
-    if (!cam.valid || !scene || (engine && (!engine->e || engine->failed)) || cam.depth_gen != texture_destroy_generation())
+    if (!cam.valid || !scene || (engine && (!engine->e || engine->failed)) || !there_still(cam))
         return nullptr;
     const uint32_t rw = cam.width, rh = cam.height;
     const VkImageUsageFlags need = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT;
@@ -1870,7 +1914,9 @@ bool temporal_pre_composite(const Texture* color0, uint32_t width, uint32_t heig
     // (the engine's picture is larger than the scene: the draw once more, into the upscale's output at its size)
     Texture* out = s.pre_out;
     const auto& pic = s.pre_picture;
-    if (!pic.view || (pic.width == width && pic.height == height) || !out || s.pre_out_gen != texture_destroy_generation())
+    // (the output as the last frame's dispatch had it, unless that texture itself went since: with the video memory full
+    // textures go in most frames, and by the generation each of those frames was left to pre_copy, the scene's size scaled up)
+    if (!pic.view || (pic.width == width && pic.height == height) || !out || !there_still(s.pre_out_id, s.pre_out_noted))
         return false;
     if (out->width != pic.width || out->height != pic.height || !temporal_scene_format(out->format) ||
         !(out->usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) || out->samples != VK_SAMPLE_COUNT_1_BIT || out->layers != 1)

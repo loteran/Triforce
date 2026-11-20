@@ -55,6 +55,7 @@ def main():
 #include <filesystem>
 #include <string>
 #include <vector>
+#include "file_whole.h"
 """ + helpers + r"""
 int main(int argc, char** argv) {
     const std::string dir = argv[1], path = dir + "/hookshot_prepared.bin", seed = dir + "/hookshot_shaders.bin";
@@ -125,7 +126,7 @@ int main(int argc, char** argv) {
     with tempfile.TemporaryDirectory(prefix="prepared-stamps-") as tmp:
         c, exe = Path(tmp) / "fixture.cpp", Path(tmp) / "fixture"
         c.write_text(cpp, encoding="utf-8")
-        subprocess.run([a.cxx, "-std=c++20", "-Wall", str(c), "-o", str(exe)], check=True)
+        subprocess.run([a.cxx, "-std=c++20", "-Wall", "-I" + str(ROOT / "gpu" / "vk"), str(c), "-o", str(exe)], check=True)
         work = Path(tmp) / "game"
         work.mkdir()
         got = subprocess.run([str(exe), str(work)], capture_output=True, text=True)

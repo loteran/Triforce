@@ -262,14 +262,25 @@ class MarkGroupsTests(unittest.TestCase):
 
     def test_the_lift_groups_once_with_its_stats(self):
         """emit_function leaves the marks as they are; nx2/lift.py calls chunks.edit_c, which groups the written files once, with
-        the lift's stats, before its report"""
+        the lift's stats, before its report.
+        (Triforce) Once: by the lift's own process, or, where the emit's processes were spawned (Windows), by them, a file
+        each (chunks.marks_one), never both; and the lift waits for theirs (chunks.marks_done) before its report"""
         self.assertNotIn("mark_groups", inspect.getsource(a64_lift.Lifter.emit_function))
         src = read(os.path.join(ROOT, "nx2", "lift.py"))
-        self.assertEqual(src.count("group_marks(") + read(os.path.join(ROOT, "nx2", "chunks.py")).count("group_marks("), 1)
-        self.assertIn("group_marks(", inspect.getsource(chunks.edit_c))
+        self.assertEqual(src.count("group_marks("), 0)
+        self.assertEqual(read(os.path.join(ROOT, "nx2", "chunks.py")).count("group_marks("), 2)   # (the two below)
+        edit = inspect.getsource(chunks.edit_c)
+        own = "    if workers is None:\n        a64_lift.group_marks(paths, stats)\n        return\n"
+        self.assertEqual(edit.count("group_marks("), 1)
+        self.assertIn(own, edit)   # (the lift's process groups them and is done,
+        self.assertLess(edit.find(own), edit.find("ask_marks(paths, workers)"))   # or the processes are asked, after that return)
+        self.assertGreater(edit.find("ask_marks(paths, workers)"), 0)
+        self.assertIn("a64_lift.group_marks([path], st)", inspect.getsource(chunks.marks_one))
+        self.assertIn("workers.ask(marks_one, ", inspect.getsource(chunks.ask_marks))
         call = src.find("chunks.edit_c(gen, L.stats, ")
         self.assertGreater(call, 0)
-        self.assertLess(call, src.find("L.report()"))
+        self.assertLess(call, src.find("chunks.marks_done()"))
+        self.assertLess(src.find("chunks.marks_done()"), src.find("L.report()"))
 
 
 # The output-size edits' places (nx2/oot_patches.py OUT_EDITS) in small functions, no game code: [0] and [3] each followed by

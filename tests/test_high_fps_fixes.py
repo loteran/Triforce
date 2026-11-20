@@ -13,7 +13,19 @@ Solver: the game cuts frame step * n + 0.001 to its solver steps (n a 60 fps fra
 wanders; with n = 4, 0 above 240). With the frames' own time and a step under 1 it is rounded up (10% leeway for the frame time's
 jitter) and at least 1, never under the game's; a step of 1 or more, or no frame time (a cap of 60), keeps the game's count.
 
-The patches put the gate at the job's head and the step through the host, hook both solver places, declare the hooks, and leave
+Floors: the follow-surface updates keep a tenth of a floor's velocity above an inverse step of 100, which is every update above
+100 fps; the number compared with becomes 100 / the frame's 60 fps frames under one frame (200 at 120 fps, 240 at 144), and stays
+100 at 60 fps and below and without a frame time.
+
+Surfaces: the water managers and the interactive floors cut seconds / (1/60 s) to whole fixed steps, 0 above 60 fps; with the
+fractions carried per object 144 updates of 60/144 give 60 steps, each object its own, and without a frame time, or for a
+quotient that is no count, the quotient is handed back as it is.
+
+Recorder: the ocarina recorder's clock adds (unsigned)step, 0 above 60 fps; with the fraction carried 144 frames give 60, a
+whole step gives the game's count, and without a frame time it is the game's cut.
+
+The patches put the gate at the job's head and the step through the host, hook both solver places, the three floor compares, the three surface cuts and the four
+recorder adds, declare the hooks, and leave
 a file patched before, or whose code differs, as it is.
 
 python -I -B tests/test_high_fps_fixes.py
@@ -113,6 +125,48 @@ int main(void) {
     CHECK(OURS(1.6f, 4.0f, 1) == 6 && OURS(1.708f, 8.0f, 1) == 13);   /* (a slow frame: the game's count) */
     CHECK(oot_solver_steps(3, bits(NAN), bits(4.0f), 1) == 3 && oot_solver_steps(0, bits(-1.0f), bits(4.0f), 1) == 0);
     CHECK(oot_solver_steps(1, bits(2.0f), bits(0.0f), 1) == 1);   /* (no steps a frame: the game's) */
+    /* (a floor's carry: the number the inverse step is compared with) */
+    CHECK(oot_floor_cut(0) == bits(100.0f));   /* (a cap of 60) */
+    CHECK(oot_floor_cut(bits(1.0f / 60.0f)) == bits(100.0f) && oot_floor_cut(bits(1.0f / 30.0f)) == bits(100.0f));
+    CHECK(oot_bits_float(oot_floor_cut(bits(1.0f / 120.0f))) > 199.9f && oot_bits_float(oot_floor_cut(bits(1.0f / 120.0f))) < 200.1f);
+    CHECK(oot_bits_float(oot_floor_cut(bits(1.0f / 144.0f))) > 239.9f && oot_bits_float(oot_floor_cut(bits(1.0f / 144.0f))) < 240.1f);
+    for (int fps = 61; fps <= 240; fps++) {   /* (the inverse step of a frame at fps is under the cut, as 60 is under 100) */
+        const float secs = 1.0f / (float)fps;
+        CHECK(1.0f / secs < oot_bits_float(oot_floor_cut(bits(secs))));
+        CHECK(1.0f / (secs * 0.59f) > oot_bits_float(oot_floor_cut(bits(secs))));   /* (and a slow motion under 0.6 still passes it) */
+    }
+    CHECK(oot_floor_cut(bits(NAN)) == bits(100.0f) && oot_floor_cut(bits(-1.0f)) == bits(100.0f));
+    {   /* (the surfaces' fixed steps) */
+        static FrameWhole w;
+        float n = 0, m = 0;
+        for (int i = 0; i < 144; i++) {
+            n += oot_bits_float(oot_sim_steps(&w, 0x1000, bits(60.0f / 144.0f), 1));
+            m += oot_bits_float(oot_sim_steps(&w, 0x2000, bits(60.0f / 144.0f), 1));
+        }
+        CHECK((n == 60.0f || n == 59.0f) && m == n);   /* (each object its own remainder) */
+        CHECK(oot_sim_steps(&w, 0x3000, bits(1.0f), 1) == bits(1.0f) && oot_sim_steps(&w, 0x3000, bits(2.0f), 1) == bits(2.0f));
+        CHECK(oot_sim_steps(&w, 0x3000, bits(0.42f), 0) == bits(0.42f));   /* (a cap of 60: the quotient, for the game's cut) */
+        CHECK(oot_sim_steps(&w, 0x3000, bits(0.0f), 1) == bits(0.0f) && oot_sim_steps(&w, 0x3000, bits(-2.0f), 1) == bits(-2.0f));
+        CHECK(oot_sim_steps(&w, 0x3000, bits(NAN), 1) == bits(NAN) && oot_sim_steps(&w, 0x3000, bits(3e9f), 1) == bits(3e9f));
+        float slow = 0;   /* (a frame slower than 60 fps: 1.5 steps a frame are 1 and 2 in turn) */
+        for (int i = 0; i < 40; i++) slow += oot_bits_float(oot_sim_steps(&w, 0x4000, bits(1.5f), 1));
+        CHECK(slow == 60.0f);
+    }
+    {   /* (the ocarina recorder's clock) */
+        float rem = 0;
+        uint32_t n = 0;
+        for (int i = 0; i < 144; i++) n += oot_record_frames(&rem, bits(60.0f / 144.0f), 1);
+        CHECK(n == 60 || n == 59);
+        rem = 0, n = 0;
+        for (int i = 0; i < 1200; i++) n += oot_record_frames(&rem, bits(0.5f), 1);
+        CHECK(n == 600);
+        rem = 0;
+        CHECK(oot_record_frames(&rem, bits(1.0f), 1) == 1 && rem == 0.0f && oot_record_frames(&rem, bits(2.0f), 1) == 2 && rem == 0.0f);
+        CHECK(oot_record_frames(&rem, bits(0.75f), 1) == 0 && rem == 0.75f && oot_record_frames(&rem, bits(0.75f), 1) == 1 && rem == 0.5f);
+        CHECK(oot_record_frames(&rem, bits(0.42f), 0) == 0 && rem == 0.0f);   /* (a cap of 60: the game's cut, the remainder cleared) */
+        CHECK(oot_record_frames(&rem, bits(1.9f), 0) == 1 && oot_record_frames(&rem, bits(-1.0f), 1) == 0 && oot_record_frames(&rem, bits(NAN), 1) == 0);
+        CHECK(oot_record_frames(&rem, bits(5e9f), 0) == 0xffffffffu);   /* (fcvtzu saturates) */
+    }
     if (!fails) printf("PASS\n");
     return fails != 0;
 }
@@ -123,6 +177,18 @@ LIFTED_SOUND = ('#include "a64.h"\n' + oot_patches.SOUND_HEAD + "    /* nop/hint
                 + oot_patches.SOUND_OLD + "}\n")
 LIFTED_SOLVER = '#include "a64.h"\n' + "".join(head + "    c->x[8]=1;\n" + oot_patches.SOLVER_OLD + "}\n"
                                                for head in oot_patches.SOLVER_HEADS)
+
+
+LIFTED_FLOOR = '#include "a64.h"\n' + "".join(
+    head + "    { { uint64_t _v=recomp_load32(c,(c->x[8]+40ULL)); a64_vset64(c->vreg[0],_v); } }\n" + oot_patches.FLOOR_OLD
+    + "if ((c->n == c->v) && !c->z) { goto L_1; }\nL_1:;\n    return;\n}\n" for head in oot_patches.FLOOR_HEADS)
+# (a divide, the cut into the site's register, and one more cut of another register after it, as f_80652cb0 has many)
+LIFTED_SIM = '#include "a64.h"\n' + "".join(
+    head + "    _v=a64_fpx_div32_div32(c,_a,_b);\n    a64_vset64(c->vreg[0],_v);}\n" + oot_patches.SIM_OLD % reg
+    + (oot_patches.SIM_OLD % (reg + 1)).replace("vreg[0]", "vreg[1]") + "    return;\n}\n" for head, reg in oot_patches.SIM_SITES)
+LIFTED_RECORD = '#include "a64.h"\n' + "".join(
+    head + (oot_patches.RECORD_OLD + "    recomp_store32(c,c->x[20] + 1532,c->x[8]);\n") * count
+    + oot_patches.RECORD_OLD.replace(",32,32,0,3,", ",32,32,1,3,") + "    return;\n}\n" for head, count in oot_patches.RECORD_SITES)
 
 
 class HighFpsTests(unittest.TestCase):
@@ -166,6 +232,49 @@ class HighFpsTests(unittest.TestCase):
         self.assertEqual(oot_patches.patch_solver_steps(out), (out, 2))
         other = LIFTED_SOLVER.replace("+ 712", "+ 716")
         self.assertEqual(oot_patches.patch_solver_steps(other), (other, 0))
+
+
+    def test_floor_patch(self):
+        out, n = oot_patches.patch_floor_carry(LIFTED_FLOOR)
+        self.assertEqual(n, 3)
+        self.assertEqual(out.count(oot_patches.FLOOR_NEW), 3)
+        self.assertNotIn("0x42c80000", out)
+        self.assertIn(oot_patches.FLOOR_DECL, out)
+        self.assertEqual(oot_patches.patch_floor_carry(out), (out, 3))   # (patched before: as it is)
+        other = LIFTED_FLOOR.replace("0x42c80000ULL", "0x42c90000ULL")   # (another game version's code)
+        self.assertEqual(oot_patches.patch_floor_carry(other), (other, 0))
+        # (the same words in a function that is not one of the three stay the game's)
+        stray = LIFTED_FLOOR + "void f_80000000(Ctx *__restrict A64_NOESC c) {\n" + oot_patches.FLOOR_OLD + "}\n"
+        out, n = oot_patches.patch_floor_carry(stray)
+        self.assertEqual((n, out.count(oot_patches.FLOOR_OLD)), (3, 1))
+
+    def test_sim_patch(self):
+        out, n = oot_patches.patch_sim_steps(LIFTED_SIM)
+        self.assertEqual(n, 3)
+        self.assertEqual(out.count(oot_patches.SIM_HOOK), 3)
+        for _, reg in oot_patches.SIM_SITES:   # (the hook right before the game's own cut, which stays)
+            self.assertIn(oot_patches.SIM_HOOK + oot_patches.SIM_OLD % reg, out)
+        self.assertEqual(out.count("recomp_fp_to_int"), LIFTED_SIM.count("recomp_fp_to_int"))
+        self.assertIn(oot_patches.SIM_DECL, out)
+        self.assertEqual(oot_patches.patch_sim_steps(out), (out, 3))
+        other = LIFTED_SIM.replace(",32,32,1,3,", ",32,31,1,3,")
+        self.assertEqual(oot_patches.patch_sim_steps(other), (other, 0))
+        twice = LIFTED_SIM.replace(oot_patches.SIM_OLD % 22, (oot_patches.SIM_OLD % 22) * 2)   # (two such cuts: not this build)
+        self.assertEqual(oot_patches.patch_sim_steps(twice)[1], 2)
+
+    def test_record_patch(self):
+        out, n = oot_patches.patch_record_clock(LIFTED_RECORD)
+        self.assertEqual(n, 4)
+        self.assertEqual(out.count(oot_patches.RECORD_NEW), 4)
+        self.assertNotIn(oot_patches.RECORD_OLD, out)
+        self.assertEqual(out.count(",32,32,1,3,"), 3)   # (the functions' signed cuts stay the game's)
+        self.assertIn(oot_patches.RECORD_DECL, out)
+        self.assertEqual(oot_patches.patch_record_clock(out), (out, 4))
+        # (a function with another number of adds than this build's is left whole)
+        head, _ = oot_patches.RECORD_SITES[2]
+        other = LIFTED_RECORD.replace(head, head + oot_patches.RECORD_OLD, 1)
+        out, n = oot_patches.patch_record_clock(other)
+        self.assertEqual((n, out.count(oot_patches.RECORD_OLD)), (2, 3))
 
 
 if __name__ == "__main__":

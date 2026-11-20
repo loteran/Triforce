@@ -25,7 +25,14 @@ struct Device { VkDevice device{}; bool push_descriptor = true, offscreen = fals
 struct Options { int framegen = 2; } opts;
 auto vkCmdPushDescriptorSetKHR = reinterpret_cast<PFN_vkCmdPushDescriptorSetKHR>(uintptr_t(1));
 constexpr uint32_t FG_COPY_COMP_SPV[] = {0}, FG_LUMA_COMP_SPV[] = {0}, FG_FLOW_COMP_SPV[] = {0},
-                   FG_MEDIAN_COMP_SPV[] = {0}, FG_SYNTH_COMP_SPV[] = {0}, FG_SCALE_COMP_SPV[] = {0};
+                   FG_MEDIAN_COMP_SPV[] = {0}, FG_SYNTH_COMP_SPV[] = {0}, FG_SCALE_COMP_SPV[] = {0},
+                   FG_HALF_COMP_SPV[] = {0}, FG_FINE_FLOW_COMP_SPV[] = {0}, FG_FINE_PICK_COMP_SPV[] = {0},
+                   FG_FINE_SYNTH_COMP_SPV[] = {0}, FSR1_EASU_COMP_SPV[] = {0}, FSR1_RCAS_COMP_SPV[] = {0};
+namespace dlssg { bool active() { return false; } }
+// (the fine vectors (vk_framegen.cpp fine_vectors) or the old way, as RX_VK_FRAMEGEN_FINE chooses: both are run)
+bool fine_mode = true;
+bool fine_vectors() { return fine_mode; }
+constexpr float kFineBias = 0.3f;
 /* ACTUAL_STRUCTS */
 int multiplier() { return opts.framegen; }
 int display_refresh_mhz() { return 60000; }
@@ -84,10 +91,11 @@ void clear_model() {
     CHECK(live.empty()); fg.init = fg.failed = false; fg.w = fg.h = 0; fg.mult = 0;
     fg.have_prev = false; fg.recorded = nullptr; fg.nearest = fg.linear = 0;
     fg.copy = fg.luma = fg.flow = fg.median = fg.synth = {};
+    fg.half = fg.fine_flow = fg.fine_pick = fg.fine_synth = {};
     fg.cur = fg.next_set = 0; fg.jobs.clear();
-    for (int i = 0; i < 2; ++i) fg.frames[i] = fg.lumas[i] = fg.flows[i] = {};
+    for (int i = 0; i < 2; ++i) fg.frames[i] = fg.lumas[i] = fg.flows[i] = fg.halfs[i] = fg.fines[i] = {};
     for (auto& set : fg.sets) { set.busy = false; for (auto& image : set.frame) image = {}; }
-    scale.init = scale.failed = false; scale.pipe = {}; scale.linear = 0;
+    scale.init = scale.failed = false; scale.pipe = scale.easu = scale.rcas = {}; scale.linear = scale.nearest = 0;
     attempts = fail_at = barriers = waits = 0; submitted = false; idle = true;
 }
 void inspect_disabled() {
@@ -95,30 +103,39 @@ void inspect_disabled() {
     const int before = attempts; CHECK(!init() && attempts == before);
 }
 int run(const std::string& phase) {
+  for (bool fine : {true, false}) {
+    fine_mode = fine;
+    // ((Triforce) pipelines: copy, luma, flow, median, then the fine vectors' four or fg_synth alone; 4 attempts and 3
+    // objects each, then the two samplers. A frame's images: frame, luma, flow, and the fine vectors' half-size luma and
+    // vectors; 2 attempts and 3 objects each)
+    const int pipes = fine ? 8 : 5, setups = 4 * pipes + 2, per_frame = fine ? 5 : 3;
     clear_model();
     if (phase == "samplers") {
-        fail_at = 21; CHECK(!init()); inspect_disabled(); return 0;
+        fail_at = setups - 1; CHECK(!init()); inspect_disabled(); continue;
     }
     if (phase == "all") {
-        for (int failure = 1; failure <= 22; ++failure) {
+        for (int failure = 1; failure <= setups; ++failure) {
             clear_model(); fail_at = failure; CHECK(!init()); inspect_disabled();
         }
         clear_model(); dev.push_descriptor = false; CHECK(!init() && live.empty()); dev.push_descriptor = true;
     }
     // Every image or view failure at fixed2x and max8x, after successful pipeline setup.
-    for (int mult : {2, 8}) for (int failed = 1; failed <= 2 * (6 + 3 * mult); ++failed) {
-        clear_model(); opts.framegen = mult; CHECK(init() && live.size() == 17);
+    for (int mult : {2, 8}) for (int failed = 1; failed <= 2 * (2 * per_frame + 3 * mult); ++failed) {
+        clear_model(); opts.framegen = mult; CHECK(init() && (int)live.size() == 3 * pipes + 2);
         fail_at = attempts + failed; CHECK(!ensure_size({}, 3440, 1440));
         CHECK(barriers == 0 && !fg.w && !fg.h && !fg.mult && !fg.have_prev && !fg.recorded);
         inspect_disabled();
     }
     // Resize must drain old work before releasing it, then roll back a partially allocated replacement.
     clear_model(); opts.framegen = 2; CHECK(init()); CHECK(ensure_size({}, 1720, 720));
-    CHECK(live.size() == 53 && barriers == 12 && framegen_on());
+    CHECK((int)live.size() == 3 * pipes + 2 + 3 * (2 * per_frame + 3 * 2) && barriers == 2 * per_frame + 6 && framegen_on());
+    CHECK((fg.fine_flow.pipe != 0) == fine && (fg.synth.pipe != 0) == !fine && (fg.fines[1].image != 0) == fine);
     const int count = attempts; CHECK(ensure_size({}, 1720, 720) && attempts == count);
     submitted = true; idle = false; fail_at = attempts + 8;
     CHECK(!ensure_size({}, 3440, 1440)); CHECK(waits == 2 && idle);
     CHECK(!fg.w && !fg.h && !fg.mult && !fg.have_prev && !fg.recorded); inspect_disabled();
+  }
+  if (phase == "samplers") return 0;
     // The independent scale setup must also release each partial pipeline/sampler on failure.
     for (int failure = 1; failure <= 5; ++failure) {
         clear_model(); fail_at = failure; CHECK(!init_scale() && scale.failed && live.empty());

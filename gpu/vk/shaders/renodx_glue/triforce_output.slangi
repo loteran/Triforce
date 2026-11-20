@@ -1,0 +1,28 @@
+#ifndef TRIFORCE_RENODX_OUTPUT_SLANGI
+#define TRIFORCE_RENODX_OUTPUT_SLANGI
+// (Triforce) The gamma correction of NX2navi's HDR on RenoDX's Zelda OoT output encoder. scripts/renodx_shaders.py
+// compiles this file in front of RenoDX's encoder, the frame's last draw: it reads the finished picture (the scene and
+// the HUD over it, linear, white at 1) once and writes it as HDR10. The game's picture is made for a display of gamma
+// about 2.2, and the sRGB curve it is decoded with is linear near black, which leaves the darkest tones lighter than
+// such a display shows them. With the correction on, the encoder is given the picture as a display of gamma 2.2 or 2.4
+// shows its sRGB code (RenoDX's renodx::color::correct::GammaSafe); off, the picture as it is, and the encoder does what
+// it did without this file. The tone mappers are given a peak with the correction taken out of it, so that the brightest
+// light still lands on the display's peak (gpu/vk/vk_renodx.cpp peak_before_gamma).
+#include "triforce_settings.slangi"
+
+float3 TriforceGammaCorrect(float3 color, float gamma_correction) {
+    if (gamma_correction == 1.f) return renodx::color::correct::GammaSafe(color, false, 2.2f);
+    if (gamma_correction == 2.f) return renodx::color::correct::GammaSafe(color, false, 2.4f);
+    return color;
+}
+
+/// The encoder's one read of the picture
+vec4 TriforceOutputPicture(sampler2D picture, vec2 at) {
+    vec4 color = texture(picture, at);
+    color.rgb = TriforceGammaCorrect(color.rgb, triforce_constants.settings.gamma_correction);
+    return color;
+}
+// (from here on, which is RenoDX's encoder: its texture() is the read above)
+#define texture TriforceOutputPicture
+
+#endif

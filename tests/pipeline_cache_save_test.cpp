@@ -19,6 +19,7 @@
 constexpr int MOVEFILE_REPLACE_EXISTING = 1;
 void Sleep(unsigned ms) { std::this_thread::sleep_for(std::chrono::milliseconds(ms)); }
 #endif
+#include "file_whole.h"   // ((Triforce, handoff §8) the save's Writing, and its .for file written whole)
 
 // Arm only the allocating thread, after the query/copy API or immediately before thread construction.
 // Real std::vector, std::string and std::thread allocations still run; nothing models their failure handling.
@@ -42,8 +43,13 @@ void operator delete[](void* p, std::size_t) noexcept { ::operator delete(p); }
 
 using VkResult = int;
 constexpr VkResult VK_SUCCESS = 0, VK_ERROR_UNKNOWN = -13;
-struct { int device = 1; } dev;
+// props: the save in play is left out on Intel; the fixture's card is not one.
+struct { int device = 1; struct { unsigned vendorID = 0x10DE; } props; } dev;
 int pcache = 2;
+// The stamp the file is kept for (written beside it as <file>.for), and the file's bound (0: none).
+unsigned long long program_cache_stamp() { return 0x1122334455667788ull; }
+#include "pcache_bound.h"
+std::uint64_t pcache_bound_bytes = 0;
 std::string pcache_path;
 std::atomic<int64_t> pcache_built_since_save{32};
 std::atomic<std::size_t> pcache_saved_size{0};
@@ -88,6 +94,8 @@ VkResult vkGetPipelineCacheData(int device, int cache, std::size_t* n, void* dat
 }
 
 std::size_t save_fwrite(const void* p, std::size_t size, std::size_t n, FILE* f) {
+    // The stamp written beside a saved file (<file>.for) is not the cache's data: neither counted nor made to fail.
+    if (n == 16 && std::memcmp(p, "1122334455667788", 16) == 0) return std::fwrite(p, size, n, f);
     ++writes;
     if (fault == SHORT_WRITE) return 0;
     return std::fwrite(p, size, n, f);
@@ -102,6 +110,26 @@ int save_replace(const char* from, const char* to, unsigned flags) {
     return std::rename(from, to) == 0;
 #endif
 }
+
+// (Triforce) The cache's gate (vk_draw.cpp pcache_use, pcache_gate.h): closed, the cache was let go for the PC's RAM and is
+// neither asked nor written again. And the RAM a copy of the data needs in play (vk_memory.cpp memory_ram_fits)
+std::atomic<bool> let_go{false}, ram_fits{true};
+std::atomic<int> fit_asks{0};
+struct UseStub {
+    int cache;
+};
+UseStub pcache_use() { return {let_go ? 0 : pcache}; }
+bool memory_ram_fits(std::uint64_t bytes) {
+    ++fit_asks;
+    return bytes && ram_fits;
+}
+
+// (Triforce) The play file (vk_draw.cpp pcache_play_save, pcache_play.h; tests/test_pcache_play.py): no play cache here, so the
+// main file is saved as before
+std::atomic<int64_t> pcache_main_built{0};
+std::atomic<int> pcache_preparing{0};
+bool pcache_play_save(int64_t) { return true; }
+void pcache_main_written(int64_t) {}
 
 #define fwrite save_fwrite
 #define MoveFileExA save_replace
@@ -221,6 +249,51 @@ int run(const std::string& name) {
         pipeline_cache_save(true);
         CHECK(copies == 4 && replacements == 3 && new_file());
         CHECK(save_errors == 0 && start_errors == 0);
+    } else if (name == "over-bound") {
+        pcache_bound_bytes = 80;  // The data is 64 bytes: under the bound, written as ever.
+        pipeline_cache_save(true);
+        CHECK(new_file() && replacements == 1 && pcache_saved_size == 64);
+        cache_size = 80;  // At the bound: still written.
+        pipeline_cache_save(true);
+        CHECK(new_file() && replacements == 2 && pcache_saved_size == 80);
+        cache_size = 96;  // Over it: its size is asked, nothing is fetched or written, and the file keeps its last save.
+        pipeline_cache_save(true);
+        CHECK(queries == 3 && copies == 2 && writes == 2 && replacements == 2 && pcache_saved_size == 80);
+        cache_size = 80;
+        CHECK(new_file());
+        cache_size = 96;
+        pcache_built_since_save = 32;  // In play too, on the worker.
+        pipeline_cache_save(false);
+        CHECK(wait_until(queries, 4));
+        pipeline_cache_save(true);  // After the worker.
+        CHECK(queries == 5 && copies == 2 && writes == 2 && replacements == 2 && pcache_saved_size == 80);
+        pcache_bound_bytes = 0;  // The bound lifted: the same data is written.
+        pipeline_cache_save(true);
+        CHECK(new_file() && copies == 3 && replacements == 3 && pcache_saved_size == 96);
+        CHECK(save_errors == 0 && start_errors == 0);
+    } else if (name == "ram-short") {
+        ram_fits = false;  // In play, a copy of the data would not fit in the RAM available: it waits, nothing fetched.
+        pcache_built_since_save = 32;
+        pipeline_cache_save(false);
+        CHECK(wait_until(fit_asks, 1));
+        Sleep(20);
+        CHECK(copies == 0 && old_file() && pcache_built_since_save >= 32);  // Asked again at the next check in play.
+        pipeline_cache_save(true);  // After the worker; at the game's close the RAM is not asked, the save is made.
+        CHECK(fit_asks == 1 && queries == 2 && copies == 1 && replacements == 1 && new_file());
+        pcache_built_since_save = 32;
+        ram_fits = true;
+        cache_size = 96;
+        pipeline_cache_save(false);
+        CHECK(wait_until(copies, 2));
+        pipeline_cache_save(true);
+        CHECK(fit_asks == 2 && replacements == 2 && new_file() && save_errors == 0);
+    } else if (name == "let-go") {
+        let_go = true;  // The cache let go: no save asks the driver anything, the file keeps its last save.
+        pcache_built_since_save = 32;
+        pipeline_cache_save(false);
+        pipeline_cache_save(true);
+        Sleep(50);
+        CHECK(queries == 0 && copies == 0 && writes == 0 && replacements == 0 && old_file() && save_errors == 0);
     } else {
         CHECK(false);
     }

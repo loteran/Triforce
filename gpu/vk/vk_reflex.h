@@ -32,7 +32,12 @@ void reflex_submit_ends();
 /// The present: a VkPresentIdKHR for VkPresentInfoKHR's pNext (or null), and the present's start marker
 const void* reflex_present_id(const void* next);
 void reflex_presented();
-/// After the present: the driver's sleep until the next frame should start, then that frame's start markers
+/// After the present: the driver's sleep until the next frame should start, then that frame's start markers (left out while
+/// the game's thread takes it where its frame starts: reflex_pace)
 void reflex_sleep();
+/// (Triforce, RX_VK_REFLEX_LIMIT=1) Where the game's frame starts (vk_pace.cpp frame_start), without DLSS frame generation:
+/// true when Reflex's sleep holds this frame to the Game frame rate cap's period (period_ns; 0: none it may hold), taken
+/// here; false, always without the switch: the game's own wait holds it
+bool reflex_pace(int64_t period_ns);
 
 } // namespace mkwvk

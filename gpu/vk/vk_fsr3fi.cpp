@@ -18,6 +18,7 @@
 
 #include <utility>
 
+#include "vk_dlssg.h"
 #include "vk_fsr3fi.h"
 #include "vk_menu.h"    // (the Frame generation row)
 #include "vk_gprof.h"   // (RX_VK_PASS_TIMING: a span per pass, so the report names them)
@@ -675,7 +676,7 @@ bool capable() {
 
 uint32_t frames_wanted() {
     // (the row first: a device is not asked anything, and nothing is logged, while frame generation is not at 2x)
-    return asked() && capable() ? 1u : 0u;
+    return asked() && !dlssg::active() && capable() ? 1u : 0u;   // (Triforce: not beside NVIDIA DLSS frame generation)
 }
 
 bool prepare(uint32_t width, uint32_t height, uint32_t render_width, uint32_t render_height,

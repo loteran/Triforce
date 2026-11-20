@@ -25,3 +25,12 @@ These checks use no driver or real cache and do not reproduce issue #1022's repo
 its root cause, validate saving a multi-gigabyte driver cache, force an OS thread-resource failure, or change cache
 size/retry policy. The existing wait-then-store protocol for concurrent forced callers is unchanged; the current
 force call is in prepare-only startup. Driver/native faults and thread-detach failures are outside this change.
+
+## The file's bound
+
+The cache's size has a rule since: `gpu/vk/pcache_bound.h`. A file over the bound is not read (the cache starts
+empty), and data over the bound is neither fetched nor written, so the file keeps its last save
+(`RX_VK_PCACHE_MAX_MB`, in the development guide's switches). The fixture's `over-bound` case runs the save's side
+against the actual function: under and at the bound the data is written as ever, over it the old file stays, in a
+forced save and on the worker, and with the bound lifted the same data is written. The read's side is
+`tests/test_pcache_bound.py`. A read that ends early is refused whole by the header; no test makes a read end early.

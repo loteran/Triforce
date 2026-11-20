@@ -7,7 +7,9 @@
 
 namespace mkwvk::menu_restart {
 
-constexpr int kMax = 16;   // (rows that take a restart: the menu has ten; a row past kMax would have no slot)
+// (rows that take a restart: the menu has about twenty; a row past kMax would have no slot. At most the bits of pending()'s
+// mask: 32)
+constexpr int kMax = 32;
 
 struct State {
     int n = 0;

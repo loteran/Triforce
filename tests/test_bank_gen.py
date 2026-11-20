@@ -36,9 +36,11 @@ def main():
     if "stage == 5" not in fill[: fill.index("static constexpr uint32_t kSsboTable")]:
         raise SystemExit("compute's c0 is no longer apart from the graphics stages'")
     # (every place the handles or storage buffers change moves their generation with bind_gen)
+    # ((Triforce) in the replay's walk: other functions list the same ops, mesh_run_kind and gate_kind)
+    walk = block(replay, "void replay(VkCommandBuffer& cmd, NvnState& s, const uint8_t* p, const uint8_t* end = nullptr) {")
     for marker, field in (("case NOP_BIND_TEX:", "tex_gen"), ("case NOP_SET_TEX_POOL:", "tex_gen")):
-        at = replay.index(marker)
-        if field not in replay[at: at + 1400]:
+        at = walk.index(marker)
+        if field not in walk[at: at + 1400]:
             raise SystemExit(f"{marker} does not set {field}")
     if replay.count("ssbo_gen[b.stage] = s.bind_gen") != 2:
         raise SystemExit("a storage buffer bind does not set ssbo_gen (NOP_BIND_BUFS and NOP_BIND_SSBO)")

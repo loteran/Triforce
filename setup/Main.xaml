@@ -260,6 +260,24 @@
         </Setter.Value>
       </Setter>
     </Style>
+    <!-- (Triforce) words in the caption that are a setting: the Sounds choice (Shell.Sounds.cs) -->
+    <Style x:Key="CaptionWords" TargetType="Button" BasedOn="{StaticResource Caption}">
+      <Setter Property="Foreground" Value="{StaticResource TextDim}"/>
+      <Setter Property="Width" Value="NaN"/>
+      <Setter Property="Cursor" Value="Hand"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="Button">
+            <Border Background="#00000000">
+              <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center" Margin="14,0"/>
+            </Border>
+            <ControlTemplate.Triggers>
+              <Trigger Property="IsMouseOver" Value="True"><Setter Property="Foreground" Value="{StaticResource Gold}"/></Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
     <Style x:Key="CaptionClose" TargetType="Button" BasedOn="{StaticResource Caption}">
       <Setter Property="Template">
         <Setter.Value>
@@ -476,6 +494,32 @@
       </Style.Triggers>
     </Style>
 
+    <!-- a row of a list one thing is picked from (the saves found, the mods): a gold bar beside the chosen one, a hairline under each -->
+    <Style x:Key="Row" TargetType="ListBoxItem">
+      <Setter Property="Cursor" Value="Hand"/>
+      <Setter Property="FocusVisualStyle" Value="{x:Null}"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="ListBoxItem">
+            <Grid Background="#00000000">
+              <Border x:Name="B" Background="#00000000" Padding="16,10,12,10">
+                <ContentPresenter/>
+              </Border>
+              <Rectangle x:Name="Bar" Width="2" HorizontalAlignment="Left" Fill="{StaticResource Gold}" Opacity="0" Margin="0,8"/>
+              <Rectangle Style="{StaticResource Hair}" VerticalAlignment="Bottom"/>
+            </Grid>
+            <ControlTemplate.Triggers>
+              <Trigger Property="IsMouseOver" Value="True"><Setter TargetName="B" Property="Background" Value="#8012100C"/></Trigger>
+              <Trigger Property="IsSelected" Value="True">
+                <Setter TargetName="B" Property="Background" Value="#D912100C"/>
+                <Setter TargetName="Bar" Property="Opacity" Value="1"/>
+              </Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+
     <Style TargetType="ToolTip">
       <Setter Property="Foreground" Value="{StaticResource Text}"/>
       <Setter Property="FontSize" Value="12"/>
@@ -508,6 +552,11 @@
         <TextBlock x:Name="VersionText" Margin="14,0,0,1" VerticalAlignment="Center" FontSize="10.5" Foreground="{StaticResource TextFaint}"/>
       </StackPanel>
       <StackPanel Grid.Column="1" Orientation="Horizontal" HorizontalAlignment="Right" shell:WindowChrome.IsHitTestVisibleInChrome="True">
+        <!-- (Triforce) the game's own menu sounds in Setup: Off, Low, Medium, High, the next one at each click -->
+        <Button x:Name="SoundsButton" Style="{StaticResource CaptionWords}">
+          <t:Caps x:Name="SoundsLabel" Label="Sounds" Gaps="1" FontSize="9.5" FontWeight="SemiBold"
+                  Foreground="{Binding Foreground, RelativeSource={RelativeSource AncestorType=Button}}"/>
+        </Button>
         <Button x:Name="MinButton" Style="{StaticResource Caption}" ToolTip="Minimize">
           <Rectangle Width="10" Height="1" Fill="{Binding Foreground, RelativeSource={RelativeSource AncestorType=Button}}"/>
         </Button>
@@ -592,14 +641,19 @@
         <StackPanel Grid.Row="1" Margin="0,30,0,0">
           <Rectangle Style="{StaticResource Hair}" Fill="{StaticResource Fading}"/>
           <Grid Margin="0,13,0,13">
-            <Grid.ColumnDefinitions><ColumnDefinition Width="172"/><ColumnDefinition/></Grid.ColumnDefinitions>
+            <Grid.ColumnDefinitions><ColumnDefinition Width="172"/><ColumnDefinition/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
             <StackPanel Orientation="Horizontal" VerticalAlignment="Top" Margin="1,5,0,0">
               <Rectangle x:Name="GameMark" Style="{StaticResource Diamond}"/>
               <t:Caps Label="Your game" Style="{StaticResource FieldLabel}" Margin="12,0,0,0"/>
             </StackPanel>
-            <StackPanel Grid.Column="1">
+            <StackPanel Grid.Column="1" Margin="0,0,16,0">
               <TextBlock x:Name="GameLine" Style="{StaticResource Value}"/>
               <TextBlock x:Name="GamePath" Style="{StaticResource Small}" TextWrapping="NoWrap" TextTrimming="CharacterEllipsis" Margin="0,1,0,0"/>
+            </StackPanel>
+            <!-- (Triforce) with a game built: its mods (Shell.Mods.cs), and the game as a shortcut in Steam's library (Steam.cs) -->
+            <StackPanel Grid.Column="2" VerticalAlignment="Top" Margin="0,-3,0,-7">
+              <Button x:Name="ModsButton" Style="{StaticResource Link}" Content="Mods" HorizontalAlignment="Right"/>
+              <Button x:Name="SteamButton" Style="{StaticResource Link}" Content="Add to Steam" HorizontalAlignment="Right" Margin="0,-5,0,0"/>
             </StackPanel>
           </Grid>
           <Rectangle Style="{StaticResource Hair}" Fill="{StaticResource Fading}"/>
@@ -667,34 +721,7 @@
           <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/></Grid.RowDefinitions>
           <t:Caps x:Name="SavesListLabel" Style="{StaticResource FieldLabel}" Label="Take the saves from" Margin="0,0,0,6"/>
           <ListBox x:Name="SaveList" Grid.Row="1" Background="#00000000" BorderThickness="0" Padding="0" Margin="-1,0,0,0"
-                   ScrollViewer.HorizontalScrollBarVisibility="Disabled" FocusVisualStyle="{x:Null}">
-            <ListBox.ItemContainerStyle>
-              <Style TargetType="ListBoxItem">
-                <Setter Property="Cursor" Value="Hand"/>
-                <Setter Property="FocusVisualStyle" Value="{x:Null}"/>
-                <Setter Property="Template">
-                  <Setter.Value>
-                    <ControlTemplate TargetType="ListBoxItem">
-                      <Grid Background="#00000000">
-                        <Border x:Name="B" Background="#00000000" Padding="16,10,12,10">
-                          <ContentPresenter/>
-                        </Border>
-                        <Rectangle x:Name="Bar" Width="2" HorizontalAlignment="Left" Fill="{StaticResource Gold}" Opacity="0" Margin="0,8"/>
-                        <Rectangle Style="{StaticResource Hair}" VerticalAlignment="Bottom"/>
-                      </Grid>
-                      <ControlTemplate.Triggers>
-                        <Trigger Property="IsMouseOver" Value="True"><Setter TargetName="B" Property="Background" Value="#8012100C"/></Trigger>
-                        <Trigger Property="IsSelected" Value="True">
-                          <Setter TargetName="B" Property="Background" Value="#D912100C"/>
-                          <Setter TargetName="Bar" Property="Opacity" Value="1"/>
-                        </Trigger>
-                      </ControlTemplate.Triggers>
-                    </ControlTemplate>
-                  </Setter.Value>
-                </Setter>
-              </Style>
-            </ListBox.ItemContainerStyle>
-          </ListBox>
+                   ScrollViewer.HorizontalScrollBarVisibility="Disabled" FocusVisualStyle="{x:Null}" ItemContainerStyle="{StaticResource Row}"/>
         </Grid>
         <TextBlock x:Name="SavesInfo" Grid.Row="3" Style="{StaticResource Small}" Foreground="{StaticResource Text}" Margin="0,12,0,16" MinHeight="38"/>
         <Grid Grid.Row="4">
@@ -703,6 +730,49 @@
           <StackPanel Grid.Column="1" Orientation="Horizontal">
             <Button x:Name="SavesBack" Style="{StaticResource Quiet}" Height="44" Content="Back" Margin="0,0,12,0"/>
             <Button x:Name="SavesGo" Style="{StaticResource Primary}" Content="Convert" IsEnabled="False"/>
+          </StackPanel>
+        </Grid>
+      </Grid>
+
+      <!-- page: mods (Triforce: the mods folder of the game as the game reads it, Mods.cs: on and off, the order, conflicts, adding
+           from an archive, removing) -->
+      <Grid x:Name="ModsPage" Grid.Row="1" Margin="56,22,34,36" Visibility="Collapsed">
+        <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="*"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
+        <StackPanel>
+          <StackPanel Orientation="Horizontal">
+            <Rectangle Width="20" Height="1" Fill="{StaticResource LineGoldHi}" VerticalAlignment="Center" Margin="0,0,10,0"/>
+            <t:Caps Label="Mods" Style="{StaticResource Eyebrow}"/>
+          </StackPanel>
+          <TextBlock Text="Your mods" Style="{StaticResource Title}"/>
+          <TextBlock Style="{StaticResource Body}" Margin="0,12,0,0"
+                     Text="Each folder in your game's mods folder is a mod. Where two change the same file, the one further down this list wins."/>
+        </StackPanel>
+        <Grid Grid.Row="1" Margin="0,18,0,0">
+          <StackPanel Orientation="Horizontal" VerticalAlignment="Top" Margin="0,-5,0,0">
+            <Button x:Name="ModsAdd" Style="{StaticResource Link}" Content="Add a mod" Margin="0,0,22,0"/>
+            <Button x:Name="ModsOpen" Style="{StaticResource Link}" Content="Open the folder" Margin="0,0,22,0"/>
+            <Button x:Name="ModsRescan" Style="{StaticResource Link}" Content="Look again"/>
+          </StackPanel>
+          <Button x:Name="ModsConflicts" Style="{StaticResource Link}" Content="Copy conflicts" HorizontalAlignment="Right" VerticalAlignment="Top" Margin="0,-5,0,0" Visibility="Collapsed"/>
+          <Rectangle Style="{StaticResource Hair}" VerticalAlignment="Bottom" Margin="0,30,0,0"/>
+        </Grid>
+        <ListBox x:Name="ModList" Grid.Row="2" Background="#00000000" BorderThickness="0" Padding="0" Margin="-1,0,0,0"
+                 ScrollViewer.HorizontalScrollBarVisibility="Disabled" FocusVisualStyle="{x:Null}" ItemContainerStyle="{StaticResource Row}"/>
+        <TextBlock x:Name="ModsInfo" Grid.Row="3" Style="{StaticResource Small}" Foreground="{StaticResource Text}" Margin="0,12,0,14" MinHeight="57"/>
+        <Grid Grid.Row="4">
+          <Grid.ColumnDefinitions><ColumnDefinition/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+          <!-- (a mod with code patches or cheats was added, removed or switched since the game was built: they are compiled in) -->
+          <Button x:Name="ModsBuild" Style="{StaticResource Link}" Foreground="{StaticResource Gold300}" VerticalAlignment="Center" HorizontalAlignment="Left" Visibility="Collapsed"/>
+          <StackPanel Grid.Column="1" Orientation="Horizontal">
+            <Button x:Name="ModsBack" Style="{StaticResource Quiet}" Height="44" Padding="13,0" Content="Back" Margin="0,0,6,0"/>
+            <Button x:Name="ModsUp" Style="{StaticResource Quiet}" Height="44" Padding="11,0" Margin="0,0,6,0" ToolTip="Load it earlier: the mods after it win over it">
+              <Path Data="M0,5 L5,0 L10,5" StrokeThickness="1.4" Stroke="{Binding Foreground, RelativeSource={RelativeSource AncestorType=Button}}"/>
+            </Button>
+            <Button x:Name="ModsDown" Style="{StaticResource Quiet}" Height="44" Padding="11,0" Margin="0,0,6,0" ToolTip="Load it later: it wins over the mods before it">
+              <Path Data="M0,0 L5,5 L10,0" StrokeThickness="1.4" Stroke="{Binding Foreground, RelativeSource={RelativeSource AncestorType=Button}}"/>
+            </Button>
+            <Button x:Name="ModsRemove" Style="{StaticResource Quiet}" Height="44" Padding="13,0" Content="Remove" Margin="0,0,8,0"/>
+            <Button x:Name="ModsToggle" Style="{StaticResource Primary}" MinWidth="140" Content="Switch off" IsEnabled="False"/>
           </StackPanel>
         </Grid>
       </Grid>
@@ -810,7 +880,11 @@
         </Grid>
         <Grid Grid.Row="2" Height="44">
           <Grid.ColumnDefinitions><ColumnDefinition/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
-          <ToggleButton x:Name="ShowLog" Style="{StaticResource Link}" VerticalAlignment="Center" HorizontalAlignment="Left"/>
+          <StackPanel Orientation="Horizontal" VerticalAlignment="Center" HorizontalAlignment="Left">
+            <ToggleButton x:Name="ShowLog" Style="{StaticResource Link}" VerticalAlignment="Center"/>
+            <!-- (after a build that stopped: what Setup knows of it, its last lines and setup.log's go to the clipboard, Shell.cs CopyTheReport) -->
+            <Button x:Name="CopyReport" Style="{StaticResource Link}" VerticalAlignment="Center" Margin="22,0,0,0" Visibility="Collapsed"/>
+          </StackPanel>
           <StackPanel Grid.Column="1" Orientation="Horizontal">
             <Button x:Name="OpenButton" Style="{StaticResource Quiet}" Height="44" Visibility="Collapsed" Margin="0,0,12,0"/>
             <Button x:Name="BackButton" Style="{StaticResource Quiet}" Height="44" Visibility="Collapsed"/>

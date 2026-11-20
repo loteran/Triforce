@@ -1,0 +1,6 @@
+Majora's Mask (majora_mask.bin, majora_alb.png, majora_emc.png)
+  3D model "Majora's Mask" by PigeonMage, https://sketchfab.com/3d-models/majoras-mask-e9cfcdf9875846f6b6137f0156cd4eb2
+  Licence: Creative Commons Attribution 4.0 (CC BY 4.0), https://creativecommons.org/licenses/by/4.0/
+  Changes: the mesh placed on the Happy Mask Salesman's head bone, scaled, and its textures resized to 1024 x 1024.
+
+The Happy Mask Salesman himself is not in these files: Triforce reads his model and animations from your own game files.

@@ -1,17 +1,23 @@
 /* Mods, in the layout emulators use, so RomFS mods made for them work as they are:
      <mods>/<name>/romfs/...          files that replace (or add to) the game's RomFS
+     <mods>/<name>/exefs/...          .ips and .pchtxt patches of the game's code: applied when the game is built
+     <mods>/<name>/cheats/<id>.txt    a cheat file for the build of the game with that id: run by host/mod_cheats.c
    <mods> is the "mods" folder beside the executable, or HOS_MODS=<dir>. A mod may sit deeper, as emulators keep them
-   (<mods>/contents/<title id>/<name>/romfs): any folder holding a romfs or exefs folder is a mod. Folders whose names
-   start with '-' or '_' are left out (off). When two mods have the same file, the one whose path sorts last wins (name
-   them 01-..., 02-... to order them).
+   (<mods>/contents/<title id>/<name>/romfs): any folder holding a romfs, exefs or cheats folder is a mod. Folders whose
+   names start with '-' or '_' are left out (off). When two mods have the same file, the one whose path sorts last wins
+   (name them 01-..., 02-... to order them).
    Every mod file is indexed once at the start (no disk lookups per open); nn_fs.c asks hos_mods_romfs for each rom:
    path and lists a folder's mod-only entries with the game's own (hos_mods_dir_extras). HOS_FS_OVERLAY (nn_fs.c) is
    looked at after this, so a test overlay wins over mods.
-   exefs patches (.pchtxt, .ips) are not applied: the code is compiled ahead of time from the original instructions, and
-   the game folder has no module map (image.json) to place data patches with. A mod's exefs folder is logged as left out.
+   (Triforce) exefs patches cannot be applied here: the code is compiled ahead of time. A build applies them to the code it
+   translates (nx2/code_mods.py walks the mods folder as find_mods below does) and writes what it did into the game
+   folder; the start holds that against the mods folder as it is now (mod_code.h) and says in the log which patch files
+   are built in and which wait for a build: one added or edited since, and one that is built in and has been taken away
+   or switched off, which the game has until it is built again.
    From Skybound's loader (NotRexed/SkyboundTotk a64-kit/hos/mods.c, MIT): its RomFS part. */
 #include "hos.h"
 #include "hos_paths.h"
+#include "mod_code.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -19,7 +25,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 
-typedef struct { char *key; char *host; uint64_t size; int is_dir, logged; } Entry;   /* key: romfs path, lower case, '/' */
+typedef struct { char *key; char *host; uint64_t size; int is_dir, logged; volatile uint64_t need; } Entry;   /* key: romfs path, lower case, '/'; need: hos_mods_table_size's */
 static Entry *table;
 static size_t table_cap, table_n;
 
@@ -109,7 +115,7 @@ static int index_romfs(const char *host_dir, const char *rel, int depth) {
     return files;
 }
 
-/* the mod folders under root, sorted (a mod: a folder holding romfs or exefs) */
+/* the mod folders under root, sorted (a mod: a folder holding romfs, exefs or cheats) */
 typedef struct { char path[MAX_PATH]; char name[MAX_PATH]; } Mod;
 static Mod *mods;
 static int nmods, cap_mods;
@@ -119,7 +125,9 @@ static void find_mods(const char *dir, const char *name, int depth) {
     const int has_romfs = GetFileAttributesA(probe) != INVALID_FILE_ATTRIBUTES;
     snprintf(probe, sizeof probe, "%s\\exefs", dir);
     const int has_exefs = GetFileAttributesA(probe) != INVALID_FILE_ATTRIBUTES;
-    if ((has_romfs || has_exefs) && depth > 0) {
+    snprintf(probe, sizeof probe, "%s\\cheats", dir);   /* (Triforce: a mod of cheats alone) */
+    const int has_cheats = GetFileAttributesA(probe) != INVALID_FILE_ATTRIBUTES;
+    if ((has_romfs || has_exefs || has_cheats) && depth > 0) {
         if (nmods == cap_mods) mods = (Mod *)realloc(mods, sizeof *mods * (size_t)(cap_mods = cap_mods ? cap_mods * 2 : 16));
         snprintf(mods[nmods].path, MAX_PATH, "%s", dir);
         snprintf(mods[nmods].name, MAX_PATH, "%s", name);
@@ -147,9 +155,117 @@ static void find_mods(const char *dir, const char *name, int depth) {
 }
 static int mod_cmp(const void *a, const void *b) { return _stricmp(((const Mod *)a)->name, ((const Mod *)b)->name); }
 
-/* hos_main.c, once the image is loaded (image_path: kept for exefs patches, which are not applied here) */
-void hos_mods_init(const char *image_path) {
-    (void)image_path;
+/* (Triforce) a file's bytes, at most `most` of them (a larger file: NULL), with a 0 after them; freed by the caller */
+static char *read_whole(const char *path, size_t most, size_t *len) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return NULL;
+    char *data = NULL;
+    size_t n = 0, cap = 0;
+    for (;;) {   /* (in pieces: no room taken for more than the file has) */
+        if (n == cap) {
+            cap = cap ? cap * 2 : 4096;
+            char *more = cap <= most + 4096 ? (char *)realloc(data, cap + 1) : NULL;
+            if (!more) {
+                free(data);
+                fclose(f);
+                return NULL;
+            }
+            data = more;
+        }
+        const size_t got = fread(data + n, 1, cap - n, f);
+        if (!got) break;
+        n += got;
+    }
+    fclose(f);
+    if (n > most) {
+        free(data);
+        return NULL;
+    }
+    data[n] = 0;
+    *len = n;
+    return data;
+}
+
+/* (Triforce) The mods' code patches against what the game was built with (mod_code.h, nx2/code_mods.py): the build's
+   record from the game folder, a line in the log for each patch file of a mod, and how many wait for a build */
+enum { BUILT_MOST = 512 };
+static ModCodeEntry *built;
+static int nbuilt, code_waits;
+static void code_record_load(void) {
+    char path[MAX_PATH + 32];
+    hos_game_path_a(path, MAX_PATH);
+    char *slash = (char *)last_sep(path);
+    if (!slash) return;
+    snprintf(slash + 1, sizeof path - (size_t)(slash + 1 - path), "%s", MOD_CODE_RECORD);
+    size_t len = 0;
+    char *text = read_whole(path, 1 << 20, &len);
+    if (!text) return;   /* (no record: a game built without code patches) */
+    built = (ModCodeEntry *)calloc(BUILT_MOST, sizeof *built);
+    if (built) nbuilt = mod_code_parse(text, built, BUILT_MOST);
+    free(text);
+}
+/* (returns how many of this mod's patches wait for a build: new since it, or changed) */
+static int code_patches(const Mod *mod) {
+    char pat[MAX_PATH];
+    snprintf(pat, sizeof pat, "%s\\exefs\\*", mod->path);
+    WIN32_FIND_DATAA fd;
+    HANDLE f = FindFirstFileA(pat, &fd);
+    if (f == INVALID_HANDLE_VALUE) return 0;
+    int waits = 0;
+    do {
+        if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || !mod_code_is_patch(fd.cFileName)) continue;
+        char path[MAX_PATH], rel[MOD_CODE_PATH];
+        snprintf(path, sizeof path, "%s\\exefs\\%s", mod->path, fd.cFileName);
+        snprintf(rel, sizeof rel, "%s/exefs/%s", mod->name, fd.cFileName);
+        size_t len = 0;
+        char *data = read_whole(path, 16 << 20, &len);
+        const char *why = "";
+        const int state = data ? mod_code_state(built, nbuilt, rel, mod_code_fnv(data, len), len, &why) : MOD_CODE_WAITS;
+        free(data);
+        if (state == MOD_CODE_BUILT) hos_log("mods: %s is built into the game", rel);
+        else if (state == MOD_CODE_REFUSED) hos_log("mods: %s was not applied when the game was built: %s", rel, why);
+        else if (state == MOD_CODE_CHANGED) hos_log("mods: %s changed since the game was built: the game has it as it was then", rel);
+        else hos_log("mods: %s is not built into the game", rel);
+        waits += state == MOD_CODE_CHANGED || state == MOD_CODE_WAITS;
+    } while (FindNextFileA(f, &fd));
+    FindClose(f);
+    code_waits += waits;
+    return waits;
+}
+/* (and the patches the game has that the mods folder no longer does, with or without a mods folder) */
+static void code_patches_gone(void) {
+    int at = 0;
+    for (const ModCodeEntry *e; (e = mod_code_gone(built, nbuilt, &at)) != NULL; code_waits++)
+        hos_log("mods: %s is built into the game, and is gone from the mods folder or switched off: the game has it until it is built again",
+                e->path);
+    if (code_waits)
+        hos_log("mods: %d code patches wait for a build: they are applied when the game is built. Build it again for the mods folder as "
+                "it is now (Triforce Setup, or nx2/make_game.py --update with the game folder)", code_waits);
+}
+
+/* (Triforce) a mod's cheat file for this build of the game, cheats\<the first 16 digits of main's build id>.txt (the
+   name's case does not matter), to host/mod_cheats.c; one named after another build is said and left */
+static void cheat_files(const Mod *mod) {
+    void hos_mod_cheats_add(const char *mod, const char *path);
+    char pat[MAX_PATH], id[17];
+    snprintf(id, sizeof id, "%.16s", hos_main_build_id);
+    snprintf(pat, sizeof pat, "%s\\cheats\\*", mod->path);
+    WIN32_FIND_DATAA fd;
+    HANDLE f = FindFirstFileA(pat, &fd);
+    if (f == INVALID_HANDLE_VALUE) return;
+    do {
+        const size_t n = strlen(fd.cFileName);
+        if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || n != 20 || _stricmp(fd.cFileName + 16, ".txt")) continue;
+        if (strspn(fd.cFileName, "0123456789abcdefABCDEF") != 16) continue;   /* (not named after a build: not a cheat file) */
+        char path[MAX_PATH];
+        snprintf(path, sizeof path, "%s\\cheats\\%s", mod->path, fd.cFileName);
+        if (strlen(id) == 16 && !_strnicmp(fd.cFileName, id, 16)) hos_mod_cheats_add(mod->name, path);
+        else hos_log("mods: %s/cheats/%s is for another build of the game (this one is %s): not read", mod->name, fd.cFileName, id);
+    } while (FindNextFileA(f, &fd));
+    FindClose(f);
+}
+
+static void mods_scan(void) {
     char root[MAX_PATH];
     if (getenv("HOS_MODS")) {
         snprintf(root, sizeof root, "%s", getenv("HOS_MODS"));
@@ -169,13 +285,32 @@ void hos_mods_init(const char *image_path) {
     for (int i = 0; i < nmods; i++) {
         char dir[MAX_PATH];
         snprintf(dir, sizeof dir, "%s\\romfs", mods[i].path);
-        const int files = index_romfs(dir, "", 0);
-        snprintf(dir, sizeof dir, "%s\\exefs", mods[i].path);
-        if (GetFileAttributesA(dir) != INVALID_FILE_ATTRIBUTES)
-            hos_log("mods: %s: exefs patches are left out (the code is compiled ahead of time)", mods[i].name);
-        hos_log("mods: %s: %d RomFS files", mods[i].name, files);
+        /* (Triforce: its exefs patches, built in or waiting, first. (11-18) A mod whose code waits for a build keeps its RomFS
+           files waiting too: the game crashed at its start with a mod's new files over its old code (Classic Item Slots
+           put in by the Mods menu, #bug-tracker "Crashing on startup"; a build put them in step). They come with the code,
+           at the next build. HOS_MODS_SPLIT=1: the files now anyway, as before) */
+        const int waits = code_patches(&mods[i]);
+        static int split = -1;
+        if (split < 0) split = getenv("HOS_MODS_SPLIT") && atoi(getenv("HOS_MODS_SPLIT")) == 1;
+        const int hold = waits > 0 && !split;
+        const int files = hold ? 0 : index_romfs(dir, "", 0);
+        cheat_files(&mods[i]);    /* (and its cheat file) */
+        if (hold)
+            hos_log("mods: %s: its RomFS files wait for the build too, with its code (%d patch(es) not built in yet)", mods[i].name, waits);
+        else
+            hos_log("mods: %s: %d RomFS files", mods[i].name, files);
     }
     hos_log("mods: %d mods from %s: %zu RomFS entries", nmods, root, table_n);
+}
+
+/* hos_main.c, once the image is loaded (image_path: not used; exefs patches are applied when the game is built) */
+void hos_mods_init(const char *image_path) {
+    void hos_mod_cheats_ready(void);
+    (void)image_path;
+    code_record_load();
+    mods_scan();
+    code_patches_gone();
+    hos_mod_cheats_ready();   /* (mod_cheats.c: every mod's cheat file is read) */
 }
 
 /* nn_fs.c: the mod file for a RomFS path ("UI/x.zs", no mount, no leading slash), or 0 */
@@ -191,6 +326,82 @@ int hos_mods_romfs(const char *rel, char *out, size_t cap) {
     if (!e->logged && InterlockedIncrement(&logged) <= 200) hos_log("mods: %s <- %s", rel, e->host);
     e->logged = 1;
     return 1;
+}
+
+/* ((Triforce) 11-17) The size a zstd file holds once unpacked: its frame header's content size (0: not a zstd frame, or
+   the size not written) */
+static uint64_t zs_content_size(const char *host_path) {
+    FILE *f = fopen(host_path, "rb");
+    if (!f) return 0;
+    uint8_t h[18] = {0};
+    const size_t n = fread(h, 1, sizeof h, f);
+    fclose(f);
+    if (n < 6 || h[0] != 0x28 || h[1] != 0xb5 || h[2] != 0x2f || h[3] != 0xfd) return 0;
+    const int fcs_flag = h[4] >> 6, single = h[4] >> 5 & 1, dict = h[4] & 3;
+    const size_t at = 5 + (single ? 0 : 1) + (size_t)(dict == 3 ? 4 : dict);
+    const size_t len = fcs_flag == 0 ? (single ? 1 : 0) : fcs_flag == 1 ? 2 : fcs_flag == 2 ? 4 : 8;
+    if (!len || at + len > n) return 0;
+    uint64_t v = 0;
+    for (size_t i = 0; i < len; i++) v |= (uint64_t)h[at + i] << (8 * i);
+    return len == 2 ? v + 256 : v;
+}
+
+/* ((Triforce) 11-17) The memory the game makes for loading a file is the ResourceSizeTable's figure for its path (the
+   lifted f_801b6340 asks the table, f_836e3d30, and this is called with the answer: nx2/oot_patches.py patch_mod_sizes).
+   For a file a mod serves, the table's figure (the game's, or the one the mod ships) can be too small: a model with more
+   materials and shapes than the one it replaces needs more beside its own bytes, and the game does not check the
+   allocations that then fail (the Dark Link mod's Deku Shield and Slingshot crashed loading a child save, a write to
+   address 0). So a mod's file gets at least its unpacked size and room beside it: an eighth of it, 128 KB at least, and
+   64 KB more (a model needs about 8 KB, and 3 to 4 KB a material and a shape: 99 of the game's own fitted, 11-17). The
+   game's own files keep the table's figure; a figure is only ever raised. size: the table's, path: the guest's path */
+volatile LONG hos_mods_size_hook_seen;   /* ((Triforce, 11-18) the lifted code calls the hook below: prompts.c asks */
+int hos_prompts_font_file(const char *key, char *out, size_t cap);   /* prompts.c */
+uint64_t hos_mods_table_size(uint64_t size, uint64_t path) {
+    if (!hos_mods_size_hook_seen) InterlockedExchange(&hos_mods_size_hook_seen, 1);
+    if (!table_n || !path) return size;
+    const char *p = (const char *)GP(path);
+    char rel[MAX_PATH], key[MAX_PATH];
+    size_t i = 0;
+    for (; i + 4 < sizeof rel && p[i]; i++) rel[i] = p[i];
+    rel[i] = 0;
+    snprintf(key, sizeof key, "%s.zs", rel);   /* (the table names the unpacked file; the RomFS has it packed) */
+    lower_slash(key);
+    Entry *e = find(key);
+    int packed = 1;
+    if (!e) {
+        /* ((Triforce, 11-18) the button prompts' font, larger than the game's: with a mod's own size table served, ours
+           (prompts/rsizetable.zs, which has room for it) is not, so its room comes from here instead. Before, prompts.c
+           gave the prompts up whenever a mod had a size table (#bug-tracker 11-18: "Button Prompt UI Broken", with the
+           Young Link Rides Pony Epona mod) */
+        char built[MAX_PATH];
+        if (hos_prompts_font_file(key, built, sizeof built)) {
+            const uint64_t real = zs_content_size(built);
+            const uint64_t need = real ? (real + (64u << 10) + 0xfff) & ~(uint64_t)0xfff : 0;
+            static volatile LONG told_font;
+            if (need > (uint32_t)size && !InterlockedExchange(&told_font, 1))
+                hos_log("mods: the button prompts' font gets %llu bytes to load in (the size table's %llu; the font %llu unpacked)",
+                        (unsigned long long)need, (unsigned long long)(uint32_t)size, (unsigned long long)real);
+            return need > (uint32_t)size ? need : size;
+        }
+        snprintf(key, sizeof key, "%s", rel);
+        lower_slash(key);
+        e = find(key), packed = 0;
+    }
+    if (!e || e->is_dir) return size;
+    uint64_t need = e->need;
+    if (!need) {
+        const uint64_t real = packed ? zs_content_size(e->host) : e->size;
+        if (!real) return size;   /* (a packed file whose header has no size: the table's figure, as the game has it) */
+        const uint64_t room = real / 8 > (128u << 10) ? real / 8 : (128u << 10);
+        need = (real + room + (64u << 10) + 0xfff) & ~(uint64_t)0xfff;
+        if (need > 0xfffff000u) need = 0xfffff000u;
+        e->need = need;
+        static volatile LONG told;
+        if (need > (uint32_t)size && InterlockedIncrement(&told) <= 100)
+            hos_log("mods: %s gets %llu bytes to load in (the size table's %llu; the file %llu unpacked)", rel,
+                    (unsigned long long)need, (unsigned long long)(uint32_t)size, (unsigned long long)real);
+    }
+    return need > (uint32_t)size ? need : size;
 }
 
 /* prompts.c: 1 when a mod has a file whose key (lower case, '/') starts with prefix and ends with suffix */

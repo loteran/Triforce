@@ -35,8 +35,9 @@
 
 #include "../gpu/vk/vk_api.h"
 
-#define HOOKSHOT_DISCORD_APP_ID_DEFAULT ""   /* (Triforce: no Discord application of its own, so no status unless the player names one: upstream Hookshot's id would announce "Playing Hookshot") */
-#define HOOKSHOT_DISCORD_IMAGE_DEFAULT "hookshot"     /* (its large-image art asset key) */
+#define HOOKSHOT_DISCORD_APP_ID_DEFAULT "1571462295710597261"   /* (Triforce's own Discord application, made 11-15: "Playing Triforce" and its logo. An application id is public: it is in every status the client sends) */
+/* (its large-image art asset key: the name the owner's logo has on Discord's side, under Rich Presence > Art Assets) */
+#define HOOKSHOT_DISCORD_IMAGE_DEFAULT "triangle_emblem_discord_zoomed_out_transparent"
 
 void hos_log(const char *fmt, ...);
 int rx_option(int id, int otherwise);
@@ -224,9 +225,9 @@ static int send_activity(Ipc p, long long started) {
     snprintf(version, sizeof version, "%s", hos_version());
     version[strcspn(version, " +")] = 0;   /* ("v2.0.12 (source ...)": the release alone) */
     snprintf(json, sizeof json,
-             "{\"cmd\":\"SET_ACTIVITY\",\"nonce\":\"%u\",\"args\":{\"pid\":%lu,\"activity\":{\"details\":\"Ocarina of Time\","
-             "\"state\":\"Hookshot %s\",\"timestamps\":{\"start\":%lld},\"assets\":{\"large_image\":\"%s\",\"large_text\":"
-             "\"Hookshot %s\"}}}}",
+             "{\"cmd\":\"SET_ACTIVITY\",\"nonce\":\"%u\",\"args\":{\"pid\":%lu,\"activity\":{\"details\":\"Triforce %s\","
+             "\"timestamps\":{\"start\":%lld},\"assets\":{\"large_image\":\"%s\",\"large_text\":"
+             "\"Triforce %s\"}}}}",
              ++nonce, process_id(), version, started, HOOKSHOT_DISCORD_IMAGE_DEFAULT, version);
     if (!write_frame(p, OP_FRAME, json)) return 0;
     uint32_t op = 0;

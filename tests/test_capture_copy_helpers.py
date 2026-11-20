@@ -45,6 +45,10 @@ def main():
     parts = [source[source.index("struct CopyPair {"):source.index("\n", source.index("struct CopyPair {"))],
              block(source, "struct CopyPart {", ";"),
              block(source, "void copy_part(const CopyPart& w)"),
+             # ((Triforce) a capture's copies behind: the helpers take their parts too, tests/test_capture_behind.py)
+             block(source, "struct BehindCopy : capture_behind::Work {", ";"),
+             source[source.index("std::atomic<int64_t> st_cg_n{0}"):source.index(";", source.index("std::atomic<int64_t> st_cg_n{0}")) + 1],
+             block(source, "void behind_copy(BehindCopy& b"),
              block(source, "struct CopyHelpers {", ";"),
              block(source, "void copy_helper_main()"),
              block(source, "int capture_copy_helpers()"),
@@ -59,9 +63,12 @@ def main():
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <memory>
 #include <mutex>
 #include <thread>
 #include <vector>
+#include "capture_behind.h"
+namespace capture_behind = mkwvk::capture_behind;
 #define CHECK(x) do { if (!(x)) { std::fprintf(stderr, "FAIL:%d %s\n", __LINE__, #x); std::fflush(stderr); std::_Exit(1); } } while (0)
 typedef size_t SIZE_T;
 constexpr uint64_t kPageShift = 12;
@@ -80,6 +87,8 @@ static bool guarded_copy(void* dst, const void* src, size_t n) {
 static void copy_fence() {}   // (#1619's fence after a page-by-page retry: the stub's copies are plain memcpy)
 static int GetCurrentThread() { return 0; }
 static void SetThreadDescription(int, const wchar_t*) {}
+using VmaAllocation = void*;
+struct BehindCopy;
 ''' + "\n".join(parts) + r'''
 static void fill(uint8_t* p, uint32_t seed) { for (int i = 0; i < 4096; i += 4) { uint32_t v = seed * 2654435761u + i; std::memcpy(p + i, &v, 4); } }
 int main() {
@@ -144,7 +153,7 @@ int main() {
         cpp.write_text(fixture, encoding="utf-8")
         # (_CRT_SECURE_NO_WARNINGS: the MSVC CRT's getenv deprecation, as the game's own Windows build passes)
         subprocess.run([a.cxx, "-std=c++20", "-O2", "-pthread", "-Wall", "-Wextra", "-Werror", "-D_CRT_SECURE_NO_WARNINGS",
-                        str(cpp), "-o", str(exe)], check=True)
+                        "-I", str(ROOT / "gpu" / "vk"), str(cpp), "-o", str(exe)], check=True)
         subprocess.run([str(exe)], check=True, timeout=120, env={**os.environ, "RX_VK_CAPTURE_THREADS": "2"})
 
 

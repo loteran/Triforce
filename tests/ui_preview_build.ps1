@@ -28,7 +28,11 @@ function Obj([string]$src, [string[]]$f, [string]$compiler = $clang) {
 # (the menu and the stand-in always: their headers change)
 $script:force = $true
 Obj "$vk\vk_menu.cpp" $flags
+Obj "$vk\perf_machine.cpp" $flags   # ((Triforce) the Full overlay's machine sampler: the PC's own numbers in the picture)
 Obj "$PSScriptRoot\ui_preview.cpp" $flags
+Obj "$vk\vk_mods.cpp" $flags   # (Triforce: the Mods page's engine)
+Obj "$vk\vk_salesman.cpp" $flags   # (Triforce: the Salesman beside its cards)
+Obj "$vk\vk_bc_decoder.cpp" $flags
 $script:force = $false
 foreach ($f in 'imgui.cpp', 'imgui_draw.cpp', 'imgui_tables.cpp', 'imgui_widgets.cpp') { Obj "$imgui\$f" $flags }
 Obj "$gpu\third_party\suyu\video_core\textures\astc.cpp" $flags

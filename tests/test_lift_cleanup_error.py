@@ -66,7 +66,22 @@ class LiftCleanupErrorTests(unittest.TestCase):
             (self.gen / "a64_table.c").write_text("/* authored table */\n", encoding="utf-8")
             (self.image / "image.bin").write_bytes(b"authored image sentinel")
 
-        self.namespace.update(run=run, write_lift_key=write_key)
+        events = self.events
+
+        class Early:
+            """make_game.py's EarlyCompile: what needs no lifted code, compiled beside the lift"""
+
+            def __init__(self, work, env, jobs):
+                events.append("early")
+
+            def finish(self):
+                events.append("early done")
+
+            def stop(self):
+                pass
+
+        self.namespace.update(run=run, write_lift_key=write_key, EarlyCompile=Early, a=mock.Mock(jobs=None),
+                              atexit=mock.Mock())
 
     def seed(self, same_key=False):
         self.gen.mkdir(parents=True)
@@ -140,7 +155,7 @@ class LiftCleanupErrorTests(unittest.TestCase):
 
         self.namespace["run"] = run
         self.exercise()
-        self.assertEqual(self.events, ["lift", "key"])
+        self.assertEqual(self.events, ["early", "lift", "early done", "key"])
         self.assertTrue(self.namespace["lifted_before"](str(self.work), "b" * 40))
         for path, data in protected.items():
             self.assertEqual(path.read_bytes(), data)
@@ -158,7 +173,7 @@ class LiftCleanupErrorTests(unittest.TestCase):
 
         with mock.patch.object(os, "remove", side_effect=delete):
             self.exercise()
-        self.assertEqual(self.events, ["lift", "key"])
+        self.assertEqual(self.events, ["early", "lift", "early done", "key"])
         self.assertTrue(self.namespace["lifted_before"](str(self.work), "b" * 40))
 
     def test_matching_cached_lift_is_not_cleared(self):
@@ -171,7 +186,7 @@ class LiftCleanupErrorTests(unittest.TestCase):
 
     def test_first_lift_without_generated_directory(self):
         self.exercise()
-        self.assertEqual(self.events, ["lift", "key"])
+        self.assertEqual(self.events, ["early", "lift", "early done", "key"])
         self.assertTrue(self.namespace["lifted_before"](str(self.work), "b" * 40))
 
     def test_failed_lift_leaves_no_fresh_key(self):
@@ -185,7 +200,7 @@ class LiftCleanupErrorTests(unittest.TestCase):
         with self.assertRaises(SystemExit) as result:
             self.exercise()
         self.assertEqual(result.exception.code, 37)
-        self.assertEqual(self.events, ["lift"])
+        self.assertEqual(self.events, ["early", "lift"])
         self.assertFalse(self.key.exists())
 
 

@@ -24,7 +24,10 @@ def main():
     trace = ""
     if "    // Geometry trace:" in source[end:]:
         start = source.index("    // Geometry trace:", end)
-        trace = source[start:source.index("    menu_record(", start)]
+        stop = source.index("    menu_record(", start)
+        # (Triforce: the device lost's marker before the menu, wp8-lost, is not the trace's)
+        marked = source.find("    checkpoint_mark(f.cmd, index, 'M');", start)
+        trace = source[start:marked if 0 <= marked < stop else stop]
     fixture = (ROOT / "tests/present_geometry_trace_test.cpp").read_text(encoding="utf-8")
     fixture = fixture.replace("/* ACTUAL_DRAW */", draw).replace("/* ACTUAL_TRACE */", trace)
     with tempfile.TemporaryDirectory(prefix="present-geometry-trace-") as temp:

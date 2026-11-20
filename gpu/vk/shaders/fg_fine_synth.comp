@@ -1,0 +1,82 @@
+#version 450
+// (Triforce) An in-between frame at time t from the fine vectors (fg_fine_flow.comp, fg_fine_pick.comp; vk_framegen.cpp,
+// RX_VK_FRAMEGEN_FINE, on by default). Each pixel takes the frame before back along t of a motion and this frame forward
+// along 1 - t, blended by t, the motion chosen per pixel by how well those two agree on it and its four neighbours:
+//   - the vectors' own, between the four blocks around (a vector is where the frame before's pixel went, so it is looked
+//     up again where the pixel came from: a moving edge's vectors end where the edge is at t, not where it was);
+//   - where the four blocks' vectors differ (an object's edge, a block that is wrong), each of the four as it is, taken
+//     only when it agrees clearly better: one motion a pixel, never a blend of two, which bent a straight edge into a ramp;
+//   - none (the HUD, anything still on the screen): only when it agrees clearly better too, and the pixel is the same in
+//     both frames or a block around holds still. fg_synth.comp took a pixel alike in both frames as still: a thin line
+//     moving over a plain surface is not at its place of t in either frame, so it was not drawn at all between the game's.
+// Where no motion agrees (what is uncovered or covered, a cut, a flash), the nearer of the two frames as it is, as
+// fg_synth.comp does: a picture that is one of the game's, not one made of two that do not belong together. Where the
+// vectors around all hold still, the plain blend, which is either frame.
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(binding = 0) uniform sampler2D fa;     // (the frame before, the linear sampler)
+layout(binding = 1) uniform sampler2D fb;     // (this frame)
+layout(binding = 2) uniform sampler2D fine;   // (the vectors, pixels, one per 8x8)
+layout(binding = 3, rgba8) uniform writeonly image2D dst;
+layout(push_constant) uniform P { float t; } pc;
+
+ivec2 fm;
+vec2 inv;
+float t;
+
+vec2 vat(ivec2 q) { return texelFetch(fine, clamp(q, ivec2(0), fm), 0).xy; }
+float gap(vec3 x, vec3 y) { const vec3 d = abs(x - y); return max(d.r, max(d.g, d.b)); }
+vec3 at_a(vec2 p) { return textureLod(fa, p * inv, 0.0).rgb; }
+vec3 at_b(vec2 p) { return textureLod(fb, p * inv, 0.0).rgb; }
+float miss(vec2 p, vec2 v) {   // (how far the two frames moved by v disagree at p and its four neighbours)
+    const vec2 pa = p - t * v, pb = p + (1.0 - t) * v;
+    float e = gap(at_a(pa), at_b(pb));
+    e += gap(at_a(pa + vec2(1.0, 0.0)), at_b(pb + vec2(1.0, 0.0)));
+    e += gap(at_a(pa - vec2(1.0, 0.0)), at_b(pb - vec2(1.0, 0.0)));
+    e += gap(at_a(pa + vec2(0.0, 1.0)), at_b(pb + vec2(0.0, 1.0)));
+    e += gap(at_a(pa - vec2(0.0, 1.0)), at_b(pb - vec2(0.0, 1.0)));
+    return e / 5.0;
+}
+float far(vec2 a, vec2 b) { return max(abs(a.x - b.x), abs(a.y - b.y)); }
+
+void main() {
+    const ivec2 g = ivec2(gl_GlobalInvocationID.xy);
+    const ivec2 d = imageSize(dst);
+    if (any(greaterThanEqual(g, d))) return;
+    t = pc.t;
+    fm = textureSize(fine, 0) - 1;
+    inv = 1.0 / vec2(d);
+    const vec2 p = vec2(g) + 0.5;
+    vec2 fp = p / 8.0 - 0.5;
+    ivec2 i = ivec2(floor(fp));
+    vec2 w = fp - floor(fp);
+    const vec2 v1 = mix(mix(vat(i), vat(i + ivec2(1, 0)), w.x), mix(vat(i + ivec2(0, 1)), vat(i + ivec2(1, 1)), w.x), w.y);
+    fp = (p - t * v1) / 8.0 - 0.5;
+    i = ivec2(floor(fp));
+    w = fp - floor(fp);
+    const vec2 c00 = vat(i), c10 = vat(i + ivec2(1, 0)), c01 = vat(i + ivec2(0, 1)), c11 = vat(i + ivec2(1, 1));
+    const vec2 v = mix(mix(c00, c10, w.x), mix(c01, c11, w.x), w.y);
+    const vec3 a0 = texelFetch(fa, g, 0).rgb, b0 = texelFetch(fb, g, 0).rgb;
+    const vec2 zero = vec2(0.0);
+    if (max(max(far(c00, zero), far(c10, zero)), max(far(c01, zero), far(c11, zero))) < 0.125) {
+        imageStore(dst, g, vec4(mix(a0, b0, t), 1.0));
+        return;
+    }
+    vec2 best = v;
+    float eb = miss(p, v);
+    if (max(max(far(c00, v), far(c10, v)), max(far(c01, v), far(c11, v))) > 0.5) {
+        float e = miss(p, c00);
+        if (e < eb - 0.01) best = c00, eb = e;
+        e = miss(p, c10);
+        if (e < eb - 0.01) best = c10, eb = e;
+        e = miss(p, c01);
+        if (e < eb - 0.01) best = c01, eb = e;
+        e = miss(p, c11);
+        if (e < eb - 0.01) best = c11, eb = e;
+    }
+    const float e0 = miss(p, zero);
+    const float still = min(min(far(c00, zero), far(c10, zero)), min(far(c01, zero), far(c11, zero)));
+    if (e0 < eb - 0.01 && (e0 < 0.004 || still < 1.0)) best = zero, eb = e0;
+    const vec3 a = at_a(p - t * best), b = at_b(p + (1.0 - t) * best);
+    const float lost = smoothstep(0.06, 0.18, eb);
+    imageStore(dst, g, vec4(mix(mix(a, b, t), t <= 0.5 ? a0 : b0, lost), 1.0));
+}

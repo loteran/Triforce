@@ -5,6 +5,8 @@
    there. TPIDRRO_EL0 (thread-local region): 0x200 bytes; the SDK's nn::os keeps the current ThreadType* at
    +0x1F8, so lifted SDK code that reads it inline finds the same thread the HLE knows. */
 #include "hos.h"
+#include "hos_x3d.h"
+#include "pace_wait.h"   /* ((Triforce) hos_sleep_until_ns: the frame wait to its time) */
 #include <stdio.h>
 #include <stdlib.h>
 #define WIN32_LEAN_AND_MEAN
@@ -32,10 +34,11 @@ struct HosThread {
     /* the kernel side (hos_svc.c): this thread's Horizon handle and the event it blocks on */
     uint32_t kernel_handle;
     HANDLE wake;
-    /* virtual cores (HOS_VCORES): the core held + 1 (0: none), the last one, a better waiter's request, queued */
+    /* virtual cores (HOS_VCORES): the core held + 1 (0: none), the last one, a better waiter's request, queued; (Triforce)
+       when a release granted it the core it waits for (vc_grant), until it runs (the vcores: line's grant to run) */
     int vc_held, vc_last, vc_queued;
     volatile int vc_kick;
-    int64_t vc_since;
+    int64_t vc_since, vc_grant_at;
     CONDITION_VARIABLE vc_cv;
     /* (hookshot) fibers: the context running now (NULL: ctx, the thread's own), the thread's host fiber once it
        switched to a guest fiber */
@@ -306,12 +309,46 @@ void hos_log(const char *fmt, ...) {
     fflush(stderr);
 }
 
+/* (Triforce, after NX2navi) 32 KiB of the calling thread's or fiber's stack kept back for its own stack overflow. Windows
+   leaves a thread that ran out of stack about a guard page's worth, and the crash report (mkw_glue.c report_crash: its
+   kilobyte buffers, hos_log's, the frame walk) needs more: it faulted again inside the report and the process ended with
+   nothing in the log. The game's threads and fibers ask at their start (64 MB of stack reserved each, so a guest function
+   that calls itself without end is the case), and each then commits that much more of its stack. The guarantee is the
+   running fiber's own, so a fiber asks too. tests/test_crash_report.py */
+void hos_stack_guarantee(void) {
+#ifdef _WIN32
+    ULONG bytes = 32768;
+    SetThreadStackGuarantee(&bytes);
+#endif
+}
+
+/* (Triforce, after NX2navi) One end for a failed run. A crash is reported by every thread that faults, without waiting
+   for the others, and a fatal error can come beside a crash from the same bad state (an allocation that failed here, a
+   null pointer read there): the later one ended the process and cut the first report where it was. 1 for the first
+   caller, which reports and ends the process; 0 for that thread again (a failure inside its own report: no second
+   one); any other thread waits here, logging nothing (it may hold what the report needs), until the process ends, and
+   ends it itself after 30 s if the first report never finishes. */
+int hos_ending_enter(void) {
+    static volatile LONG ending;
+    const LONG me = (LONG)GetCurrentThreadId();
+    const LONG was = InterlockedCompareExchange(&ending, me, 0);
+    if (!was) return 1;
+    if (was == me) return 0;
+    Sleep(30000);
+    TerminateProcess(GetCurrentProcess(), 3);
+    return 0;
+}
+
 void hos_fatal(Ctx *c, const char *fmt, ...) {
     char buf[1024];
     va_list ap;
     va_start(ap, fmt);
     vsnprintf(buf, sizeof buf, fmt, ap);
     va_end(ap);
+    if (!hos_ending_enter()) {   /* (a fatal error inside this thread's own report: the report so far stands) */
+        TerminateProcess(GetCurrentProcess(), 3);
+        ExitProcess(3);
+    }
     if (!c) c = hos_ctx();
     log_flush();
     fprintf(stderr, "[hos %s] FATAL: %s", cur ? cur->name : "host", buf);
@@ -321,7 +358,12 @@ void hos_fatal(Ctx *c, const char *fmt, ...) {
     void hos_backtrace(void), hos_hostcall_stats(void);
     hos_backtrace();
     hos_hostcall_stats();
-    ExitProcess(3);
+    /* (Triforce, after NX2navi) TerminateProcess, not ExitProcess: ExitProcess stops the other threads wherever they are
+       and then runs every library's detach on this thread, and a detach that faults there (an upscaler's, a driver's) put
+       a crash report of its own after the lines above, or held the process open. Everything said here is written out
+       already (log_flush, fflush). tests/test_device_lost_exit.py */
+    TerminateProcess(GetCurrentProcess(), 3);
+    ExitProcess(3);   /* (not reached) */
 }
 
 /* Traps from the lifted code (rt/a64_rt.c): name the thread, then stop. */
@@ -468,6 +510,7 @@ Ctx *hos_boot_main_thread(uint64_t stack_size) {
 
 static DWORD WINAPI thread_main(void *p) {
     HosThread *t = (HosThread *)p;
+    hos_stack_guarantee();
     cur = t;
     Ctx *c = &t->ctx;
     c->x[0] = t->arg;
@@ -557,6 +600,7 @@ void hos_thread_destroy(HosThread *t) {
         if (threads[i] == t) { threads[i] = threads[--nthreads]; break; }
     ReleaseSRWLockExclusive(&threads_lock);
     if (t->handle) CloseHandle(t->handle);
+    if (t->wake) CloseHandle(t->wake);
     free(t);
 }
 
@@ -623,6 +667,79 @@ static uint64_t pick_reserved_core(const uint64_t *masks, const unsigned char *c
     if (logical < 8 || fast < 4) return 0;
     return last;
 }
+/* (Triforce, after NX2navi's cache placement) The die with the largest L3 cache, on a processor whose L3 caches differ: a
+   two-die X3D part, 3D V-Cache on one die (host/hos_x3d.h has the rule and where nothing is done). The game's threads
+   are kept on it (hos_thread_pin), and the core kept for the replay is its last one (last_fastest_core), not the
+   processor's last, which is on the other die: the replay reads what the game's threads just wrote. Only where the rule
+   finds such a die; everywhere else 0, and nothing changes. HOS_X3D=0: off there too. Other threads of the process (the
+   driver's, the shader workers) stay where Windows puts them. Windows only: Linux as before.
+   NX2navi keeps the whole process on the die and reserves no core there; here the replay's core stays, on the die, as
+   the replay is pinned to it by default (gpu/vk/vk_replay.cpp ReplayPin). HOS_RESERVE_CORE=0 keeps none, as ever */
+#if defined(_WIN32)
+/* (hos_x3d_pick over what Windows lists for the calling thread's processor group) */
+static uint64_t x3d_detect(HosX3d *out) {
+    static HosCache caches[1024];
+    static uint64_t cores[256];
+    int ncaches = 0, ncores = 0;
+    HosX3d none = {HOS_X3D_NONE, 0, 0, 0, 0};
+    *out = none;
+    DWORD_PTR proc = 0, sys = 0;
+    if (!GetProcessAffinityMask(GetCurrentProcess(), &proc, &sys) || !proc) return 0;
+    GROUP_AFFINITY ga;
+    const WORD group = GetThreadGroupAffinity(GetCurrentThread(), &ga) ? ga.Group : 0;
+    for (int pass = 0; pass < 2; pass++) {
+        const LOGICAL_PROCESSOR_RELATIONSHIP rel = pass ? RelationProcessorCore : RelationCache;
+        DWORD len = 0;
+        if (GetLogicalProcessorInformationEx(rel, NULL, &len) || GetLastError() != ERROR_INSUFFICIENT_BUFFER) return 0;
+        char *buf = (char *)malloc(len);
+        if (!buf || !GetLogicalProcessorInformationEx(rel, (SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *)buf, &len)) {
+            free(buf);
+            return 0;
+        }
+        for (DWORD at = 0; at < len;) {
+            const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *e = (const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *)(buf + at);
+            if (!e->Size) break;
+            if (e->Relationship == RelationCache && e->Cache.GroupMask.Group == group && ncaches < 1024) {
+                caches[ncaches].level = e->Cache.Level;
+                caches[ncaches].mask = (uint64_t)e->Cache.GroupMask.Mask;
+                caches[ncaches].bytes = e->Cache.CacheSize;
+                ncaches++;
+            } else if (e->Relationship == RelationProcessorCore && e->Processor.GroupCount &&
+                       e->Processor.GroupMask[0].Group == group && ncores < 256) {
+                cores[ncores++] = (uint64_t)e->Processor.GroupMask[0].Mask;
+            }
+            at += e->Size;
+        }
+        free(buf);
+    }
+    return hos_x3d_pick(caches, ncaches, cores, ncores, (uint64_t)proc, (int)GetActiveProcessorGroupCount(), out);
+}
+#endif
+static uint64_t hos_x3d_cpus(void) {
+    static uint64_t mask = ~0ull;
+    static SRWLOCK lk = SRWLOCK_INIT;
+    AcquireSRWLockExclusive(&lk);
+    if (mask == ~0ull) {
+        mask = 0;
+#if defined(_WIN32)
+        HosX3d x;
+        const char *e = getenv("HOS_X3D");
+        const int off = e && *e && !atoi(e);
+        const uint64_t die = x3d_detect(&x);
+        if (x.why == HOS_X3D_USED && !off) mask = die;
+        if (x.why == HOS_X3D_USED || x.why == HOS_X3D_FEW)   /* (a processor with L3 caches of two sizes: said either way) */
+            hos_log("cpu: logical processors %#llx share the largest L3 cache (%llu MB, against %llu MB), %d cores: %s",
+                    (unsigned long long)x.die, (unsigned long long)(x.big >> 20), (unsigned long long)(x.small >> 20), x.cores,
+                    x.why == HOS_X3D_FEW ? "fewer than 8, so the game's threads are not kept there"
+                    : off ? "not used (HOS_X3D=0)"
+                    : "the game's threads and the replay's core are kept there (HOS_X3D=0: as before)");
+#endif
+    }
+    const uint64_t m = mask;
+    ReleaseSRWLockExclusive(&lk);
+    return m;
+}
+
 #if defined(_WIN32)
 /* (pick_reserved_core over the calling thread's group's cores; *cores: how many, 0 when they could not be read) */
 static uint64_t last_fastest_core(int *cores) {
@@ -633,6 +750,7 @@ static uint64_t last_fastest_core(int *cores) {
     *cores = 0;
     GROUP_AFFINITY ga;
     const WORD group = GetThreadGroupAffinity(GetCurrentThread(), &ga) ? ga.Group : 0;
+    const uint64_t die = hos_x3d_cpus();   /* (Triforce: the cores of the die the game's threads are kept on, when there is one) */
     if (GetLogicalProcessorInformationEx(RelationProcessorCore, NULL, &len) || GetLastError() != ERROR_INSUFFICIENT_BUFFER)
         return 0;
     char *buf = (char *)malloc(len);
@@ -640,7 +758,8 @@ static uint64_t last_fastest_core(int *cores) {
         for (DWORD at = 0; at < len && n < 256;) {
             const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *e = (const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *)(buf + at);
             if (!e->Size) break;
-            if (e->Relationship == RelationProcessorCore && e->Processor.GroupCount && e->Processor.GroupMask[0].Group == group) {
+            if (e->Relationship == RelationProcessorCore && e->Processor.GroupCount && e->Processor.GroupMask[0].Group == group &&
+                (!die || ((uint64_t)e->Processor.GroupMask[0].Mask & die))) {
                 masks[n] = (uint64_t)e->Processor.GroupMask[0].Mask;
                 classes[n] = e->Processor.EfficiencyClass;
                 n++;
@@ -679,11 +798,12 @@ uint64_t hos_reserved_cpus(void) {
 }
 
 void hos_thread_pin(void *h, const char *name) {
-    const uint64_t reserved = hos_reserved_cpus();
-    if (reserved) {
+    const uint64_t reserved = hos_reserved_cpus(), die = hos_x3d_cpus();
+    if (reserved || die) {   /* (Triforce: on the die with the largest L3 where there is one, hos_x3d.h; else as before) */
         DWORD_PTR proc = 0, sys = 0;
         GetProcessAffinityMask(GetCurrentProcess(), &proc, &sys);
-        if ((uint64_t)proc & ~reserved) SetThreadAffinityMask(h, (DWORD_PTR)((uint64_t)proc & ~reserved));
+        const uint64_t want = hos_x3d_thread_mask((uint64_t)proc, die, reserved);
+        if (want) SetThreadAffinityMask(h, (DWORD_PTR)want);
     }
     static NameSpec pins[24], prios[24];
     static int npins = -1, nprios;
@@ -789,6 +909,24 @@ static void sleep_ns(int64_t ns) {
     }
     if (ns > 2000000) Sleep((DWORD)((ns - 1000000) / 1000000));
     while (hos_now_ns() < until) SwitchToThread();
+}
+/* (Triforce) The game's frame wait to its time (pace_wait.h, host/nn_vi.c hos_vi_native_acquire): the timer up to the
+   margin before it (sleep_ns, which takes the timer for a millisecond and more), the rest yielded away as sleep_ns yields
+   a short wait; the core given up once for the whole of it, as hos_sleep_ns gives it up */
+static void yield_for_wait(void) {
+    if (!SwitchToThread()) YieldProcessor();
+}
+void hos_sleep_until_ns(int64_t until, int64_t margin_ns) {
+    if (until <= hos_now_ns()) return;
+    const int away = hos_vcore_away();
+#ifdef __EMSCRIPTEN__
+    (void)yield_for_wait, (void)margin_ns;   /* (the web's own sleep_ns spins the end of a wait already) */
+    const int64_t left = until - hos_now_ns();
+    if (left > 0) sleep_ns(left);
+#else
+    pace_wait_until(until, margin_ns, hos_now_ns, sleep_ns, yield_for_wait);
+#endif
+    if (away) hos_vcore_back();
 }
 
 /* ---- nn::os threads -------------------------------------------------------------------------------------- */
@@ -1061,6 +1199,7 @@ static void fiber_switch(Ctx *from, HosFiber *to);
 
 static void WINAPI fiber_main(void *p) {
     HosFiber *f = (HosFiber *)p;
+    hos_stack_guarantee();   /* (the guarantee is the fiber's own stack's) */
     Ctx *c = &f->ctx;
     c->x[0] = f->arg;
     c->x[30] = 0;
@@ -1169,13 +1308,19 @@ void hos_thread_log_handles(void) {
    once. Guest code with no checkpoint (a spin loop) keeps its core, so a waiter that has waited too long runs anyway
    without one (an "escape", logged with the holders): HOS_VCORE_ESCAPE_US for a better waiter (default 1000),
    HOS_VCORE_ESCAPE_EQ_US otherwise (20000). Every 5 s the log has a "vcores:" line. GetCurrentCoreNumber answers the
-   core a thread holds. */
+   core a thread holds. (Triforce) A waiter that asked a holder for its core spins for it before it sleeps (vc_spin). */
 #if !defined(__EMSCRIPTEN__)
 static SRWLOCK vc_lock = SRWLOCK_INIT;
 static HosThread *vc_owner[8];
 static HosThread *vc_queue[1024];
 static int vc_nq;
-static struct { int64_t takes, waits, wait_ns, max_ns, escapes, kicks, yields, since; } vc_st;
+static struct {
+    int64_t takes, waits, wait_ns, max_ns, escapes, kicks, yields, since;
+    /* (Triforce) the waits that ended in the spin and those that slept, the time spun, the spins left out (HOS_VCORE_SPIN_MAX
+       threads spinning already); grant to run: from vc_grant until the waiter holds vc_lock again, after a spin and after a
+       sleep (NX2navi's "core grant to run", runtime/kernel.c grant_at) */
+    int64_t spun, slept, spin_ns, spin_capped, run_spin_ns, run_spin_n, run_sleep_ns, run_sleep_n, run_max_ns;
+} vc_st;
 
 int hos_vcores_on(void) {
     static int on = -1;
@@ -1188,6 +1333,16 @@ int hos_vcores_on(void) {
 static int vc_cores(void) { return hos_cores() > 8 ? 8 : hos_cores(); }
 static unsigned vc_allowed(HosThread *t) {
     const unsigned all = (1u << vc_cores()) - 1;
+    /* (Triforce, 11-14, the lab) HOS_VCORE_ANY=1: a thread takes any free core, not only the ones its affinity mask names.
+       What the game needs of the cores is that no two threads run under one core number at a time (its per-core data has no
+       locks); the masks are the console's placement. OoT pins nearly every thread to one core (six BaseProc executors, five
+       module workers, the main and Presentation threads on six cores), and here a thread waits for ITS core while others
+       stand free: at the Market ~61 waits a frame of ~0.1 ms each, 7 ms of waiting a frame summed over the threads, on the
+       path the frame now waits for (the game's own CPU work, 13-14 ms a frame with the replay on its own thread). The risk:
+       a thread that reads its core number, blocks, and goes on under another */
+    static int any = -1;
+    if (any < 0) any = getenv("HOS_VCORE_ANY") && atoi(getenv("HOS_VCORE_ANY")) != 0;
+    if (any) return all;
     unsigned m = (unsigned)(t->core_mask & all);
     if (!m) m = 1u << hos_thread_core(t);
     return m;
@@ -1208,7 +1363,7 @@ static int vc_free_for(HosThread *t) {
 }
 static void vc_take(HosThread *t, int c) {
     vc_owner[c] = t;
-    t->vc_held = c + 1;
+    __atomic_store_n(&t->vc_held, c + 1, __ATOMIC_RELEASE);   /* ((Triforce) a waiter in vc_spin reads it without vc_lock) */
     t->vc_last = c + 1;
     t->vc_kick = 0;
 }
@@ -1227,16 +1382,23 @@ static void vc_grant(int c) {
         if ((vc_allowed(vc_queue[i]) >> c & 1) && (!best || vc_better(vc_queue[i], best))) best = vc_queue[i];
     if (!best) return;
     vc_dequeue(best);
+    best->vc_grant_at = hos_now_ns();   /* ((Triforce) grant to run, taken where it holds vc_lock again: vc_acquire) */
     vc_take(best, c);
-    WakeConditionVariable(&best->vc_cv);
+    WakeConditionVariable(&best->vc_cv);   /* (no one sleeps there when it spins: vc_spin reads vc_held) */
 }
 static void vc_stats_locked(int64_t now) {
     if (!vc_st.since) vc_st.since = now;
     if (now - vc_st.since < 5000000000LL) return;
-    hos_log("vcores: %lld takes, %lld waits (mean %.0f us, longest %.1f ms), %lld kicks, %lld yields, %lld escapes in %.0f s",
+    hos_log("vcores: %lld takes, %lld waits (mean %.0f us, longest %.1f ms), %lld kicks, %lld yields, %lld escapes in %.0f s; "
+            "%lld of the waits ended in the spin (%.2f ms spun, %lld spins left out with HOS_VCORE_SPIN_MAX threads spinning), "
+            "%lld slept; a granted core ran %.1f us after its grant after a spin (%lld), %.1f us after a sleep (%lld), longest "
+            "%.0f us",
             (long long)vc_st.takes, (long long)vc_st.waits, vc_st.waits ? vc_st.wait_ns / 1e3 / vc_st.waits : 0.0,
             vc_st.max_ns / 1e6, (long long)vc_st.kicks, (long long)vc_st.yields, (long long)vc_st.escapes,
-            (now - vc_st.since) / 1e9);
+            (now - vc_st.since) / 1e9, (long long)vc_st.spun, vc_st.spin_ns / 1e6, (long long)vc_st.spin_capped,
+            (long long)vc_st.slept, vc_st.run_spin_n ? vc_st.run_spin_ns / 1e3 / vc_st.run_spin_n : 0.0,
+            (long long)vc_st.run_spin_n, vc_st.run_sleep_n ? vc_st.run_sleep_ns / 1e3 / vc_st.run_sleep_n : 0.0,
+            (long long)vc_st.run_sleep_n, vc_st.run_max_ns / 1e3);
     memset(&vc_st, 0, sizeof vc_st);
     vc_st.since = now;
 }
@@ -1244,10 +1406,63 @@ static int64_t vc_env_ns(const char *name, int64_t us) {
     const char *e = getenv(name);
     return (e ? atoll(e) : us) * 1000;
 }
+/* (Triforce, the third performance audit's P1: NX2navi's spin before the sleep, runtime/kernel.c core_take, which came
+   from totk-pc-recomp's runtime/kernel.c, MIT, Copyright (c) 2026 the totk-pc-recomp authors) A waiter that asked a holder
+   to give its core up spins for it before it sleeps: up to HOS_VCORE_SPIN_US (250; 0: it sleeps at once, as before), with
+   vc_lock let go, until a release grants it the core (vc_grant sets its vc_held), then takes the lock again. The holder
+   gives the core up at its next nn::os call, SVC or loop poll, mostly within microseconds; a sleep adds an OS wake to
+   each such hand-off (NX2navi's log on this PC: 1,391,252 waits ended in its spin against 530 that did not; Triforce at
+   the Market: ~66,000 core waits per 5 s, 67 us mean). Who gets a core does not change: the waiter stays queued, and
+   vc_grant picks the best waiter as before; only how soon the one it picks runs. At most HOS_VCORE_SPIN_MAX threads spin
+   at once (vc_spin_most: by default a quarter of the logical processors beyond 8, at most 4: none on 8 or fewer, 1 on 12,
+   2 on 16), so that the spin takes only processors the game leaves idle (5.4-6.1 of 16 busy at the Market) and a busy PC
+   does not lose. tests/test_vcore_spin.py */
+static int vc_spin_most(int logical) {
+    const int n = logical > 8 ? (logical - 8) / 4 : 0;
+    return n > 4 ? 4 : n;
+}
+static int vc_spinning;   /* (threads in vc_spin now) */
+static int vc_spin_max(void) {
+    static int most = -1;
+    if (most < 0) {
+        const char *e = getenv("HOS_VCORE_SPIN_MAX");
+        SYSTEM_INFO si;
+        GetSystemInfo(&si);
+        const int n = e ? atoi(e) : vc_spin_most((int)si.dwNumberOfProcessors);
+        most = n < 0 ? 0 : n;
+    }
+    return most;
+}
+/* holding vc_lock: lets it go and spins until t holds a core or ns pass, then takes it again; 0: it did not spin
+   (HOS_VCORE_SPIN_MAX threads spin already) */
+static int vc_spin(HosThread *t, int64_t ns) {
+    if (__atomic_add_fetch(&vc_spinning, 1, __ATOMIC_RELAXED) > vc_spin_max()) {
+        __atomic_sub_fetch(&vc_spinning, 1, __ATOMIC_RELAXED);
+        vc_st.spin_capped++;
+        return 0;
+    }
+    ReleaseSRWLockExclusive(&vc_lock);
+    const int64_t s0 = hos_now_ns(), end = s0 + ns;
+    while (!__atomic_load_n(&t->vc_held, __ATOMIC_ACQUIRE) && hos_now_ns() < end) _mm_pause();
+    const int64_t spun = hos_now_ns() - s0;
+    __atomic_sub_fetch(&vc_spinning, 1, __ATOMIC_RELAXED);
+    AcquireSRWLockExclusive(&vc_lock);
+    vc_st.spin_ns += spun;
+    return 1;
+}
 static void vc_acquire(HosThread *t) {
-    static int64_t esc_better = -1, esc_eq, slice;
+    static int64_t esc_better = -1, esc_eq, slice, spin;
     if (esc_better < 0) {
         esc_eq = vc_env_ns("HOS_VCORE_ESCAPE_EQ_US", 250000);
+        {   /* ((Triforce) the spin, vc_spin: HOS_VCORE_SPIN_US, up to a second; off where no thread may spin) */
+            const int64_t s = vc_env_ns("HOS_VCORE_SPIN_US", 250);
+            spin = !vc_spin_max() || s <= 0 ? 0 : s > 1000000000LL ? 1000000000LL : s;
+            static int told;
+            if (!told++)
+                hos_log("vcores: a waiter spins up to %lld us for a core it asked a holder for before it sleeps "
+                        "(HOS_VCORE_SPIN_US; 0: off), %d threads at most at once (HOS_VCORE_SPIN_MAX)",
+                        (long long)(spin / 1000), vc_spin_max());
+        }
         esc_better = vc_env_ns("HOS_VCORE_ESCAPE_US", 250000);
         slice = vc_env_ns("HOS_VCORE_SLICE_US", 2000);
     }
@@ -1264,6 +1479,7 @@ static void vc_acquire(HosThread *t) {
     t->vc_queued = 1;
     if (vc_nq < 1024) vc_queue[vc_nq++] = t;
     vc_st.waits++;
+    int spun = 0, slept = 0, ended = 0;   /* ((Triforce) the spin tried, a sleep taken, the wait ended in the spin) */
     for (;;) {
         /* the worst holder worse than t on a core t may use gives it up at its next checkpoint; after
            HOS_VCORE_SLICE_US (2000) of waiting, a holder as good as t does too (a time slice: Horizon would leave
@@ -1284,6 +1500,24 @@ static void vc_acquire(HosThread *t) {
             __atomic_store_n(rc ? &rc->poll : &worst->ctx.poll, 1, __ATOMIC_RELAXED);
             vc_st.kicks++;
         }
+        /* (Triforce) a holder was asked for a core t may use: a spin for it first, once a wait (vc_spin). A release in
+           the spin granted t its core (vc_held), the only one it then holds; else a core freed that no waiter took */
+        if (worst && spin && !spun) {
+            spun = 1;
+            if (vc_spin(t, spin)) {
+                if (t->vc_held) {
+                    ended = 1;
+                    break;
+                }
+                if ((c = vc_free_for(t)) >= 0) {
+                    vc_dequeue(t);
+                    vc_take(t, c);
+                    ended = 1;
+                    break;
+                }
+            }
+        }
+        slept = 1;
         SleepConditionVariableSRW(&t->vc_cv, &vc_lock, 1, 0);
         if (t->vc_held) break;   /* granted by a release */
         if ((c = vc_free_for(t)) >= 0) {
@@ -1310,10 +1544,19 @@ static void vc_acquire(HosThread *t) {
             break;
         }
     }
-    const int64_t waited = hos_now_ns() - t0;
+    const int64_t now = hos_now_ns(), waited = now - t0;
     vc_st.wait_ns += waited;
     if (waited > vc_st.max_ns) vc_st.max_ns = waited;
-    vc_stats_locked(hos_now_ns());
+    if (ended) vc_st.spun++;   /* ((Triforce) every wait ends in the spin or after a sleep) */
+    else if (slept) vc_st.slept++;
+    if (t->vc_grant_at) {   /* ((Triforce) granted by a release: from the grant until it runs) */
+        const int64_t run = now - t->vc_grant_at;
+        if (ended) vc_st.run_spin_ns += run, vc_st.run_spin_n++;
+        else vc_st.run_sleep_ns += run, vc_st.run_sleep_n++;
+        if (run > vc_st.run_max_ns) vc_st.run_max_ns = run;
+        t->vc_grant_at = 0;
+    }
+    vc_stats_locked(now);
     ReleaseSRWLockExclusive(&vc_lock);
 }
 static void vc_release(HosThread *t) {
@@ -1329,6 +1572,12 @@ static void vc_release(HosThread *t) {
 /* gives the core to a waiter allowed on it that is better than t (strict) or as good (a yield) */
 static void vc_yield(HosThread *t, int strict) {
     if (!t->vc_held) return;
+    /* (Triforce, NX2navi's yield fast path: runtime/kernel.c SleepThread's yield, chrg6 745d48bc) nobody waits for a core
+       and no waiter asked t for its own: no lock taken, as most yields find (the game's yield loops pay this thousands of
+       times a second). The look is racy as NX2navi's: a thread that queues right after it is seen by t's next yield, and
+       asks t itself meanwhile (vc_acquire's kick: at once when better, after HOS_VCORE_SLICE_US when as good); a request
+       already made (vc_kick) takes the lock as before */
+    if (!__atomic_load_n(&vc_nq, __ATOMIC_RELAXED) && !t->vc_kick) return;
     AcquireSRWLockExclusive(&vc_lock);
     const int c = t->vc_held - 1;
     int any = 0;

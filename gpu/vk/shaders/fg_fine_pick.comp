@@ -1,0 +1,55 @@
+#version 450
+// (Triforce) The fine vectors (fg_fine_flow.comp) settled among their neighbours, run twice: each block keeps whichever of
+// its own vector and its 8 neighbours' matches its own pixels best (the squared difference of the frames' luma at 8x8
+// points 1.5 pixels apart over the block and 2 pixels around it), a vector far from the neighbours' median paying a
+// little more. A block that could not tell its motion -- a line alone in it, which matches as well moved along itself, a
+// fence whose bars match one bar over -- takes its neighbours' where it fits as well, so that the vectors along a line or
+// across a fence are one motion, not each block's own guess (a line moved by vectors that differ comes out bent).
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(binding = 0) uniform sampler2D fa;    // (the frame before, the linear sampler)
+layout(binding = 1) uniform sampler2D fb;    // (this frame)
+layout(binding = 2) uniform sampler2D src;   // (the vectors)
+layout(binding = 3, rgba16f) uniform writeonly image2D dst;
+
+float pa[64];
+vec2 q0;
+vec2 inv;
+
+float luma(vec3 c) { return dot(c, vec3(0.299, 0.587, 0.114)); }
+float ssd(vec2 v) {
+    float s = 0.0;
+    for (int i = 0; i < 64; i++) {
+        const float d = luma(textureLod(fb, (q0 + vec2(float(i % 8), float(i / 8)) * 1.5 + v) * inv, 0.0).rgb) - pa[i];
+        s += d * d;
+    }
+    return s / 64.0;
+}
+float med9(float v[9]) {   // (as fg_median.comp's)
+    for (int i = 0; i < 5; i++)
+        for (int j = i + 1; j < 9; j++)
+            if (v[j] < v[i]) { const float t = v[i]; v[i] = v[j]; v[j] = t; }
+    return v[4];
+}
+
+void main() {
+    const ivec2 g = ivec2(gl_GlobalInvocationID.xy);
+    const ivec2 d = imageSize(dst);
+    if (any(greaterThanEqual(g, d))) return;
+    inv = 1.0 / vec2(textureSize(fa, 0));
+    q0 = vec2(g * 8) - 1.25;
+    for (int i = 0; i < 64; i++) pa[i] = luma(textureLod(fa, (q0 + vec2(float(i % 8), float(i / 8)) * 1.5) * inv, 0.0).rgb);
+    vec2 c[9];
+    float xs[9], ys[9];
+    for (int i = 0; i < 9; i++) {
+        c[i] = texelFetch(src, clamp(g + ivec2(i % 3 - 1, i / 3 - 1), ivec2(0), d - 1), 0).xy;
+        xs[i] = c[i].x, ys[i] = c[i].y;
+    }
+    const vec2 m = vec2(med9(xs), med9(ys));
+    vec2 best = c[4];
+    float least = 1e9;
+    for (int i = 0; i < 9; i++) {
+        const float s = ssd(c[i]) + 0.00002 * length(c[i] - m);
+        if (s < least) least = s, best = c[i];
+    }
+    imageStore(dst, g, vec4(best, texelFetch(src, g, 0).z, 1.0));
+}

@@ -40,11 +40,17 @@ static struct {
     int32_t id;
     uint16_t rumble_lo, rumble_hi;
     int64_t rumble_ns;
+    /* (Triforce) the triggers' motors (trigger_poll): what they were last sent and when, when to ask a pad that refused
+       again, and what the log has said of this pad (1 refused, 2 plays) */
+    uint16_t trigger;
+    uint8_t trigger_said;
+    int64_t trigger_ns, trigger_retry_ns;
     uint8_t hd, hd_kind, hd_ever;   /* HD rumble (hd_rumble.h): HD_RUMBLE_UNKNOWN / ON / OFF, the pad's kind, sent once */
     uint8_t hd_sent[HD_RUMBLE_PACKET_SIZE];
     int64_t hd_ns;
     int motion, motion_on;
     int64_t motion_retry_ns, used_ns;
+    int64_t opened_ns;   /* (Triforce) when SDL opened it, for the log's line when it goes */
     uint64_t input_sig;
     unsigned rested;   /* (hookshot) the sticks' axes seen at rest since it was opened, a bit each: only those steer */
     signed char held[4];   /* (the way each axis was last held, -1, 0 or 1: one held the other way has passed its rest) */
@@ -75,11 +81,24 @@ static int motion_head, motion_count, motion_live;
 static volatile LONG gyro_status;   /* 0 no controller, 1 controllers but none with a gyro, 2 one with a gyro */
 
 int32_t hos_stick_axis(int16_t v, int zone);   /* nn_hid.c: the menu's Stick dead zone, as XInput's pads */
+/* ((Triforce) nn_hid.c: a stick's own dead zone, the menu's Left and Right stick dead zone, -1 none; an axis cut at it,
+   or at the menu's Stick dead zone when its stick has none) */
+int hos_stick_own(int stick);
+int32_t hos_stick_axis_own(int16_t v, int zone, int own);
 
-static int32_t stick_value(int16_t v, int flip, int zone) {
-    const int32_t a = hos_stick_axis(v, zone);
+static int32_t stick_value(int16_t v, int flip, int zone, int own) {
+    const int32_t a = hos_stick_axis_own(v, zone, own);
     return flip ? -a : a;
 }
+
+/* (Triforce) Whether an axis is at rest, for the poll's rule that an axis steers once it has been seen at rest, when its
+   stick has a dead zone of its own. That zone can be smaller than any stick's rest: with 0 an axis is never exactly at
+   rest, and with a few percent a stick resting just past it would steer only after a push the other way. So an axis
+   inside the default dead zone (XInput's 24%, hos_stick_axis's zone 0) is at rest whatever smaller zone its stick cuts
+   at: the rule asks what it has always asked at the default, and a phantom axis, held far outside it, still never
+   steers. Without a zone of its own (-1) this adds nothing: rest is the Stick dead zone row's, as before. raw: the axis
+   as SDL gives it. */
+static int stick_rests(int16_t raw, int own) { return own >= 0 && hos_stick_axis(raw, 0) == 0; }
 
 /* SDL's controller support started; 0 when it could not be */
 static int pads_start(void) {
@@ -122,10 +141,24 @@ static int rumble_due(unsigned lo, unsigned hi, unsigned sent_lo, unsigned sent_
     return 0;
 }
 
-/* The Insert menu's Rumble strength (percent; 0 Off) on the motors' 0..65535, heavy and light together: up to 100 each
-   motor is scaled on its own (100 sends them as they are); above, when the stronger would pass the motor's top, both
-   are scaled by the same factor so that it just reaches it, keeping the balance between the motors that the frequency
-   split chose. Off stops a rumble that is playing (the poll sends the change). */
+/* (Triforce, after NX2navi's rumble_curve) The Insert menu's Vibration curve (hundredths, 20 to 150) on one motor's
+   0..65535, before the Rumble strength: a power on the motor's strength taken as 0 to 1. 100 leaves it as it is, for
+   every value. Under 100 the weak rumbles, which is most of what OoT sends, come up towards the strong ones (at 60 a
+   tenth of the motor's strength becomes a quarter); over 100 they go down. Silence and the motor's top stay where they
+   are, and a stronger rumble never comes out the weaker of two. 0 or less is no curve (an option table that does not
+   know the row answers 0). */
+static unsigned rumble_curve(unsigned value, int curve) {
+    if (value >= 0xFFFFu) return 0xFFFFu;
+    if (!value || curve <= 0 || curve == 100) return value;
+    const double power = (curve < 20 ? 20 : curve > 150 ? 150 : curve) / 100.0;
+    const double v = pow(value / 65535.0, power) * 65535.0 + 0.5;
+    return v >= 65535.0 ? 0xFFFFu : (unsigned)v;
+}
+
+/* The Insert menu's Rumble strength (percent; 0 Off, up to 300) on the motors' 0..65535, heavy and light together: up
+   to 100 each motor is scaled on its own (100 sends them as they are); above, when the stronger would pass the motor's
+   top, both are scaled by the same factor so that it just reaches it, keeping the balance between the motors that the
+   frequency split chose. Off stops a rumble that is playing (the poll sends the change). */
 static void rumble_strength(unsigned heavy, unsigned light, int percent, uint16_t out[2]) {
     if (percent <= 0) {
         out[0] = out[1] = 0;
@@ -140,6 +173,33 @@ static void rumble_strength(unsigned heavy, unsigned light, int percent, uint16_
     }
     out[0] = (uint16_t)h;
     out[1] = (uint16_t)l;
+}
+
+/* (Triforce, after NX2navi's rumble_triggers) The motors in the triggers of an Xbox One or Series pad, with the Insert
+   menu's Trigger vibration on: both play the light motor's rumble, sent when it changes and again before SDL's effect
+   ends, as the motors' own is (rumble_due). want: that strength, 0 with the row off. A pad whose triggers were never
+   sent a rumble is never sent a stop either, so with the row off nothing is called at all; turned off while they play,
+   they are stopped. A pad without such motors, a driver that cannot reach them and an SDL without the call all refuse:
+   said once a pad in the log, and that pad is asked again two seconds later at the soonest (a write that failed once
+   comes back; one that never will costs a call every two seconds of rumble). */
+static void trigger_poll(int i, unsigned want, long long now) {
+    if (now < pads[i].trigger_retry_ns) return;
+    if (!rumble_due(want, want, pads[i].trigger, pads[i].trigger, now, pads[i].trigger_ns)) return;
+    const int ok = hos_sdl_pad_rumble_triggers(pads[i].gc, (uint16_t)want, (uint16_t)want, want ? 1000 : 0) != 0;
+    if (want && !(pads[i].trigger_said >> ok & 1)) {
+        pads[i].trigger_said |= (uint8_t)(1 << ok);
+        if (ok) hos_log("hid: trigger vibration on \"%s\"", hos_sdl_pad_name(pads[i].gc));
+        else hos_log("hid: \"%s\" took no trigger vibration (%s)", hos_sdl_pad_name(pads[i].gc),
+                     hos_sdl_pad_has_trigger_rumble() ? hos_sdl_error() : "this SDL has no call for it");
+    }
+    if (!ok) {   /* (nothing plays there, as far as is known: the next rumble asks again, not before the two seconds) */
+        pads[i].trigger = 0;
+        pads[i].trigger_ns = 0;
+        pads[i].trigger_retry_ns = now + 2000000000LL;
+        return;
+    }
+    pads[i].trigger = (uint16_t)want;
+    pads[i].trigger_ns = now;
 }
 
 /* A pad SDL just opened: HD rumble when it is a Switch Pro Controller or a Joy-Con and the SDL has the effect call
@@ -288,13 +348,18 @@ static void motion_poll(int64_t now, int count) {
 /* one poll: controllers plugged in or gone (each second), then every open one's buttons, sticks and rumble */
 static void pads_poll(void) {
     static int64_t next_scan = 0;
+    static int64_t gone_ns;   /* (Triforce) when a controller last disconnected, for the log */
     hos_sdl_pads_update();
         const int64_t now = hos_now_ns();
         if (now >= next_scan) {   /* new controllers (and ones that went away) */
             next_scan = now + 1000000000LL;
             for (int i = 0; i < MAX_PADS; i++)
                 if (pads[i].gc && !hos_sdl_pad_connected(pads[i].gc)) {
-                    hos_log("hid: controller \"%s\" disconnected (SDL)", hos_sdl_pad_name(pads[i].gc));
+                    /* (Triforce) how long it had been connected: a pad that leaves after seconds or minutes, again and
+                       again, is its link, its battery or another program taking it, and the log then shows the rhythm */
+                    hos_log("hid: controller \"%s\" disconnected (SDL), %.0f s after it connected", hos_sdl_pad_name(pads[i].gc),
+                            (now - pads[i].opened_ns) / 1e9);
+                    gone_ns = now;
                     hos_sdl_pad_close(pads[i].gc);
                     pads[i].gc = NULL;
                     pads[i].rumble_lo = pads[i].rumble_hi = 0;
@@ -318,6 +383,8 @@ static void pads_poll(void) {
                 pads[slot].id = hos_sdl_pad_id(gc);
                 pads[slot].rumble_lo = pads[slot].rumble_hi = 0;
                 pads[slot].rumble_ns = 0;
+                pads[slot].trigger = 0, pads[slot].trigger_said = 0;
+                pads[slot].trigger_ns = pads[slot].trigger_retry_ns = 0;
                 hd_open(slot, gc);
                 pads[slot].motion = hos_sdl_pad_has_sensor(gc, HOS_SDL_SENSOR_GYRO) && hos_sdl_pad_has_sensor(gc, HOS_SDL_SENSOR_ACCEL);
                 pads[slot].motion_on = 0;
@@ -329,6 +396,9 @@ static void pads_poll(void) {
                 pads[slot].has_bias = 0;
                 hos_log("hid: controller \"%s\" connected (SDL)%s", hos_sdl_pad_name(gc),
                         pads[slot].motion ? ", with a gyroscope" : "");
+                pads[slot].opened_ns = now;
+                if (gone_ns && now - gone_ns < 60000000000LL)
+                    hos_log("hid: that is %.1f s after a controller disconnected", (now - gone_ns) / 1e9);
             }
         }
         uint64_t b = 0;
@@ -336,8 +406,13 @@ static void pads_poll(void) {
         int count = 0;
         int rx_option(int id, int otherwise);
         const int strength = rx_option(9, 100);   /* (the menu's Rumble strength: the motors' and HD rumble's) */
+        /* ((Triforce) the menu's Vibration curve: the motors' alone. A Switch controller's HD rumble has its own,
+           hd_rumble.h's hd_rumble_felt, and plays the game's values by it whatever this row says) */
+        const int curve = rx_option(HOS_OPT_RUMBLE_CURVE, 100);
+        const int triggers = rx_option(HOS_OPT_RUMBLE_TRIGGERS, 0) != 0;   /* ((Triforce) the menu's Trigger vibration) */
         uint16_t motors[2];
-        rumble_strength((uint16_t)rumble_low, (uint16_t)rumble_high, strength, motors);
+        rumble_strength(rumble_curve((uint16_t)rumble_low, curve), rumble_curve((uint16_t)rumble_high, curve), strength,
+                        motors);
         const uint16_t lo = motors[0], hi = motors[1];
         uint8_t side[3][4];   /* (the HD rumble pads': each side's bytes, then both merged for a single Joy-Con) */
         {
@@ -363,18 +438,23 @@ static void pads_poll(void) {
             const int inv_x = rx_option(16, 0);
             const int inv_y = rx_option(17, 0);
             const int z = rx_option(11, 0);   /* (the menu's Stick dead zone: nn_hid.c's hos_stick_axis) */
-            int32_t v[4] = {stick_value(hos_sdl_pad_axis(gc, AX_LX), 0, z),
-                            stick_value(hos_sdl_pad_axis(gc, AX_LY), 1, z),
-                            stick_value(hos_sdl_pad_axis(gc, AX_RX), inv_x, z),
-                            stick_value(hos_sdl_pad_axis(gc, AX_RY), inv_y ? 0 : 1, z)};
+            const int own[2] = {hos_stick_own(0), hos_stick_own(1)};   /* ((Triforce) each stick's own, -1 none) */
+            const int16_t raw[4] = {hos_sdl_pad_axis(gc, AX_LX), hos_sdl_pad_axis(gc, AX_LY), hos_sdl_pad_axis(gc, AX_RX),
+                                    hos_sdl_pad_axis(gc, AX_RY)};
+            int32_t v[4] = {stick_value(raw[0], 0, z, own[0]),
+                            stick_value(raw[1], 1, z, own[0]),
+                            stick_value(raw[2], inv_x, z, own[1]),
+                            stick_value(raw[3], inv_y ? 0 : 1, z, own[1])};
             /* (hookshot) An axis steers once it has been seen at rest (inside the dead zone) since the pad was opened. The sticks are
                the strongest of all the pads', so a device whose axis reads held for good (a mapping that puts a trigger or an
                unused axis on a stick, a second virtual pad) turned the camera or walked Link in circles on its own, with the
                player's pad at rest (#1673: Xbox 360 pad, CachyOS; #1661: GameSir 2 Lite, wired). A real stick rests at the start. */
             /* (a worn stick resting just past a small dead zone counts once it is pushed the other way: it went past its rest) */
+            /* ((Triforce) with a dead zone of its stick's own, an axis inside the default one is at rest too: stick_rests) */
             for (int k = 0; k < 4; k++) {
                 const signed char way = (signed char)(v[k] > 0 ? 1 : v[k] < 0 ? -1 : 0);
-                if (!way || (pads[i].held[k] && way != pads[i].held[k])) pads[i].rested |= 1u << k;
+                if (!way || (pads[i].held[k] && way != pads[i].held[k]) || stick_rests(raw[k], own[k >> 1]))
+                    pads[i].rested |= 1u << k;
                 pads[i].held[k] = way;
                 if (!(pads[i].rested >> k & 1)) v[k] = 0;
             }
@@ -384,7 +464,10 @@ static void pads_poll(void) {
                 uint64_t sig = 0;
                 for (int k = BTN_A; k <= BTN_RIGHT; k++)
                     if (hos_sdl_pad_button(gc, k)) sig |= 1ULL << k;
-                for (int k = 0; k < 4; k++) sig |= (uint64_t)(v[k] > 0 ? 1 : v[k] < 0 ? 2 : 0) << (32 + 2 * k);
+                for (int k = 0; k < 4; k++) {   /* ((Triforce) a resting stick's noise past a small zone of its own is no push) */
+                    const int32_t u = stick_rests(raw[k], own[k >> 1]) ? 0 : v[k];
+                    sig |= (uint64_t)(u > 0 ? 1 : u < 0 ? 2 : 0) << (32 + 2 * k);
+                }
                 if (sig != pads[i].input_sig) pads[i].input_sig = sig, pads[i].used_ns = now;
             }
             if (hd_poll(i, side, now)) continue;
@@ -394,6 +477,7 @@ static void pads_poll(void) {
                 pads[i].rumble_hi = hi;
                 pads[i].rumble_ns = now;
             }
+            trigger_poll(i, triggers ? hi : 0, now);   /* ((Triforce) the light motor's rumble, in the triggers too) */
         }
         motion_poll(now, count);
         AcquireSRWLockExclusive(&state_lock);

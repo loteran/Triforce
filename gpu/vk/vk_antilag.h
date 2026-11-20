@@ -20,5 +20,8 @@ bool antilag_available();
 void antilag_present();
 /// After the present: the next frame's input stage, where the driver waits until that frame should start
 void antilag_input();
+/// (Triforce) Its stages are given now (the row on and the device able): the present thread (vk_replay.cpp,
+/// RX_VK_PRESENT_THREAD) is not used then, as its present stage would come after the next frame's input stage
+bool antilag_running();
 
 } // namespace mkwvk

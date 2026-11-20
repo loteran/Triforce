@@ -164,14 +164,87 @@ bool size_compatible(const Sub& a, const Sub& b) {
     return a.bpb == b.bpb && a.bw == b.bw && a.bh == b.bh;
 }
 
+bool b2t_gpu_on() {   // (RX_VK_B2T_CPU=1: buffer-to-texture copies on the CPU, every format)
+    static const bool on = getenv("RX_VK_B2T_CPU") == nullptr;
+    return on;
+}
+bool b2t_astc(const nvn_p_copy_bt& p) {
+    return p.tex && vk_format(view_nvn_format(p.tex, p.has_view ? &p.view : nullptr)).astc;
+}
+/// A buffer-to-texture copy that is the CPU's (see copy_b2t): the buffer's bytes into the texture's storage in the game's
+/// memory, when `write`. True: it was the CPU's, made or left out; false: the GPU's to make
+bool b2t_on_cpu(const NvnState& st, const nvn_p_copy_bt& p, bool write) {
+    const bool astc = b2t_astc(p);
+    if (!p.tex || (b2t_gpu_on() && !astc)) return false;
+    uint64_t avail = 0;
+    const uint8_t* src = host->gpu_ptr(p.buf, &avail);
+    if (src && !texels_fit(p.tex, &p.r, st.copy_stride > 0 ? (uint64_t)st.copy_stride : 0, avail)) {
+        warn(3, "copy buffer runs past its mapping: skipped");
+        return true;
+    }
+    if (src) {
+        const nvn_view* v = p.has_view ? &p.view : nullptr;
+        if (write)
+            texture_read_texels(p.tex, view_level(v), view_layer(v), &p.r, const_cast<uint8_t*>(src),
+                                st.copy_stride > 0 ? (uint64_t)st.copy_stride : 0, 0, true);
+        return true;
+    }
+    return astc;   // (others without CPU access to the buffer: on the GPU)
+}
+
 } // namespace
 
-void copy_b2t(VkCommandBuffer cmd, NvnState& st, const nvn_p_copy_bt& p, bool to_image) {
+// ---- (Triforce) the parallel replay's dry pass: what a copy or a texture clear writes, marked in stream order ----
+// The dry pass (vk_replay.cpp replay_handle) walks a command buffer on the replay thread before its segments are recorded
+// on several threads, and marks what each draw and clear of a pass will write as the GPU's (vk_draw.cpp dry_mark_written):
+// a worker ahead of the stream then does not take such a texture for never written and upload the game's memory over it.
+// Copies and texture clears were not marked. A later segment's worker that sampled a copy's destination first uploaded it
+// into its own uploads; the earlier segment's worker then uploaded it again and copied; in the queue the later segment's
+// upload came last, over the copy: the texture held the game's memory instead of what was copied, for that frame, or for
+// good when the copy was made once (the image being the content from then on).
+// Here, in stream order: the destination is looked up as the copy itself looks it up (its contents from the game's memory
+// first, when it had none: into the uploads of the recording before the segments, which the queue runs before them all),
+// and marked written. The worker's own copy finds it so and uploads nothing. A copy the worker then leaves out for its
+// buffer or its formats (a warning's case) has marked its destination all the same: uploaded here, it holds what the
+// memory held. RX_VK_NO_DRY_COPIES=1: as before.
+void dry_copy_b2t(NvnState& st, const nvn_p_copy_bt& p) {
+    if (p.tex) texture_get(p.tex, false);   // (first met as a copy's destination, as copy_b2t's own first look makes it)
+    // (the CPU's kind, ASTC blocks into the texture's storage: made here, in stream order, and not again by the worker.
+    // It was made whenever its segment's worker got to it, so which of the other segments saw the new texels was chance)
+    if (b2t_on_cpu(st, p, true)) return;
+    Sub s;
+    if (!resolve(p.tex, &p.view, p.has_view != 0, p.r, s)) return;
+    if (s.tex->aspect == (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)) return;   // (left out: copy_b2t)
+    texture_written(s.tex, "the dry pass (a buffer-to-texture copy)");
+}
+void dry_copy_t2t(const nvn_p_copy_tt& p) {
+    Sub s, d;
+    if (!resolve(p.src, &p.sv, p.has_sv != 0, p.sr, s, true)) return;
+    if (!resolve(p.dst, &p.dv, p.has_dv != 0, p.dr, d, true)) return;
+    // (as copy_t2t: a texture kept as BC1 is BC3 before the copy; here, so that no segment's worker meets the change of its
+    // image halfway through the segments)
+    if (d.tex->bc1 && !texture_bc1_to_bc3(d.tex, "a copy on the GPU into it")) return;
+    if (s.tex->bc1 && d.tex->bc && !texture_bc1_to_bc3(s.tex, "a copy on the GPU out of it into a BC3 texture")) return;
+    if (s.tex == d.tex && s.level == d.level && s.layer == d.layer) return;   // (left out: copy_t2t)
+    const bool color = s.aspect == VK_IMAGE_ASPECT_COLOR_BIT && d.aspect == VK_IMAGE_ASPECT_COLOR_BIT;
+    if (!color && s.tex->format != d.tex->format) return;
+    texture_written(d.tex, "the dry pass (a texture-to-texture copy)");
+}
+void dry_clear_tex(const nvn_p_clear_tex& p) {
+    Sub s;
+    if (!resolve(p.tex, &p.view, p.has_view != 0, p.r, s)) return;
+    // (as clear_tex ends: a texture all the GPU did was clear still takes what the CPU writes, a font cache's letters)
+    const bool fresh = !s.tex->gpu_written || s.tex->released || s.tex->only_cleared;
+    texture_written(s.tex, "the dry pass (a texture clear)");
+    s.tex->only_cleared = fresh && s.tex->aspect == VK_IMAGE_ASPECT_COLOR_BIT;
+}
+
+void copy_b2t(VkCommandBuffer cmd, NvnState& st, const nvn_p_copy_bt& p, bool to_image, bool cpu_done) {
     // (ASTC blocks into a decoded image: into the texture's storage on the CPU, which uploads it again. Other formats are
     // copied on the GPU: the buffer may hold what the GPU wrote this submission (not yet in guest memory), and the image
     // it fills is kept (texture_frame: a texture the GPU filled once is not evicted). RX_VK_B2T_CPU=1: on the CPU too)
-    static const bool b2t_gpu = getenv("RX_VK_B2T_CPU") == nullptr;
-    const bool astc = to_image && p.tex && vk_format(view_nvn_format(p.tex, p.has_view ? &p.view : nullptr)).astc;
+    static const bool b2t_gpu = b2t_gpu_on();
+    const bool astc = to_image && b2t_astc(p);
     if (to_image && p.tex) {   // (RX_VK_LOG_BIG_COPY)
         if (Texture* t = texture_get(p.tex, false))
             log_big_copy(b2t_gpu && !astc ? "buffer (GPU)" : "buffer (CPU)", t, view_level(p.has_view ? &p.view : nullptr),
@@ -192,21 +265,8 @@ void copy_b2t(VkCommandBuffer cmd, NvnState& st, const nvn_p_copy_bt& p, bool to
                  p.r.yoffset, st.copy_stride);
         }
     }
-    if (to_image && p.tex && (!b2t_gpu || astc)) {
-        uint64_t avail = 0;
-        const uint8_t* src = host->gpu_ptr(p.buf, &avail);
-        if (src && !texels_fit(p.tex, &p.r, st.copy_stride > 0 ? (uint64_t)st.copy_stride : 0, avail)) {
-            warn(3, "copy buffer runs past its mapping: skipped");
-            return;
-        }
-        if (src) {
-            const nvn_view* v = p.has_view ? &p.view : nullptr;
-            texture_read_texels(p.tex, view_level(v), view_layer(v), &p.r, const_cast<uint8_t*>(src),
-                                st.copy_stride > 0 ? (uint64_t)st.copy_stride : 0, 0, true);
-            return;
-        }
-        if (astc) return;   // (others without CPU access to the buffer: on the GPU, below)
-    }
+    // (Triforce: cpu_done: a parallel replay's worker, whose dry pass made the CPU's copy in stream order, dry_copy_b2t)
+    if (to_image && b2t_on_cpu(st, p, !cpu_done)) return;
     Sub s;
     if (!resolve(p.tex, &p.view, p.has_view != 0, p.r, s)) return;
     uint64_t size = 0;
@@ -241,6 +301,11 @@ void copy_t2t(VkCommandBuffer cmd, NvnState& st, const nvn_p_copy_tt& p) {
     Sub s, d;
     if (!resolve(p.src, &p.sv, p.has_sv != 0, p.sr, s, true)) return;
     if (!resolve(p.dst, &p.dv, p.has_dv != 0, p.dr, d, true)) return;
+    // (Triforce) a texture kept as BC1 (opaque ASTC, tex_bc1.h) is BC3 before a copy writes it, since what comes in may have
+    // alpha, and before its blocks are copied into a BC3 image, which has blocks of another size. Out of one into a
+    // texture that is not kept compressed is the blit below, as from BC3
+    if (d.tex->bc1 && !texture_bc1_to_bc3(d.tex, "a copy on the GPU into it")) return;
+    if (s.tex->bc1 && d.tex->bc && !texture_bc1_to_bc3(s.tex, "a copy on the GPU out of it into a BC3 texture")) return;
     {   // (RX_VK_LOG_COPY: the texture copies, 400 of them)
         static const bool log_copy = getenv("RX_VK_LOG_COPY") != nullptr;
         static int logged;

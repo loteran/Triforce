@@ -65,6 +65,13 @@ void draw_flush_recording(int slot);
 bool stream_holds(const uint8_t* base, uint64_t at, uint64_t n);
 /// The open render pass ends (before transfers, clears, barriers and the recording's end)
 void end_pass(VkCommandBuffer cmd);
+/// (Triforce) RX_VK_SPLIT_BARRIER (barrier_rules.h, vk_replay.cpp maybe_split): before a part's split ends the pass, whether one
+/// is open (not with the parallel replay); its targets and what its draws sampled and wrote kept for pass_carry_resume
+bool pass_carry_take();
+/// The pass pass_carry_take kept, begun again on cmd (the next part's) with its targets behind vk_texture.cpp pass_resume_barrier,
+/// with what its draws sampled and wrote: draw_hazards and clear_after_draws go on as in one pass. go: false drops it (the split
+/// went the old way, with full barriers)
+void pass_carry_resume(VkCommandBuffer cmd, bool go);
 void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d);
 /// Clears of the bound targets, inside the open pass (NOP_CLEAR_COLOR, NOP_CLEAR_DS)
 void clear_color_target(VkCommandBuffer cmd, NvnState& s, int index, const float rgba[4], uint32_t mask);
@@ -75,9 +82,47 @@ void clear_stats(int64_t* clears, int64_t* masked);
 void dispatch(VkCommandBuffer cmd, NvnState& s, uint32_t x, uint32_t y, uint32_t z, uint64_t indirect);
 void dry_mark_written(NvnState& s, bool compute, bool first);   // (hookshot: the parallel replay's dry pass)
 void dry_marks_begin();   // (at the start of each dry pass: the last targets it skipped by are forgotten)
+/// (Triforce) The dry pass with a temporal upscaler or a frame generation on (stream_order.h): a draw (NVN primitive prim, or a
+/// mesh draw) told to their hooks as draw() tells them, true at the engine's point before the bloom; a dispatch, true where it
+/// may be the upscale's. At the first true the dry pass stops telling them, and the segments' recording takes over there in
+/// order (vk_replay.cpp replay_handle)
+bool dry_temporal_draw(NvnState& s, int prim, bool mesh);
+bool dry_temporal_dispatch(NvnState& s);
+/// (Triforce) The early tail (vk_replay.cpp, tail_early.h): a dispatch that is the gameplay upscale's, where a frame's tail
+/// begins; and the watch on the game's programs that reach guest memory past their bindings (page table, texel buffers), counted
+/// while it is on
+bool upscale_dispatch(NvnState& s);
+void draw_tail_watch(bool on);
+uint64_t draw_tail_programs();
+/// (Triforce, vk_replay.cpp) While a segment is recorded whose draws the dry pass told the temporal hooks: draw() does not
+/// tell them again
+bool replay_hooks_told();
+/// (Triforce, vk_replay.cpp) The draw or dispatch being recorded: its place in the stream (the command buffer's replay, then
+/// its draws and dispatches before it), the same whichever thread records it
+uint64_t replay_stream_pos();
+/// (Triforce, 11-17, vk_replay.cpp "occlusion queries") RX_VK_OCC_QUERY (default on, =0 off): NVN's samples-passed reports from Vulkan
+/// occlusion queries. occ_live: the queries run (set once, at the first recording; false: none of these is called). draw()
+/// calls occ_draw_enter as a draw comes in, occ_draw_begin once its pass is open (a count's first draw of a pass begins a
+/// query) and occ_draw_issued for each draw it records (a count missing one is not kept); end_pass calls occ_pass_end before
+/// the pass ends (a query begun in a pass ends in it)
+extern bool occ_live;
+void occ_draw_enter();
+void occ_draw_begin(VkCommandBuffer cmd);
+void occ_draw_issued();
+void occ_pass_end(VkCommandBuffer cmd);
 void draw_stats(int64_t* draws, int64_t* skipped, int64_t* dispatches, int64_t* pipelines);
 void draw_stats2(int64_t* passes, int64_t* mesh, double* pipeline_ms);
 void draw_stats3(int64_t* pending_skips, int64_t* waits, double* wait_ms);
+/// (Triforce) Of draw_stats3's wait_ms, in microseconds so far: the replay's waits for pipelines (a draw's, waited for whole or
+/// from the frame's budget) and for translations (a draw's and a dispatch's program, the dry pass's too): the performance
+/// overlay's Pipeline waits and Shader waits (vk_menu.cpp perf_sample). Atomic counters: read from any thread
+void draw_wait_split(int64_t* pipe_us, int64_t* shader_us);
+/// (Triforce, vk_replay.cpp hold_step, once a present) The draws and dispatches left out since the last present because their
+/// program or pipeline was still being made (0 with RX_VK_HOLD_PIPELINES=0): such a frame is held as one with a texture owed
+/// its bytes (present_hold.h, pipe_wait.h). And the hold's mode for the next frame's draws (present_hold::Mode): with DEFERS a
+/// full-screen draw whose pipeline is not ready is left out, its frame held, rather than waited for
+int64_t draw_left_out_take();
+void draw_hold_mode(int mode);
 int64_t draw_dummy_textures();   // (Triforce: texture bindings that sampled the dummy so far: RX_VK_FRAME_TRACE)
 /// (hookshot) pipelines linked from stage libraries in the draw, and the libraries asked of the driver for them: had, and cold;
 /// of the cold, those a worker has built since, and the workers' time in them. False: no stage libraries (RX_VK_GPL)
@@ -96,6 +141,9 @@ uint64_t ub_generation();
 void ub_thread_off();
 /// The pipeline cache to disk (force: whatever was built since the last save; else only after a few new ones)
 void pipeline_cache_save(bool force);
+/// (Triforce) Once a present, on its thread: the fast-linked pipelines whole builds have replaced are destroyed once no draw
+/// recorded with one can still be on its way (gpl_rules.h). Nothing without the fast pipeline link
+void gpl_retire_run();
 /// (vk_memory.cpp) The menu's Restart and Exit, before the window closes: no verdict on the memory trial for a session ended on purpose
 void memory_trial_orderly_end();
 

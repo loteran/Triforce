@@ -35,7 +35,7 @@ New-Item -ItemType Directory -Force $tools | Out-Null
 # tree without the picture builds a screen with the wordmark alone: every pack up to v0.3.5 left the assets folder out, so
 # no player's game showed the crest while its shaders were prepared. Reported for AMD cards, where that screen stays longest)
 if (-not (Test-Path (Join-Path $repo 'assets\triforce.png') -PathType Leaf)) { throw 'assets\triforce.png is missing: the tools would build a game without the crest on its start-up screen' }
-$files = git -C $repo ls-files -- nx2 host gpu scripts third_party LICENSE assets/triforce.png
+$files = git -C $repo ls-files -- nx2 host gpu scripts third_party LICENSE assets/triforce.png assets/triforce_assets
 foreach ($f in $files) {
     $src = Join-Path $repo $f
     if (-not (Test-Path $src -PathType Leaf)) { continue }

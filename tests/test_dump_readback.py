@@ -41,7 +41,8 @@ def main():
         cpp,exe=tmp/'fixture.cpp',tmp/'fixture.exe'
         cpp.write_text(fixture,encoding='utf-8')
         flags=['-fsanitize=address,undefined','-fno-omit-frame-pointer'] if a.sanitize else []
-        subprocess.run([a.cxx,'-std=c++20','-O1','-Wall','-Wextra','-Werror','-Wno-missing-field-initializers',*flags,'-I'+str(a.headers),str(cpp),'-o',str(exe)],check=True)
+        # ((Triforce, P4) gpu/vk for cmd_work.h, full_barrier's count and marks)
+        subprocess.run([a.cxx,'-std=c++20','-O1','-Wall','-Wextra','-Werror','-Wno-missing-field-initializers',*flags,'-I'+str(a.headers),'-I'+str(a.source/'gpu'/'vk'),str(cpp),'-o',str(exe)],check=True)
         cases=['float','uint','sint','nan-inf','d16','d24','d32','depth-scaled','rgb9e5','ssbo','ssbo-tail','raw','stats','empty']
         for case in cases:
             for coherent,implicit in [(1,1),(1,0),(0,1),(0,0)]:

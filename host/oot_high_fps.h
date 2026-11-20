@@ -19,11 +19,33 @@
    fps); 4 steps a 60 fps frame would be 0 above 240. A moving platform (the stone one under the spikes in the Deku Tree)
    then slides out from under Link (issue 1798). While the step is under 1 the count is rounded up instead, so a solver step
    never covers more time than at 60 fps, give or take 10% (the frame time's jitter, so a steady rate keeps a steady count),
-   and it is at least 1 and never under the game's. A step of 1 or more (a frame slower than 60 fps) keeps the game's count. */
+   and it is at least 1 and never under the game's. A step of 1 or more (a frame slower than 60 fps) keeps the game's count.
+
+   Three more places, as NX2navi found and fixed them for this build (its recomp/patches-v111.txt, the sets ofollow, owater and
+   orecord: public domain / MIT), here as hooks in the lifted C:
+
+   Floors that carry a character: the character controller's three follow-surface updates (f_8015d490, f_80159dc0,
+   f_838baa40) add the velocity of what the character stands on to its move, but keep only a tenth of it when the physics'
+   inverse step (one over the frame's seconds times the time scale) is over 100.0. At the console's 60 and 30 fps that is a
+   slow motion under 0.6 of the game's speed; with the frames' own time as the step it is every update above 100 fps, and
+   Link slides off a moving platform that carries him at 60. The compare takes 100 / (the frame's seconds x 60) while a frame
+   is shorter than a 60 fps one, so the cut comes where it came at 60 fps; 100 otherwise.
+
+   The fixed steps of the physics' height-field surfaces: the two water managers (f_83895f20, f_838a2660) and the interactive
+   floors (f_80652cb0: the Deku Tree's ground webs) simulate in steps of 1/60 s. Each update divides its seconds by 1/60 and cuts
+   the quotient to whole steps, dropping the fraction: every update shorter than 1/60 s ran none, so above 60 fps those surfaces
+   stood still whatever pushed into them. The quotient becomes the whole steps in it plus a remainder kept for the object
+   (oot_sim_steps), as a float the game's own cut and clamp then take: 60 steps a second at any rate.
+
+   The ocarina recorder's clock: the ocarina manager adds (unsigned)frame step to the length of the current note or rest
+   (in 60 fps frames) at four places (f_832b2690, f_832b32b0, twice in f_832b6840). Cut to 0 above 60 fps, the clock stood
+   still: a recorded song lost its rests and the clock's limits never came. One remainder for the four (oot_record_frames):
+   the clock counts 60 a second at any rate. */
 #pragma once
 #include <math.h>
 #include <stdint.h>
 #include <string.h>
+#include "frame_whole.h"
 
 typedef struct {
     float part;   /* (the steps added up since the job last ran, under 1) */
@@ -83,4 +105,35 @@ static inline int32_t oot_solver_steps(int32_t game, uint32_t scaled_bits, uint3
     int32_t steps = (int32_t)ceilf(scaled - 0.1f);
     if (steps < 1) steps = 1;
     return steps > game ? steps : game;
+}
+
+/* The number the follow-surface updates compare the physics' inverse step with (a float's bits): seconds_bits, the frame's
+   seconds as the step hook has them (host/nn_vi.c hos_frame_seconds_bits; 0: the game's own step) */
+static inline uint32_t oot_floor_cut(uint32_t seconds_bits) {
+    const float frames = oot_bits_float(seconds_bits) * 60.0f;   /* (the frame in 60 fps frames) */
+    if (!seconds_bits || !(frames > 0.0f) || !(frames < 1.0f)) return 0x42c80000u;   /* (100.0, the game's) */
+    return oot_float_bits(100.0f / frames);
+}
+
+/* A height-field surface's fixed steps for this update: quotient_bits, its seconds over 1/60 s (a float's bits). With the frames'
+   own time as the step the whole steps in it plus the object's remainder, as a float; else, and for a quotient that is no
+   count (0, below 0, NaN, huge), the quotient as it is, for the game's own cut. The caller holds the table's lock. */
+static inline uint32_t oot_sim_steps(FrameWhole *w, uint64_t object, uint32_t quotient_bits, int timed) {
+    const float q = oot_bits_float(quotient_bits);
+    if (!timed || !(q > 0.0f) || q >= 2147483648.0f) return quotient_bits;
+    return oot_float_bits((float)frame_whole(w, object, quotient_bits, 1));
+}
+
+/* The frames the ocarina recorder's clock takes for a frame step (a float's bits): as the game cuts it (fcvtzu: toward zero,
+   below 0 and NaN 0), with the fraction carried in *rem while the frames' own time is the step */
+static inline uint32_t oot_record_frames(float *rem, uint32_t step_bits, int timed) {
+    const float step = oot_bits_float(step_bits);
+    if (!timed || !(step > 0.0f) || step >= 2147483648.0f) {
+        *rem = 0.0f;
+        return !(step > 0.0f) ? 0 : step >= 4294967296.0f ? 0xffffffffu : (uint32_t)step;
+    }
+    const float sum = *rem + step;
+    const uint32_t whole = (uint32_t)sum;
+    *rem = sum - (float)whole;
+    return whole;
 }

@@ -1,4 +1,5 @@
-"""A quality preset's texture budget gives way to RX_VK_VRAM_MB and to an integrated GPU's cap.
+"""A quality preset's texture budget gives way to RX_VK_VRAM_MB and to the card's own budget (11-16: on every card, not
+only an integrated GPU's cap: a preset lowers it, never raises it).
 
 texture_frame (gpu/vk/vk_texture.cpp) used a preset's vram_mb in place of `own`, the budget that carries RX_VK_VRAM_MB
 and the 2560 MB cap for integrated GPUs, so either was dropped whenever a preset was on. preset_texture_budget is
@@ -19,6 +20,7 @@ FIXTURE = r"""
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 
 /* ACTUAL_HELPER */
 
@@ -36,6 +38,10 @@ int main() {
     check("RX_VK_VRAM_MB wins", preset_texture_budget(2200, true, true, false, 1500 * MB), 1500);
     // (an integrated GPU on Balanced (8GB): at most the 2560 MB cap, not 4800)
     check("integrated GPU capped", preset_texture_budget(4800, true, false, true, 2560 * MB), 2560);
+    // (11-16: an 8 GB card on Balanced (8GB): its own 45% of ~7,300 MB allowed, not the preset's 4800, past the card)
+    check("8 GB card on Balanced", preset_texture_budget(4800, true, false, false, 3285 * MB), 3285);
+    // (a 12 GB card on High (12GB): its own 6144, not 7500)
+    check("12 GB card on High", preset_texture_budget(7500, true, false, false, 6144 * MB), 6144);
     // (an integrated GPU on Minimum: the preset's smaller budget stands)
     check("integrated GPU, smaller preset", preset_texture_budget(2200, true, false, true, 2560 * MB), 2200);
     // (Custom, or a preset for a smaller card than this one: the card's own)

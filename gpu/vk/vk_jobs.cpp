@@ -2,6 +2,7 @@
 // virtual cores, and the replay thread is one of the busiest.
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <exception>
 #include <condition_variable>
 #include <deque>
@@ -132,6 +133,22 @@ void jobs_wait(const std::atomic<bool>& flag) {
                 break;
             }
     done_cv.wait(lk, [&] { return flag.load(std::memory_order_acquire); });
+}
+bool jobs_wait_for(const std::atomic<bool>& flag, int ms) {
+    std::unique_lock lk(mu);
+    if (flag.load(std::memory_order_acquire)) return true;
+    // ((Triforce) still queued: to the front, for the next worker that is free. Not run here, as jobs_wait does: this wait has
+    // a bound, and a pipeline's compile on this thread would not keep it)
+    for (auto it = queue.begin(); it != queue.end(); ++it)
+        if (it->flag == &flag) {
+            if (it != queue.begin()) {
+                Entry e = std::move(*it);
+                queue.erase(it);
+                queue.push_front(std::move(e));
+            }
+            break;
+        }
+    return done_cv.wait_for(lk, std::chrono::milliseconds(std::max(0, ms)), [&] { return flag.load(std::memory_order_acquire); });
 }
 int jobs_pending() {
     return pending.load();

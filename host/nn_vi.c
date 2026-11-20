@@ -2,6 +2,9 @@
    layer, and the display's vsync event, signaled at 60 Hz by a host thread. HDR and VRR are reported unsupported,
    so the game takes its SDR path. Frames are paced at the native NVN layer's window acquire (the end of this file). */
 #include "hos.h"
+#include "pace_wait.h"   /* ((Triforce) the acquire's wait to the frame's time: pace_sleep) */
+#include "step_steady.h"   /* ((Triforce) HOS_STEP_STEADY=1: realtime_step) */
+#include "pace_steady.h"   /* ((Triforce) the Steady frame rate row: steady_period) */
 #include "../gpu/vk/vk_api.h"   /* (HOS_OPT_HDR_*: the Insert menu's HDR, answered by the renderer) */
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -20,9 +23,10 @@ static HANDLE vsync_thread;
 static int fps_max(void);   /* (below: HOS_FPS_MAX) */
 static DWORD WINAPI vsync_main(void *p) {
     (void)p;
-    const int64_t period = 1000000000LL / fps_max();
-    int64_t next = hos_now_ns() + period;
+    int64_t next = hos_now_ns() + 1000000000LL / fps_max();
     for (;;) {
+        /* (asked each time: with the cap on Monitor's rate it is 60 until the renderer says the display's, fps_max) */
+        const int64_t period = 1000000000LL / fps_max();
         const int64_t now = hos_now_ns();
         if (next > now) hos_sleep_ns(next - now);
         next += period;
@@ -111,21 +115,50 @@ static volatile int present_interval = 1;
    own limiter (+0xfc) and the vsync event go up to it, and the game's time step is the frames' own time (realtime_step), so the game is
    not sped up. Unset or 60: 60, as on the console */
 int hos_ini_option(const char *key, int otherwise);   /* (nn_applet.c) */
+static volatile LONG64 presents;
+/* The cap for the Insert menu's Frame rate cap (row: frame_rate_cap=, 0 the console's 60, then 90, 120, 144, 165, 240), HOS_FPS_MAX
+   (env) over it. */
+/* (Triforce, after NX2navi's limits under 60: -1 45, -2 40, -3 30, for a PC or a handheld's display that holds one
+   of them steadily where 60 swings. The pacing follows the cap and the game's time step is real time (realtime_step),
+   as when a PC cannot hold 60: the game keeps its speed) */
+/* (Triforce, after NX2navi's fps_limit = display: 6, Monitor's rate, is the refresh rate of the display the window is on. display:
+   what the renderer says of it (HOS_OPT_DISPLAY_CAP: rounded, 30 to 240), 0 when the rate cannot be read (60 then), under 0
+   while there is no renderer to ask: the answer is then 0, not settled yet. NX2navi's "unlimited" is not offered: the time step
+   here (realtime_step) stops at 1/240 s, and past it the game would run faster than the clock) */
+static int fps_cap_of(int row, const char *env, int display) {
+    static const int caps[] = {60, 90, 120, 144, 165, 240}, low[] = {45, 40, 30};
+    int want = env ? atoi(env) : row >= 0 && row < 6 ? caps[row] : row < 0 && row >= -3 ? low[-row - 1] : 60;
+    if (!env && row == 6) {
+        if (display < 0) return 0;
+        want = display < 1 ? 60 : display < 30 ? 30 : display > 240 ? 240 : display;
+    }
+    return want > 60 ? (want > 240 ? 240 : want) : want >= 20 && want < 60 ? want : 60;
+}
 static int fps_max(void) {
     static int v = -1;
     if (v < 0) {
-        /* (the Insert menu's Frame rate cap, frame_rate_cap=: 0 the console's 60, then 90, 120, 144, 165, 240; HOS_FPS_MAX over it) */
-        static const int caps[] = {60, 90, 120, 144, 165, 240};
-        const int i = hos_ini_option("frame_rate_cap", 0);
+        /* (the options file once: with Monitor's rate this is asked again until the renderer is up. Until then the cap is 60 and
+           nothing is settled; the game presents nothing before the renderer is up (hos_renderer_wait), so the pacing, the game's
+           limiter and its time step all start with the settled cap. A renderer that never answers (the WebGPU one) leaves 60
+           at the first frame presented) */
+        static int row = -100;
+        if (row == -100) row = hos_ini_option("frame_rate_cap", 0);
         const char *e = getenv("HOS_FPS_MAX");
-        const int want = e ? atoi(e) : caps[i >= 0 && i < 6 ? i : 0];
-        v = want > 60 ? (want > 240 ? 240 : want) : 60;
+        const int monitor = !e && row == 6;
+        int rx_option(int id, int otherwise);
+        int display = monitor ? rx_option(HOS_OPT_DISPLAY_CAP, -1) : 0;
+        if (display < 0 && presents) display = 0;
+        const int cap = fps_cap_of(row, e, display);
+        if (!cap) return 60;
+        v = cap;
+        if (monitor && display > 0) hos_log("vi: frame rate cap: the monitor's rate, %d", v);
+        if (monitor && display <= 0) hos_log("vi: frame rate cap: the monitor's rate is not known: %d", v);
         if (v > 60) hos_log("vi: frame rate cap %d: pacing, the game's limiter and its time step follow it", v);
+        if (v < 60) hos_log("vi: frame rate cap %d: pacing follows it, the game keeps real time", v);
     }
     return v;
 }
 static int64_t next_frame_at, window_start, frames_in_window;
-static volatile LONG64 presents;
 int hos_vi_native_interval(Ctx *c, int requested) {
     (void)c;
     /* (hookshot) OoT's frame-rate controller asks for 2, 3 or 4 vsyncs a frame whenever one runs long (480 changes a minute
@@ -137,7 +170,8 @@ int hos_vi_native_interval(Ctx *c, int requested) {
     if (game_interval < 0) game_interval = getenv("HOS_GAME_INTERVAL") && atoi(getenv("HOS_GAME_INTERVAL")) != 0;
     int rx_option(int id, int otherwise);
     const int clamped = requested < 1 ? 1 : requested > 4 ? 4 : requested;
-    present_interval = game_interval || !rx_option(0, 1) ? clamped : 1;
+    /* (a cap under 60 paces by itself: with the game's 2 vsyncs on top a cap of 30 would show 15) */
+    present_interval = (game_interval || !rx_option(0, 1)) && fps_max() >= 60 ? clamped : 1;
     return requested;
 }
 /* (hookshot) The window's textures as the console's display queue has them: each present is shown at its display
@@ -150,18 +184,107 @@ int hos_vi_native_interval(Ctx *c, int requested) {
    that behaviour */
 static int64_t shown_at[16];
 static volatile LONG64 shown_count;
+/* (Triforce, after NX2navi's one limiter a frame: its runtime/frame_rate.c frame_step_cap_ns, vk_dlssg.c vk_dlssg_pace and
+   rtss_limit.c) Another limiter may hold this frame in the acquire's wait's place: RivaTuner Statistics Server, which is
+   the game's limiter wherever it is installed, runs and is seen holding the game (gpu/vk/vk_pace.cpp, rtss_limit.cpp), or
+   NVIDIA Reflex's sleep, with DLSS frame generation and the Display tab's Reflex frame limit row (gpu/vk/vk_dlssg.cpp
+   pace). The renderer is asked where the frame starts, with the period this file paces by and whether a movie plays, once
+   a frame (the game may acquire again before it presents: the frame's answer stays). 1: that limiter holds this frame,
+   RivaTuner's wait seen to be taken at the frame's presents and Reflex's taken inside the call, and the wait below steps
+   aside for this frame alone. 0: the wait below, as before; that is the answer without a renderer to ask, without
+   RivaTuner, and while a movie plays. One or the other for every frame, never both and never neither.
+   HOS_PACE_HANDOFF=0: never asked (and RivaTuner then gets no limit from the game). */
+static int64_t pace_period_ns;   /* (the period hos_vi_native_presented last paced by) */
+/* ((Triforce) for the Steady frame rate row, steady_period below: how long the acquire's own wait took since the last
+   present, on the presenting thread and on any other (OoT acquires on its main thread and presents on its Presentation
+   Thread), and whether another limiter held a frame since then. The presenting thread is the one steady_period runs on) */
+static int64_t frame_waited_own_ns;
+static volatile LONG64 frame_waited_other_ns;
+static volatile LONG frame_handed;
+static _Thread_local int presenting_thread;
+/* (Triforce) When a movie player last updated (hos_movie_frames, below, which the game's movie players call at each of
+   their updates): within a quarter second of one, a movie plays. NX2navi's pacer holds a movie itself while RivaTuner keeps
+   the play limit, and so does this one */
+static volatile LONG64 movie_seen_ns;
+static void movie_seen(void) { __atomic_store_n(&movie_seen_ns, (LONG64)hos_now_ns(), __ATOMIC_RELAXED); }
+static int movie_plays(void) {
+    const int64_t seen = (int64_t)__atomic_load_n(&movie_seen_ns, __ATOMIC_RELAXED);
+    return seen && hos_now_ns() - seen < 250000000LL;
+}
+static int pace_handed(void) {
+    static int on = -1, held;
+    static LONG64 asked = -1;
+    int rx_option(int id, int otherwise);
+    void rx_option_set(int id, int value);
+    if (on < 0) on = !(getenv("HOS_PACE_HANDOFF") && !atoi(getenv("HOS_PACE_HANDOFF")));
+    if (!on) return 0;
+    const LONG64 frame = presents;
+    if (frame == asked) return held;
+    asked = frame;
+    rx_option_set(HOS_OPT_PACE_PERIOD, (int)pace_period_ns);
+    rx_option_set(HOS_OPT_PACE_MOVIE, movie_plays());
+    held = rx_option(HOS_OPT_PACE_START, 0) == 1;
+    if (held) __atomic_store_n(&frame_handed, 1, __ATOMIC_RELAXED);   /* ((Triforce) steady_period: not this file's wait's frame) */
+    return held;
+}
+/* (Triforce, after NX2navi's sleep_until: pace_wait.h) The acquire's wait to the frame's time: the timer up to a margin
+   before it and the rest yielded away, so that the frame starts on its time and not up to half a millisecond after it.
+   HOS_PACE_SPIN=<microseconds>: another margin; =0: the timer for the whole wait, as before. Every 5 s in which frames
+   waited, how long after their time the waits ended (vi: frame waits), for comparing the two */
+static void pace_sleep(int64_t until, int64_t now) {
+    static int64_t margin = -1, waits, late_sum, late_max, since;
+    if (margin < 0) {
+        const char *e = getenv("HOS_PACE_SPIN");
+        margin = e && *e ? atoll(e) * 1000 : PACE_WAIT_MARGIN_NS;
+        if (margin < 0) margin = 0;
+    }
+    if (margin) hos_sleep_until_ns(until, margin);
+    else hos_sleep_ns(until - now);
+    const int64_t after = hos_now_ns(), late = after > until ? after - until : 0;
+    /* ((Triforce) steady_period: not what the frame needed) */
+    if (presenting_thread) frame_waited_own_ns += after - now;
+    else __atomic_fetch_add(&frame_waited_other_ns, (LONG64)(after - now), __ATOMIC_RELAXED);
+    waits++, late_sum += late;
+    if (late > late_max) late_max = late;
+    if (!since) since = after;
+    if (after - since >= 5000000000LL) {
+        char how[64];
+        if (margin) snprintf(how, sizeof how, "the timer to %.2f ms before, the rest yielded", margin / 1e6);
+        else snprintf(how, sizeof how, "the timer for the whole wait: HOS_PACE_SPIN=0");
+        hos_log("vi: frame waits: %lld in %.1f s ended %.0f us after their time on average, %.0f us at most (%s)",
+                (long long)waits, (after - since) / 1e9, late_sum / 1e3 / waits, late_max / 1e3, how);
+        waits = late_sum = late_max = 0, since = after;
+    }
+}
 void hos_vi_native_acquire(int active) {
     static int no_pacing = -1, double_buffered = -1;
     if (no_pacing < 0) no_pacing = getenv("HOS_NO_PACING") != NULL;
     if (double_buffered < 0) double_buffered = getenv("HOS_VI_DOUBLE") != NULL;
     if (no_pacing || !next_frame_at) return;
+    {   /* (Triforce: another limiter holds this frame: its wait was taken in the asking, or is at the frame's present) */
+        static int handed_before;
+        if (pace_handed()) { handed_before = 1; return; }
+        if (handed_before) {
+            /* (the first frame back from another limiter. Its frames' times were not this file's: where they came sooner than
+               the period, a limiter that let go, each present still put the display queue a whole period on, so the queue's times
+               ran ahead of the clock by all the time not waited, and the wait below would be that long, once, a freeze. The
+               queue is moved back, its frames as far apart as they were, to where this file's own pacing has it at most: its
+               newest frame shown no later than a period from now for each texture the game may be ahead by) */
+            const int64_t now = hos_now_ns(), n = shown_count;
+            const int ahead = !double_buffered && active >= 2 ? active - 1 : 1;
+            const int64_t over = (n ? shown_at[(n - 1) & 15] : 0) - (now + pace_period_ns * ahead);
+            handed_before = 0;
+            if (over > 0) for (int i = 0; i < 16; i++) shown_at[i] -= over;
+            if (next_frame_at > now + pace_period_ns) next_frame_at = now + pace_period_ns;
+        }
+    }
     int64_t until = next_frame_at;
     if (!double_buffered && active >= 2) {
         const int64_t n = shown_count, frame = n - active + 1;   /* (the frame whose showing frees this texture) */
         until = frame >= 0 && frame < n ? shown_at[frame & 15] : 0;
     }
     const int64_t now = hos_now_ns();
-    if (until > now) hos_sleep_ns(until - now);
+    if (until > now) pace_sleep(until, now);
 }
 /* (mkw-recomp) MKW's frame pacer (0x806bcbb0, x19 when it sets the interval: nvn_native.c): its measured frame time
    (+0x128, ticks), its running excess (+0x218) and interval (+0x214), logged with the frame rate */
@@ -254,6 +377,7 @@ volatile uint32_t hos_frame_seconds_bits = 0;   /* (the frame's seconds as a flo
    HOS_FPS_MOVIE=0 (for comparisons). Called by the lifted f_83b7c710 (nx2/oot_patches.py). */
 uint32_t hos_movie_frames(uint64_t player) {
     enum { PLACES = 16 };
+    movie_seen();   /* (Triforce: a movie plays, for the frame pacing: pace_handed) */
     const uint32_t bits = __atomic_load_n(&hos_frame_seconds_bits, __ATOMIC_RELAXED);   /* (realtime_step writes it at each present) */
     if (!bits) return 1;
     static SRWLOCK lock = SRWLOCK_INIT;
@@ -414,7 +538,8 @@ static void realtime_step(int64_t now) {
     }
     /* (the Insert menu's Game speed "per frame": a frame is a 60th of a second of game time. Not past 60 fps: the game would run
        faster than real time, so a cap above 60 keeps the real-time step whatever that row says) */
-    if (!rx_option(0, 1) && fps_max() <= 60) {
+    /* (nor under 60: a cap of 30 would be the game at half speed for good) */
+    if (!rx_option(0, 1) && fps_max() == 60) {
         int *slot = (int *)GP(mod + 0x2c8);
         if (*slot >= 15 && *slot <= 60) *slot = 60;
         return;
@@ -423,9 +548,10 @@ static void realtime_step(int64_t now) {
     static double samples[5], carry;
     static unsigned count, next;
     static long long steps;
+    static StepSteady steady;   /* ((Triforce) HOS_STEP_STEADY=1, below) */
     const double dt = (now - last) / 1e9;
     last = now;
-    if (dt <= 0 || dt > 0.25) { count = next = 0; carry = 0; return; }   /* (a load: the average starts again) */
+    if (dt <= 0 || dt > 0.25) { count = next = 0; carry = 0; step_steady_reset(&steady); return; }   /* (a load: the average starts again) */
     /* (HOS_REALTIME_WINDOW=<1-5>: frames averaged for the step; 1: each step the last frame's own time) */
     static int window = -1;
     if (window < 0) {
@@ -444,8 +570,25 @@ static void realtime_step(int64_t now) {
     static int timed_step = -1;
     if (timed_step < 0) timed_step = !(getenv("HOS_FPS_STEP") && !atoi(getenv("HOS_FPS_STEP")));
     const int timed = fps_max() > 60 && timed_step && hos_step_probe;
+    const int top = timed ? 60 : fps_max();
+    /* (Triforce, after NX2navi's steady step: host/step_steady.h) HOS_STEP_STEADY (on unless =0): the step is not the mean of the last five
+       intervals but that of the last 12 without their longest and shortest, the paced period where it is within 3% of it, and
+       what the display showed and the game was not given repaid at a 64th a frame (10% of the step at most), within the bounds
+       each path below gives it: a hitch is paid back over most of a second, not in the next five frames, and a cap the game
+       holds steps it by the period exactly. =0: the mean of the last five, as before */
+    double secs_avg = sum / count;
+    {
+        static int steady_on = -1;
+        if (steady_on < 0) {
+            /* ((Triforce, 11-15) On by default, as NX2navi's STEP_STEADY: the lab's A/B cost nothing at the Market; its gain is
+               at hitches (tests/test_step_steady.py). HOS_STEP_STEADY=0: the mean of the last five, as before) */
+            steady_on = !(getenv("HOS_STEP_STEADY") && *getenv("HOS_STEP_STEADY") && atoi(getenv("HOS_STEP_STEADY")) == 0);
+            if (steady_on) hos_log("vi: the steady step: 12 intervals without their longest and shortest, the paced period within 3%%, a hitch repaid slowly (HOS_STEP_STEADY=0: off)");
+        }
+        if (steady_on) secs_avg = step_steady(&steady, dt, (double)pace_period_ns / 1e9, timed ? 1.0 / 240.0 : 1.0 / top, 4.0 / 60.0);
+    }
     if (timed) {
-        const double secs = sum / count;
+        const double secs = secs_avg;
         const float f = (float)(secs > 4.0 / 60.0 ? 4.0 / 60.0 : secs < 1.0 / 240.0 ? 1.0 / 240.0 : secs);
         uint32_t bits;
         memcpy(&bits, &f, 4);
@@ -453,10 +596,9 @@ static void realtime_step(int64_t now) {
     } else {
         __atomic_store_n(&hos_frame_seconds_bits, 0, __ATOMIC_RELAXED);
     }
-    const int top = timed ? 60 : fps_max();
-    const double ratio = sum / count * 60.0;
+    const double ratio = secs_avg * 60.0;
     int *slot = (int *)GP(mod + 0x2c8);
-    if (*slot < 15 || *slot > fps_max()) {
+    if (*slot < 15 || *slot > (fps_max() > 60 ? fps_max() : 60)) {   /* (under a cap below 60 it starts at the game's 60) */
         static int logged;
         if (!logged++) hos_log("vi: the graphics module's frame rate reads %d: no real-time step", *slot);
         return;
@@ -467,6 +609,128 @@ static void realtime_step(int64_t now) {
     carry = timed ? 0 : frame_carry;
     *slot = fps;
     if (!(steps++ % 3000)) hos_log("vi: real-time step on: ratio %.3f, game's frame rate %d", ratio, fps);
+}
+/* (Triforce) The Steady frame rate row (steady_frame_rate=, HOS_FPS_STEADY=<0-2> over it; read at the start): 0 Off, the frames
+   paced by the cap as before. 1 (any rate: a display with variable refresh, or VSync off) and 2 (steps of the display's refresh,
+   for VSync without variable refresh): the period the frames are paced by is one this PC holds in the scene, lowered quickly when
+   frames run late and raised slowly when there is room, never shorter than the cap's (base; host/pace_steady.h has the rule and
+   its reasons), and the renderer holds the game's pictures to it (HOS_OPT_PACE_STEADY, gpu/vk/vk_pace.cpp steady_floor_ns,
+   present_smooth.h present_smooth_paced_at): the acquire's wait evens the frames' starts and with them the game's time step
+   (realtime_step's steady step snaps to the period), the present's hold their pictures.
+   What a frame took and needed (pace_steady_measure): its present interval, and the pacing's waits in it, the acquire's
+   (pace_sleep, on this thread or another) and the present's hold (the renderer says how long). A frame another limiter held
+   (pace_handed) is not measured, and the cap's period is back until the game's own wait holds the frames again. A line at
+   each change, and every 5 s what the rule was given (steady_line) */
+typedef struct {   /* (what steady_line says: the frames since its last line) */
+    int64_t interval[2048], took[2048], need[2048], own, other, held, since;
+    int n, frames;
+    int64_t hitches, loads, unmeasured, kept, settling;
+} SteadyWindow;
+/* (the 5 s line's last part: the probes' measure, or the wait before a raise without them) */
+static const char *steady_line_rule(const PaceSteady *s) {
+    static char text[160];
+    if (s->probe)
+        snprintf(text, sizeof text, "%lld probes (%lld found a new scene), the scene's last took %.2f / %.2f ms unpaced "
+                 "(p50 / p90)", (long long)s->probes, (long long)s->scenes, s->probe_p50 / 1e6, s->probe_p90 / 1e6);
+    else snprintf(text, sizeof text, "a raise waits for %.0f s since the last change (HOS_FPS_STEADY_PROBE=0)", s->hold_ns / 1e9);
+    return text;
+}
+static void steady_line(SteadyWindow *w, PaceSteady *s, int64_t now) {
+    if (!w->since) w->since = now;
+    if (now - w->since < 5000000000LL) return;
+    unsigned late = 0;
+    if (s->count >= PACE_STEADY_SHORT)
+        for (unsigned i = 0; i < PACE_STEADY_SHORT; i++) late += s->took[i] > pace_steady_held(s);
+    const int n = w->n, f = w->frames ? w->frames : 1;
+#define STEADY_Q(a, q) (n ? pace_steady_select(a, n, (int)(n * (q)) < n ? (int)(n * (q)) : n - 1) / 1e6 : 0.0)
+    const double iv50 = STEADY_Q(w->interval, 0.5), took50 = STEADY_Q(w->took, 0.5), took90 = STEADY_Q(w->took, 0.9);
+    const double need50 = STEADY_Q(w->need, 0.5), need90 = STEADY_Q(w->need, 0.9);
+#undef STEADY_Q
+    hos_log("vi: steady frame rate: %.1f fps held; the last %.1f s, %d frames: took %.2f / %.2f ms (p50 / p90), needed %.2f / "
+            "%.2f, present interval p50 %.2f; a frame's waits: the acquire's %.2f ms on the presenting thread, %.2f on others, the "
+            "present's hold %.2f; %lld kept, left out %lld hitches, %lld loads, %lld unmeasured, %lld settling after a load; %u of "
+            "the last %d kept late; %lld raised, %lld lowered so far, %s",
+            1e9 / (double)pace_steady_held(s), (now - w->since) / 1e9, w->frames, took50, took90, need50, need90, iv50,
+            w->own / 1e6 / f, w->other / 1e6 / f, w->held / 1e6 / f, (long long)(s->kept - w->kept),
+            (long long)(s->hitches - w->hitches), (long long)(s->loads - w->loads), (long long)(s->unmeasured - w->unmeasured),
+            (long long)(s->settling - w->settling), late, PACE_STEADY_SHORT, (long long)s->raises, (long long)s->lowerings,
+            steady_line_rule(s));
+    w->n = w->frames = 0, w->own = w->other = w->held = 0, w->since = now;
+    w->hitches = s->hitches, w->loads = s->loads, w->unmeasured = s->unmeasured, w->kept = s->kept;
+    w->settling = s->settling;
+}
+static int64_t steady_period(int64_t base, int64_t now) {
+    static int mode = -1, cap;
+    static PaceSteady steady;
+    static SteadyWindow window;
+    static int64_t last;
+    static long long frames;
+    int rx_option(int id, int otherwise);
+    void rx_option_set(int id, int value);
+    presenting_thread = 1;   /* (pace_sleep: the acquire's waits on this thread add to the present's hold) */
+    const int64_t own = frame_waited_own_ns, interval = last ? now - last : 0;
+    const int64_t other = (int64_t)__atomic_exchange_n(&frame_waited_other_ns, 0, __ATOMIC_RELAXED);
+    const int handed = __atomic_exchange_n(&frame_handed, 0, __ATOMIC_RELAXED) != 0;
+    frame_waited_own_ns = 0, last = now;
+    if (mode < 0) {
+        const char *e = getenv("HOS_FPS_STEADY");
+        mode = e && *e ? atoi(e) : hos_ini_option("steady_frame_rate", PACE_STEADY_OFF);
+        if (mode < PACE_STEADY_OFF || mode > PACE_STEADY_REFRESH) mode = PACE_STEADY_OFF;
+    }
+    if (mode == PACE_STEADY_OFF) return base;
+    frames++;
+    if (cap != fps_max()) {
+        /* (the set, once the cap is settled: on Monitor's rate fps_max is 60 until the renderer answers. Steps of the refresh
+           wait for the renderer to say the display's rate, half a minute of frames at most: then the set of any rate) */
+        int refresh = mode == PACE_STEADY_REFRESH ? rx_option(HOS_OPT_DISPLAY_CAP, -1) : 0;
+        if (refresh < 0 && frames < 1800) return base;
+        pace_steady_init(&steady, mode, fps_max(), refresh);
+        cap = fps_max();
+        /* ((Triforce, test31) HOS_FPS_STEADY_PROBE=0: the rate by the frames' own measure as they run, as before the probes) */
+        const char *pe = getenv("HOS_FPS_STEADY_PROBE");
+        steady.probe = !(pe && *pe && atoi(pe) == 0);
+        hos_log("vi: steady frame rate: %s, %d rates from the cap's %d fps to %.1f, %s (%s)",
+                mode == PACE_STEADY_REFRESH && refresh > 0 ? "steps of the display's refresh" : "any rate", steady.n,
+                cap, 1e9 / (double)steady.periods[steady.n - 1],
+                steady.probe ? "chosen by unpaced probes" : "chosen by the frames as they run (HOS_FPS_STEADY_PROBE=0)",
+                mode == PACE_STEADY_REFRESH && refresh <= 0 ? "the display's refresh rate is not known" : "HOS_FPS_STEADY=0: off");
+    }
+    const int64_t held = (int64_t)rx_option(HOS_OPT_PACE_STEADY, 0) * 1000;   /* (the present's hold, since the last present) */
+    if (handed) {
+        if (steady.at || steady.count) pace_steady_reset(&steady), hos_log("vi: steady frame rate: another limiter holds the frames");
+        rx_option_set(HOS_OPT_PACE_STEADY, 0);
+        window.frames++;
+        steady_line(&window, &steady, now);
+        return base;
+    }
+    const int64_t before = pace_steady_held(&steady);
+    int64_t took, need;
+    pace_steady_measure(interval, own + held, other, &took, &need);
+    if (other > 0) steady.one_step = 1;   /* (the acquire on another thread: what a frame needs is not always known) */
+    if (interval > 0 && interval <= PACE_STEADY_LOAD_NS && window.n < 2048) {
+        window.interval[window.n] = interval, window.took[window.n] = took, window.need[window.n] = need;
+        window.n++;
+    }
+    window.frames++, window.own += own, window.other += other, window.held += held;
+    if (pace_steady_feed(&steady, took, need, interval)) {
+        const int64_t p = pace_steady_held(&steady);
+        if (steady.probe)
+            hos_log("vi: steady frame rate: %.1f fps (was %.1f): the last three probes' %u frames took %.2f ms unpaced at the 90th "
+                    "percentile, %.2f at the median (%lld probes, %lld raised, %lld lowered)", 1e9 / (double)p, 1e9 / (double)before,
+                    steady.probe_count, steady.probe_p90 / 1e6, steady.probe_p50 / 1e6, (long long)steady.probes,
+                    (long long)steady.raises, (long long)steady.lowerings);
+        else
+            hos_log("vi: steady frame rate: %.1f fps (was %.1f): the last %u frames needed %.2f ms at the 90th percentile, %.2f at "
+                    "the 95th (%lld raised, %lld lowered, %lld hitches left out; the next raise waits %.0f s at least)", 1e9 / (double)p,
+                    1e9 / (double)before, steady.count, pace_steady_quantile(&steady, PACE_STEADY_RING, 0.90) / 1e6,
+                    pace_steady_quantile(&steady, PACE_STEADY_RING, 0.95) / 1e6, (long long)steady.raises,
+                    (long long)steady.lowerings, (long long)steady.hitches, steady.hold_ns / 1e9);
+    }
+    steady_line(&window, &steady, now);
+    const int64_t p = pace_steady_period(&steady) > base ? pace_steady_period(&steady) : base;
+    rx_option_set(HOS_OPT_PACE_PERIOD, (int)p);
+    rx_option_set(HOS_OPT_PACE_STEADY, 1);
+    return p;
 }
 /* HOS_PRESENT_TRACE=<csv>: native game present-call returns, not GPU completion or display times.
    Uses the existing frame ID/clock; a forced stop can lose the last second of buffered present records. */
@@ -504,7 +768,12 @@ void hos_vi_native_presented(void) {
         if (ms < 0) ms = getenv("HOS_FRAME_SLEEP_MS") ? atoi(getenv("HOS_FRAME_SLEEP_MS")) : 0;
         if (ms) hos_sleep_ns(ms * 1000000LL);
     }
-    const int64_t period = 1000000000LL / fps_max() * present_interval, now = hos_now_ns();
+    /* (a cap under 60 paces by itself, whatever interval the game asked for while Monitor's rate was not known yet) */
+    const int interval = fps_max() < 60 ? 1 : present_interval;
+    const int64_t now = hos_now_ns();
+    /* ((Triforce) the Steady frame rate row: a period this PC holds in the scene, never shorter than the cap's) */
+    const int64_t period = steady_period(1000000000LL / fps_max() * interval, now);
+    pace_period_ns = period;   /* (Triforce: what another limiter is given to hold in this file's place, pace_handed) */
     realtime_step(now);
     /* (behind by more than a frame: the next one is paced from now, with no burst to catch up) */
     next_frame_at = next_frame_at && now - next_frame_at < period ? next_frame_at + period : now + period;
@@ -528,17 +797,29 @@ void hos_vi_native_presented(void) {
     /* (present-to-present intervals of the window, in buckets: which frames miss their vsync) */
     static int64_t last_present;
     static int hist[6];
+    /* ((Triforce) and against the period the frames are paced by, which the buckets above, made for 60, do not see at a cap
+       of 240 (every interval under 15.5 ms): from under three quarters of it to over twice it, and the intervals' mean
+       distance from it, the frame-time spread a change of the pacing shows in) */
+    static int rel[6];
+    static int64_t off_sum;
     if (last_present) {
-        const int64_t d = now - last_present;
+        const int64_t d = now - last_present, off = d > period ? d - period : period - d;
         hist[d < 15500000 ? 0 : d < 17800000 ? 1 : d < 22000000 ? 2 : d < 30000000 ? 3 : d < 40000000 ? 4 : 5]++;
+        rel[d * 4 < period * 3 ? 0 : d * 20 < period * 19 ? 1 : d * 20 <= period * 21 ? 2 : d * 4 <= period * 5 ? 3 : d <= period * 2 ? 4 : 5]++;
+        off_sum += off;
     }
     last_present = now;
     if (now - window_start >= 5000000000LL) {
         hos_log("vi: %lld frames presented (%.1f fps over the last %.1f s, interval %d)", (long long)n,
-                frames_in_window * 1e9 / (double)(now - window_start), (now - window_start) / 1e9, present_interval);
+                frames_in_window * 1e9 / (double)(now - window_start), (now - window_start) / 1e9, interval);
         hos_log("vi: present intervals: <15.5 ms %d, 15.5-17.8 %d, 17.8-22 %d, 22-30 %d, 30-40 %d, over 40 %d", hist[0],
                 hist[1], hist[2], hist[3], hist[4], hist[5]);
+        const int counted = rel[0] + rel[1] + rel[2] + rel[3] + rel[4] + rel[5];
+        hos_log("vi: frame intervals against the paced period of %.3f ms: under 0.75 of it %d, 0.75-0.95 %d, 0.95-1.05 %d, "
+                "1.05-1.25 %d, 1.25-2 %d, over 2 %d; %.3f ms from it on average", period / 1e6, rel[0], rel[1], rel[2], rel[3],
+                rel[4], rel[5], counted ? off_sum / 1e6 / counted : 0.0);
         memset(hist, 0, sizeof hist);
+        memset(rel, 0, sizeof rel), off_sum = 0;
         window_start = now, frames_in_window = 0;
         const uint64_t pacer = hos_mkw_pacer, freq = pacer ? G64(0x837de940) : 0;   /* (MKW only: nvn_native.c) */
         if (pacer && freq)

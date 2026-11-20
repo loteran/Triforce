@@ -30,8 +30,8 @@ STAGES = {0x1: "vertex", 0x2: "tesscontrol", 0x4: "tesseval", 0x8: "geometry", 0
 
 def records(path, want):
     """(key, kind, bytes) of each record want(key, kind) takes, in file order. The layout is disk_init's: a 16-byte head
-    (magic, 0, stamp), then records of a u64 key, a u64 size and that many bytes, which start with the u32 kind. A record
-    cut short ends the walk, as it does there"""
+    (magic, the build of the translator that last opened it, stamp), then records of a u64 key, a u64 size and that many bytes,
+    which start with the u32 kind. A record cut short ends the walk, as it does there"""
     with open(path, "rb") as f:
         head = f.read(16)
         if len(head) < 16 or struct.unpack_from("<I", head)[0] != CACHE_MAGIC:

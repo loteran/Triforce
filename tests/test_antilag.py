@@ -38,15 +38,19 @@ for call in ("antilag_device_extensions(want, exts);", "antilag_device_features(
 if main.index("antilag_device_features(tail);") > main.index("vkGetPhysicalDeviceFeatures2(dev.physical, &f);"):
     raise SystemExit("vk_main.cpp: Anti-Lag 2's feature joins the chain after the features were queried")
 replay = (ROOT / "gpu" / "vk" / "vk_replay.cpp").read_text(encoding="utf-8")
-present = block(replay, "void present_image(")
+# ((Triforce) the present's last step is present_out, on the presenting thread or the present thread: RX_VK_PRESENT_THREAD,
+# which stays off while Anti-Lag 2 gives its stages, as its present stage would come after the next frame's input stage)
+present = block(replay, "static void present_out(const PresentOut& o, std::unique_lock<std::mutex>& qk, bool on_thread) {")
 if "antilag_present();" not in present or present.index("antilag_present();") > present.index("vkQueuePresentKHR("):
-    raise SystemExit("present_image: Anti-Lag 2's present stage is not given before vkQueuePresentKHR")
+    raise SystemExit("present_out: Anti-Lag 2's present stage is not given before vkQueuePresentKHR")
+if "antilag_running()" not in block(replay, "bool present_thread_wanted() {"):
+    raise SystemExit("vk_replay.cpp: the present thread does not stay off while Anti-Lag 2 runs")
 if "reflex_sleep(); antilag_input();" not in block(replay, "void do_present("):
     raise SystemExit("do_present: Anti-Lag 2's input stage is not given after the present")
 
 functions = "\n".join(block(source, m) + (";" if m.startswith("struct") else "") for m in (
     "struct AntiLag {", "AntiLag& al()", "void update(", "bool on()", "void stage(", "void antilag_present()",
-    "void antilag_input()"))
+    "void antilag_input()", "bool antilag_running()"))
 fixture = r'''
 #include <vulkan/vulkan_core.h>
 #include <cstdio>
@@ -72,6 +76,7 @@ int main(){
     // a present before the first input stage gives nothing
     antilag_present();CHECK(calls.empty());
     // a frame: its input stage, then its present stage, with one index, mode On
+    CHECK(antilag_running());   // ((Triforce) the present thread stays off from here)
     antilag_input();antilag_present();
     CHECK(calls.size()==2&&calls[0].stage==VK_ANTI_LAG_STAGE_INPUT_AMD&&calls[1].stage==VK_ANTI_LAG_STAGE_PRESENT_AMD);
     CHECK(calls[0].frame==calls[1].frame&&calls[0].mode==VK_ANTI_LAG_MODE_ON_AMD&&calls[1].mode==VK_ANTI_LAG_MODE_ON_AMD);
@@ -79,12 +84,14 @@ int main(){
     // frame generation on: the driver told Off once, then nothing
     calls.clear();fg=true;antilag_input();antilag_present();antilag_input();
     CHECK(calls.size()==1&&calls[0].mode==VK_ANTI_LAG_MODE_OFF_AMD&&calls[0].stage==-1);
+    CHECK(!antilag_running());
     // on again: the present waits for an input stage
     calls.clear();fg=false;antilag_present();CHECK(calls.empty());
     antilag_input();antilag_present();CHECK(calls.size()==2&&calls[1].stage==VK_ANTI_LAG_STAGE_PRESENT_AMD);
     // the row off: Off once, then nothing
     calls.clear();want=0;antilag_input();antilag_present();antilag_input();
     CHECK(calls.size()==1&&calls[0].mode==VK_ANTI_LAG_MODE_OFF_AMD);
+    CHECK(!antilag_running());
     std::puts("PASS: Anti-Lag 2's stages in order with one index a frame, Off told once, nothing while off");
 }
 '''

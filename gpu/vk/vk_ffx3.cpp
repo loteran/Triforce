@@ -461,7 +461,7 @@ bool evaluate(VkCommandBuffer cmd, const TemporalFrame& f) {
     if (!s.told_first) logf("vk: FSR 3.1: the first ffxDispatch (upscale) starts: %ux%u -> %ux%u (frame %llu)", f.render_w, f.render_h,
                             f.output.width, f.output.height, (unsigned long long)texture_frame_no());
     const ffxReturnCode_t r = l.dispatch(&s.context[s.cur]->context, &d.header);
-    note_work();   // (AMD's dispatches: full_barrier must not take the next barrier for a repeat of the one before them)
+    note_work(cmd);   // (AMD's dispatches: full_barrier must not take the next barrier for a repeat of the one before them)
     s.slot[s.cur].fence = std::max(s.slot[s.cur].fence, draw_recording_value());   // (recorded into cmd, a refusal too, for all this side knows)
 
     const VkImageMemoryBarrier2 out[4] = {barrier(f.color.image, VK_ACCESS_2_SHADER_READ_BIT, any, R, G),

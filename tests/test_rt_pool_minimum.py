@@ -64,6 +64,8 @@ static const struct {
     {3840, 2160, 0, 768, NULL, 1728},
     {5120, 2880, 0, 305, NULL, 900},
     {5120, 2880, 0, 305, "1220", 1220},
+    {5120, 2160, 0, 305, NULL, 900},   /* ((Triforce) the 5120 x 2160 output: 915 MiB scaled, kept to 900 as 5120 x 2880's) */
+    {5120, 2160, 0, 305, "1000", 1000},
 };
 int main(void) {
     int failed = 0;
@@ -84,6 +86,16 @@ int main(void) {
     if (hos_rt_pool_size(305 * MIB) != (512 + 128) * MIB) { fprintf(stderr, "RGBA16F scene: not 640 MiB\n"); failed = 1; }
     override = "256";
     if (hos_rt_pool_size(305 * MIB) != 256 * MIB) { fprintf(stderr, "RGBA16F scene: the override not kept\n"); failed = 1; }
+    /* (the 5120 x 2880 output with an RGBA16F scene: 900 MiB for the whole pool, not 900 + 128, which failed the game's
+       reservation at boot; 3840 x 2160 keeps its 128 MiB more, and an explicit override still wins) */
+    output_width = 5120; output_height = 2880; override = NULL;
+    if (hos_rt_pool_size(305 * MIB) != 900 * MIB) { fprintf(stderr, "RGBA16F scene at 5120x2880: not 900 MiB\n"); failed = 1; }
+    override = "1028";
+    if (hos_rt_pool_size(305 * MIB) != 1028 * MIB) { fprintf(stderr, "RGBA16F scene at 5120x2880: the override not kept\n"); failed = 1; }
+    output_width = 5120; output_height = 2160; override = NULL;
+    if (hos_rt_pool_size(305 * MIB) != 900 * MIB) { fprintf(stderr, "RGBA16F scene at 5120x2160: not 900 MiB\n"); failed = 1; }
+    output_width = 3840; output_height = 2160; override = NULL;
+    if (hos_rt_pool_size(305 * MIB) != (687 + 128) * MIB) { fprintf(stderr, "RGBA16F scene at 3840x2160: not 815 MiB\n"); failed = 1; }
     return failed;
 }
 '''
@@ -97,8 +109,8 @@ int main(void) {
         source.write_text(fixture)
         subprocess.run([compiler, "-std=c11", "-O2", str(source), "-o", str(binary)], check=True)
         subprocess.run([str(binary)], check=True, timeout=5)
-    print("PASS: 512 MiB floor, 4K/ultrawide growth and explicit overrides, the 5K output's 900 MiB (14 cases), "
-          "an RGBA16F scene's 128 MiB more")
+    print("PASS: 512 MiB floor, 4K/ultrawide growth and explicit overrides, the 5120-wide outputs' 900 MiB (16 cases), "
+          "an RGBA16F scene's 128 MiB more, and the 5K output's 900 MiB with it")
 
 
 if __name__ == "__main__":

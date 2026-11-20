@@ -33,6 +33,8 @@ PREFIX = r'''#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #define CHECK(x) do { if (!(x)) { std::fprintf(stderr, "FAIL:%d %s\n", __LINE__, #x); std::exit(1); } } while (0)
+#include "framegen_rows.h"   /* (Triforce: the row's AMD FSR 4, which multiplier() names; -I gpu/vk) */
+namespace framegen_rows = mkwvk::framegen_rows;
 constexpr int kMaxMult = 8;
 struct { int framegen = 1; } opts;
 static int refresh_mhz = 60000;
@@ -105,6 +107,14 @@ int main() {
     CHECK(multiplier() == 3);                                /* a fixed setting is not Auto's */
     opts.framegen = 0;
     CHECK(multiplier() == 1);
+    for (int v = 2; v <= 8; v++) {                           /* (Triforce) the multipliers of an options file from before */
+        opts.framegen = v;
+        CHECK(multiplier() == v);
+    }
+    opts.framegen = 9;                                       /* AMD FSR 4: one made frame, the sets of a 2x, at any refresh */
+    CHECK(multiplier() == 2);
+    refresh_mhz = 240000;
+    CHECK(multiplier() == 2);
     std::printf("PASS: Auto gives each of the display's refreshes a frame, and no more\n");
 }
 '''
@@ -123,7 +133,8 @@ def main():
         cpp = Path(tmp) / "fixture.cpp"
         exe = Path(tmp) / "fixture"
         cpp.write_text(fixture, encoding="utf-8")
-        subprocess.run([a.cxx, "-std=c++20", "-Wall", "-Wextra", "-Werror", str(cpp), "-o", str(exe)], check=True)
+        subprocess.run([a.cxx, "-std=c++20", "-Wall", "-Wextra", "-Werror", "-I" + str(ROOT / "gpu" / "vk"), str(cpp), "-o", str(exe)],
+                       check=True)
         subprocess.run([str(exe)], check=True)
 
 

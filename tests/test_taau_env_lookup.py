@@ -75,7 +75,12 @@ static VkImageView texture_view_of(uint32_t handle,int type,ViewUse use,int form
     if(handle!=5 || type!=VK_IMAGE_VIEW_TYPE_2D || use!=ViewUse::Storage || format!=123) return 0;
     *out=resolve_image?&texture:nullptr;*level=7;return 99;
 }
+/* (the recording lock of a parallel replay: taau_stand_in holds it around typed_upscale, whose pipeline and history images
+   every recording thread shares) */
+static int lock_depth;
+struct ParLock { ParLock(){lock_depth++;} ~ParLock(){lock_depth--;} };
 static bool typed_upscale(VkCommandBuffer cmd,VkImageView input,VkImageView output,Texture* out,uint32_t level,uint64_t key,const char* text,bool temporal){
+    if(lock_depth<=0) return false;   /* (not under the lock: the upscale is refused, and the checks of its calls fail) */
     ++upscale_calls;forwarded_cmd=cmd;forwarded_input=input;forwarded_output=output;forwarded_texture=out;
     forwarded_level=level;forwarded_key=key;forwarded_text=text;forwarded_temporal=temporal;return upscale_result;
 }

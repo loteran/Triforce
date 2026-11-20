@@ -52,7 +52,7 @@ class PipelineNotesOpenTests(unittest.TestCase):
 
     def test_the_precompile_opens_both_before_play_with_the_notes_it_read(self):
         run = block(self.draw, "void precompile_run(void (*progress)(size_t done, size_t total))")
-        read = run.index("std::vector<std::unique_ptr<PipeNote>> notes = pipe_notes_read();")
+        read = run.index("std::vector<std::unique_ptr<PipeNote>> notes = pipe_notes_read(&note_at);")
         notes = run.index("if (!note_file) notes_open_locked(&notes);")
         states = run.index("if (!state_file) state_open_locked();")
         self.assertLess(read, notes)

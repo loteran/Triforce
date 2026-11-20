@@ -10,8 +10,11 @@
                 HOS_NVN_CONTINUE=1 (go on past nvnBootstrapLoader). */
 #include "hos.h"
 #include "hos_paths.h"
+#include "hos_instance.h"   /* ((Triforce) one game at a time for a game folder) */
 #include "../gpu/vk/vk_api.h"
 #include "../gpu/vk/oot_cheat_items.h"
+#include "../gpu/vk/oot_debug_link.h"   /* ((Triforce) the Game flags and Cutscenes pages' lines) */
+#include "../gpu/vk/ultrawide_rows.h"   /* ((Triforce) the Ultrawide row's shapes: ultrawide_ratio) */
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -56,17 +59,24 @@ uint64_t hos_space_end;
 #define IMAGE_BASE hos_image_base   /* (the lift's: Eden's layout) */
 
 #ifdef _WIN32
-static void no_power_throttling(void) {
+/* Windows 11 runs a process whose window is not in front (another window focused, a second monitor's overlay) at
+   efficiency speed (EcoQoS, the E-cores of a hybrid CPU) and may ignore its timer resolution request, which turns the
+   1 ms waits the pacing and short sleeps rely on into 15.6 ms ones. Opting out keeps full speed and the 1 ms timer
+   (ProcessPowerThrottling, 4: PROCESS_POWER_THROTTLING_EXECUTION_SPEED 0x1 and _IGNORE_TIMER_RESOLUTION 0x4 in the control
+   mask, off in the state). The ignore-timer-resolution control needs Windows 11; on Windows 10 the call fails and execution
+   speed alone is asked. HOS_POWER_THROTTLING=1 leaves Windows' throttling as it is (A/B runs).
+   ((Triforce) the comment and the outcome after NX2navi's plat_power_full, chrg6's.) Returns 2: full speed and the timer
+   kept, 1: full speed only, 0: neither (no such call here, or it failed), -1: left as it is by the switch */
+static int no_power_throttling(void) {
     const char *e = getenv("HOS_POWER_THROTTLING");
-    if (e && atoi(e)) return;
+    if (e && atoi(e)) return -1;
     typedef BOOL(WINAPI * SetInfo)(HANDLE, int, LPVOID, DWORD);
     SetInfo set = (SetInfo)(void *)GetProcAddress(GetModuleHandleA("kernel32.dll"), "SetProcessInformation");
-    if (!set) return;
+    if (!set) return 0;
     struct { ULONG version, control, state; } s = {1, 0x1 | 0x4, 0};
-    if (!set(GetCurrentProcess(), 4, &s, sizeof s)) {
-        s.control = 0x1;
-        set(GetCurrentProcess(), 4, &s, sizeof s);
-    }
+    if (set(GetCurrentProcess(), 4, &s, sizeof s)) return 2;
+    s.control = 0x1;
+    return set(GetCurrentProcess(), 4, &s, sizeof s) ? 1 : 0;
 }
 #endif
 
@@ -83,14 +93,17 @@ extern const uint64_t hos_entry_init_libc0, hos_entry_init_libc1, hos_entry_init
 /* nn_fs.c */
 extern const char *hos_romfs_dir, *hos_user_dir;
 
-/* HOS_LARGE_PAGES=1 (experiment): the guest window in 2 MB pages, for fewer TLB misses (the game touches hundreds of MB
-   of scattered heap; 4 KB pages cover only ~12 MB of it in the CPU's TLB). The whole window is then physical memory at
-   once (4 GB, locked), and Windows needs the account to hold "Lock pages in memory" (SeLockMemoryPrivilege, Local
-   Security Policy > User Rights Assignment; log off and on after): without it this logs why and uses normal pages. */
-int hos_large_pages;   /* (hos_mem.c: freed pages are not discarded then) */
+/* HOS_LARGE_PAGES=1 or =<MB> (experiment): the game's heap in 2 MB pages, for fewer TLB misses (the game's threads spend
+   their time on loads from a heap of 6.9 GB; 4 KB pages cover 8 MB of it in the CPU's second-level TLB, 2 MB pages 4 GB).
+   (triforce: the heap alone, from HOS_HEAP_BASE up: the window is 512 GB here and large pages are physical memory at once.
+   OoT asks for 6,894 MB; =1 takes 6,912.) That much is then physical memory from the start, locked, and Windows needs the
+   account to hold "Lock pages in memory" (SeLockMemoryPrivilege; log off and on after it is granted): without it, or
+   when Windows cannot find the memory in one piece, this logs why and uses normal pages. */
+int hos_large_pages;   /* (hos_mem.c: freed pages are not discarded there) */
+uint64_t hos_large_lo, hos_large_hi;   /* (the guest range in large pages: mkw_glue.c hos_commit, hos_mem.c) */
 #if defined(_WIN32) && !defined(A64_MEM_ZERO)
 #pragma comment(lib, "advapi32.lib")   /* (the token privilege calls) */
-static void *reserve_large(SIZE_T size) {
+static void *reserve_large(void *at, SIZE_T size) {
     HANDLE token;
     if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &token)) return NULL;
     TOKEN_PRIVILEGES tp = {0};
@@ -107,7 +120,7 @@ static void *reserve_large(SIZE_T size) {
     }
     const SIZE_T large = GetLargePageMinimum();
     if (!large || size % large) return NULL;
-    void *p = VirtualAlloc((void *)A64_HOST_BASE, size, MEM_RESERVE | MEM_COMMIT | MEM_LARGE_PAGES, PAGE_READWRITE);
+    void *p = VirtualAlloc(at, size, MEM_RESERVE | MEM_COMMIT | MEM_LARGE_PAGES, PAGE_READWRITE);
     if (!p) hos_log("mem: HOS_LARGE_PAGES: %llu MB of large pages not available (error %lu): normal pages",
                     (unsigned long long)(size >> 20), GetLastError());
     return p;
@@ -127,10 +140,26 @@ static int reserve_guest(void) {
        pages changed (GetWriteWatch) so that it uploads only those (soft write watch builds mark pages themselves). */
 #if defined(A64_WRITE_TRACK)
     const DWORD watch = 0;
-    if (getenv("HOS_LARGE_PAGES") && reserve_large(GUEST_SPACE) == (void *)A64_HOST_BASE) {
-        hos_large_pages = 1;
-        hos_log("mem: the guest window is in large pages (%llu MB)", (unsigned long long)(GUEST_SPACE >> 20));
-        return 1;
+    if (getenv("HOS_LARGE_PAGES")) {
+        /* three reservations: below the heap, the heap's large pages, above them (a commit never spans two: hos_commit) */
+        uint64_t mb = strtoull(getenv("HOS_LARGE_PAGES"), NULL, 10);
+        if (mb < 64) mb = 6912;
+        const uint64_t n = ((mb << 20) + 0x1FFFFFULL) & ~0x1FFFFFULL;
+        uint8_t *const base = (uint8_t *)A64_HOST_BASE;
+        const ULONGLONG t0 = GetTickCount64();
+        if (HOS_HEAP_BASE + n < GUEST_SPACE && VirtualAlloc(base, HOS_HEAP_BASE, MEM_RESERVE, PAGE_NOACCESS) == base) {
+            if (reserve_large(base + HOS_HEAP_BASE, (SIZE_T)n) == base + HOS_HEAP_BASE &&
+                VirtualAlloc(base + HOS_HEAP_BASE + n, GUEST_SPACE - HOS_HEAP_BASE - n, MEM_RESERVE, PAGE_NOACCESS)) {
+                void hos_commit_init(void);
+                hos_commit_init();
+                hos_large_lo = HOS_HEAP_BASE, hos_large_hi = HOS_HEAP_BASE + n, hos_large_pages = 1;
+                hos_log("mem: the game's heap is in large pages (%llu MB at %#llx, made in %llu ms)", (unsigned long long)(n >> 20),
+                        (unsigned long long)HOS_HEAP_BASE, (unsigned long long)(GetTickCount64() - t0));
+                return 1;
+            }
+            VirtualFree(base + HOS_HEAP_BASE, 0, MEM_RELEASE);
+            VirtualFree(base, 0, MEM_RELEASE);
+        }
     }
 #else
     const DWORD watch = MEM_WRITE_WATCH;
@@ -1057,6 +1086,137 @@ static void oot_teleport_followup(Ctx *c) {
             events && recomp_load64(c, events + 104) ? 1 : 0);
 }
 
+/* ---- (Triforce) Game flags by name and events by name: the Debug tab's two pages ----
+   After NX2navi's F9 panel (its flags by name and its cutscene starter; that code is not the owner's and none of it
+   is here: this is written on what the tools above already had of build e0f3ccfa). A flag is a Bool of GameData, which
+   the game knows by the MurmurHash3 of its name alone; an event is started by the name of its file. The pages read both
+   lists of names from the player's own game files (gpu/vk/debug_names.h) and send what they want as lines
+   (gpu/vk/oot_debug_link.h), read here at Link's update, on the game's thread, as the other tools' actions are.
+
+   A flag is read where oot_gd_bool finds it and changed through the game's own SetBool (oot_gd_set), so that what follows
+   a change of the game's own follows this one too; never while no save is loaded, and never one the save data does not
+   have. An event is asked of the event manager as oot_teleport asks for its map change, with no arguments and Link as
+   its starter; not while another plays, a map loads or no save is loaded. */
+static void oot_link_say(int kind, const char *text) {
+    void rx_option_set(int id, int value);
+    for (const char *t = text; *t; t++) rx_option_set(HOS_OPT_DEBUG_TEXT, (unsigned char)*t);
+    rx_option_set(HOS_OPT_DEBUG_SAID, kind);
+}
+
+/* a flag as the page shows it: '1' set, '0' not, '-' the save data has no such flag, '?' no save is loaded */
+static char oot_flag_state(Ctx *c, int loaded, uint32_t hash) {
+    const uint64_t mgr = loaded ? oot_singleton(c, OOT_GAMEDATA_SLOT) : 0;
+    if (!mgr) return '?';
+    const uint64_t entry = oot_gd_bool(c, mgr, hash);
+    return !entry ? '-' : recomp_load8(c, entry + 22) & 1 ? '1' : '0';
+}
+
+/* A flag set or cleared through the game's own setter: 1 asked of the game, 0 not (no save loaded, or the save data
+   has no such flag: nothing is called and nothing written then) */
+static int oot_flag_set(Ctx *c, int loaded, uint32_t hash, int value) {
+    const uint64_t mgr = loaded ? oot_singleton(c, OOT_GAMEDATA_SLOT) : 0;
+    if (!mgr || !hash || !oot_gd_bool(c, mgr, hash)) return 0;
+    return oot_gd_set(c, mgr, hash, value ? 1u : 0u, 1);
+}
+
+/* An event asked of the event manager by its name, Link its starter: what became of it in words (says), 1 when the
+   request was made. The request as oot_teleport builds it, without arguments */
+static int oot_start_event(Ctx *c, uint64_t actor, int loaded, const char *name, char *says, size_t cap) {
+    const uint64_t events = oot_singleton(c, OOT_EVENTMGR_SLOT);
+    A64Fn make_arg = a64_lookup(0x80d99f10ULL), request = a64_lookup(0x80d9a820ULL);
+    A64Fn set_link = a64_lookup(0x802dc440ULL), release_link = a64_lookup(0x8022b6f0ULL);
+    int loading = 0;
+    if (!loaded) return snprintf(says, cap, "Load a save first."), 0;
+    if (!oot_name_ok(name)) return snprintf(says, cap, "That is not an event's name."), 0;
+    if (!events || !make_arg || !request || !set_link || !release_link) return snprintf(says, cap, "The event manager is not there."), 0;
+    if (recomp_load64(c, events + 104)) return snprintf(says, cap, "Another event is playing."), 0;
+    if (oot_gamedata_bool(c, 0xef2b60c2u, &loading) && loading) return snprintf(says, cap, "A map is loading."), 0;   /* Sequence_IsLoadingBanc */
+    if (teleport.requested_at && hos_now_ns() - teleport.requested_at < 8000000000LL) return snprintf(says, cap, "A teleport is under way."), 0;
+    const Ctx saved = *c;
+    const uint64_t arg = (c->x[31] - OOT_EVENT_ARG_SIZE - 0x100) & ~0xfULL;
+    c->x[31] = arg;
+    c->x[0] = arg;
+    make_arg(c);
+    int ok = 1;
+    {   /* the event's name: arg+6800 points at its buffer, arg+6808 the capacity */
+        const uint64_t buf = recomp_load64(c, arg + 6800);
+        const uint32_t room = recomp_load32(c, arg + 6808);
+        if (!buf || strlen(name) + 1 > room) ok = 0;
+        else memcpy(A64_PTR(buf), name, strlen(name) + 1);
+    }
+    uint64_t result = 0;
+    if (ok) {
+        c->x[31] = arg;
+        c->x[0] = arg + 0x1950, c->x[1] = actor, c->x[2] = 0;
+        set_link(c);
+        c->x[31] = arg;
+        c->x[0] = events, c->x[1] = arg;
+        request(c);
+        result = c->x[0];
+    }
+    for (unsigned i = 0; i < 2; i++) {   /* (the arg's two actor links let go, as SeqOneShotRequestEvent does) */
+        const uint64_t link = arg + (i ? 0x1950 : 0x1968);
+        recomp_store64(c, link, 0x84994b20ULL);
+        c->x[31] = arg;
+        c->x[0] = link;
+        release_link(c);
+    }
+    *c = saved;
+    hos_log("cheats: event %s: request %s, result %#llx", name, ok ? "sent" : "not built", (unsigned long long)result);
+    if (!ok) return snprintf(says, cap, "The request could not be built."), 0;
+    snprintf(says, cap, result ? "%s asked of the game." : "The game did not take %s.", name);
+    return 1;
+}
+
+/* The pages' lines taken and answered, at Link's update (now: hos_now_ns): a line read whole before it is acted on; the
+   watched flags' states twice a second, and at once after a line. Nothing is read of the game while no line came and no
+   flag is watched */
+static void oot_link_tick(Ctx *c, uint64_t actor, int64_t now) {
+    int rx_option(int id, int otherwise);
+    static uint32_t watch[OOT_WATCH_MAX];
+    static int watching;
+    static int64_t next;
+    static char line[OOT_LINE_MAX + 1];
+    static size_t used;
+    static int long_line;
+    int loaded = -1, byte;   /* (a save is loaded once the pouch answers, as the Inventory page has it: asked once a tick at most) */
+    while ((byte = rx_option(HOS_OPT_DEBUG_ASK, 0)) > 0) {
+        if (byte != '\n') {
+            if (used < OOT_LINE_MAX) line[used++] = (char)byte;
+            else long_line = 1;
+            continue;
+        }
+        line[used] = 0;
+        const int whole = !long_line;
+        used = 0, long_line = 0;
+        OotAsk ask;
+        if (!whole || !oot_ask_parse(line, &ask)) continue;   /* (not a line of the pages': dropped) */
+        if (loaded < 0) loaded = oot_pouch_count(c, oot_item_names[0]) >= 0;
+        if (ask.kind == 'W') {
+            memcpy(watch, ask.watch, sizeof watch);
+            watching = ask.count;
+        } else if (ask.kind == 'F') {
+            const int done = oot_flag_set(c, loaded, ask.hash, ask.value);
+            hos_log("cheats: flag %08x %s: %s", (unsigned)ask.hash, ask.value ? "set" : "cleared",
+                    done ? "asked of the game" : loaded ? "the save data has no such flag" : "no save is loaded");
+            oot_link_say(OOT_SAID_STATUS, done ? (ask.value ? "Flag set." : "Flag cleared.") : loaded ? "The save data has no such flag." : "Load a save first.");
+        } else {
+            char says[160];
+            oot_start_event(c, actor, loaded, ask.name, says, sizeof says);
+            oot_link_say(OOT_SAID_STATUS, says);
+        }
+        next = now + 100000000LL;   /* (the states soon: a change is made at the game's next frame) */
+    }
+    if (!watching || now < next) return;
+    next = now + 500000000LL;
+    if (loaded < 0) loaded = oot_pouch_count(c, oot_item_names[0]) >= 0;
+    char states[16 + OOT_WATCH_MAX];
+    int at = snprintf(states, sizeof states, "%08x ", (unsigned)oot_watch_sum(watch, watching));
+    for (int i = 0; i < watching; i++) states[at++] = oot_flag_state(c, loaded, watch[i]);
+    states[at] = 0;
+    oot_link_say(OOT_SAID_FLAGS, states);
+}
+
 static uint64_t oot_gameplay_view(Ctx *c) {
     const uint64_t singleton = recomp_load64(c, 0x84ca6bc0ULL);
     const uint64_t manager = singleton ? recomp_load64(c, singleton) : 0;
@@ -1092,6 +1252,7 @@ static void oot_update_player_cheats(Ctx *c, uint64_t actor, uint64_t components
     if (!action) action = __atomic_exchange_n(&hos_oot_live_action, 0, __ATOMIC_RELAXED);
     oot_teleport_followup(c);
     oot_inventory_refresh(c, now);
+    oot_link_tick(c, actor, now);   /* ((Triforce) the Game flags and Cutscenes pages) */
     if (action >= OOT_CHEAT_ITEM_ACTION && action < OOT_CHEAT_ITEM_ACTION + 256 * (int)OOT_ITEM_COUNT) {
         oot_inventory_edit(c, action);
     } else if (action == OOT_AGE_ACTION) {
@@ -1454,6 +1615,15 @@ void hos_oot_free_view(Ctx *c, uint64_t view) {
 }
 
 float hos_aspect_ratio = 0;   /* (the window's default shape: host/display.c) */
+/* (Triforce, after NX2navi's game_aspect) The Insert menu's Ultrawide row (ultrawide= in the options file, of options_version
+   version) as the picture's shape, width over height, 0 for the game's own 16:9: 0 the game's own, 1 a fixed 16:10, 2 a fixed
+   21:9 (64:27), 3 a fixed 32:9 (gpu/vk/ultrawide_rows.h). The fixed ones are for a window, or for a screen of that shape; a
+   screen of another shape shows the picture between black bars. A file from before options_version 6 whose row is 1 had the
+   main monitor's shape (screen_w x screen_h), no longer a choice: the shape nearest it. A value past the row is its nearest
+   end, as the menu reads it (gpu/vk/vk_menu.cpp) */
+static float ultrawide_ratio(int row, int version, int screen_w, int screen_h) {
+    return ultrawide_row_ratio(ultrawide_row_read(row, version, screen_w, screen_h));
+}
 /* (nx2/oot_wide.py) read by the widescreen patches in the game's code; 0: the game's own 16:9 */
 volatile uint64_t hos_wide_out, hos_wide_scene;
 /* (nx2/oot_native_resolution.py) mode 1's scene base scale 1.0 instead of 0.8: Resolution 100% (host/nn_vi.c keeps it current),
@@ -1474,6 +1644,19 @@ static void occlusion_switch(void) {
    a message says it once at boot; the game starts anyway. The text, or 0 when there is enough */
 #define HOS_MEMORY_NEEDED_MB 10240ull
 static int memory_notice_text(unsigned long long ram_mb, unsigned long long swap_mb, char *out, size_t cap) {
+    /* ((Triforce, 11-18) and no swap at all below 40 GB of memory: a player's PC of 32 GB with Windows' page file off
+       crashed as every save loaded, 17 "commit ... failed (error 1455)" before it: the game's own memory and the
+       renderer's reach about 21 GB there, and without a page file the other programs' share counts against the same
+       limit. With the page file back on it played (#bug-tracker 11-18) */
+    if (swap_mb == 0 && ram_mb < 40960ull) {
+        snprintf(out, cap,
+                 "This PC has %.1f GB of memory and no swap (the page file on Windows is turned off). Loading a save the game "
+                 "uses about 21 GB, and without a page file Windows can run out and the game closes.\n\nOn Windows: search "
+                 "\"Adjust the appearance and performance of Windows\", Advanced, Virtual memory: Change, tick \"Automatically "
+                 "manage paging file size for all drives\", then restart the PC. It starts now anyway.",
+                 ram_mb / 1024.0);
+        return 1;
+    }
     if (ram_mb + swap_mb >= HOS_MEMORY_NEEDED_MB) return 0;
     snprintf(out, cap,
              "This PC has %.1f GB of memory and %.1f GB of swap (the page file on Windows). The game needs about %llu GB of the "
@@ -1502,7 +1685,10 @@ static void memory_notice(void) {
         hos_log("boot: %llu MB of memory, %llu MB of swap", ram, swap);
         return;
     }
-    hos_log("boot: LOW MEMORY: %llu MB of memory, %llu MB of swap, below the ~%llu MB the game needs", ram, swap, HOS_MEMORY_NEEDED_MB);
+    if (swap == 0 && ram + swap >= HOS_MEMORY_NEEDED_MB)   /* ((Triforce, 11-18) memory_notice_text's no-swap case) */
+        hos_log("boot: NO PAGE FILE: %llu MB of memory, 0 MB of swap: loading a save can run out of memory (error 1455)", ram);
+    else
+        hos_log("boot: LOW MEMORY: %llu MB of memory, %llu MB of swap, below the ~%llu MB the game needs", ram, swap, HOS_MEMORY_NEEDED_MB);
     if (getenv("HOS_HEADLESS")) return;
 #ifndef _WIN32
     int hos_sdl_load(void);
@@ -1546,6 +1732,35 @@ static int narrow_paths_ok(int argc, char **argv) {
     return 0;
 }
 
+/* ((Triforce) handoff §5) One game at a time for a game folder: host/hos_instance.h. Taken before the log is opened (a second
+   copy's rotation moved the first's triforce_log.txt away and wrote over it) and after a restart's wait for the run before it.
+   A copy that finds the folder held waits up to 5 s for one that is ending (a close and a new start at once; 20 s after the
+   menu's Restart), then says which process holds it and ends: a message box, or for the builder's --prepare-shaders run and
+   HOS_HEADLESS a line on stdout and stderr. 0: refused. HOS_SINGLE_INSTANCE=0: no lock */
+static int instance_held = -1;   /* (for the log's line: 1 held, 0 not asked) */
+static int one_game_per_folder(int argc, char **argv, int restart) {
+    const char *e = getenv("HOS_SINGLE_INSTANCE");
+    if (e && !strcmp(e, "0")) return instance_held = 0, 1;
+    wchar_t folder[1100];
+    DWORD n = hos_game_path_w(folder, 1100);
+    if (!n || n >= 1100) return instance_held = 0, 1;
+    hos_instance_folder_of(folder);   /* ((Triforce) "C:\" for a game at a drive's root, not drive C's working directory) */
+    HosInstanceWho who;
+    if (hos_instance_take(folder, restart ? 20000 : 5000, &who)) return instance_held = 1, 1;
+    wchar_t text[2600];
+    hos_instance_message(folder, &who, text, sizeof text / sizeof text[0]);
+    int quiet = getenv("HOS_HEADLESS") != NULL;
+    for (int i = 1; i < argc; i++) quiet |= !strcmp(argv[i], "--prepare-shaders");
+    if (quiet) {
+        printf("@@error Triforce is running from this game folder (process %lu): it prepares its shaders itself\n", (unsigned long)who.pid);
+        fprintf(stderr, "triforce: this game folder is held by process %lu: not started\n", (unsigned long)who.pid);
+        fflush(stdout);
+    } else {
+        MessageBoxW(NULL, text, L"Triforce", MB_OK | MB_ICONINFORMATION | MB_SETFOREGROUND);
+    }
+    return 0;
+}
+
 int main(int argc, char **argv) {
 #else
 static int game_main(int argc, char **argv) {
@@ -1572,11 +1787,17 @@ static int game_main(int argc, char **argv) {
         {   /* (started again by the Insert menu's Restart now (host/hos_relaunch.c): the run before still has its log open until
                it exits, so wait for it (up to 10 s) before the log moves to .1, or the move fails and its log is overwritten) */
             const char *of = getenv("HOS_RESTART_OF");
-            if (of && *of) {
+            const int restart = of && *of;
+            if (restart) {
                 HANDLE before = OpenProcess(SYNCHRONIZE, FALSE, (DWORD)strtoul(of, NULL, 10));
                 if (before) WaitForSingleObject(before, 10000), CloseHandle(before);
                 SetEnvironmentVariableA("HOS_RESTART_OF", NULL);   /* (not passed on: a later restart sets its own) */
                 _putenv("HOS_RESTART_OF=");
+            }
+            if (!one_game_per_folder(argc, argv, restart)) {   /* ((Triforce) before the log: host/hos_instance.h) */
+                for (int i = 1; i < argc; i++)
+                    if (!strcmp(argv[i], "--prepare-shaders")) return 3;   /* (as with no Vulkan: the game prepares at its start) */
+                return 1;
             }
         }
 #endif
@@ -1599,6 +1820,21 @@ static int game_main(int argc, char **argv) {
         }
     }
     hos_log("triforce %s", HOOKSHOT_VERSION);   /* (the log's first line: which build a report comes from) */
+#ifdef _WIN32
+    if (instance_held >= 0)
+        hos_log("instance: %s", instance_held ? "this game folder is this run's (a second copy started on it says so and ends)"
+                                              : "no lock on this game folder (HOS_SINGLE_INSTANCE=0, or its path was not found)");
+#endif
+#ifdef _WIN32
+    {   /* ((Triforce) every run, the shader preparation's too, as NX2navi's, and said in the log: it was the game's run alone,
+           after its image was read, and the log never said whether Windows took it) */
+        const int got = no_power_throttling();
+        hos_log("power: %s", got == 2 ? "full speed and the 1 ms timer kept when the window is not in front"
+                             : got == 1 ? "full speed kept when the window is not in front (no timer control here: Windows 10)"
+                             : got == 0 ? "Windows' throttling of a window not in front stays as it is (refused, or no such call)"
+                                        : "Windows' throttling of a window not in front left as it is (HOS_POWER_THROTTLING=1)");
+    }
+#endif
     const char *image = NULL;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--romfs") && i + 1 < argc) hos_romfs_dir = argv[++i];
@@ -1683,8 +1919,11 @@ static int game_main(int argc, char **argv) {
     const long long file_size = _ftelli64(f);
     fseek(f, 0, SEEK_SET);
     if (file_size > 0) hos_commit(IMAGE_BASE, (uint64_t)file_size);
+    /* (Triforce: the kernel writes guest memory here, before any renderer runs: the lazy write-back's rule all the same) */
+    const int io = file_size > 0 ? hos_guest_io_begin(A64_MEM + IMAGE_BASE, (uint64_t)file_size) : 0;
     size_t n = file_size > 0 && (uint64_t)file_size <= GUEST_SPACE - IMAGE_BASE
                    ? fread(A64_MEM + IMAGE_BASE, 1, (size_t)file_size, f) : 0;
+    hos_guest_io_end(io);
     fclose(f);
 #endif
     if (IMAGE_BASE + n != hos_image_end) {
@@ -1694,14 +1933,14 @@ static int game_main(int argc, char **argv) {
     }
     hos_mem_init(hos_image_end);
     {   /* (hookshot) Widescreen and ultrawide (nx2/oot_wide.py): HOS_ASPECT=<ratio> (2.3889 for 3440x1440), else the Insert menu's
-           Ultrawide (off unless it says 1) takes the main monitor's shape. The game's picture takes that shape at its own height (the
+           Ultrawide (off unless set: a fixed 16:10, 21:9 or 32:9, ultrawide_ratio). The game's picture takes that shape at its own height (the
            world wider at the sides on an ultrawide screen, narrower on a 16:10 or 4:3 one), its 16:9 cameras the picture's ratio. Wider
            than 16:9 the HUD, menus and movies keep the middle 16:9; narrower they fill the picture's width. Until now the one 16:9
            constant in the game's data was changed and the 16:9 picture stretched to the window. */
         const char *e = getenv("HOS_ASPECT");
         float want = e ? (float)atof(e) : 0.0f;
         if (!e) {
-            int on = 0;
+            int row = 0, version = 0;
             char path[MAX_PATH];
             const DWORD len = hos_game_path_a(path, MAX_PATH);
             char *slash = len ? strrchr(path, SEP) : NULL;
@@ -1711,15 +1950,15 @@ static int game_main(int argc, char **argv) {
                 if (o) {
                     char line[80];
                     while (fgets(line, sizeof line, o)) {
-                        if (!strncmp(line, "ultrawide=", 10)) on = atoi(line + 10) != 0;
+                        if (!strncmp(line, "ultrawide=", 10)) row = atoi(line + 10);
+                        if (!strncmp(line, "options_version=", 16)) version = atoi(line + 16);   /* ((Triforce) 1's old meaning before 6) */
                         /* (the game sizes its scene before the menu is up: Resolution 100% read here too) */
                         /* (resolution=1 no longer raises the scene: #849 makes a fixed Resolution reach the 3D; HOS_SCENE_NATIVE=1 below) */
                     }
                     fclose(o);
                 }
             }
-            const int sw = GetSystemMetrics(SM_CXSCREEN), sh = GetSystemMetrics(SM_CYSCREEN);
-            if (on && sh > 0) want = (float)sw / (float)sh;
+            want = ultrawide_ratio(row, version, GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN));
         }
         if (getenv("HOS_SCENE_NATIVE")) hos_native_scene = atoi(getenv("HOS_SCENE_NATIVE")) != 0;
         if (getenv("HOS_FIX_RES")) hos_fix_res = atoi(getenv("HOS_FIX_RES")) != 0;
@@ -1769,7 +2008,6 @@ static int game_main(int argc, char **argv) {
     hos_prof_start();   /* HOS_PROFILE=<seconds> */
 #ifdef _WIN32
     timeBeginPeriod(1);   /* 1 ms timer resolution: the 60 Hz vsync and the game's frame pacing sleep in short steps */
-    no_power_throttling();
 #endif
     void hos_display_start(void);
     hos_display_start();  /* the game's window; HOS_HEADLESS=1 for none */
@@ -1803,6 +2041,8 @@ static int game_argc;
 static char **game_argv;
 static DWORD WINAPI game_thread(void *p) {
     (void)p;
+    void hos_stack_guarantee(void);   /* (hos_thread.c: room for a stack overflow's crash report) */
+    hos_stack_guarantee();
     ExitProcess((UINT)game_main(game_argc, game_argv));
 }
 int main(int argc, char **argv) {

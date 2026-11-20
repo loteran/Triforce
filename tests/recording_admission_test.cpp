@@ -109,6 +109,7 @@ VkBuffer zero_buffer = reinterpret_cast<VkBuffer>(uintptr_t(99)); VmaAllocation 
 struct Pass {}; Pass& pass() { static thread_local Pass p; return p; }
 bool work_since_barrier = false, last_dyn_valid = false, last_desc_valid = false, last_vb_valid = false;
 VkPipeline last_pipeline{};
+VkCommandBuffer dispatch_last_cmd{};   // ((Triforce) vk_draw.cpp: RX_VK_DISPATCH_BARRIER's, which a new recording starts afresh)
 struct { bool on = false; } vertex_set, last_ib;
 void descriptors_disturbed() {}
 std::unordered_map<int, int>& handle_hits() { static thread_local std::unordered_map<int, int> h; return h; }
@@ -117,6 +118,7 @@ constexpr int kNvnStages = 8;
 /* BANK_CACHE */
 std::array<std::array<BankCache, kNvnStages>, 2>& bank_cache() { static thread_local std::array<std::array<BankCache, kNvnStages>, 2> b; return b; }
 void make_dummies() {}
+thread_local uint64_t desc_rec = 0;   // (vk_draw.cpp: the recording the kept descriptors are of)
 /* BEGIN */
 #define FINE_SCOPE(...) ((void)0)
 #define FINE_N(...) ((void)0)
@@ -137,6 +139,13 @@ VkDescriptorBufferInfo cached_bank(const NvnState& s, const Stage& st) {
 }
 struct Writes { std::vector<VkWriteDescriptorSet> writes{VkWriteDescriptorSet{}}; } writes;
 Writes& dw() { return writes; }
+// (vk_draw.cpp's set path after the allocation: its update template and its kept set (tests/test_desc_sets.py runs them); here a
+// set is written whole with the write structs, as before, so that the pool's ownership is what is checked)
+template <class P> bool set_write_template(VkDescriptorSet, const P&) { return false; }
+void set_written(VkCommandBuffer, VkPipelineBindPoint, VkPipelineLayout, VkDescriptorSet) {}
+std::atomic<int64_t> st_set_new{0}, st_set_new_n{0};
+void count_add(std::atomic<int64_t>& c, int64_t n) { c += n; }
+int64_t descs_of(const VkWriteDescriptorSet* w, size_t n) { int64_t k = 0; for (size_t i = 0; i < n; i++) k += w[i].descriptorCount; return k; }
 bool bind_tail() {
     VkCommandBuffer cmd{}; VkPipelineBindPoint bp = VK_PIPELINE_BIND_POINT_GRAPHICS;
     struct { VkDescriptorSetLayout set_layout{}; VkPipelineLayout layout{}; } p;

@@ -75,17 +75,20 @@ static class Storage
 
     /// What Free lets go. afterBuild: what goes once the game is ready, the compiled objects of the build (objcache, which make_game.py
     /// prunes to them) and their system headers' stamp kept, so that the next update compiles only what changed (issue 1287: every
-    /// update compiled all ~600 files again, an hour and more). The Free up space button lets those go too
-    static IEnumerable<string> Freeable(bool afterBuild = false)
+    /// update compiled all ~600 files again, an hour and more). The Free up space button lets those go too. (Triforce) Never an
+    /// unfinished version that still holds folders of the installed one (Reuse.Lent): deleted, the installed version lost its
+    /// Python or its compiler for good. installing: a setup holds the folder now, and what it is putting together (downloads\,
+    /// versions\) stays. Nothing is changed here: Measure counts it
+    static IEnumerable<string> Freeable(bool afterBuild = false, bool installing = false)
     {
         foreach (var d in afterBuild ? new[] { "sa", "exefs", "probe" } : new[] { "objcache", "sa", "exefs", "probe" })
             yield return Path.Combine(Work, d);
-        foreach (var d in new[] { "downloads", "update" })
+        foreach (var d in installing ? new[] { "update" } : new[] { "downloads", "update" })
             yield return Path.Combine(Base, d);
         var versions = Path.Combine(Base, "versions");
-        if (Directory.Exists(versions))
+        if (Directory.Exists(versions) && !installing)
             foreach (var v in Directory.EnumerateDirectories(versions))
-                if (!Kept(v)) yield return v;
+                if (!Kept(v) && !Reuse.Lent(v)) yield return v;
     }
 
     /// Bytes in the builder's folder and the build files folder, and in what Free lets go (an object hard-linked in both sa\build and
@@ -103,12 +106,18 @@ static class Storage
     /// Lets go of what Measure counts as freeable; returns the bytes it could not delete (a file in use)
     public static long Free(bool afterBuild = false)
     {
-        foreach (var d in Freeable(afterBuild)) Delete(d);
+        // ((Triforce) what a cut-off setup moved from the installed version goes back first (Reuse.UndoEveryReuse), and then its
+        // <tag>.part is freeable; one whose folders could not all go back stays. With the setup's folder held: a setup running now
+        // is not undone under it, and its folders are left alone)
+        using var setup = Reuse.TakeLock(Base);
+        var installing = setup == null;
+        if (!installing) Reuse.UndoEveryReuse(Path.Combine(Base, "versions"));
+        foreach (var d in Freeable(afterBuild, installing)) Delete(d);
         if (!afterBuild) Delete(Path.Combine(Work, "system_headers.txt"));   // (the stamp of the compiled objects' system headers goes with them)
         if (!afterBuild) return Measure().freeable;
         var seen = new HashSet<(uint, ulong)>();   // (what of the after-build set is still there: a file in use)
         long left = 0;
-        foreach (var d in Freeable(afterBuild: true)) left += Size(d, seen);
+        foreach (var d in Freeable(afterBuild: true, installing)) left += Size(d, seen);
         return left;
     }
 

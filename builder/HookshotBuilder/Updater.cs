@@ -302,27 +302,85 @@ static class Updater
         using var response = await http.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, token);
         if (!response.IsSuccessStatusCode) throw HttpFailure(response);
 
-        var total = response.Content.Headers.ContentLength ?? size;
-        await using var from = await response.Content.ReadAsStreamAsync(token);
-        await using var to = File.Create(path);
-        var buffer = new byte[1 << 20];
-        long have = 0;
-        var shown = DateTime.MinValue;
-        int n;
-        while (true)
+        // ((Triforce) the size the release lists, which the server must not contradict; the server's only where none is listed (the
+        // server's went first, and a short or other file passed as whole). Room for it asked before the first byte, and the bytes
+        // written to <file>.part, which becomes the file only once complete: a failure removes it)
+        var told = response.Content.Headers.ContentLength;
+        if (size > 0 && told is { } other && other != size)
+            throw new IOException($"The server offers {other} bytes as {Path.GetFileName(path)}, and the release lists {size}. Nothing was downloaded.");
+        var total = size > 0 ? size : told ?? 0;
+        if (total > 0 && NoRoom(path, total) is { } none) throw new IOException(none);
+        var part = path + ".part";
+        try
         {
-            try { n = await from.ReadAsync(buffer, token); }
-            catch (IOException e) { throw new HttpRequestException("The download connection ended unexpectedly.", e); }
-            if (n == 0) break;
-            await to.WriteAsync(buffer.AsMemory(0, n), token);
-            have += n;
-            if (progress != null && total > 0 && DateTime.UtcNow - shown > TimeSpan.FromMilliseconds(200))
+            await using (var from = await response.Content.ReadAsStreamAsync(token))
+            await using (var to = File.Create(part))
             {
-                shown = DateTime.UtcNow;
-                progress(Math.Min(1.0, (double)have / total));
+                var buffer = new byte[1 << 20];
+                long have = 0;
+                var shown = DateTime.MinValue;
+                int n;
+                while (true)
+                {
+                    try { n = await from.ReadAsync(buffer, token); }
+                    catch (IOException e) { throw new HttpRequestException("The download connection ended unexpectedly.", e); }
+                    if (n == 0) break;
+                    await to.WriteAsync(buffer.AsMemory(0, n), token);
+                    have += n;
+                    if (total > 0 && have > total) throw new IOException($"The server sent more than the {total} bytes of {Path.GetFileName(path)}.");
+                    if (progress != null && total > 0 && DateTime.UtcNow - shown > TimeSpan.FromMilliseconds(200))
+                    {
+                        shown = DateTime.UtcNow;
+                        progress(Math.Min(1.0, (double)have / total));
+                    }
+                }
+                if (total > 0 && have != total) throw new HttpRequestException($"The download ended early ({have >> 20} of {total >> 20} MB).");
             }
+            File.Move(part, path, true);
         }
-        if (total > 0 && have != total) throw new HttpRequestException($"The download ended early ({have >> 20} of {total >> 20} MB).");
+        catch (Exception)
+        {
+            try { File.Delete(part); } catch (Exception) { }
+            throw;
+        }
+    }
+
+    /// ((Triforce) setup/Guard.cs Space, the same rule) Null when the disk of path has room for need bytes and 32 MB more (or
+    /// cannot be asked); else the sentence that says how much it takes and how much is free
+    static string? NoRoom(string path, long need)
+    {
+        long free;
+        try { free = new DriveInfo(Path.GetPathRoot(Path.GetFullPath(path))!).AvailableFreeSpace; }
+        catch (Exception) { return null; }
+        need += 32L << 20;
+        return free >= need ? null
+            : $"There is no room for {Path.GetFileName(path)} on {Path.GetPathRoot(Path.GetFullPath(path))}: it takes {(need + (1 << 20) - 1) >> 20} MB there, and {free >> 20} MB are free. Make room and try again.";
+    }
+
+    static readonly HashSet<string> Devices = new(StringComparer.OrdinalIgnoreCase) { "CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$" };
+
+    /// ((Triforce) setup/Mods.cs Unsafe, the same rules) Why a zip's member must not be unpacked under its name, null when it may:
+    /// a path from the disk's root or through "..", a colon (a drive's letter, a hidden stream), a name Windows keeps for a device
+    /// (with or without an extension), a name that ends in a dot or a space (Windows drops them), a character Windows refuses
+    internal static string? UnsafeName(string name)
+    {
+        var n = name.Replace('\\', '/');
+        if (n.Trim().Length == 0) return "a file without a name";
+        if (n[0] == '/') return "a path that starts at the disk's root";
+        if (n.IndexOf(':') >= 0) return "a name with a colon or a drive's letter";
+        foreach (var p in n.Split('/'))
+        {
+            if (p.Length == 0 || p == ".") continue;
+            if (p == "..") return "a path that leaves its own folder (..)";
+            if (p[p.Length - 1] == '.' || p[p.Length - 1] == ' ') return "a name that ends in a dot or a space, which Windows drops";
+            var dot = p.IndexOf('.');
+            var stem = (dot >= 0 ? p.Substring(0, dot) : p).TrimEnd(' ');
+            if (Devices.Contains(stem) || stem.Length == 4 && (stem.StartsWith("COM", StringComparison.OrdinalIgnoreCase) || stem.StartsWith("LPT", StringComparison.OrdinalIgnoreCase)) &&
+                (stem[3] is >= '1' and <= '9' || stem[3] == (char)0xB9 || stem[3] == (char)0xB2 || stem[3] == (char)0xB3))
+                return "a name Windows keeps for a device (" + p + ")";
+            if (p.Any(c => c < 32 || "<>\"|?*".IndexOf(c) >= 0)) return "a name with a character Windows does not allow";
+        }
+        return null;
     }
 
     static HttpRequestException HttpFailure(HttpResponseMessage response) =>
@@ -335,14 +393,41 @@ static class Updater
         error is HttpRequestException { StatusCode: { } status } ? $" (HTTP {(int)status})" : "";
 
     /// The zip's HookshotBuilder folder, as target (an older one there replaced)
+    /// ((Triforce) every name checked first (UnsafeName: such a zip is refused whole), a failure removes the part, and an older
+    /// target is moved aside and back when the new one cannot take its place: before, it was deleted first, and a move that
+    /// failed then left neither)
     static async Task<string> Unpack(string zip, string target)
     {
         var part = target + ".part";
         if (Directory.Exists(part)) Directory.Delete(part, true);
-        await Task.Run(() => ZipFile.ExtractToDirectory(zip, part));
+        try
+        {
+            await Task.Run(() =>
+            {
+                using (var z = ZipFile.OpenRead(zip))
+                    foreach (var e in z.Entries)
+                        if (UnsafeName(e.FullName) is { } why)
+                            throw new InvalidDataException($"The download holds {why} (\"{e.FullName}\"): it was not unpacked.");
+                ZipFile.ExtractToDirectory(zip, part);
+            });
+        }
+        catch (Exception)
+        {
+            try { if (Directory.Exists(part)) Directory.Delete(part, true); } catch (Exception) { }
+            throw;
+        }
         var inner = Path.Combine(part, "HookshotBuilder");
-        if (Directory.Exists(target)) Directory.Delete(target, true);
-        Directory.Move(Directory.Exists(inner) ? inner : part, target);
+        var old = target + ".old";
+        if (Directory.Exists(old)) Directory.Delete(old, true);
+        if (Directory.Exists(target)) Directory.Move(target, old);
+        try { Directory.Move(Directory.Exists(inner) ? inner : part, target); }
+        catch (Exception)
+        {
+            try { if (!Directory.Exists(target) && Directory.Exists(old)) Directory.Move(old, target); } catch (Exception) { }
+            try { if (Directory.Exists(part)) Directory.Delete(part, true); } catch (Exception) { }
+            throw;
+        }
+        try { if (Directory.Exists(old)) Directory.Delete(old, true); } catch (Exception) { }
         if (Directory.Exists(part)) Directory.Delete(part, true);
         return target;
     }

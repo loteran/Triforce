@@ -56,12 +56,12 @@ class CacheModuleCleanupTests(unittest.TestCase):
         test_source = ROOT / 'tests/program_cache_cleanup_test.cpp'
         if Path(compiler).stem.lower() == 'cl':
             command = [compiler, '/nologo', '/std:c++20', '/EHsc', '/W4', '/WX', '/D_CRT_SECURE_NO_WARNINGS',
-                       '/I' + str(directory), str(test_source), '/Fe:' + str(cls.executable)]
+                       '/I' + str(directory), '/I' + str(ROOT / 'gpu/vk'), str(test_source), '/Fe:' + str(cls.executable)]
             if SANITIZE:
                 command += ['/fsanitize=address', '/Zi']
         else:
             command = [compiler, '-std=c++20', '-O1', '-g', '-Wall', '-Wextra', '-Werror',
-                       '-I' + str(directory), str(test_source), '-o', str(cls.executable)]
+                       '-I' + str(directory), '-I' + str(ROOT / 'gpu/vk'), str(test_source), '-o', str(cls.executable)]
             if SANITIZE:
                 command += ['-fsanitize=address,undefined', '-fno-sanitize-recover=all', '-fno-omit-frame-pointer']
         result = subprocess.run(command, cwd=directory, capture_output=True, text=True)

@@ -202,7 +202,7 @@ sealed partial class Shell
         SavesInfo.Text = "Copying...";
         try
         {
-            var from = into ? pick.Folder : tri;
+            var from = into ? pick.Folder : Saves.TriforceNewest(game);
             var to = into ? tri : pick.Folder;
             var label = into ? "Triforce before " + pick.Name : pick.Name + " before Triforce";
             var backup = await Task.Run(() => Saves.Copy(from, to, backups, label));

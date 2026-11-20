@@ -9,6 +9,12 @@ Controllers counted only while the game's window was in front, so a game streame
 and Moonlight), or left running behind another window, ignored the pad. The Insert menu's "Controller in background"
 row, or HOS_INPUT_BACKGROUND=1, lets the pads through; the keyboard and mouse stay with the window in front.
 
+The "walk" case is the Insert menu's Walk key row through the same path: the movement keys' push of the left stick is
+scaled while the walk key is held, and the script's and the pad's are not (tests/test_walk_key.py has the rest).
+
+(Triforce) The "options-back" case: our options' tabs inside the game's own Options screen left with the mouse's right button
+held tap the game's Back, as the pad's B and Esc do.
+
 python -I -B tests/test_input_background.py [--cc gcc]
 """
 import argparse
@@ -24,7 +30,7 @@ RUN_ALL_ARGS = ["--cc", "gcc"]
 ROOT = Path(__file__).resolve().parents[1]
 CASES = ("foreground", "script-background", "headless", "noactivate", "live-background",
          "no-script-background", "exclusive-foreground", "exclusive-background", "pads-env", "pads-menu", "pads-off",
-         "frame-hold", "live-frame", "reuse-frame", "wall", "zero", "empty")
+         "frame-hold", "live-frame", "reuse-frame", "wall", "zero", "empty", "no-window", "walk", "options-back")
 
 
 def block(text, marker):
@@ -63,7 +69,13 @@ def main():
     api = (ROOT / "gpu/vk/vk_api.h").read_text(encoding="utf-8")
     constants = block(hid, "enum { B_A") + ";\n" + block(api, "enum { HOS_SW_A") + ";\n"
     constants += block(api, "enum { HOS_KEY_MOVE_UP") + ";\n"   # (the keys-only controls)
+    # (the gamepads' inputs by position and the two sets of controls: read_input asks which pad input B is bound to)
+    constants += block(api, "enum { HOS_PAD_SOUTH") + ";\n" + block(api, "enum { HOS_BIND_PAD") + ";\n"
     constants += block(api, "enum { HOS_OPT_CHEAT_HEARTS") + ";\n"
+    constants += block(api, "enum { HOS_OPT_RUMBLE_CURVE") + ";\n"   # (the walk key's row and its scale, which read_input asks for)
+    # ((Triforce) the Mods entry under the game's lists: npad_states keeps Down from the game there, and all while Mods has the cursor)
+    constants += block(api, "enum { HOS_OPT_MODS_LIST") + ";\n" + block(api, "enum { HOS_MODS_PRESS_UP") + ";\n"
+    constants += block(api, "enum { HOS_OPT_TEXT_CHAR") + ";\n"   # ((Triforce) the live file's "!type", the search's text)
     for name in ("STATE_SIZE", "NPAD_NO1", "ATTR_CONNECTED"):
         matches = re.findall(r"^#define " + name + r"\s+[^\n]+", hid, re.M)
         assert len(matches) == 1, name
@@ -74,23 +86,30 @@ def main():
     cheat_state = re.search(r"^static uint64_t flight_input;\nstatic uint64_t free_camera_axes;\nstatic int free_camera_height;", hid, re.M).group(0)
     cheat_spies = """
 volatile int hos_oot_live_action;
+volatile uint64_t hos_npad_buttons;   /* (nn_hid.c's own, beside npad_states: the buttons the game was given, for the mods' cheats) */
 int hos_oot_flight_shortcut_ready(void) { CHECK(!"unexpected cheat readiness query"); return 0; }
 void rx_option_set(int id, int value) { (void)id; (void)value; CHECK(!"unexpected cheat option change"); }
 """
     # (the host's own presses and stick, for the game's menus' mouse (host/oot_menu.c): none here; the player's input
-    # time it hides the mouse by: not looked at)
+    # time it hides the mouse by: not looked at; the Scan amiibo page's choice, which the pad read takes
+    # (host/nn_nfp.c, tests/test_amiibo.py): none here)
     host_spies = """
 static void host_taps(void) {}
 static void host_stick_read(int32_t stick[4]) { (void)stick; }
 static void host_drag_read(int32_t stick[4]) { (void)stick; }
 static void player_used(void) {}
+void hos_amiibo_poll(void) {}
+int hos_oot_mods_down(void) { return 0; }   /* ((Triforce) host/oot_menu.c: no game list's last button has the cursor here) */
 """
     actual = "\n".join((cheat_state, cheat_spies, host_spies, block(hid, "static int key("), block(hid, "static int kmap_down("),
         block(hid, "static int game_in_front("), hid[start:end], block(hid, "static void stick_max("),
         block(hid, "static int pads_in_background("),
         # (the bound keys' helpers read_input calls: a mouse button counts only while the mouse is captured)
         block(hid, "static int mouse_vk_slot("), re.search(r"^static int mouse_armed\[5\];", hid, re.M).group(0),
-        block(hid, "static void mouse_buttons_arm("), block(hid, "static int bound_down("),
+        block(hid, "static void mouse_buttons_arm("),
+        # (the walk key: no control's key while it is the walk key, and the movement keys' stick while it is held)
+        re.search(r"^static int walk_vk;", hid, re.M).group(0), block(hid, "static int bound_down("),
+        block(hid, "static int walk_key_code("), block(hid, "static void walk_keys("),
         block(hid, "static int flight_jump_shortcut("), read, block(hid, "static void npad_states(")))
     glue = (ROOT / "host/mkw_glue.c").read_text(encoding="utf-8")
     actual += "\n" + "\n".join(block(glue, "uint64_t " + name + "(")

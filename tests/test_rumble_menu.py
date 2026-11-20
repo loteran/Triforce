@@ -1,7 +1,7 @@
-"""The Insert menu's Rumble strength row (Controls): Off, 25% to 150% in steps of 25, stopping at its ends.
+"""The Insert menu's Rumble strength row (Controls): Off, 25% to 300% in steps of 25, stopping at its ends.
 
 gpu/vk/vk_menu.cpp's row, set_row (the arrows, Enter and a click on the value) and the ini's snap to the row's steps are
-compiled from the source with stubs and run: one step below Off stays Off, one above 150% stays 150%, however it is
+compiled from the source with stubs and run: one step below Off stays Off, one above 300% stays 300%, however it is
 asked. The mouse wheel never changes a value (it scrolls the rows): menu_tick is checked for that. The option id the host reads it by (9, host/pad_sdl.c) is checked against the
 renderer's option table (gpu/vk/vk_replay.cpp) and the other ids.
 
@@ -93,32 +93,34 @@ int step_output_choice(int id, int dir) { return id + dir; }
 void arrow(Row& r, bool right) { %(arrow)s }
 int main() {
     Row r = {TAB_CONTROLS, "Rumble strength", &opts.rumble, %(lo)s, %(hi)s, %(step)s, nullptr, nullptr%(exempt)s};
-    CHECK(r.lo == 0 && r.hi == 150 && r.step == 25);
+    CHECK(r.lo == 0 && r.hi == 300 && r.step == 25);
     CHECK(opts.rumble == 100);
     CHECK(!std::strcmp(ini_key(r), "rumble_strength"));
     opts.preset = 3;
-    /* the arrows (and clicks): Off stays Off, 150%% stays 150%% */
+    /* the arrows (and clicks): Off stays Off, 300%% stays 300%% */
     opts.rumble = 0;
     arrow(r, false);
     CHECK(opts.rumble == 0);
     arrow(r, true);
     CHECK(opts.rumble == 25);
-    for (int i = 0; i < 10; i++) arrow(r, true);
-    CHECK(opts.rumble == 150);
+    for (int i = 0; i < 5; i++) arrow(r, true);
+    CHECK(opts.rumble == 150);   /* (the row's top before it went to 300: a step like the others now) */
+    for (int i = 0; i < 16; i++) arrow(r, true);
+    CHECK(opts.rumble == 300);
     arrow(r, false);
-    CHECK(opts.rumble == 125);
-    for (int i = 0; i < 10; i++) arrow(r, false);
+    CHECK(opts.rumble == 275);
+    for (int i = 0; i < 16; i++) arrow(r, false);
     CHECK(opts.rumble == 0);
-    set_row(r, 175, 1);
-    CHECK(opts.rumble == 150);
+    set_row(r, 325, 1);
+    CHECK(opts.rumble == 300);
     set_row(r, -25, -1);
     CHECK(opts.rumble == 0);
     /* it is a control: the quality preset stays */
     CHECK(opts.preset == 3 && presets == 0 && saves > 0);
     /* an ini's value: on the steps, within the range */
-    static const int in[] = {-10, 0, 12, 13, 60, 63, 100, 137, 138, 150, 151, 999};
-    static const int out[] = {0, 0, 0, 25, 50, 75, 100, 125, 150, 150, 150, 150};
-    for (int i = 0; i < 12; i++) CHECK(rumble_step(in[i]) == out[i]);
+    static const int in[] = {-10, 0, 12, 13, 60, 63, 100, 137, 138, 150, 151, 163, 287, 288, 300, 301, 999};
+    static const int out[] = {0, 0, 0, 25, 50, 75, 100, 125, 150, 150, 150, 175, 275, 300, 300, 300, 300};
+    for (int i = 0; i < 17; i++) CHECK(rumble_step(in[i]) == out[i]);
     return 0;
 }
 """
@@ -176,8 +178,8 @@ def menu_fixture():
 def option_ids():
     """option 9 is the menu's Rumble strength, and no other option has its id"""
     replay, api = read("gpu", "vk", "vk_replay.cpp"), read("gpu", "vk", "vk_api.h")
-    value = {}   # (every HOS_OPT_* enum: the cheats', the motion rows' and DLSS's jitter)
-    for first, start, rest in re.findall(r"enum \{ (HOS_OPT_\w+) = (\d+), ([^}]*)\}", api):
+    value = {}   # (every HOS_OPT_* enum: the cheats', the motion rows' and DLSS's jitter; one of a single name too)
+    for first, start, rest in re.findall(r"enum \{ (HOS_OPT_\w+) = (\d+)(?:, ([^}]*))?\s*\}", api):
         names = [first] + [n.strip() for n in rest.split(",") if n.strip()]
         value.update({n: int(start) + i for i, n in enumerate(names)})
     table = block(replay, replay.index("t.option = [](int id) -> int {"))
@@ -211,7 +213,7 @@ def main():
         src.write_text(menu_fixture(), encoding="utf-8")
         subprocess.run([args.cxx, "-std=c++20", "-Wall", "-Wextra", "-Werror", str(src), "-o", str(exe)], check=True)
         subprocess.run([str(exe)], check=True)
-    print("PASS: the menu's Rumble strength stops at Off and 150%, and option 9 is its own")
+    print("PASS: the menu's Rumble strength stops at Off and 300%, and option 9 is its own")
 
 
 if __name__ == "__main__":

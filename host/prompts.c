@@ -5,8 +5,13 @@
    button to press on this pad, custom controls too.
 
    The face: triforce_options.ini's button_prompts (the menu's Button prompts row): 0 Auto, from the first controller's name
-   (SDL), else 1 Switch, 2 Xbox, 3 PlayStation 4, 4 PlayStation 5, 5 Steam Deck. The game reads the font once, at its start:
-   a new face or new controls show at the next start.
+   (SDL), else 1 Switch, 2 Xbox, 3 PlayStation 4, 4 PlayStation 5, 5 Steam Deck, 6 Keyboard & mouse. The game reads the font
+   once, at its start: a new face or new controls show at the next start.
+
+   (Triforce) The keyboard and mouse face (NX2navi's prompts = pc; nx2/prompt_keys.py draws it): its font has an icon per
+   key that can be bound, at U+F700 + the key's code, and each button's icon is that of the first key bound to it
+   (bound_input). The left stick's and the d-pad's icons there are those keys side by side (bind_keys); the right stick's
+   are the mouse. Auto chooses it when the game starts with no controller (auto_face).
 
    The font as built: an OpenType font behind an 8-byte header, XORed per little-endian word with the key the header's magic
    (0x18029a7f) gives. Its cmap has one icon per pad input at U+F700 + HOS_PAD_*, and each Switch button's code point in a
@@ -25,15 +30,17 @@
 int hos_binding(int set, int button, int slot);   /* nn_hid.c */
 int hos_sdl_pads(uint64_t *buttons, int32_t stick[4]);   /* pad_sdl.c */
 void hos_sdl_pad_first_name(char *out, size_t cap);
+int hos_xinput_connected(void);   /* nn_hid.c */
 int hos_mods_has(const char *prefix, const char *suffix);   /* mods.c */
 
 #define FONT_PATH "font2/scalable/external.nin_ounce_nvn2.bfotf.zs"   /* (as hos_mods_romfs's keys: lower case) */
 #define TEXTURES_PATH "ui/layout2archive/common.product.100.nin_ounce_nvn2.bntx.zs"
 #define LAYOUTS_PATH "ui/layout2archive/common.product.100.nin_ounce_nvn2.blarc.zs"
 #define SIZES_PATH "system/resource/resourcesizetable."   /* (then the version, ".rsizetable.zs") */
+#define CAMERA_PATH "pack/actor/playercamera.pack.zs"   /* (Triforce: the Camera speed row, build_camera) */
 #define MAGIC 0x18029a7fu
 #define PAD_BASE 0xF700
-static const char *const faces[HOS_PROMPT_N] = {"switch", "xbox", "ps4", "ps5", "steamdeck"};
+static const char *const faces[HOS_PROMPT_N] = {"switch", "xbox", "ps4", "ps5", "steamdeck", "keyboard"};
 /* the Switch buttons' code points in the font, in HOS_SW_* order (nx2/prompt_assets.py SWITCH) */
 static const uint16_t switch_code[HOS_SW_N] = {0xE040, 0xE041, 0xE042, 0xE043, 0xE056, 0xE057, 0xE044, 0xE045,
                                                0xE046, 0xE047, 0xE04B, 0xE04C, 0xE062, 0xE060, 0xE063, 0xE061};
@@ -57,6 +64,21 @@ static int contains(const char *text, const char *word) {   /* (any case) */
     return 0;
 }
 
+/* (Triforce) Auto's face: the first controller's, from its name (SDL's; "": it has none). With none the keyboard and mouse
+   are what the player has: their keys' icons, where the Switch's were shown before. xinput: XInput has a controller that
+   SDL does not name (HOS_NO_SDL=1, or no SDL beside the game): the game's own icons, as before.
+   The game reads its icons once, at its start, so Auto is chosen once, then: it cannot follow the device used last during
+   play, as NX2navi's prompts setting could not (a fixed choice, after a restart). A controller that is there at the start
+   is the face even while the keys are used with it, so the two never take turns */
+static int auto_face(const char *name, int xinput) {
+    if (!name[0]) return xinput ? HOS_PROMPT_SWITCH : HOS_PROMPT_KEYBOARD;
+    if (contains(name, "dualsense") || contains(name, "ps5")) return HOS_PROMPT_PS5;
+    if (contains(name, "dualshock") || contains(name, "ps4") || contains(name, "playstation")) return HOS_PROMPT_PS4;
+    if (contains(name, "steam deck")) return HOS_PROMPT_STEAMDECK;
+    if (contains(name, "nintendo") || contains(name, "switch") || contains(name, "joy-con")) return HOS_PROMPT_SWITCH;
+    return HOS_PROMPT_XBOX;   /* (Xbox pads, and the many that copy their layout) */
+}
+
 /* HOS_PROMPT_* (faces[]) */
 static int choose_face(const char *dir) {
     char path[MAX_PATH], line[80];
@@ -78,14 +100,9 @@ static int choose_face(const char *dir) {
         hos_sdl_pad_first_name(name, sizeof name);
         if (!name[0]) Sleep(50);
     }
-    int face;
-    if (!name[0]) face = HOS_PROMPT_SWITCH;   /* (no controller: the keyboard, the game's own icons; or XInput without SDL) */
-    else if (contains(name, "dualsense") || contains(name, "ps5")) face = HOS_PROMPT_PS5;
-    else if (contains(name, "dualshock") || contains(name, "ps4") || contains(name, "playstation")) face = HOS_PROMPT_PS4;
-    else if (contains(name, "steam deck")) face = HOS_PROMPT_STEAMDECK;
-    else if (contains(name, "nintendo") || contains(name, "switch") || contains(name, "joy-con")) face = HOS_PROMPT_SWITCH;
-    else face = HOS_PROMPT_XBOX;   /* (Xbox pads, and the many that copy their layout) */
-    hos_log("prompts: auto: controller \"%s\": %s", name[0] ? name : "(none)", faces[face]);
+    const int xinput = !name[0] && hos_xinput_connected();
+    const int face = auto_face(name, xinput);
+    hos_log("prompts: auto: controller \"%s\": %s", name[0] ? name : xinput ? "(XInput's, no name)" : "(none)", faces[face]);
     return face;
 }
 
@@ -113,20 +130,36 @@ static unsigned cmap4_glyph(const uint8_t *st, size_t n, unsigned code) {
     return 0;
 }
 
-/* each Switch button's segment pointed at its pad input's icon; how many */
-static int cmap4_bind(uint8_t *st, size_t n) {
+/* (Triforce) What a control is on (control: a Switch button, HOS_SW_*, or a movement key's place, HOS_KEY_*), as the
+   face's icons are numbered: a controller's input (HOS_PAD_*; -1 none, and for what is no button), or on the keyboard and
+   mouse face the first of the control's keys (its key code; 0 none: the blank cap), as NX2navi's showed the first key */
+static int bound_input(int face, int control) {
+    if (face != HOS_PROMPT_KEYBOARD) return hos_binding(HOS_BIND_PAD, control, 0);
+    const int first = hos_binding(HOS_BIND_KEY, control, 0);
+    return first > 0 ? first : hos_binding(HOS_BIND_KEY, control, 1);
+}
+
+/* each Switch button's segment pointed at its input's icon (bound_input); how many. (Triforce) On the keyboard and mouse
+   face the left stick's four directions too, at their movement keys' icons (nx2/prompt_keys.py MOVES), and a key that has
+   no icon (one a hand put into the options file) shows the blank cap */
+static int cmap4_bind(uint8_t *st, size_t n, int face) {
     const unsigned segs = rd16(st + 6) / 2;
     if (14 + 8 * (size_t)segs + 2 > n) return 0;   /* (as cmap4_glyph: the ranges' last entry too) */
     uint8_t *ends = st + 14, *starts = ends + 2 * segs + 2, *deltas = starts + 2 * segs, *ranges = deltas + 2 * segs;
+    static const struct { uint16_t code; uint8_t control; } moves[4] = {
+        {0xE052, HOS_KEY_MOVE_UP}, {0xE050, HOS_KEY_MOVE_DOWN}, {0xE05A, HOS_KEY_MOVE_LEFT}, {0xE058, HOS_KEY_MOVE_RIGHT}};
+    const int keys = face == HOS_PROMPT_KEYBOARD, inputs = keys ? 256 : HOS_PAD_N;
     int done = 0;
-    for (int b = 0; b < HOS_SW_N; b++) {
-        const int pad = hos_binding(HOS_BIND_PAD, b, 0);
-        if (pad < 0 || pad >= HOS_PAD_N) continue;   /* (unbound: the default icon stays) */
-        const unsigned gid = cmap4_glyph(st, n, PAD_BASE + (unsigned)pad);
+    for (int b = 0; b < HOS_SW_N + (keys ? 4 : 0); b++) {
+        const unsigned code = b < HOS_SW_N ? switch_code[b] : moves[b - HOS_SW_N].code;
+        const int pad = bound_input(face, b < HOS_SW_N ? b : moves[b - HOS_SW_N].control);
+        if (pad < 0 || pad >= inputs) continue;   /* (unbound: the default icon stays) */
+        unsigned gid = cmap4_glyph(st, n, PAD_BASE + (unsigned)pad);
+        if (!gid && keys) gid = cmap4_glyph(st, n, PAD_BASE);
         if (!gid) continue;
         for (unsigned i = 0; i < segs; i++)
-            if (rd16(starts + 2 * i) == switch_code[b] && rd16(ends + 2 * i) == switch_code[b] && !rd16(ranges + 2 * i)) {
-                wr16(deltas + 2 * i, (gid - switch_code[b]) & 0xFFFF);
+            if (rd16(starts + 2 * i) == code && rd16(ends + 2 * i) == code && !rd16(ranges + 2 * i)) {
+                wr16(deltas + 2 * i, (gid - code) & 0xFFFF);
                 done++;
                 break;
             }
@@ -134,8 +167,35 @@ static int cmap4_bind(uint8_t *st, size_t n) {
     return done;
 }
 
+/* (Triforce) The keyboard and mouse face's icons of several keys (the left stick: the movement keys; the d-pad: its four
+   keys). Each such glyph calls a subroutine per key, that key's small cap, and prompts/keyboard/keys.bin (t; nx2/
+   prompt_keys.py: "HPKB", u32 count; each: u32 offset in the font, u8 control (HOS_KEY_*), 3 bytes; then u32 keys, and for
+   each key code the two bytes of its cap's call, 0 0 none) says where those calls are: each gets the call of the first key
+   bound to its control (none bound, or a key with no cap: the blank cap's, key code 0's). A call is two bytes whatever the
+   key (a charstring's number from 108 to 1131: its first byte 247 to 250), so nothing else in the font moves; a place or a
+   call that is not such a number is left alone. How many were written */
+static int bind_keys(uint8_t *otf, size_t n, const uint8_t *t, size_t tn) {
+    if (tn < 12) return 0;
+    const uint32_t count = rd32le(t + 4);
+    if (count > (tn - 12) / 8) return 0;
+    const uint8_t *calls = t + 12 + 8 * (size_t)count;
+    const uint32_t keys = rd32le(calls - 4);
+    if (!keys || keys > (tn - (size_t)(calls - t)) / 2) return 0;
+    int done = 0;
+    for (uint32_t i = 0; i < count; i++) {
+        const uint8_t *e = t + 8 + 8 * (size_t)i;
+        const uint32_t off = rd32le(e);
+        const int key = bound_input(HOS_PROMPT_KEYBOARD, e[4]);
+        const uint8_t *call = calls + (key > 0 && (uint32_t)key < keys && calls[2 * (size_t)key] ? 2 * (size_t)key : 0);
+        if (off > n || n - off < 2 || otf[off] < 247 || otf[off] > 250 || call[0] < 247 || call[0] > 250) continue;
+        otf[off] = call[0], otf[off + 1] = call[1];
+        done++;
+    }
+    return done;
+}
+
 /* the controls into the decrypted font's format 4 subtables; how many buttons */
-static int bind_font(uint8_t *otf, size_t n) {
+static int bind_font(uint8_t *otf, size_t n, int face) {
     if (n < 12) return 0;
     const unsigned tables = rd16(otf + 4);
     for (unsigned t = 0; t < tables && 12 + 16 * (size_t)(t + 1) <= n; t++) {
@@ -155,7 +215,7 @@ static int bind_font(uint8_t *otf, size_t n) {
             if (dup) continue;
             if (nseen < 8) seen[nseen++] = so;
             const unsigned sl = rd16(cmap + so + 2);
-            done = cmap4_bind(cmap + so, sl <= len - so ? sl : len - so);
+            done = cmap4_bind(cmap + so, sl <= len - so ? sl : len - so, face);
         }
         return done;
     }
@@ -326,8 +386,8 @@ static int build_textures(char *out, size_t cap) {
     long tn;
     uint8_t *t = read_all(path, "HPTX", &tn);
     if (!t) return 0;   /* (built without the textures: the game's) */
-    int bind[HOS_SW_N];
-    for (int b = 0; b < HOS_SW_N; b++) bind[b] = hos_binding(HOS_BIND_PAD, b, 0);
+    int bind[HOS_SW_N];   /* ((Triforce) on the keyboard and mouse face the entries' inputs are key codes: bound_input) */
+    for (int b = 0; b < HOS_SW_N; b++) bind[b] = bound_input(face, b);
     uint64_t h = fnv(fnv(fnv(0xcbf29ce484222325ull, &face, sizeof face), bind, sizeof bind), t, (size_t)tn);
     /* the runs these controls choose */
     const uint32_t count = rd32le(t + 4);
@@ -350,7 +410,7 @@ static int build_textures(char *out, size_t cap) {
     char keypath[MAX_PATH];
     snprintf(keypath, sizeof keypath, "%sprompts/Common.key", dir);
     const int ok = write_patched(path, out, keypath, h, runs, nruns);
-    hos_log("prompts: %s textures, %zu runs for this pad's controls%s", faces[face], nruns,
+    hos_log("prompts: %s textures, %zu runs for these controls%s", faces[face], nruns,
             ok ? "" : ": could not be written");
     free(runs);
     free(t);
@@ -391,14 +451,18 @@ static void ring_places(const int *bind, int place[4]) {
    - the ocarina hint's icons moved apart for the wide ones bound (prompts/<face>/hint.bin, nx2/prompt_assets.py HINTS: "HPHN",
      u32 count of pad inputs, each one's icon's extra width (f32), u32 panes; each: u32 offset, u8 slot, 3 bytes, f32 x): each
      icon the one before's extra further on, the last one where it is;
-   none when both are as the game has them (the game's own file) */
+   - the hearts, the item slot and the small map out at a wide picture's sides (prompts/wide.bin, nx2/prompt_assets.py HUD_SIDE_PANES: "HPWD", u32
+     count; each: u32 offset, i8 side, 3 bytes, f32 x), with the Insert menu's Ultrawide HUD row on Screen edges
+     (host/oot_wide_hud.h);
+   none when all are as the game has them (the game's own file) */
 static int build_layouts(char *out, size_t cap) {
     char dir[MAX_PATH], path[MAX_PATH];
     int face;
     if (!setup(dir, sizeof dir, &face)) return 0;
-    int bind[HOS_SW_N], place[4];
-    for (int b = 0; b < HOS_SW_N; b++) bind[b] = hos_binding(HOS_BIND_PAD, b, 0);
-    ring_places(bind, place);
+    int bind[HOS_SW_N], place[4] = {0, 1, 2, 3};
+    for (int b = 0; b < HOS_SW_N; b++) bind[b] = bound_input(face, b);
+    /* ((Triforce) keys have no places among four face buttons: the keyboard and mouse face keeps the Switch's) */
+    if (face != HOS_PROMPT_KEYBOARD) ring_places(bind, place);
     const int ring_moved = !(place[0] == 0 && place[1] == 1 && place[2] == 2 && place[3] == 3);
     size_t nruns = 0, cap_runs = 64;
     Run *runs = (Run *)malloc(cap_runs * sizeof *runs);
@@ -453,6 +517,27 @@ static int build_layouts(char *out, size_t cap) {
             h = fnv(fnv(h, shift, sizeof shift), hint, (size_t)hn);
         }
     }
+    float hos_wide_hud_out(void);
+    const float wide_out = hos_wide_hud_out();
+    long wn = 0;
+    snprintf(path, sizeof path, "%sprompts/wide.bin", dir);
+    uint8_t *wide = wide_out > 0.0f ? read_all(path, "HPWD", &wn) : NULL;
+    float *wxs = NULL;
+    if (wide) {
+        const uint32_t count = rd32le(wide + 4);
+        if (count && count <= ((size_t)wn - 8) / 12) {
+            wxs = (float *)malloc(count * sizeof *wxs);
+            for (uint32_t k = 0; k < count; k++) {
+                const uint8_t *e = wide + 8 + 12 * k;
+                memcpy(&wxs[k], e + 8, 4);
+                wxs[k] += (float)(int8_t)e[4] * wide_out;
+                add_run(&runs, &nruns, &cap_runs, rd32le(e), 4, (const uint8_t *)&wxs[k]);
+            }
+            h = fnv(fnv(h, &wide_out, sizeof wide_out), wide, (size_t)wn);
+        }
+    } else if (wide_out > 0.0f) {
+        hos_log("prompts: no prompts/wide.bin: the Ultrawide HUD stays in the middle (Setup's Update makes it)");
+    }
     int ok = 0;
     if (nruns) {
         char keypath[MAX_PATH];
@@ -460,9 +545,12 @@ static int build_layouts(char *out, size_t cap) {
         snprintf(path, sizeof path, "%sprompts/Common.blarc", dir);
         snprintf(keypath, sizeof keypath, "%sprompts/Common.blarc.key", dir);
         ok = write_patched(path, out, keypath, h, runs, nruns);
-        hos_log("prompts: the Talk ring's A B X Y at places %d %d %d %d, the ocarina hint %s%s", place[0], place[1], place[2],
-                place[3], xs ? "spread" : "as is", ok ? "" : ": could not be written");
+        hos_log("prompts: the Talk ring's A B X Y at places %d %d %d %d, the ocarina hint %s, the hearts, item slot and map %s%s",
+                place[0], place[1], place[2], place[3], xs ? "spread" : "as is", wxs ? "at the picture's sides" : "as is",
+                ok ? "" : ": could not be written");
     }
+    free(wxs);
+    free(wide);
     free(xs);
     free(hint);
     free(runs);
@@ -475,10 +563,16 @@ static int build(char *out, size_t cap) {
     char dir[MAX_PATH], path[MAX_PATH];
     int face;
     if (!setup(dir, sizeof dir, &face)) return 0;
-    /* (a mod's size table is served, not ours: the faces' fonts, larger than the game's, do not fit it) */
+    /* (a mod's size table is served, not ours: the faces' fonts, larger than the game's, do not fit it. ((Triforce, 11-18)
+       unless the lifted code asks host/mods.c's hos_mods_table_size for each file's room, which gives the font its own: so
+       only when that hook has not run in this game, an older build of it) */
+    extern volatile LONG hos_mods_size_hook_seen;
     if (hos_mods_has(SIZES_PATH, ".rsizetable.zs")) {
-        hos_log("prompts: a mod has the resource size table: the game's own icons in texts");
-        return 0;
+        if (!hos_mods_size_hook_seen) {
+            hos_log("prompts: a mod has the resource size table: the game's own icons in texts");
+            return 0;
+        }
+        hos_log("prompts: a mod has the resource size table: the font's room comes from the size hook (host/mods.c)");
     }
     snprintf(path, sizeof path, "%sprompts/%s/External.bfotf", dir, faces[face]);
     long n;
@@ -490,20 +584,97 @@ static int build(char *out, size_t cap) {
     }
     const uint32_t key = rd32le(b) ^ MAGIC;
     for (long i = 8; i < n; i += 4) wr32le(b + i, rd32le(b + i) ^ key);
-    const int bound = bind_font(b + 8, (size_t)n - 8);
+    const int bound = bind_font(b + 8, (size_t)n - 8, face);
+    int several = 0;
+    if (face == HOS_PROMPT_KEYBOARD) {   /* ((Triforce) the icons of several keys: bind_keys) */
+        long kn = 0;
+        snprintf(path, sizeof path, "%sprompts/%s/keys.bin", dir, faces[face]);
+        uint8_t *k = read_all(path, "HPKB", &kn);
+        if (k) several = bind_keys(b + 8, (size_t)n - 8, k, (size_t)kn);
+        free(k);
+    }
     for (long i = 8; i < n; i += 4) wr32le(b + i, rd32le(b + i) ^ key);
     snprintf(out, cap, "%sprompts/External.bfotf.zs", dir);
     const int ok = write_zstd_raw(out, b, (size_t)n);
     free(b);
-    hos_log("prompts: %s icons, %d buttons on this pad's controls%s", faces[face], bound, ok ? "" : ": could not be written");
+    if (face == HOS_PROMPT_KEYBOARD)
+        hos_log("prompts: %s icons, %d buttons and directions on these keys, %d keys in the icons of several%s", faces[face],
+                bound, several, ok ? "" : ": could not be written");
+    else
+        hos_log("prompts: %s icons, %d buttons on this pad's controls%s", faces[face], bound, ok ? "" : ": could not be written");
     return ok;
+}
+
+/* (Triforce) The Insert menu's Camera speed row (camera_speed= in the options file, percent; HOS_CAMERA_SPEED=<percent>
+   over it): how fast the right stick turns the camera, times the game's own speed at any of the five Camera sensitivity
+   settings of its Options. The rates are five floats in the game's camera pack (nx2/prompt_assets.py CAMERA has where and
+   why): prompts/PlayerCamera.pack.zs is that pack (prompts/PlayerCamera.pack) with each rate of prompts/camera.bin ("HPCM",
+   u32 count; each: u32 offset, f32 the game's rate) times the factor. Read once: the game loads the pack at its start, so
+   the row applies after a restart. At 100 the game's own file is served. NX2navi's camera speed setting, without its
+   search of the game's memory for a change during play. */
+int hos_ini_option(const char *key, int otherwise);
+static volatile double camera_applied = 1.0;   /* the factor in the pack the game was given */
+static double camera_wanted(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("HOS_CAMERA_SPEED");
+        v = e && atoi(e) > 0 ? atoi(e) : hos_ini_option("camera_speed", 100);
+        v = v < 25 ? 25 : v > 300 ? 300 : v;
+    }
+    return v / 100.0;
+}
+/* host/nn_hid.c: the mouse's panning reaches the game as the right stick; divided by this it keeps its own sensitivity */
+double hos_camera_speed(void) {
+    return camera_applied;
+}
+static int build_camera(char *out, size_t cap) {
+    char dir[MAX_PATH], path[MAX_PATH], keypath[MAX_PATH];
+    int face;
+    const double k = camera_wanted();
+    if (k == 1.0 || !setup(dir, sizeof dir, &face)) return 0;
+    long tn = 0;
+    snprintf(path, sizeof path, "%sprompts/camera.bin", dir);
+    uint8_t *t = read_all(path, "HPCM", &tn);
+    const uint32_t count = t ? rd32le(t + 4) : 0;
+    if (!count || count > 8 || (size_t)tn < 8 + 8 * (size_t)count) {
+        hos_log("prompts: no prompts/camera.bin: the camera keeps the game's speed (Setup's Update makes it)");
+        free(t);
+        return 0;
+    }
+    float rates[8];
+    size_t nruns = 0, cap_runs = 8;
+    Run *runs = (Run *)malloc(cap_runs * sizeof *runs);
+    for (uint32_t i = 0; i < count; i++) {
+        memcpy(&rates[i], t + 8 + 8 * i + 4, 4);
+        rates[i] = (float)(rates[i] * k);
+        add_run(&runs, &nruns, &cap_runs, rd32le(t + 8 + 8 * i), 4, (const uint8_t *)&rates[i]);
+    }
+    const uint64_t h = fnv(fnv(0xcbf29ce484222325ull, &k, sizeof k), t, (size_t)tn);
+    snprintf(out, cap, "%sprompts/PlayerCamera.pack.zs", dir);
+    snprintf(path, sizeof path, "%sprompts/PlayerCamera.pack", dir);
+    snprintf(keypath, sizeof keypath, "%sprompts/PlayerCamera.key", dir);
+    const int ok = write_patched(path, out, keypath, h, runs, nruns);
+    if (ok) camera_applied = k;
+    hos_log("prompts: camera speed x%.2f, the first rate %.2f%s", k, (double)rates[0], ok ? "" : ": could not be written");
+    free(runs);
+    free(t);
+    return ok;
+}
+
+int hos_prompts_romfs(const char *key, char *out, size_t cap);
+/* ((Triforce, 11-18) mods.c's size hook: for the font's key (lower case, '/', packed name), the font built for this run
+   (built now if it was not), 1 with one; 0 for any other key or with no prompts. A mod's own font is the mod's: the hook
+   finds that one first) */
+int hos_prompts_font_file(const char *key, char *out, size_t cap) {
+    if (strcmp(key, FONT_PATH)) return 0;
+    return hos_prompts_romfs(FONT_PATH, out, cap);
 }
 
 /* mods.c: the file for a RomFS path the prompts replace (key: lower case, '/'), 1 with one. Asked only when no mod has
    the file: a mod's own wins */
 int hos_prompts_romfs(const char *key, char *out, size_t cap) {
-    static volatile LONG state[3];   /* the font, the textures, the layouts: 0 not built, 1 being built, 2 built, 3 none */
-    static char path[3][MAX_PATH];
+    static volatile LONG state[4];   /* the font, the textures, the layouts, the camera: 0 not built, 1 being built, 2 built, 3 none */
+    static char path[4][MAX_PATH];
     const size_t kn = strlen(key);
     if (!strncmp(key, SIZES_PATH, sizeof SIZES_PATH - 1) && kn > 14 && !strcmp(key + kn - 14, ".rsizetable.zs")) {
         char dir[MAX_PATH];   /* (the game's size table with room for the faces' fonts, larger than its: nx2/prompt_assets.py) */
@@ -512,9 +683,10 @@ int hos_prompts_romfs(const char *key, char *out, size_t cap) {
         snprintf(out, cap, "%sprompts/rsizetable.zs", dir);
         return GetFileAttributesA(out) != INVALID_FILE_ATTRIBUTES;
     }
-    const int which = !strcmp(key, FONT_PATH) ? 0 : !strcmp(key, TEXTURES_PATH) ? 1 : !strcmp(key, LAYOUTS_PATH) ? 2 : -1;
+    const int which = !strcmp(key, FONT_PATH) ? 0 : !strcmp(key, TEXTURES_PATH) ? 1 : !strcmp(key, LAYOUTS_PATH) ? 2 :
+                      !strcmp(key, CAMERA_PATH) ? 3 : -1;
     if (which < 0) return 0;
-    static int (*const builders[3])(char *, size_t) = {build, build_textures, build_layouts};
+    static int (*const builders[4])(char *, size_t) = {build, build_textures, build_layouts, build_camera};
     if (InterlockedCompareExchange(&state[which], 1, 0) == 0)
         InterlockedExchange(&state[which], builders[which](path[which], MAX_PATH) ? 2 : 3);
     while (state[which] == 1) Sleep(1);

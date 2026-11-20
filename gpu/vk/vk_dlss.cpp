@@ -91,6 +91,10 @@ struct State {
     // (0: none here), and the reason when it is none, for the log
     int fg_max = 0;
     const char* fg_why = "NGX was not started";
+    // ((Triforce, upstream 6770b115 #2550) the preset, output and HDR a creation failed for (not for want of video memory,
+    // retried above): not tried again each frame, but once any of them changes, so the menu's DLSS rows bring DLSS back
+    // without a restart. 0: none failed)
+    uint64_t refused = 0;
 };
 State& st() {
     static State s;
@@ -424,6 +428,8 @@ int prepare(VkCommandBuffer cmd, uint32_t rw, uint32_t rh, uint32_t ow, uint32_t
     else
         snprintf(why, sizeof why, "the render size %ux%u left its range, %ux%u to %ux%u", rw, rh, s.min_rw, s.min_rh,
                  s.feature_rw, s.feature_rh);
+    const uint64_t key = (uint64_t)ow << 44 ^ (uint64_t)oh << 24 ^ (uint64_t)preset << 1 ^ (hdr ? 1 : 0) ^ 1ull << 63;
+    if (s.refused == key) return *fail = "its feature was not made", 0;   // (until a DLSS setting changes: upstream #2550)
     if (s.feature) {
         NVSDK_NGX_Handle* old = s.feature;
         temporal_later([old] { NVSDK_NGX_VULKAN_ReleaseFeature(old); });
@@ -474,7 +480,7 @@ int prepare(VkCommandBuffer cmd, uint32_t rw, uint32_t rh, uint32_t ow, uint32_t
     logf("vk: NVIDIA DLSS: making its feature (%s; frame %llu): %ux%u -> %ux%u", why, (unsigned long long)texture_frame_no(), max_w, max_h, ow, oh);
     const NVSDK_NGX_Result r = NGX_VULKAN_CREATE_DLSS_EXT(cmd, 1, 1, &s.feature, s.params, &cp);
     const double made_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-    note_work();   // (NGX's own commands, which vk_work.h does not see: the next full_barrier is not left out)
+    note_work(cmd);   // (NGX's own commands, which vk_work.h does not see: the next full_barrier is not left out)
     if (NVSDK_NGX_FAILED(r) || !s.feature) {
         logf("vk: NVIDIA DLSS: its feature was not made (%#x) for %ux%u -> %ux%u", (unsigned)r, max_w, max_h, ow, oh);
         s.feature = nullptr;
@@ -488,9 +494,14 @@ int prepare(VkCommandBuffer cmd, uint32_t rw, uint32_t rh, uint32_t ow, uint32_t
                  (unsigned long long)s.retry_frame, s.retries, kMemoryRetries);
             return *fail = kNoMemory, 0;
         }
-        return *fail = "its feature was not made", -1;
+        // ((Triforce, upstream 6770b115 #2550) any other failure: the game's upscale until a DLSS setting (preset, output,
+        // HDR) changes, not for the rest of the run. Quick DLSS model switches left several features alive, and NGX then
+        // refused the next one (0xbad00002): DLSS was gone until a restart, with no word why)
+        s.refused = key;
+        logf("vk: NVIDIA DLSS: the game's upscale until a DLSS setting changes (the DLSS model row, the output, HDR)");
+        return *fail = "its feature was not made", 0;
     }
-    s.retries = 0, s.retry_frame = 0;
+    s.retries = 0, s.retry_frame = 0, s.refused = 0;
     s.feature_rw = max_w, s.feature_rh = max_h, s.feature_ow = ow, s.feature_oh = oh, s.min_rw = min_w, s.min_rh = min_h;
     s.feature_preset = preset, s.feature_hdr = hdr;
     s.features_made++;
@@ -517,7 +528,7 @@ bool evaluate(VkCommandBuffer cmd, const TemporalFrame& f) {
     ep.InMVScaleX = ep.InMVScaleY = 1.0f;
     ::mkwvk::rec::boundary(::mkwvk::rec::B_DIRECT);   // (NGX records into cmd itself: what this thread recorded through vk_work.h reaches cmd first)
     const NVSDK_NGX_Result r = NGX_VULKAN_EVALUATE_DLSS_EXT(cmd, s.feature, s.params, &ep);
-    note_work();   // (as at its creation: the barrier after it, and the game's next one, are recorded)
+    note_work(cmd);   // (as at its creation: the barrier after it, and the game's next one, are recorded)
     if (NVSDK_NGX_FAILED(r)) {
         logf("vk: NVIDIA DLSS: its evaluation failed (%#x)", (unsigned)r);
         return false;

@@ -44,7 +44,7 @@ def run(jobs):
 def main():
     one = run(1)
     if "fork" not in chunks.multiprocessing.get_all_start_methods():
-        print("no fork here: the emit runs in one process (nothing to compare)")
+        print("no fork here: the forked emit has nothing to compare (the spawned one is tests/test_spawn_emit.py's)")
         return
     many = run(4)
     if [o[:2] for o in one[0]] != [o[:2] for o in many[0]] or [o[2] for o in one[0]] != [o[2] for o in many[0]]:

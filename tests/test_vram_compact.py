@@ -69,12 +69,13 @@ def check_source():
     need("vk_texture.cpp: texture_sweep()", sweep_fn,
          ["const bool by_hold = evict_to != 0 && !sweep;",
           "if (shifted || drawn_over(tex)) hold_dead += tex->bytes + tex->pad;",
-          "if ((!sweep && !by_hold && (pending_bytes >= total_bytes || total_bytes - pending_bytes <= budget / 8 * 7)) ||",
-          "const uint64_t to = vram_compact::hold_target(frame_no - last, need_unused, rule_to, hold_to, evict_to);",
+          # ((Triforce) the pass's own end, the hold's pass apart: 7/8 of a size, the budget itself by live use, tex_pressure.h)
+          "if ((!sweep && !by_hold && tex_pressure::met(total_bytes, pending_bytes, budget, press.live)) || too_young(last))",
+          "const uint64_t to = vram_compact::hold_target(age60(frame_no - last), need_unused, rule_to, hold_to, evict_to);",
           "if (to == UINT64_MAX || vram_compact::hold_met(total_bytes, hold_live, hold_dead, to)) continue;",
           "if (by_hold && !overwritten) hold_live += tex->bytes + tex->pad;"])
     # (and a live texture is judged by the hold only once it is known whether a render target drew over it)
-    if not sweep_fn.index("const bool overwritten = shifted || drawn_over(tex);") < sweep_fn.index("vram_compact::hold_target(frame_no - last"):
+    if not sweep_fn.index("const bool overwritten = shifted || drawn_over(tex);") < sweep_fn.index("vram_compact::hold_target(age60(frame_no - last)"):
         raise SystemExit("vk_texture.cpp: the hold's pass judges a texture before it knows whether it is a dead render target")
     need("vk_texture.cpp: compact_step()", block(tex, "void compact_step(uint64_t completed)"),
          ["if (!compact_on()) return;", "vram_compact::run_from(min_free, compact.pressed)", "vram_compact::rest(compact.pressed)",

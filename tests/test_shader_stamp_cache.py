@@ -21,7 +21,7 @@ BUILD_SCRIPT = ROOT / "nx2" / "build.py"
 
 def production_code(path):
     tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-    names = {"tree_headers", "vk_sources", "flag_text", "object_key"}
+    names = {"tree_headers", "vk_sources", "flag_text", "object_key", "strip_comments", "translation_text", "translation_stamp"}
     functions = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in names]
     assert {n.name for n in functions} == names
     main = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "main")
@@ -180,8 +180,11 @@ class ShaderStampCacheTests(unittest.TestCase):
                 before = self.jobs(linux, release=True)
                 for name, job in before.items():
                     shader = [f for f in job["flags"] if f.startswith("-DHOOKSHOT_SHADER_STAMP=")]
+                    # ((Triforce) and what of the translator translates: the program cache's carry, tests/test_program_carry.py)
+                    translation = [f for f in job["flags"] if f.startswith("-DHOOKSHOT_TRANSLATION_STAMP=")]
                     version = [f for f in job["flags"] if f.startswith("-DHOOKSHOT_VERSION=")]
                     self.assertEqual(len(shader), int(name == "gpu/vk/vk_shader.cpp"))
+                    self.assertEqual(len(translation), int(name == "gpu/vk/vk_shader.cpp"))
                     self.assertEqual(len(version), int(name == "gpu/vk/vk_menu.cpp"))
                     if not name.startswith(("host/posix/", "third_party/zstd/", "gen/")):   # (plain C libraries, the fonts' bytes)
                         self.assertIn("-DHOOKSHOT_RELEASE", job["flags"])

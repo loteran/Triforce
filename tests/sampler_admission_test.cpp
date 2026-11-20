@@ -115,11 +115,25 @@ void vkDestroySampler(VkDevice, VkSampler sampler, const VkAllocationCallbacks*)
     if (!sampler) return;   // (Vulkan permits null destruction; a non-null error output is still undefined)
     assert(live.erase(sampler) == 1); destroyed++;   // (not undefined error output or an already-owned sampler)
 }
+struct { int aniso = 0; } opts;   // (the Texture filtering row: off, the game's own)
 /* ACTUAL */
 
-struct Program { bool push = true; VkPipelineLayout layout{}; VkDescriptorSetLayout set_layout{}; };
+struct Program { bool push = true; VkPipelineLayout layout{}; VkDescriptorSetLayout set_layout{}; uint32_t renodx = 0, frag_crc = 0; };
 struct DescriptorWrites { std::vector<VkWriteDescriptorSet> writes; } descriptor_writes;
 DescriptorWrites& dw() { return descriptor_writes; }
+std::atomic<bool> renodx_tracing{false};   // (the RenoDX port's set 1: none here)
+void renodx_bind(VkCommandBuffer, VkPipelineBindPoint, VkPipelineLayout, uint32_t) {}
+void renodx_trace_draw(uint32_t) {}
+// (Triforce, vk_draw.cpp: the descriptors' counts, and the set path's kept set and update template, which tests/test_desc_sets.py
+// runs; here a set is allocated and written whole each time, as before)
+std::atomic<int64_t> st_push_full{0}, st_push_full_n{0}, st_push_delta{0}, st_push_delta_n{0}, st_push_none{0};
+std::atomic<int64_t> st_set_new{0}, st_set_new_n{0}, st_set_again{0};
+void count_add(std::atomic<int64_t>& c, int64_t n) { c += n; }
+int64_t descs_of(const VkWriteDescriptorSet* w, size_t n) { int64_t k = 0; for (size_t i = 0; i < n; i++) k += w[i].descriptorCount; return k; }
+VkDescriptorSet set_kept(VkCommandBuffer, VkPipelineBindPoint, VkPipelineLayout) { return VK_NULL_HANDLE; }
+bool set_write_template(VkDescriptorSet, const Program&) { return false; }
+bool push_write_template(VkCommandBuffer, VkPipelineBindPoint, const Program&) { return false; }   // ((Triforce) the push template: tests/test_desc_sets.py)
+void set_written(VkCommandBuffer, VkPipelineBindPoint, VkPipelineLayout, VkDescriptorSet) {}
 struct Pushed;
 std::array<Pushed, 2>& pushed();
 struct Recording { VkDescriptorPool pool{}; std::vector<VkDescriptorPool> extra; } recording;

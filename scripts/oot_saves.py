@@ -178,9 +178,34 @@ def pick(found, name, flag, wanted=None):
     return next(iter(found.items()))
 
 
+def own_tx(save):
+    """Hookshot commits its save as a transaction too (host/save_tx.h): <user>/save-tx/<uid> beside <user>/save/<uid> holds
+    the game's working copy (work) and a finished commit that could not be put in place yet (ready-<n>, newer than the save
+    folder). That folder for a save folder, or None when there is none."""
+    save = os.path.normpath(save)
+    parent = os.path.dirname(save)
+    tx = os.path.join(os.path.dirname(parent), "save-tx", os.path.basename(save))
+    return tx if os.path.basename(parent).lower() == "save" and os.path.isdir(tx) else None
+
+
+def own_newest(save):
+    """The save Hookshot loads at its next start: the highest ready-<n> of its transaction folder that holds a save, else the
+    save folder."""
+    tx = own_tx(save)
+    ready = []
+    for name in (os.listdir(tx) if tx else []):
+        digits = name[6:]
+        path = os.path.join(tx, name)
+        if name.startswith("ready-") and digits.isdigit() and len(digits) <= 9 and is_save_folder(path):
+            ready.append((int(digits), path))
+    return max(ready)[1] if ready else save
+
+
 def pending_commit(save):
     """NX2navi writes a save to profile/save-tx first and moves it into profile/save/<account> after: while something is
     waiting there, that is the save the game loads next, not the account folder."""
+    if own_tx(save):   # (Hookshot's own transaction folder, which own_newest reads)
+        return None
     parent = os.path.dirname(os.path.normpath(save))
     tx = os.path.join(os.path.dirname(parent), "save-tx")
     if os.path.basename(parent).lower() == "save" and os.path.isdir(tx):
@@ -352,7 +377,7 @@ def run(args):
     _, em = locate(other, args.folder, flag)
     hs_id, hs_path = pick(hs, "Hookshot", "--hookshot <the user id folder>")
     em_id, em_path = pick(em, other.display, "--profile <id>", args.profile)
-    src, dst = (em_path, hs_path) if args.command == "import" else (hs_path, em_path)
+    src, dst = (em_path, hs_path) if args.command == "import" else (own_newest(hs_path), em_path)
     if os.path.realpath(src) == os.path.realpath(dst):
         raise Fail("%s is both the source and the target" % src)
     if not args.force:
@@ -372,6 +397,10 @@ def run(args):
         n += 1
         backup = "%s-%d" % (base, n)
     copy_saves(src, dst, backup, args.keep_settings, args.dry_run)
+    # (into Hookshot: its working copy and any finished commit still waiting belong to the save that was replaced, and the
+    # game would put such a commit over the copy at its next start)
+    if args.command == "import" and not args.dry_run and own_tx(dst):
+        shutil.rmtree(own_tx(dst), ignore_errors=True)
 
 
 def main(argv=None):

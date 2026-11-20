@@ -25,6 +25,10 @@ static uint64_t want_gpu = 0x123456789abULL, want_size = 0x100002345ULL;
 static const MkwVkRenderer* vk;
 
 static int hos_vcores_on() { return enabled; }
+static int64_t hos_now_ns() { return 0; }   // (the wrapper times its call for the lab's HOS_NVN_LOG_FLUSH log)
+static void hos_log(const char*, ...) {}
+int hos_ft_on() { return 0; }      // (the frame trace, HOS_FT: off here)
+double hos_ft_ms() { return 0.0; }
 static void vc_release(HosThread* t) {
     std::lock_guard<std::mutex> lock(lease_mu);
     CHECK(owner == t && t->vc_held == 1);

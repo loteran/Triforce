@@ -18,7 +18,7 @@ typedef intptr_t LRESULT;
 #define HIWORD(v) (((unsigned)(uintptr_t)(v) >> 16) & 0xffff)
 enum {
     WM_TIMER = 0x113, WM_SYSCOMMAND = 0x112, WM_INPUT = 0xff, WM_LBUTTONDOWN = 0x201,
-    WM_KEYDOWN = 0x100, WM_SYSKEYDOWN = 0x104, WM_SYSCHAR = 0x106, WM_APP = 0x8000,
+    WM_KEYDOWN = 0x100, WM_SYSKEYDOWN = 0x104, WM_SYSCHAR = 0x106, WM_CHAR = 0x102, WM_APP = 0x8000,
     WM_DPICHANGED = 0x2e0, WM_KILLFOCUS = 8, WM_CANCELMODE = 0x1f, WM_SETCURSOR = 0x20,
     WM_MOVE = 3, WM_SIZE = 5, WM_PAINT = 0xf, WM_ERASEBKGND = 0x14, WM_CLOSE = 0x10,
     VK_ESCAPE = 0x1b, VK_F11 = 0x7a, VK_RETURN = 0xd, HTCLIENT = 1,
@@ -93,6 +93,7 @@ static void hos_relaunch_ask(void) { unexpected(); }         /* (host/hos_relaun
 static void hos_window_closed_exit(void) { unexpected(); }
 static void rx_close_asked(void) { unexpected(); }   /* (host/rx_backend.c: WM_CLOSE, not one of the checked messages) */
 void hos_vk_note_key_press(unsigned key) { (void)key; }   /* (host/rx_backend.c: the menu notes key presses; nothing here) */
+static void typed_text(HWND w, WPARAM wp) { (void)w; (void)wp; }   /* ((Triforce) host/display.c: text for the menu; none here) */
 
 /* (PR 946: the Insert menu takes the mouse while it is open; these branches never run here either) */
 enum {

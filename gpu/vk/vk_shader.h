@@ -12,6 +12,7 @@
 #include "shader_recompiler/runtime_info.h"
 #include "shader_recompiler/shader_info.h"
 
+#include "spv_store.h"
 #include "vk_internal.h"
 #include "vk_state.h"
 
@@ -21,6 +22,11 @@ struct Stage {
     int nvn_stage = 0;   // 0 vertex, 1 fragment, 5 compute (what its banks are read for)
     VkShaderStageFlagBits vk_stage = VK_SHADER_STAGE_VERTEX_BIT;
     VkShaderModule module = VK_NULL_HANDLE;
+    // (Triforce, RX_VK_SPV_PACK: spv_store.h) Its SPIR-V packed, in the module's place: module is null then, and one is
+    // made for each pipeline's creation and let go after it. Null with RX_VK_SPV_PACK=0, and for the programs that keep
+    // their modules (compute programs, those a draw reads itself: vk_shader.cpp PackSkip): the module above is kept for the
+    // run, as before. Whoever creates a pipeline takes the module through StageModule, never from the field
+    std::shared_ptr<spv_store::Code<VkShaderModule>> code;
     Shader::Info info;
     std::vector<uint8_t> c1;   // its c1 constants (the code area's tail)
     uint32_t crc = 0;          // (local, RenoDX port) the CRC-32 of the module the translation gave (fragment stages)
@@ -30,6 +36,40 @@ struct Stage {
 /// A texture handle the stage reads from a storage buffer: its handle program (Shader::Info::handle_programs, Eden's
 /// recompiler) run over the stage's constant banks and storage buffers as the draw has them
 uint32_t stage_handle(const NvnState& s, const Stage& st, uint32_t program, uint32_t element = 0);
+
+/// (Triforce, texture detail) Whether the module reads the texture at that binding by texel position or asks its size
+/// (spv_exact.h); false on a card whose textures are whole anyway. Any thread of the replay.
+bool shader_reads_exact(VkShaderModule module, uint32_t binding);
+
+/// (Triforce, spv_store.h) A stage's shader module for the time a pipeline is created with it: the one accessor of
+/// Stage::module. Without packing it is the stage's own module and costs nothing. With a packed stage the module is made
+/// from the packed SPIR-V here (or shared with another builder of the same stage that holds one now) and destroyed when
+/// the last holder is done. get() is null when it could not be made: the caller then makes no pipeline. Any thread
+class StageModule {
+public:
+    explicit StageModule(const Stage& st);
+    ~StageModule();
+    StageModule(StageModule&& o) noexcept : code_(std::move(o.code_)), m_(o.m_) { o.m_ = VK_NULL_HANDLE; }
+    StageModule(const StageModule&) = delete;
+    StageModule& operator=(const StageModule&) = delete;
+    StageModule& operator=(StageModule&&) = delete;
+    VkShaderModule get() const { return m_; }
+
+private:
+    std::shared_ptr<spv_store::Code<VkShaderModule>> code_;   // (the store the module is pinned in; null: the stage's own module)
+    VkShaderModule m_ = VK_NULL_HANDLE;
+};
+/// What shader_reads_exact is asked by for a stage: its module, or, packed, the store that stands in the module's place
+inline VkShaderModule stage_exact_key(const Stage& st) {
+    return st.code ? (VkShaderModule)(uintptr_t)st.code.get() : st.module;
+}
+/// Whether stages are packed in this run (on unless RX_VK_SPV_PACK=0)
+bool spv_pack_on();
+/// (Triforce) A program stage's module let go (vkDestroyShaderModule), and forgotten by the memory line's count (mem_parts.h):
+/// every place that lets a program's module go does it through this
+void stage_module_destroy(VkShaderModule m);
+/// (Triforce) The program variants' shader modules alive and the SPIR-V they were made of; the packed stores alive and their bytes
+void program_module_stats(int64_t* modules, int64_t* module_bytes, int64_t* packed, int64_t* packed_bytes);
 
 /// A translated program variant: its stages, in descriptor order. The pipeline layout and pipelines made for it live
 /// in vk_pipeline.cpp (keyed by key).
@@ -96,6 +136,16 @@ void program_wait(const Program* p);
 uint64_t program_cache_stamp();   // (what the kept programs and pipelines are good for)
 size_t program_cache_load_some(const std::unordered_set<uint64_t>& wanted, const std::function<void(Program&)>& fn,
                                bool computes = true, bool fallbacks = false);   // (computes: and every kept compute program)
+/// (Triforce) The pipeline notes' programs, one key a note in their order: the order the program read-ahead reads in
+void program_readahead_notes(const std::vector<uint64_t>& note_programs);
+/// (Triforce, vk_draw.cpp) The noted pipelines of variants a read-ahead worker has just read, made before their draws: pipe_warm.h.
+/// ((Triforce, test18) at: their place in the read-ahead's order, -1: none; a compute program's pipeline too)
+void pipelines_warm(std::vector<std::unique_ptr<Program>>& variants, int64_t at);
+/// ((Triforce, test18) vk_draw.cpp: the draws consumed the program at at in the read-ahead's order (where they are: pipe_warm.h)
+void pipelines_warm_consumed(int64_t at);
+/// ((Triforce, test18) vk_shader.cpp, the RAM short: the compute pipelines the warm made for programs still read ahead, taken
+/// off them into out (the caller destroys them: no dispatch had one). False: the shelf was busy, nothing taken
+bool readahead_computes_let_go(std::vector<VkPipeline>& out);
 /// The precompile of every shader of the game (triforce_shaders.bin, from nx2/shader_census.py): how many programs it names, 0: none
 size_t seed_open();
 std::string seed_path();   // (triforce_shaders.bin, beside the game)
@@ -138,5 +188,7 @@ Shader::TextureType handle_texture_type(uint32_t handle);
 void shader_stats(int64_t* translated, int64_t* failed);
 double shader_translate_ms();
 void program_released(const nvn_prog* p);
+/// ((Triforce) program_released, once no program pick has the shaders' lock let go for a read: program_read_once.h)
+void program_released_after_reads(const nvn_prog* p);
 
 } // namespace mkwvk

@@ -232,16 +232,21 @@ def _kept_version(d):
     return bool(cur) and _same(cur, d)
 
 
-def freeable(after_build=False):
+def freeable(after_build=False, installing=False):
+    """What free lets go (measure counts it; nothing is changed here). (Triforce) Never an unfinished version that still holds
+    folders of the installed one (setup_parts.lent: its reused.txt): deleted, the installed version lost its Python or its
+    compiler for good. installing: another install holds the setup's folder now, and what it is putting together
+    (downloads\\, versions\\) stays"""
+    from . import setup_parts
     for d in (("sa", "exefs", "probe") if after_build else ("objcache", "sa", "exefs", "probe")):
         yield os.path.join(work(), d)
-    for d in ("downloads", "update"):
+    for d in ("update",) if installing else ("downloads", "update"):
         yield os.path.join(paths.base(), d)
     v = paths.versions()
-    if os.path.isdir(v):
+    if os.path.isdir(v) and not installing:
         for name in os.listdir(v):
             p = os.path.join(v, name)
-            if os.path.isdir(p) and not _kept_version(p):
+            if os.path.isdir(p) and not _kept_version(p) and not setup_parts.lent(p):
                 yield p
 
 
@@ -275,13 +280,24 @@ def measure():
 
 def free(after_build=False):
     """Lets go of what measure counts as freeable; returns the bytes it could not delete (a file in use)"""
-    for d in list(freeable(after_build)):
-        _delete(d)
-    if not after_build:
-        _delete(os.path.join(work(), "system_headers.txt"))
-        return measure()[1]
-    seen = set()
-    return sum(_size(d, seen) for d in freeable(True))
+    from . import setup_parts
+    # ((Triforce) what a cut-off install moved from the installed version goes back first (setup_parts.undo_every_reuse), and
+    # then its <tag>.part is freeable; one whose folders could not all go back stays. With the setup's folder held: an install
+    # running now is not undone under it, and its folders are left alone)
+    lock = setup_parts.take_lock(0)
+    try:
+        if lock:
+            setup_parts.undo_every_reuse()
+        for d in list(freeable(after_build, installing=not lock)):
+            _delete(d)
+        if not after_build:
+            _delete(os.path.join(work(), "system_headers.txt"))
+            return measure()[1]
+        seen = set()
+        return sum(_size(d, seen) for d in freeable(True, installing=not lock))
+    finally:
+        if lock:
+            lock.release()
 
 
 def gb(n):

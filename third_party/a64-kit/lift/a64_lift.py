@@ -490,6 +490,23 @@ def local_regs():
     return int(v) if v.isdigit() else 0
 
 
+_local_sets = None
+
+
+def local_here(name):
+    """(triforce) A64_LOCAL_REGS for this function? A64_LOCAL_HOT=1: only the hot functions (A64_HOT_FUNCS).
+    A64_NO_LOCAL=<file>: the functions listed there (one name a line) keep their registers in the context: the ones other
+    tools edit by their exact text after the lift (the game's patches)."""
+    global _local_sets
+    if _local_sets is None:
+        hot = hot_functions() if os.environ.get("A64_LOCAL_HOT") else None
+        path = os.environ.get("A64_NO_LOCAL")
+        no = {w for line in open(path) for w in line.split()[:1]} if path else set()
+        _local_sets = (hot, no)
+    hot, no = _local_sets
+    return (hot is None or name in hot) and name not in no
+
+
 def localize_regs(text, local, dirty):
     """Expand the context marks (see SYNC_CALL): with `local`, the registers become locals first, and each mark writes
     back what may have changed since the last one (dirty: per instruction index, the masks before and after it) or
@@ -727,11 +744,15 @@ static inline __m128i a64_v_ovf(const Ctx *c, __m128i a, __m128i b, __m128i t) {
     const __m128i inf = _mm_cmpeq_epi32(a64_v_abs(t), _mm_set1_epi32(0x7f800000));
     return _mm_andnot_si128(_mm_or_si128(a64_v_nonfin(a), a64_v_nonfin(b)), inf);
 }
+/* (triforce) Past the fast path the lanes' helper is called without the context and on copies of the registers (the
+   control word in, the status word in and out): handed the context or pointers into it, the call may change any of it,
+   and the compiler kept every guest register in memory around each vector op. */
 #define A64_VFPX_SUM(name, op, scalar) \
-static __attribute__((noinline, cold)) void a64_vfpx_##name##_lanes(Ctx *c, uint64_t *d, const uint64_t *n, const uint64_t *m, int k) { \
+static __attribute__((noinline, cold)) void a64_vfpx_##name##_lanes(uint64_t fpcr, uint64_t *fpsr, uint64_t *d, const uint64_t *n, const uint64_t *m, int k) { \
+    Ctx t; t.fpcr = fpcr; t.fpsr = *fpsr; \
     uint32_t a[4], b[4], r[4] = {0}; memcpy(a, n, 16); memcpy(b, m, 16); \
-    for (int j = 0; j < k; j++) r[j] = (uint32_t)scalar(c, a[j], b[j]); \
-    memcpy(d, r, 16); } \
+    for (int j = 0; j < k; j++) r[j] = (uint32_t)scalar(&t, a[j], b[j]); \
+    memcpy(d, r, 16); *fpsr = t.fpsr; } \
 static inline __attribute__((always_inline)) void a64_vfpx_##name(Ctx *c, uint64_t *d, const uint64_t *n, const uint64_t *m, int k) { \
     if (RECOMP_LIKELY(RECOMP_FPX_OPEN(c))) { \
         const __m128i a = _mm_loadu_si128((const __m128i *)n), b = _mm_loadu_si128((const __m128i *)m); \
@@ -751,7 +772,8 @@ static inline __attribute__((always_inline)) void a64_vfpx_##name(Ctx *c, uint64
             !(_mm_movemask_epi8(_mm_andnot_si128(a64_v_ovf(c, a, b, t), bad)) & lanes)) { \
             if (k == 4) _mm_storeu_si128((__m128i *)d, r); else a64_vst_lo64(d, r); \
             return; } } \
-    a64_vfpx_##name##_lanes(c, d, n, m, k); }
+    { uint64_t nn_[2], mm_[2], dd_[2], s_ = c->fpsr; memcpy(nn_, n, 16); memcpy(mm_, m, 16); \
+      a64_vfpx_##name##_lanes(c->fpcr, &s_, dd_, nn_, mm_, k); c->fpsr = s_; memcpy(d, dd_, 16); } }
 #else
 #define A64_VFPX_SUM(name, op, scalar) \
 static __attribute__((noinline)) void a64_vfpx_##name(Ctx *c, uint64_t *d, const uint64_t *n, const uint64_t *m, int k) { \
@@ -761,10 +783,12 @@ static __attribute__((noinline)) void a64_vfpx_##name(Ctx *c, uint64_t *d, const
 #endif
 """
 VFPX_MUL_HEADER = r"""
-static __attribute__((noinline, cold)) void a64_vfpx_mul32_lanes(Ctx *c, uint64_t *d, const uint64_t *n, const uint64_t *m) {
+/* (triforce: without the context, as A64_VFPX_SUM's) */
+static __attribute__((noinline, cold)) void a64_vfpx_mul32_lanes(uint64_t fpcr, uint64_t *fpsr, uint64_t *d, const uint64_t *n, const uint64_t *m) {
+    Ctx t; t.fpcr = fpcr; t.fpsr = *fpsr;
     uint32_t a[4], b[4], r[4]; memcpy(a, n, 16); memcpy(b, m, 16);
-    for (int j = 0; j < 4; j++) r[j] = (uint32_t)a64_fpx_mul32_fma32(c, a[j], b[j], (a[j] ^ b[j]) & 0x80000000u);
-    memcpy(d, r, 16); }
+    for (int j = 0; j < 4; j++) r[j] = (uint32_t)a64_fpx_mul32_fma32(&t, a[j], b[j], (a[j] ^ b[j]) & 0x80000000u);
+    memcpy(d, r, 16); *fpsr = t.fpsr; }
 static inline __attribute__((always_inline)) void a64_vfpx_mul32(Ctx *c, uint64_t *d, const uint64_t *n, const uint64_t *m, int k) {
     (void)k;
 #if RECOMP_FPX_HOST == 2
@@ -792,7 +816,8 @@ static inline __attribute__((always_inline)) void a64_vfpx_mul32(Ctx *c, uint64_
         }
     }
 #endif
-    a64_vfpx_mul32_lanes(c, d, n, m);
+    { uint64_t nn_[2], mm_[2], dd_[2], s_ = c->fpsr; memcpy(nn_, n, 16); memcpy(mm_, m, 16);
+      a64_vfpx_mul32_lanes(c->fpcr, &s_, dd_, nn_, mm_); c->fpsr = s_; memcpy(d, dd_, 16); }
 }
 """
 
@@ -936,10 +961,28 @@ def fpx_header(used):
                                                        ", ".join("a%d" % i for i in range(nf)), rescue, exact,
                                                        ", ".join("a%d" % i for i in range(ne))))
         # (the hot functions' copy, see HOT_FPX: the fast path inline, everything else through the helper)
+        # (triforce) Past the fast path the helper is called without the context (a64_fpx_nc_*: the control word in, the
+        # status word in and out; the FP bodies read and write nothing else of it). A call handed the context may change
+        # any of it, so with one behind every float op the compiler stored each guest register as it was written and read
+        # the control and status words again at every op. And the result goes on as a float (or double), the bits made
+        # from it: the exact call's bits met the fast path's in an integer, and every float value went through a general
+        # register and the context's memory on its way to the next op. The tests and the results are the same.
+        # -DA64_FPX_HOT_CTX: the copy as it was.
+        args_f, args_e = ", ".join("a%d" % i for i in range(nf)), ", ".join("a%d" % i for i in range(ne))
+        ftype, to_f, to_b = ("float", "recomp_fpx_f", "recomp_fpx_fb") if fast.endswith("32") else ("double", "recomp_fpx_d", "recomp_fpx_db")
+        out.append("#ifndef A64_FPX_HOT_CTX")
+        out.append("static __attribute__((noinline, cold)) uint64_t a64_fpx_nc_%s_%s(uint64_t fpcr, uint64_t *fpsr, %s) { "
+                   "Ctx t; t.fpcr = fpcr; t.fpsr = *fpsr; const uint64_t v = a64_fpx_%s_%s(&t, %s); *fpsr = t.fpsr; return v; }"
+                   % (fast, exact, params, fast, exact, args_e))
+        out.append("static inline __attribute__((always_inline)) uint64_t a64_fpx_hot_%s_%s(Ctx *c, %s) { uint64_t v; %s r; "
+                   "if (RECOMP_FPX_OPEN(c) && RECOMP_LIKELY(recomp_fpx_%s(%s, RECOMP_FPX_FZ(c), &v))) r = %s(v); "
+                   "else { uint64_t s = c->fpsr; v = a64_fpx_nc_%s_%s(c->fpcr, &s, %s); c->fpsr = s; r = %s(v); } "
+                   "return %s(r); }" % (fast, exact, params, ftype, fast, args_f, to_f, fast, exact, args_e, to_f, to_b))
+        out.append("#else")
         out.append("static inline __attribute__((always_inline)) uint64_t a64_fpx_hot_%s_%s(Ctx *c, %s) { uint64_t v; "
                    "if (RECOMP_FPX_OPEN(c) && RECOMP_LIKELY(recomp_fpx_%s(%s, RECOMP_FPX_FZ(c), &v))) return v; "
-                   "return a64_fpx_%s_%s(c, %s); }" % (fast, exact, params, fast, ", ".join("a%d" % i for i in range(nf)),
-                                                       fast, exact, ", ".join("a%d" % i for i in range(ne))))
+                   "return a64_fpx_%s_%s(c, %s); }" % (fast, exact, params, fast, args_f, fast, exact, args_e))
+        out.append("#endif")
     out.append(VSET_HEADER)
     out.append(VFCMP_HEADER)
     if any(e[:2] in (("add32", "add32"), ("sub32", "sub32"), ("mul32", "fma32")) for e in used):
@@ -950,13 +993,76 @@ def fpx_header(used):
             out.append("A64_VFPX_SUM(sub32, _mm_sub_ps, a64_fpx_sub32_sub32)")
         if ("mul32", "fma32", 2, 3) in used:
             out.append(VFPX_MUL_HEADER)
+        if ("fma32", "fma32", 3, 3) in used:
+            out.append(VFPX_FMA_HEADER)
     return "\n".join(out) + "\n"
+
+
+# (triforce) FMUL / FMLA / FMLS .4S by element (a vector times one lane of another: matrix code) were a loop over the four
+# lanes, each lane a scalar helper with its gate and tests: 5,700 of the 9,000 lane loops in OoT's hot functions, 850 more
+# the multiply-adds. The multiply becomes a64_vfpx_mul32 on the lane spread to four (the straight .4S multiply's helper), the
+# multiply-add a64_vfpx_fma32 (one FMA op where the host has it). A lane that fails the scalar fast path's tests sends the
+# whole op through the scalar helpers, lane by lane, as before. (Matched on the text as widen_vstores leaves it.)
+# A64_NO_VFPX_ELEM=1 at lift time: off.
+VFPX_ELEM = re.compile(
+    r"\{ uint32_t _a\[4\],_r\[4\],_m; memcpy\(_a,c->vreg\[(\d+)\],16\); memcpy\(&_m,\(const uint8_t\*\)c->vreg\[(\d+)\]\+(\d+),4\); "
+    r"memcpy\(_r,c->vreg\[(\d+)\],16\);for\(int _i=0;_i<4;\+\+_i\)\{uint64_t _n=_a\[_i\],_z0=_r\[_i\];\{uint64_t _a=_n,_b=_m,_z=_z0,_v;"
+    r"(_z=\(_a\^_b\)&0x80000000ULL;_v=a64_fpx_mul32_fma32|_v=a64_fpx_fma32_fma32|_a\^=0x80000000ULL;_v=a64_fpx_fma32_fma32)"
+    r"\(c,_a,_b,_z\);_r\[_i\]=\(uint32_t\)_v;\}\}a64_vset64\(c->vreg\[(\d+)\],0\); a64_vst16\(c->vreg\[(\d+)\],_r\); \}")
+
+
+def vectorize_elem(text):
+    if "_z0=_r[_i]" not in text or os.environ.get("A64_NO_VFPX") or os.environ.get("A64_NO_VFPX_ELEM"):
+        return text
+
+    def sub(m):
+        a, e, off, acc, op, d1, d2 = m.groups()
+        if d1 != d2 or (not op.startswith("_z=") and acc != d1):
+            return m.group(0)
+        head = ("{ uint32_t _m; uint64_t _e[2]; memcpy(&_m,(const uint8_t*)c->vreg[%s]+%s,4); _e[0]=_e[1]=(uint64_t)_m<<32|_m; "
+                % (e, off))
+        if op.startswith("_z="):
+            return head + "a64_vfpx_mul32(c,c->vreg[%s],c->vreg[%s],_e,4); }" % (d1, a)
+        return head + "a64_vfpx_fma32(c,c->vreg[%s],c->vreg[%s],_e,%d); }" % (d1, a, op.startswith("_a^="))
+    return VFPX_ELEM.sub(sub, text)
+
+
+VFPX_FMA_HEADER = r"""
+/* (triforce) FMLA / FMLS on four single-precision lanes (vectorize_elem in a64_lift.py): d = fma(+-n, m, d). One FMA op
+   where the host has it, kept when every lane passes the scalar fast path's tests (recomp_fpx_fma32); otherwise each lane
+   goes through its scalar helper, called without the context as a64_vfpx_mul32's lanes are. */
+#if RECOMP_FPX_HOST == 2 && defined(__FMA__)
+#include <immintrin.h>
+#endif
+static __attribute__((noinline, cold)) void a64_vfpx_fma32_lanes(uint64_t fpcr, uint64_t *fpsr, uint64_t *d, const uint64_t *n, const uint64_t *m, const uint64_t *z) {
+    Ctx t; t.fpcr = fpcr; t.fpsr = *fpsr;
+    uint32_t a[4], b[4], w[4], r[4]; memcpy(a, n, 16); memcpy(b, m, 16); memcpy(w, z, 16);
+    for (int j = 0; j < 4; j++) r[j] = (uint32_t)a64_fpx_fma32_fma32(&t, a[j], b[j], w[j]);
+    memcpy(d, r, 16); *fpsr = t.fpsr; }
+static inline __attribute__((always_inline)) void a64_vfpx_fma32(Ctx *c, uint64_t *d, const uint64_t *n, const uint64_t *m, int neg) {
+    uint64_t nn_[2], mm_[2], zz_[2], dd_[2];
+    memcpy(nn_, n, 16); memcpy(mm_, m, 16); memcpy(zz_, d, 16);
+    if (neg) { nn_[0] ^= 0x8000000080000000ULL; nn_[1] ^= 0x8000000080000000ULL; }
+#if RECOMP_FPX_HOST == 2 && defined(__FMA__)
+    if (RECOMP_LIKELY(RECOMP_FPX_OPEN(c))) {
+        const __m128i a = _mm_loadu_si128((const __m128i *)nn_), b = _mm_loadu_si128((const __m128i *)mm_), z = _mm_loadu_si128((const __m128i *)zz_);
+        const __m128i t = _mm_castps_si128(_mm_fmadd_ps(_mm_castsi128_ps(a), _mm_castsi128_ps(b), _mm_castsi128_ps(z)));
+        /* kept: big, or a finite result of a zero factor (RECOMP_FPX_KEEP32); under FZ no subnormal operand */
+        const __m128i keep = _mm_or_si128(a64_v_big(t), _mm_andnot_si128(a64_v_nonfin(t), _mm_or_si128(a64_v_zero(a), a64_v_zero(b))));
+        __m128i bad = _mm_andnot_si128(keep, _mm_set1_epi32(-1));
+        if (RECOMP_FPX_FZ(c)) bad = _mm_or_si128(bad, _mm_or_si128(_mm_or_si128(a64_v_subn(a), a64_v_subn(b)), a64_v_subn(z)));
+        if (RECOMP_LIKELY(!_mm_movemask_epi8(bad))) { _mm_storeu_si128((__m128i *)d, t); return; }
+    }
+#endif
+    { uint64_t s_ = c->fpsr; a64_vfpx_fma32_lanes(c->fpcr, &s_, dd_, nn_, mm_, zz_); c->fpsr = s_; memcpy(d, dd_, 16); }
+}
+"""
 
 
 def op_text(text, fpx):
     """one instruction's emitted C as lifted code has it: FPX guards outlined (their shapes added to fpx, which
     fpx_header turns into a64_fpx.h), NEON FP vectorized, stores widened, flags packed"""
-    return stack_stores(pack_flags(widen_vstores(vectorize_fpx(outline_fpx(text, fpx)))))
+    return stack_stores(pack_flags(vectorize_elem(widen_vstores(vectorize_fpx(outline_fpx(text, fpx))))))
 
 
 class Lifter:
@@ -1625,7 +1731,7 @@ class Lifter:
         pcs = sorted(body)
         dead = {} if os.environ.get("A64_KEEP_FLAGS") else self.dead_flags(body, pcs, texts)
         frame = not os.environ.get("A64_MARK_FRAME")
-        local = local_regs() and e not in self.no_local
+        local = local_regs() and e not in self.no_local and local_here(self.fname(e))
         dirty = self.dirty_regs(body, pcs, texts) if local else None
         for i, pc in enumerate(pcs):
             self.cur_i = i

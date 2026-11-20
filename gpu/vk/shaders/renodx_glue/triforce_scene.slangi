@@ -1,0 +1,54 @@
+#ifndef TRIFORCE_RENODX_SCENE_SLANGI
+#define TRIFORCE_RENODX_SCENE_SLANGI
+// (Triforce) RenoDRT as a third tone mapper of RenoDX's Zelda OoT scene shaders, which have Vanilla and PsychoV35.
+// scripts/renodx_shaders.py compiles this file in front of each of RenoDX's two scene shaders. Those call
+// ApplySceneToneMap (RenoDX's scene_tonemap.slangi) for every tone mapper but Vanilla; here RenoDX's own keeps its body
+// under another name and the one the shaders call chooses: RenoDRT (tone_map_type 3, RenoDX's number for it) goes to
+// RenoDX's library, anything else to RenoDX's mapper as it is. So with Vanilla or PsychoV35 a scene shader does what it
+// did without this file.
+//
+// What RenoDRT does with the scene is what NX2navi's HDR does with it (runtime/shaders/hdr_tonemap.frag, tone mapper 3)
+// and RenoDX's own games do: the game's SDR picture of the scene is the colour grade, carried up to the display's range
+// by brightness against a neutral SDR curve of the same scene (renodx::draw::ToneMapPass), with RenoDRT's rows.
+#include "triforce_settings.slangi"
+
+#define ApplySceneToneMap RenoDXApplySceneToneMap
+#include "scene_tonemap.slangi"   // (RenoDX's)
+#undef ApplySceneToneMap
+
+/// The game's own SDR picture of what it feeds its tone curve: that curve (Narkowicz's fit of ACES, with the numbers the
+/// game's shader has) and its clamp to 0..1
+float3 TriforceGameSdr(float3 x) {
+    return saturate(x * (2.51f * x + 0.03f) / (x * (2.43f * x + 0.59f) + 0.14f));
+}
+
+/// x: what the game feeds its tone curve (the scene with bloom, times the game's exposure). config: RenoDX's, with the
+/// peak, the whites and the four grading rows in it. Returns linear Rec. 709 with the menus' white at 1, as RenoDX's own
+/// scene mapper does
+float3 TriforceRenoDRT(float3 x, renodx::draw::Config config, TriforceSettings settings) {
+    config.tone_map_type = renodx::draw::TONE_MAP_TYPE_RENO_DRT;
+    // (the peak comes with the gamma correction taken out of it already: vk_renodx.cpp peak_before_gamma)
+    config.gamma_correction = renodx::draw::GAMMA_CORRECTION_NONE;
+    config.color_grade_strength = settings.color_grade_strength;
+    config.tone_map_highlight_saturation = settings.highlight_saturation;
+    config.tone_map_blowout = settings.blowout;
+    config.tone_map_flare = settings.flare;
+    config.tone_map_hue_correction = settings.hue_correction;
+    float3 mapped = renodx::draw::ToneMapPass(x, TriforceGameSdr(x), config);
+    mapped *= config.diffuse_white_nits / config.graphics_white_nits;
+    // (as NX2navi's: a channel that is not a number is black)
+    return float3(isnan(mapped.x) ? 0.f : mapped.x, isnan(mapped.y) ? 0.f : mapped.y, isnan(mapped.z) ? 0.f : mapped.z);
+}
+
+float3 ApplySceneToneMap(float3 custom_untonemapped, float3 custom_native_gain) {
+    if (RENODX_TONE_MAP_TYPE == renodx::draw::TONE_MAP_TYPE_RENO_DRT) {
+        // (the game's exposure is the gain's first entry: both of the game's scene shaders multiply each channel by that one
+        // number before their curve. RenoDX's shader with local exposure hands its own mapper a gain whose blue is that
+        // number squared; RenoDRT starts from what the game's curve takes, so it takes the number itself for all three)
+        return TriforceRenoDRT(custom_untonemapped * custom_native_gain.x, renodx::draw::BuildConfig(),
+                               triforce_constants.settings);
+    }
+    return RenoDXApplySceneToneMap(custom_untonemapped, custom_native_gain);
+}
+
+#endif

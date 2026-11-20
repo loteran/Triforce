@@ -54,6 +54,8 @@ def main():
     fixture = f'''#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include "write_gen.h"   // (gpu/vk: a page write generation, 64 bits)
+using mkwvk::WriteGen;
 #define CHECK(x) do {{ if (!(x)) {{ std::fprintf(stderr, "FAIL:%d %s\\n", __LINE__, #x); std::exit(1); }} }} while (0)
 {fn}
 {struct}
@@ -61,11 +63,15 @@ def main():
 {pages}
 {slot}
 int main() {{
-    CHECK(submitted_page_reuse(9, 4, 7, 9, 4, 7));
-    CHECK(!submitted_page_reuse(9, 4, 8, 9, 4, 7));
-    CHECK(!submitted_page_reuse(9, 5, 7, 9, 4, 7));
-    CHECK(!submitted_page_reuse(10, 4, 7, 9, 4, 7));
-    CHECK(!submitted_page_reuse(9, 4, 7, 9, 4, 0));
+    const WriteGen g4{{4}}, g5{{5}};
+    CHECK(submitted_page_reuse(9, g4, 7, 9, g4, 7));
+    CHECK(!submitted_page_reuse(9, g4, 8, 9, g4, 7));
+    CHECK(!submitted_page_reuse(9, g5, 7, 9, g4, 7));
+    CHECK(!submitted_page_reuse(10, g4, 7, 9, g4, 7));
+    CHECK(!submitted_page_reuse(9, g4, 7, 9, g4, 0));
+    // (Triforce: a stamp 2^32 generations later is another stamp: with 32-bit generations the answer was reused)
+    CHECK(!submitted_page_reuse(9, WriteGen{{(1ull << 32) + 4}}, 7, 9, g4, 7));
+    CHECK(sizeof(SubmittedPage::pgen) == 8);
     // (a page and its neighbour, and pages a slot-count apart, keep separate answers: a uniform and a storage word read in
     // turn hit both)
     if (std::getenv("RX_VK_SUBMITTED_PAGES")) {{   // (RX_VK_SUBMITTED_PAGES=1: every page in one slot, as before #1762)
@@ -87,8 +93,8 @@ int main() {{
         cpp = Path(tmp) / "fixture.cpp"
         exe = Path(tmp) / "fixture"
         cpp.write_text(fixture, encoding="utf-8")
-        subprocess.run([a.cxx, "-std=c++20", "-Wall", "-Wextra", "-Werror", "-D_CRT_SECURE_NO_WARNINGS", str(cpp), "-o", str(exe)],
-                       check=True)
+        subprocess.run([a.cxx, "-std=c++20", "-Wall", "-Wextra", "-Werror", "-D_CRT_SECURE_NO_WARNINGS", "-I", str(ROOT / "gpu" / "vk"),
+                        str(cpp), "-o", str(exe)], check=True)
         subprocess.run([str(exe)], check=True)
         subprocess.run([str(exe)], check=True, env=dict(os.environ, RX_VK_SUBMITTED_PAGES="1"))
 

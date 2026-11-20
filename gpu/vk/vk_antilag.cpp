@@ -120,4 +120,10 @@ void antilag_input() {
     a.frame_marked = true;
 }
 
+bool antilag_running() {
+    AntiLag& a = al();
+    std::lock_guard lk(a.mu);
+    return on();
+}
+
 } // namespace mkwvk

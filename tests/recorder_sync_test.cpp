@@ -267,6 +267,10 @@ static void alive(const void* cb, const char* op, VkBuffer b) {   // (a recorded
 }
 static std::atomic<bool> g_inuse[256];
 static std::atomic<bool>& inuse(uint64_t cb) { return g_inuse[(cb >> 8) & 255]; }   // (the tests' command buffers: 0x100, 0x200, 0x300)
+// (Triforce: the recorder thread's own calls while par_active: a parallel replay's segments record directly, and the ring is empty
+// then, so it makes none; t_is_recorder set by rec::g_thread_start_hook)
+static thread_local bool t_is_recorder = false;
+static std::atomic<uint64_t> g_rec_calls_par{0};
 /// One fake call: its command buffer marked in use for the call (a second call on it meanwhile is a violation), a vkCmd* slowed by
 /// g_delay_ns, then the log's lock
 struct Guard {
@@ -282,6 +286,7 @@ struct Guard {
         if (cmd) {
             g_cmd_calls++;
             if (std::this_thread::get_id() != g_main_id) g_cmd_off_main++;
+            if (t_is_recorder && par_active.load()) g_rec_calls_par++;
             if (const int d = g_delay_ns.load(std::memory_order_relaxed)) spin_for(d);
         }
         lk = std::unique_lock(g_log_mu);
@@ -358,6 +363,10 @@ F(vkCmdPushConstants, (VkCommandBuffer cb, VkPipelineLayout l, VkShaderStageFlag
   handle(cb), handle(l), put(f), put(o), put(s); if (readable(v, s / 16)) raw(v, s);)
 F(vkCmdPushDescriptorSetKHR, (VkCommandBuffer cb, VkPipelineBindPoint bp, VkPipelineLayout l, uint32_t set, uint32_t n, const VkWriteDescriptorSet* w),
   handle(cb), put(bp), handle(l), put(set); A(w, n);)
+// ((Triforce) the bytes a push template reads, as the driver knows them from the template: here its handle's low 12 bits, kTplHandle + n)
+constexpr uint64_t kTplHandle = 0xA000;
+F(vkCmdPushDescriptorSetWithTemplateKHR, (VkCommandBuffer cb, VkDescriptorUpdateTemplate t, VkPipelineLayout l, uint32_t set, const void* d),
+  handle(cb), handle(t), handle(l), put(set); if (readable(d, ((uintptr_t)t & 0xFFF) / 16)) raw(d, (uintptr_t)t & 0xFFF);)
 F(vkCmdSetViewport, (VkCommandBuffer cb, uint32_t first, uint32_t n, const VkViewport* v), handle(cb), put(first); A(v, n);)
 F(vkCmdSetScissor, (VkCommandBuffer cb, uint32_t first, uint32_t n, const VkRect2D* r), handle(cb), put(first); A(r, n);)
 F(vkCmdSetViewportWithCount, (VkCommandBuffer cb, uint32_t n, const VkViewport* v), handle(cb); A(v, n);)
@@ -734,6 +743,15 @@ static void frame() {
                 vkCmdPushDescriptorSetKHR(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, (uint32_t)changed.size(), changed.data());
                 if (g_mutate) poison(changed);
             }
+            {   // ((Triforce) bind_descriptors' whole push through a push template: the descriptors packed into a reused thread-local
+                // array, whose size the call does not carry (push_write_template tells the packer: rec::push_template_bytes))
+                static thread_local std::vector<uint8_t> packed;
+                packed.assign(72 + 24 * (size_t)d, 0);
+                for (size_t i = 0; i < packed.size(); i++) packed[i] = (uint8_t)(i * 5 + at);
+                rec::push_template_bytes(packed.size());
+                vkCmdPushDescriptorSetWithTemplateKHR(cmd, H<VkDescriptorUpdateTemplate>(kTplHandle + packed.size()), layout, 0, packed.data());
+                if (g_mutate) poison(packed.data(), packed.size());
+            }
             dw.after_call();
             push_constants(cmd, layout, at);
             dynamic_state(cmd, at);
@@ -827,6 +845,10 @@ static void fallbacks() {
     vkCmdDraw(cmd, 5, 6, 7, 8);
     VkWriteDescriptorSet w = write(0, VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK, 16);
     vkCmdPushDescriptorSetKHR(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, H<VkPipelineLayout>(0x300), 0, 1, &w);
+    vkCmdDraw(cmd, 9, 10, 11, 12);
+    uint8_t packed[48];   // ((Triforce) a push template's data whose size the packer was not told: made directly, after what is held)
+    for (int i = 0; i < 48; i++) packed[i] = (uint8_t)(200 - i);
+    vkCmdPushDescriptorSetWithTemplateKHR(cmd, H<VkDescriptorUpdateTemplate>(kTplHandle + sizeof packed), H<VkPipelineLayout>(0x300), 0, packed);
     vkCmdDispatch(cmd, 1, 1, 1);
 }
 
@@ -839,7 +861,7 @@ static const VkCommandBuffer kCmd = H<VkCommandBuffer>(0x100), kUp = H<VkCommand
 static void lifecycle_reset() {
     g_state.clear(), g_violations = 0, g_violation.clear();
     gpu_reset();
-    g_pool_of = {{0x100, 0x10}, {0x200, 0x20}, {0x300, 0x60}};
+    g_pool_of = {{0x100, 0x10}, {0x200, 0x20}, {0x300, 0x60}, {0x400, 0x70}, {0x500, 0x80}, {0x600, 0x90}};   // (and the segments')
 }
 static void recording_begin() {
     vkResetCommandPool(kDev, kPool, 0);
@@ -1085,6 +1107,66 @@ static void stress() {
     recording_begin();
     for (int i = 0; i < g_stress_frames; i++) frame();
     recording_end(13);
+}
+// ---- (Triforce, 11-15) beside a parallel replay's segments (vk_replay.cpp replay_handle; RX_VK_RECORDER is no longer refused with
+// RX_VK_PARALLEL): the part before them through the ring (recorded, ended, submitted); the segments' command buffers reset and
+// begun and given their first timestamps through the ring (gpu_time_begin), held in flight (hold()); rec::segments_begin;
+// par_active; two helper threads recording theirs directly, then the producer its own (directly too); par_active let go; each
+// segment ended and submitted in order; the part after through the ring again. g_seg_at_once: the helpers at the same time as each
+// other and as the producer (the log's order across command buffers is then the threads': compared command buffer by command
+// buffer). The helpers have no replay lock, as vk_replay.cpp's par_worker_main threads have none
+static const VkCommandPool kSegPool[3] = {H<VkCommandPool>(0x70), H<VkCommandPool>(0x80), H<VkCommandPool>(0x90)};
+static const VkCommandBuffer kSeg[3] = {H<VkCommandBuffer>(0x400), H<VkCommandBuffer>(0x500), H<VkCommandBuffer>(0x600)};
+static const VkQueryPool kTsPool = H<VkQueryPool>(0x700);
+static bool g_seg_at_once = false;
+static void segment_into(int k) {   // (a job: its draws, then its last timestamp: gpu_time_end, by whoever records it)
+    draws_into(kSeg[k], 30, 10 + k);
+    vkCmdWriteTimestamp2(kSeg[k], VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT, kTsPool, 2 * k + 1);
+}
+static void segments() {
+    recording_begin();
+    frame();
+    recording_end(20);
+    VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    for (int k = 0; k < 3; k++) {
+        vkResetCommandPool(kDev, kSegPool[k], 0);
+        vkBeginCommandBuffer(kSeg[k], &bi);
+        vkCmdResetQueryPool(kSeg[k], kTsPool, 2 * k, 2);
+        vkCmdWriteTimestamp2(kSeg[k], VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, kTsPool, 2 * k);
+    }
+    hold();   // (those still in flight when the segments start)
+    rec::segments_begin();
+    par_active = true;
+    if (g_seg_at_once) {
+        std::thread h1([] { segment_into(1); }), h2([] { segment_into(2); });
+        segment_into(0);
+        h1.join(), h2.join();
+    } else {
+        std::thread([] { segment_into(1); }).join();
+        std::thread([] { segment_into(2); }).join();
+        segment_into(0);
+    }
+    par_active = false;
+    for (int k = 0; k < 3; k++) {
+        vkEndCommandBuffer(kSeg[k]);
+        const VkCommandBuffer one = kSeg[k];
+        submit(&one, 1, H<VkFence>(0x70 + k));
+    }
+    recording_begin();
+    frame();
+    recording_end(21);
+}
+/// A log split by command buffer (a vkCmd*'s, a begin's or an end's first argument), the rest (resets, submits, waits) in order apart
+static std::map<uint64_t, std::vector<Call>> by_command_buffer(const std::vector<Call>& log) {
+    std::map<uint64_t, std::vector<Call>> out;
+    for (const Call& c : log) {
+        const bool on_cb = c.op.rfind("vkCmd", 0) == 0 || c.op == "vkBeginCommandBuffer" || c.op == "vkEndCommandBuffer";
+        uint64_t cb = 0;
+        if (on_cb && c.bytes.size() >= 8) std::memcpy(&cb, c.bytes.data(), 8);
+        out[on_cb ? cb : 0].push_back(c);
+    }
+    return out;
 }
 /// --throw: a driver call throws on the recorder thread: the process must end loudly (exit code 3, "FATAL"), never go on
 static int throw_test() {
@@ -1482,7 +1564,7 @@ static void thread_checks(const std::vector<Call>& ref) {
     g_hold_ms = 0, g_hold_until_ns = 0;
     check_run("thread lifecycle (2 command buffers interleaved; reset, begin, end, submit, wait x2; query read; destruction; caller "
               "memory poisoned; driver 1 us a call)", lref.log, lt);
-    if (rec::t_arena.fallbacks - fb0 != 4) std::printf("FAIL thread lifecycle: %llu fallbacks, 4 expected\n", (unsigned long long)(rec::t_arena.fallbacks - fb0)), failures++;
+    if (rec::t_arena.fallbacks - fb0 != 6) std::printf("FAIL thread lifecycle: %llu fallbacks, 6 expected\n", (unsigned long long)(rec::t_arena.fallbacks - fb0)), failures++;
     // (each thread run with the recorder held at the points the producer must wait: hold(); the direct references without)
     const auto held = [](void (*scenario)(), bool lock) {
         g_hold_ms = 50;
@@ -1591,6 +1673,39 @@ static void thread_checks(const std::vector<Call>& ref) {
         par_active = false;
         same("thread while par_active (each call made directly)", ref, got);
     }
+    {   // (Triforce, 11-15: beside a parallel replay's segments. The recorder never asleep in it (a 2 s spin), so the producer's
+        // packets stay unpublished until it waits (a packet published wakes a sleeping recorder at once): the case segments_begin
+        // is there for, every time)
+        rec::g_rec.stop();
+        const uint64_t spin = rec::g_spin_ns;
+        rec::g_spin_ns = 2000000000ull;
+        rec::g_thread_start_hook = [] { t_is_recorder = true; };
+        const Out sref = run_tracked(segments, rec::OFF, false);
+        g_rec_calls_par = 0;
+        const Out st = held(segments, true);
+        check_run("thread beside a parallel replay's segments (their first timestamps in flight at their start; two helper threads, "
+                  "then the producer, each recording its segment directly)", sref.log, st);
+        if (g_rec_calls_par.load())
+            std::printf("FAIL thread segments: the recorder made %llu calls while the segments recorded\n",
+                        (unsigned long long)g_rec_calls_par.load()), failures++;
+        g_seg_at_once = true;
+        g_rec_calls_par = 0;
+        const Out sa = held(segments, true);
+        g_seg_at_once = false;
+        if (sa.violations) std::printf("FAIL thread segments at once: %d violation(s), the first: %s\n", sa.violations, sa.violation.c_str()), failures++;
+        if (g_rec_calls_par.load()) std::printf("FAIL thread segments at once: the recorder made calls while they recorded\n"), failures++;
+        const auto want = by_command_buffer(sref.log), got = by_command_buffer(sa.log);
+        if (want.size() != got.size()) std::printf("FAIL thread segments at once: %zu command buffers, %zu expected\n", got.size(), want.size()), failures++;
+        for (const auto& [cb, calls] : want) {
+            char what[160];
+            std::snprintf(what, sizeof what, "thread beside segments recorded at once, %s %#llx", cb ? "command buffer" : "the calls on none",
+                          (unsigned long long)cb);
+            const auto it = got.find(cb);
+            same(what, calls, it == got.end() ? std::vector<Call>{} : it->second);
+        }
+        rec::g_rec.stop();
+        rec::g_spin_ns = spin, rec::g_thread_start_hook = nullptr;
+    }
     g_delay_ns = 0;
     {   // (stress: >= 1e6 packets through a 16 KB ring, twice; each run's stream hashed, against the direct one's)
         rec::g_rec.stop();
@@ -1650,8 +1765,8 @@ int main(int argc, char** argv) {
     if (rec::t_arena.fallbacks) std::printf("FAIL: %llu calls not packed\n", (unsigned long long)rec::t_arena.fallbacks), failures++;
 
     const std::vector<Call> fref = run(fallbacks, rec::OFF, false);
-    same("fallback order (pNext chain, inline uniform block), deferred", fref, run(fallbacks, rec::DEFER, false));
-    if (rec::t_arena.fallbacks != 2) std::printf("FAIL: %llu fallbacks, 2 expected\n", (unsigned long long)rec::t_arena.fallbacks), failures++;
+    same("fallback order (pNext chain, inline uniform block, a push template of a size not told), deferred", fref, run(fallbacks, rec::DEFER, false));
+    if (rec::t_arena.fallbacks != 3) std::printf("FAIL: %llu fallbacks, 3 expected\n", (unsigned long long)rec::t_arena.fallbacks), failures++;
 
     // ---- defer (step 1.5): the lifecycle, the replay lock, the budgets, an allocation failure, a parallel replay
     const Out lref = run_tracked(lifecycle, rec::OFF, false);
@@ -1659,7 +1774,7 @@ int main(int argc, char** argv) {
     const Out ld = run_tracked(lifecycle, rec::DEFER, true);
     check_run("defer lifecycle (2 command buffers interleaved; reset, begin, end, submit, wait x2; query read; destruction; caller memory "
               "poisoned)", lref.log, ld);
-    if (ld.fallbacks != 4) std::printf("FAIL defer lifecycle: %llu fallbacks, 4 expected\n", (unsigned long long)ld.fallbacks), failures++;
+    if (ld.fallbacks != 6) std::printf("FAIL defer lifecycle: %llu fallbacks, 6 expected\n", (unsigned long long)ld.fallbacks), failures++;
     const Out href = run_tracked(handoff, rec::OFF, false);
     check_run("defer handoff (a recording across two threads under the replay lock)", href.log, run_tracked(handoff, rec::DEFER, true));
     {
@@ -1705,6 +1820,11 @@ int main(int argc, char** argv) {
         par_active = false;
         if (!at_once) std::printf("FAIL defer while par_active: packets held\n"), failures++;
         same("defer while par_active (each packet run at once)", ref, got);
+    }
+    {   // (Triforce, 11-15: beside a parallel replay's segments, their first timestamps held at their start)
+        const Out sref = run_tracked(segments, rec::OFF, false);
+        check_run("defer beside a parallel replay's segments (two helper threads, then the producer, each recording its segment "
+                  "directly)", sref.log, run_tracked(segments, rec::DEFER, true));
     }
 
     thread_checks(ref);

@@ -438,6 +438,25 @@ class ProgressSink:
         return count
 
 
+class HeadSink:
+    """The first four bytes written, kept: extract's look at each romfs .zs file as it is unpacked (ZS_CHECKED)."""
+    def __init__(self, output):
+        self.output = output
+        self.head = b""
+
+    def write(self, data):
+        if len(self.head) < 4:
+            self.head += bytes(data[:4 - len(self.head)])
+        return self.output.write(data)
+
+
+# (written into the folder a romfs was extracted to: how many of its .zs files were looked at as they were written, and
+# which of them do not start as zstd data, by their path under romfs. nx2/make_game.py reads it in place of opening every
+# .zs file again after the unpack, damaged_game_files: 102,185 files, 292 s of an 18 minute build where a virus scanner
+# looks at each file that is opened)
+ZS_CHECKED = "zs_checked.json"
+
+
 def file_system(path):
     """The file system of the volume path is on (NTFS, exFAT, FAT32, ReFS): Windows only, None elsewhere"""
     if os.name != "nt":
@@ -465,8 +484,13 @@ def out_of_space(error, dst, part, rel, size):
         part, rel, size, free, ", " + kind if kind else ""))
 
 
-def extract(nup, t, out, only=None, quiet=False):
+def extract(nup, t, out, only=None, quiet=False, zs=None):
+    """zs: a dict that is given "files", the romfs .zs files there are, and "damaged", those of them that do not start as
+    zstd data (their paths under romfs, "/" between the parts): each one looked at as it is written, and one that was
+    there already read back"""
     total = n = written = 0
+    if zs is not None:
+        zs.update(files=0, damaged=[])
     interval = 2
     next_report = 0 if quiet else monotonic() + interval
 
@@ -483,15 +507,26 @@ def extract(nup, t, out, only=None, quiet=False):
             continue
         for rel, r in nup.walk(t[part]):
             dst = extraction_path(out, part, rel)
+            looked = zs is not None and part == "romfs" and rel.endswith(".zs")
             if os.path.exists(dst) and os.path.getsize(dst) == r[2]:
+                if looked:
+                    with open(dst, "rb") as f:
+                        zs["files"] += 1
+                        if not zstd_start(f.read(4)):
+                            zs["damaged"].append(rel)
                 continue          # (re-runs pick up where they stopped)
             os.makedirs(os.path.dirname(dst), exist_ok=True)
             temporary = dst + ".part"
             g = open(temporary, "wb")
             try:
                 with g:
-                    nup.copy_to(r, g if quiet else ProgressSink(g, progress), rel)
+                    sink = HeadSink(g) if looked else g
+                    nup.copy_to(r, sink if quiet else ProgressSink(sink, progress), rel)
                 os.replace(temporary, dst)
+                if looked:
+                    zs["files"] += 1
+                    if not zstd_start(sink.head):
+                        zs["damaged"].append(rel)
             except BaseException as error:
                 full = out_of_space(error, dst, part, rel, r[2])   # (measured before the member's space is freed)
                 # Free the failed member's space without hiding the extraction error.
@@ -583,11 +618,16 @@ def stand_in_for(path, damaged=()):
     return best and best[1]
 
 
-def stand_in_damaged(romfs, progress=None):
+def stand_in_damaged(romfs, progress=None, known=None):
     """Each damaged .zs file in an unpacked romfs replaced by a copy of its stand-in: (damaged, stand-in or None) each.
-    Only for a romfs this tool unpacked: the player's own folder is never written to. progress: damaged_game_files'"""
+    Only for a romfs this tool unpacked: the player's own folder is never written to. progress: damaged_game_files'.
+    known: the damaged files as the unpack itself found them (extract's zs, paths under romfs with "/"): they are taken
+    as they are and no file is opened to look for them"""
     done = []
-    damaged = damaged_game_files(romfs, progress)
+    if known is None:
+        damaged = damaged_game_files(romfs, progress)
+    else:
+        damaged = [os.path.normpath(os.path.join(romfs, *rel.split("/"))) for rel in known]
     for path in damaged:
         other = stand_in_for(path, set(damaged))
         if other:
@@ -642,8 +682,13 @@ def main():
             folder = parent
         free = shutil.disk_usage(folder).free
         print("extracting title %d (v%d) to %s (%.0f GB free)" % (t["index"], t["version"], a.extract, free / 1e9))
-        n, total = extract(nup, t, a.extract, a.only)
+        zs = {}
+        n, total = extract(nup, t, a.extract, a.only, zs=zs)
         print("done: %d files written, %.2f GB" % (n, total / 1e9))
+        if a.only != "exefs":   # (for nx2/make_game.py: the romfs .zs files as they were seen while they were written)
+            import json
+            with open(os.path.join(long_path(os.path.realpath(os.path.abspath(a.extract))), ZS_CHECKED), "w", encoding="utf-8") as f:
+                json.dump(zs, f)
         if a.only != "romfs":   # (main is ZBIC-compressed on firmware 22+: made a plain NSO for the tools)
             sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
             import unpack

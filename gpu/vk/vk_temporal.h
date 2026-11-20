@@ -22,7 +22,8 @@ int temporal_mode();
 /// (vk_fsr3.cpp fsr3_wanted). Where it cannot run, a saved FSR 3.1 stays
 bool temporal_env_chosen();
 bool temporal_wanted();       // (temporal_mode() != GAME)
-/// DLAA or FSR's native anti-aliasing: the 3D drawn at full scale, whatever the Render resolution row says
+/// DLAA or FSR's native anti-aliasing (FSR 4's on this chain, FSR 3.1's with its own passes: vk_fsr3.h fsr3_native): the 3D
+/// drawn at full scale, whatever the Render resolution row says
 bool temporal_full_scale();
 
 /// A draw into a scene-sized target (colour target 0 and the depth target), with the vertex stage's uniform buffer 3 at
@@ -49,6 +50,7 @@ struct SkinnedDraw {
     uint64_t camera = 0, camera_size = 0; // (the camera it was drawn with, the vertex stage's buffer 3: its view at 0, projection
                                           // at 0x70. Characters need not be drawn with the scene's: theirs is used for them)
     uint64_t program = 0;
+    uint64_t stream_pos = 0;   // (Triforce: its place in the stream, vk_replay.cpp replay_stream_pos: the n-th of a model is named by it)
 };
 /// nullptr: taken; else why not (vk_draw.cpp's RX_VK_DLSS_TRACE says it)
 const char* temporal_note_skinned_draw(const SkinnedDraw& k);
@@ -65,6 +67,7 @@ struct CaptureDraw {
     uint64_t camera = 0, camera_size = 0;   // (the vertex stage's uniform buffer 3: the camera it is drawn with, its jitter)
     VkPrimitiveTopology topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
     bool restart = false;             // (primitive restart, as the draw has it)
+    uint64_t stream_pos = 0;          // (Triforce: its place in the stream, as SkinnedDraw's)
 };
 /// Where such a draw's vertex stage stores its positions: CAPTURE_PUSH_OFFSET's push constants (address 0: nowhere)
 struct CaptureSlot {
@@ -98,6 +101,14 @@ bool temporal_upscale(VkCommandBuffer cmd, uint64_t key, bool known, Texture* in
 /// where temporal_pre_tonemap is then to run, outside a pass. *late: a draw into the scene after the engine drew there, in
 /// a frame worth a dump (the first few such frames)
 bool temporal_pre_point(const Texture* color0, uint64_t program, bool* late = nullptr);
+/// (Triforce) The same, asked by the parallel replay's dry pass in stream order for each draw (vk_draw.cpp
+/// dry_temporal_draw), so that the segments' threads need not ask it: program(ctx) gives the draw's program, asked only when
+/// the answer depends on it (stream_order.h pre_point_step). True at the point: the dry pass's segments end there and the
+/// rest is recorded in order, where temporal_pre_point says true again for the same draw
+bool temporal_pre_point_dry(const Texture* color0, uint64_t (*program)(void* ctx), void* ctx);
+/// (Triforce) Whether the engine drew before the bloom and the upscale's dispatch is still to come (or a frame before left it
+/// so): a command buffer that starts so is recorded on the replay thread alone (vk_replay.cpp replay_handle)
+bool temporal_pre_pending();
 /// The engine's frame there: the scene's linear HDR colour, the camera's depth and motion in, its picture back into the
 /// scene's colour target (returned: it was written), so the bloom and the tone mapping work from the anti-aliased scene.
 /// The upscale's dispatch of that frame then only copies (temporal_upscale). nullptr: nothing drawn, the dispatch draws

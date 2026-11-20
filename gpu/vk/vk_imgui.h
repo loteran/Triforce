@@ -29,6 +29,14 @@ const Art* art(const char* name);
 /// (Triforce) The button icons' font asked for: read at the next begin, the one the game was served this run
 /// (host/prompts.c: the controller's face) or the game's own
 void want_glyphs();
+/// (Triforce) The files of a folder whose names end in `ending`, by name; their names in UTF-8. None when the folder is
+/// not there (the Debug tab's Scan amiibo page: the game folder's amiibo folder)
+std::vector<std::string> folder_files(const std::string& dir, const char* ending);
+/// (Triforce) The game's own files of one folder of its romfs whose names end in `ending`, each unpacked and handed to
+/// `each` with its name, by name; in memory only, written nowhere. For the Debug tab's name pages (vk_menu.cpp), on a
+/// thread of the caller's: it has its own reader. false: there is no romfs folder, or it is not the game's
+bool game_files(const char* folder, const char* ending,
+                const std::function<void(const std::string& name, const std::vector<unsigned char>& bytes)>& each);
 
 /// A new ImGui frame for a w x h window image (the context made and the fonts loaded on the first call); false when ImGui
 /// cannot draw here (no views of the window's images: the surface does not allow drawing into them)

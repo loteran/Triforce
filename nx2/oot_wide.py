@@ -18,10 +18,11 @@ MAIN = 0x80020000   # (main's base in this image: nx2/eden_image.py)
 UI_M00, UI_M11 = "(2.0f / 3840.0f)", "(2.0f / 2160.0f)"   # (the UI's full-screen orthographic projection, 3840x2160 grid)
 # (the screens whose UI keeps the whole picture: the item-wheel and pause / system menu backgrounds redraw a capture of
 # the whole picture; the event and loading fades cover it. Bit k of host/hos_main.c's hos_wide_keep_mask keeps screen k
-# whole; the Insert menu's Ultrawide menus row clears the menus' bits 1 and 3 (vk_framegen.cpp): their layout then
+# whole; the Insert menu's Ultrawide menus row clears the menus' bit 1 (vk_framegen.cpp): their layout then
 # keeps its 16:9 shape in the middle, as the HUD's does, instead of being stretched over the whole picture. Bit 0, the
-# item wheel's background (the last frame of play, blurred, HUD and all), and bit 2, the fades, keep covering it all: bit 0
-# cleared, that capture went into the middle at twice its width)
+# item wheel's background (the last frame of play, blurred, HUD and all), and bits 2 and 3, the two fades, keep covering
+# it all: bit 0 cleared, that capture went into the middle at twice its width, and a fade in the middle alone left the
+# picture showing at its sides while a place loaded)
 KEEP_VTABLES = (MAIN + 0x4bed098, MAIN + 0x4be4fb0, MAIN + 0x4be61c8, MAIN + 0x4be7b30)
 
 
@@ -40,13 +41,15 @@ def _size(name):
             % (name, name, name))
 
 
-HUD = ("{ extern volatile float hos_wide_squeeze; const float _q = hos_wide_squeeze; if (_q > 0.0f) { float _m00, _m11; "
+# (the row goes to the host with the canvas' screen: host/oot_wide_hud.c keeps it for the screens of KEEP_VTABLES, squeezes it
+# for the rest, and moves the layouts of its table out to an edge with the Insert menu's Ultrawide HUD row on Screen edges)
+HUD = ("{ extern volatile float hos_wide_squeeze; if (hos_wide_squeeze > 0.0f) { float _m00, _m11; "
        "memcpy(&_m00, c->vreg[1], 4); memcpy(&_m11, (const uint8_t *)c->vreg[4] + 4, 4); "
-       "if (_m00 == %s && _m11 == %s) { const uint64_t _vt = recomp_load64(c, c->x[0] - 0x1b8); "
-       "extern volatile uint32_t hos_wide_keep_mask; const uint32_t _kb = %s; "
-       "if (!(_kb & hos_wide_keep_mask)) { float _row[4]; memcpy(_row, c->vreg[1], 16); for (int _k = 0; _k < 4; _k++) _row[_k] *= _q; "
-       "memcpy(c->vreg[1], _row, 16); } } } }   /* (nx2/oot_wide.py: HUD in the middle 16:9) */"
-       % (UI_M00, UI_M11, " : ".join("_vt == 0x%xULL ? %du" % (v, 1 << k) for k, v in enumerate(KEEP_VTABLES)) + " : 0u"))
+       "if (_m00 == %s && _m11 == %s) { extern void hos_wide_hud_row(Ctx *c, uint64_t screen, float *first, float *move); "
+       "float _row[4], _tx; memcpy(_row, c->vreg[1], 16); memcpy(&_tx, c->vreg[6], 4); "
+       "hos_wide_hud_row(c, c->x[0] - 0x1b8, _row, &_tx); memcpy(c->vreg[1], _row, 16); memcpy(c->vreg[6], &_tx, 4); } } }"
+       "   /* (nx2/oot_wide.py: HUD in the middle 16:9, or at the screen's edges) */"
+       % (UI_M00, UI_M11))
 
 MOVIE = ("{ extern volatile float hos_wide_margin; const float _m = hos_wide_margin; if (_m > 0.0f) { "
          "const uint64_t _vp = c->x[29] - 40; uint32_t _ua = (uint32_t)recomp_load32(c, _vp + 8), _ub = (uint32_t)recomp_load32(c, _vp + 16); "

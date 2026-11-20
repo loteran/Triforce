@@ -21,6 +21,7 @@ void rx_close_asked(void);   /* host/rx_backend.c */
 #include "../gpu/vk/vk_api.h"
 
 void hos_relaunch_ask(void);        /* (host/hos_relaunch.c) */
+void hos_bug_capture_key(void);     /* (host/bug_capture.c) */
 void hos_window_closed_exit(void);
 #ifndef WM_DPICHANGED
 #define WM_DPICHANGED 0x02E0
@@ -211,15 +212,54 @@ int hos_mouse_game_pointer(int *x, int *y, int *w, int *h, uint32_t *pressed, in
     if (!(ptr_in && GetForegroundWindow() == hwnd && *w > 0 && *h > 0)) return 0;
     return shown ? 1 : 2;
 }
+int hos_oot_options_front(void);   /* (host/oot_menu.c) */
 static void game_menu_press(LPARAM lp, LONG bit) {
     ptr_x = (short)LOWORD(lp), ptr_y = (short)HIWORD(lp), ptr_in = 1;
     gm_mouse_used();
     InterlockedOr(&gm_pressed, bit);
+    /* ((Triforce) the game's Options screen: the options' tabs over its header (gpu/vk/vk_menu.cpp draw_game_tab) take their
+       clicks through hos_mouse_pointer as the open menu does; host/oot_menu.c leaves the header to them, the rest is the game's) */
+    if (bit == HOS_MOUSE_LEFT && hos_oot_options_front()) InterlockedOr(&ptr_pressed, bit);
 }
 static void menu_press(HWND w, LPARAM lp, LONG bit) {   /* (a click while the menu is open: the menu's) */
     ptr_x = (short)LOWORD(lp), ptr_y = (short)HIWORD(lp), ptr_in = 1;
     InterlockedOr(&ptr_pressed, bit);
     SetCapture(w);   /* (a drag past the window's edge still reaches it) */
+}
+
+/* ((Triforce) 11-17) Text typed while the menu wants it (the Mods screen's search: rx_option HOS_OPT_TEXT_WANTED), to the menu
+   as code points (HOS_OPT_TEXT_CHAR): the characters, 8 Backspace, 127 Ctrl+Backspace; Ctrl+V the clipboard's text. Enter, Esc
+   and Tab stay the menu's keys. The window is an ANSI one: a character's byte is in the code page of the keyboard's layout */
+int rx_option(int id, int otherwise);
+void rx_option_set(int id, int value);
+static void typed_text_paste(HWND w) {
+    if (!IsClipboardFormatAvailable(CF_UNICODETEXT) || !OpenClipboard(w)) return;
+    HANDLE h = GetClipboardData(CF_UNICODETEXT);
+    const wchar_t *t = h ? (const wchar_t *)GlobalLock(h) : NULL;
+    for (int i = 0, n = 0; t && t[i] && n < 100; i++, n++) {
+        unsigned cp = t[i];
+        if (cp >= 0xD800 && cp < 0xDC00 && t[i + 1] >= 0xDC00 && t[i + 1] < 0xE000) cp = 0x10000 + ((cp - 0xD800) << 10) + (t[++i] - 0xDC00);
+        else if (cp >= 0xD800 && cp < 0xE000) continue;   /* (half of a pair alone: no character) */
+        if (cp < 0x20 || cp == 0x7f) cp = ' ';   /* (a line's end, a tab, a DEL: a space, never the menu's own codes) */
+        rx_option_set(HOS_OPT_TEXT_CHAR, (int)cp);
+    }
+    if (h) GlobalUnlock(h);
+    CloseClipboard();
+}
+static void typed_text(HWND w, WPARAM wp) {
+    if (!menu_open || !rx_option(HOS_OPT_TEXT_WANTED, 0)) return;
+    if (wp == 0x16) { typed_text_paste(w); return; }   /* (Ctrl+V) */
+    if (wp == 8 || wp == 127) { rx_option_set(HOS_OPT_TEXT_CHAR, (int)wp); return; }
+    if (wp < 0x20) return;   /* (Enter, Esc, Tab and the other control keys) */
+    wchar_t u = (wchar_t)wp;
+    if (wp >= 0x80) {
+        char cp[8] = "", b = (char)wp;
+        const LCID layout = (LCID)(LOWORD((uintptr_t)GetKeyboardLayout(0)));
+        /* (no layout's code page: the byte left out, never read in the system's own: tests/test_utf8_paths.py) */
+        const UINT page = GetLocaleInfoA(layout, LOCALE_IDEFAULTANSICODEPAGE, cp, sizeof cp) > 0 ? (UINT)atoi(cp) : 0;
+        if (!page || MultiByteToWideChar(page, 0, &b, 1, &u, 1) != 1) return;
+    }
+    rx_option_set(HOS_OPT_TEXT_CHAR, (int)u);
 }
 
 static LRESULT CALLBACK wndproc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
@@ -314,6 +354,8 @@ static LRESULT CALLBACK wndproc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         extern void hos_vk_note_key_press(unsigned key);
         if (!(lp & (1 << 30))) hos_vk_note_key_press((unsigned)wp);
         if (wp == VK_ESCAPE) mouse_capture(w, 0);
+        /* (Triforce, after NX2navi's F8) a bug capture: only noted here, written on a thread of its own (host/bug_capture.c) */
+        if (wp == VK_F8 && !(lp & (1 << 30))) hos_bug_capture_key();
         /* (Triforce: F11 does nothing; F10 and Alt+Enter switch fullscreen, below: F10 comes as a system key) */
         return 0;
     }
@@ -329,6 +371,9 @@ static LRESULT CALLBACK wndproc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_SYSCHAR:   /* (its character: without this Windows beeps, as for an Alt key with no menu) */
         if (wp == '\r') return 0;
         break;
+    case WM_CHAR:   /* ((Triforce) a character typed: the menu's when it takes text) */
+        typed_text(w, wp);
+        return 0;
     case WM_APP + 7:   /* (the Insert menu's row) */
         set_fullscreen(w, (int)wp);
         return 0;
@@ -422,7 +467,10 @@ static DWORD WINAPI display_main(void *p) {
     int win_w = hos_aspect_ratio > 0.0f ? (int)(720 * hos_aspect_ratio + 0.5f) : 1280, win_h = 720;
     if (getenv("HOS_WINDOW_SIZE")) {
         int w = 0, h = 0;
-        if (sscanf(getenv("HOS_WINDOW_SIZE"), "%dx%d", &w, &h) == 2 && w >= 64 && h >= 64) win_w = w, win_h = h;
+        /* ((Triforce) at most 16384 a side: the window's rectangle with its frame, and the size times the screen's dpi
+           below, are ints, and wrapped for a huge one) */
+        if (sscanf(getenv("HOS_WINDOW_SIZE"), "%dx%d", &w, &h) == 2 && w >= 64 && h >= 64 && w <= 16384 && h <= 16384)
+            win_w = w, win_h = h;
     }
     RECT r = {0, 0, win_w, win_h};
     AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
@@ -433,15 +481,24 @@ static DWORD WINAPI display_main(void *p) {
     theme_caption(hwnd);
     if (window_dpi(hwnd) != 96) {
         const UINT dpi = window_dpi(hwnd);
-        RECT s = {0, 0, (LONG)(win_w * dpi / 96), (LONG)(win_h * dpi / 96)};
+        RECT s = {0, 0, (LONG)((int64_t)win_w * dpi / 96), (LONG)((int64_t)win_h * dpi / 96)};
         AdjustWindowRect(&s, WS_OVERLAPPEDWINDOW, FALSE);
         SetWindowPos(hwnd, NULL, 0, 0, s.right - s.left, s.bottom - s.top, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
     }
     /* (no activate: shown at the bottom of the z-order, so a game in front keeps its focus) */
     if (noactivate)
         SetWindowPos(hwnd, HWND_BOTTOM, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
-    else
+    else {
         ShowWindow(hwnd, SW_SHOW);
+        /* ((Triforce, 11-18) brought to the front: after the Insert menu's Restart now the new window opened behind
+           another one (the run that started it had exited meanwhile, and the window it handed the front to kept it), and
+           the controllers, which count only while the game is in front (nn_hid.c), did nothing until the game was quit
+           and started by hand (#bug-tracker "Controller fails to work upon restart"). The run before allows it
+           (hos_relaunch.c AllowSetForegroundWindow); a start from Setup or an icon is in front already) */
+        SetForegroundWindow(hwnd);
+        if (GetForegroundWindow() != hwnd)
+            hos_log("display: the window did not come to the front at its start (controllers count once it is in front)");
+    }
     if (getenv("HOS_FULLSCREEN") && atoi(getenv("HOS_FULLSCREEN"))) set_fullscreen(hwnd, 1);
     RAWINPUTDEVICE rid = {1, 2, 0, hwnd};   /* generic desktop mouse: WM_INPUT while the window is in front */
     RegisterRawInputDevices(&rid, 1, sizeof rid);

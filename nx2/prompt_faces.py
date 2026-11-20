@@ -21,6 +21,9 @@ Each face:
            line ends on it), a button's centre and radius (its line ends just off the edge it comes from), a shoulder's top
            edge (r 0). The four face buttons are framed. Not a pad input's: boxes the lines keep off (x0, y0, x1, y1: a
            screen, a touchpad). SWITCH_PARTS: the game's Pro Controller's.
+  keys     (Triforce) True for the keyboard and mouse, which is no controller and has none of the above: its icons are one
+           per key that can be bound, drawn by nx2/prompt_keys.py (the keys, their labels and what each code point of the
+           font shows are there), and the host picks them by the keys bound instead of the pad inputs.
 """
 import os
 
@@ -96,6 +99,10 @@ FACES = {
         icons=dict(_DPAD, south="button_a", east="button_b", west="button_x", north="button_y", back="button_view",
                    start="button_options", lshoulder="button_l1", rshoulder="button_r1", ltrigger="button_l2",
                    rtrigger="button_r2")),
+    # (Triforce) the keyboard and mouse: no controller, so no font of Kenney's, no drawing and no parts. keys: its icons are
+    # the keys' and the mouse's buttons', one per key that can be bound, drawn by nx2/prompt_keys.py; the controls page keeps
+    # the game's own controller picture
+    "keyboard": dict(keys=True),
 }
 
 

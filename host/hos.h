@@ -51,7 +51,22 @@ extern const char hos_main_build_id[];                 /* (gen/hos_image.c: main
    hos_thread.c) run only when the lifted main is Mario Kart World's: any other game has other code there */
 int hos_game_is_mkw(void);
 #define HOS_GAME_TITLE "Triforce"
-void hos_commit(uint64_t addr, uint64_t size);         /* (mkw_glue.c) guest pages made usable by host APIs */
+/* (mkw_glue.c) guest pages made usable by host APIs. (Triforce) 1: committed, 0: the commit failed (logged), -1: not in
+   the guest window (logged) */
+int hos_commit(uint64_t addr, uint64_t size);
+/* (Triforce) the guest memory census (hos_mem.c, host/guest_census.h): each place that commits, maps or lets go of guest
+   pages says what it did. COMMITTED: handed out and committed (before the commit itself); TOUCHED: committed on a first
+   touch; PAGES, MAPPED: the game's own pages and physical maps; DECOMMITTED: let go and decommitted; ZEROED: let go and
+   zeroed in place (an import holds them); DISCARDED: let go, out of RAM but still committed */
+enum { HOS_MEM_COMMITTED, HOS_MEM_TOUCHED, HOS_MEM_PAGES, HOS_MEM_MAPPED, HOS_MEM_DECOMMITTED, HOS_MEM_ZEROED, HOS_MEM_DISCARDED };
+void hos_mem_note(int what, uint64_t addr, uint64_t size);
+int hos_mem_census_on(void);              /* (the notes are kept: HOS_MEM_CENSUS or HOS_MEM_GIVE_BACK) */
+int64_t hos_mem_give_back(uint64_t max_bytes);
+void hos_mem_census_start(void);          /* (mkw_glue.c: the census's thread) */
+/* (Triforce, rx_backend.c) before a call that hands the guest memory [p, p + n) to the kernel or changes its pages' state,
+   and after it with what the first returned: the lazy write-back's pages there are paid and left alone meanwhile */
+int hos_guest_io_begin(const void *p, uint64_t n);
+void hos_guest_io_end(int held);
 #if defined(A64_WRITE_TRACK) && !defined(__EMSCRIPTEN__)
 void hos_mark_written(const void *p, size_t n);   /* (hos_mem.c: guest memory written by host code, native soft watch) */
 #define HOS_WRITTEN(p, n) hos_mark_written((p), (n))
@@ -150,5 +165,7 @@ uint32_t movie_reader_codec(MovieReader *r);   /* the stream's FourCC: 'VP90', '
 /* ---- time */
 uint64_t hos_ticks(void);
 void hos_sleep_ns(int64_t ns);
+/* (Triforce) until hos_now_ns reads `until`: the timer to margin_ns before it, the rest yielded (pace_wait.h) */
+void hos_sleep_until_ns(int64_t until, int64_t margin_ns);
 int64_t hos_now_ns(void);
 #endif

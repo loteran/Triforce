@@ -15,9 +15,11 @@ typedef uint32_t DWORD;
 typedef intptr_t LONG_PTR;
 typedef struct { uint64_t x[32]; } Ctx;
 enum { GWL_EXSTYLE = -20, WS_EX_TOOLWINDOW = 0x80, WS_EX_NOACTIVATE = 0x8000000,
-       VK_MENU = 0x12, VK_RETURN = 0x0d, VK_LEFT = 0x25, VK_UP, VK_RIGHT, VK_DOWN,
-       VK_LBUTTON = 1, VK_RBUTTON = 2, VK_MBUTTON = 4, VK_XBUTTON1 = 5, VK_XBUTTON2 = 6 };
+       VK_MENU = 0x12, VK_RETURN = 0x0d, VK_ESCAPE = 0x1b, VK_LEFT = 0x25, VK_UP, VK_RIGHT, VK_DOWN,
+       VK_LBUTTON = 1, VK_RBUTTON = 2, VK_MBUTTON = 4, VK_XBUTTON1 = 5, VK_XBUTTON2 = 6,
+       VK_TAB = 0x09, VK_SHIFT = 0x10, VK_CONTROL = 0x11, VK_CAPITAL = 0x14 };   /* (the Walk key row's keys) */
 static int front, menu_background, bootstrap_polls, pad_merges, key_queries, mouse_queries, focus_queries, commands;
+static int no_window;   /* (no window in front at all: GetForegroundWindow answers NULL) */
 typedef int64_t LONG64;
 volatile LONG64 hos_present_count = 1000;
 static int frame_reads;
@@ -40,17 +42,33 @@ static void *at(uint64_t address) { CHECK(address <= 512 - 8); return memory + a
 #define ARG(n) (c->x[n])
 #define RET(value) (c->x[0] = (uint64_t)(value))
 
-int rx_option(int id, int otherwise) { return id == 4 ? menu_background : id == 1 ? 0 : otherwise; }
+/* (the Insert menu's Walk key row and Walk scale, 0 the scale's default, and whether Caps Lock, the row's first key, is held) */
+static int walk_row, walk_scale, walk_held;
+/* ((Triforce) the "options-back" case: our options open (rx_option 1) over the game's Options screen, the mouse's right
+   button held, and the game's Back tapped for it) */
+static int options_open, options_front, right_held;
+static char tapped[64];
+int rx_option(int id, int otherwise) {
+    if (id == HOS_OPT_WALK_KEY) return walk_row;
+    if (id == 1 && options_open) return 1;
+    if (id == HOS_OPT_WALK_SCALE && walk_scale) return walk_scale;
+    return id == 4 ? menu_background : id == 1 ? 0 : otherwise;
+}
 int64_t hos_now_ns(void) { return now_ns; }
 void hos_log(const char *format, ...) {
     va_list args; va_start(args, format); vsnprintf(last_log, sizeof last_log, format, args); va_end(args);
 }
-HWND GetForegroundWindow(void) { focus_queries++; return (HWND)(uintptr_t)(front ? 1 : 2); }
+HWND GetForegroundWindow(void) { focus_queries++; return no_window ? (HWND)0 : (HWND)(uintptr_t)(front ? 1 : 2); }
+/* (the program in front, by its file name: production asks Windows) */
+static void front_program(DWORD pid, char *name, int size) { (void)pid; snprintf(name, (size_t)size, "fixture.exe"); }
 DWORD GetWindowThreadProcessId(HWND window, DWORD *pid) { *pid = window == (HWND)(uintptr_t)1 ? 10 : 20; return 1; }
 DWORD GetCurrentProcessId(void) { return 10; }
 LONG_PTR GetWindowLongPtrA(HWND window, int index) { (void)window; (void)index; return 0; }
 int GetClassNameA(HWND window, char *text, int size) { (void)window; return snprintf(text, (size_t)size, "fixture"); }
-short GetAsyncKeyState(int key) { key_queries++; return key == 'P' || key == 'D' ? (short)-32768 : 0; }
+short GetAsyncKeyState(int key) {
+    key_queries++;
+    return key == 'P' || key == 'D' || (walk_held && key == VK_CAPITAL) || (right_held && key == VK_RBUTTON) ? (short)-32768 : 0;
+}
 int hos_sdl_pads(uint64_t *buttons, int32_t stick[4]) {
     bootstrap_polls++; *buttons = 1ULL << B_Y; stick[0] = -31000; return 1;
 }
@@ -68,9 +86,20 @@ void binds_load(void) {
 /* the native mouse look (no camera found: the motion goes to mouse_stick) and the mouse's sensitivity, which
    read_input calls */
 int hos_mouse_native(void) { return -1; }
+void hos_mouse_native_free(int free) { (void)free; }
+void hos_mouse_native_stick(int held) { (void)held; }
 static void mouse_setup(void) {}
 static void mouse_sens_keys(void) {}
 int mouse_stick(int32_t *x, int32_t *y, int held) { (void)x; (void)y; (void)held; mouse_queries++; return 0; }
+/* (the options tabs inside the game's own Options screen, which read_input looks at: never open here, so the Back it
+   would tap for the game is never asked for) */
+int hos_binding(int set, int button, int slot) { (void)set; (void)button; (void)slot; return -1; }
+int hos_oot_options_front(void) { return options_front; }
+/* (the sprint button, which takes its press out of the buttons while Link plays: off here; and the pipeline crawl's
+   lines of a live script, which no case writes) */
+void hos_oot_sprint_pad(uint64_t *buttons) { (void)buttons; }
+void hos_oot_live_crawl(const char *line) { (void)line; CHECK(!"unexpected crawl line"); }
+void hos_hid_tap(const char *press) { CHECK(options_front && "unexpected tap of the game's Back"); snprintf(tapped, sizeof tapped, "%s", press); }
 void rx_request_frame_dump(void) { commands++; }
 void rx_set_screenshot_ms(int64_t ms) { (void)ms; commands++; }
 void rx_request_rdoc_capture(int frames) { (void)frames; commands++; }
@@ -97,6 +126,7 @@ static void packet(uint64_t buttons, int32_t lx, int32_t ly, int32_t rx) {
     }
     for (int i = 0; i < 8; i++) CHECK(memory[64 + 2 * STATE_SIZE + i] == 0xa5);
     CHECK(commands == 0);
+    CHECK(hos_npad_buttons == buttons);   /* (the mods' cheats see the buttons the game was given: host/mod_cheats.c) */
 }
 
 static void append_live(const char *text) {
@@ -173,6 +203,74 @@ int main(int argc, char **argv) {
         !strcmp(name, "wall") || !strcmp(name, "zero") || !strcmp(name, "empty")) {
         frame_clock_case(name);
         printf("PASS: actual input frame clock %s\n", name);
+        free(memory);
+        return 0;
+    }
+    if (!strcmp(name, "no-window")) {
+        /* No window is in front for a moment, with the game's in front before it: the pads and the keys still count. For
+           longer than a quarter of a second nothing counts, and everything counts again once the game's window is back */
+        const uint64_t held = (1ULL << B_B) | (1ULL << B_X);
+        front = 1;
+        packet((1ULL << B_A) | held, 32767, 32767, 8000);
+        now_ns += 201000000;
+        no_window = 1;
+        packet(held, 32767, 0, 8000);
+        const int merges = pad_merges, keys = key_queries;
+        now_ns += 251000000;
+        packet(0, 0, 0, 0);
+        CHECK(pad_merges == merges && key_queries == keys);
+        CHECK(strstr(last_log, "game window not in front"));
+        no_window = 0;
+        now_ns += 3000000;
+        packet(held, 32767, 0, 8000);
+        CHECK(strstr(last_log, "was not in front for"));
+        CHECK(bootstrap_polls == 1);
+        printf("PASS: no window in front for a moment keeps the input %s\n", name);
+        free(memory);
+        return 0;
+    }
+    if (!strcmp(name, "options-back")) {
+        /* (Triforce) Our tabs open inside the game's own Options screen, left: with the mouse's right button held (the menu's
+           Back, as Esc is) the game's Back is tapped for it, as for the pad's B and Esc; left with nothing held (L or R, a
+           click on the game's own tab), no tap */
+        front = 1, options_front = 1;
+        Ctx context = {{0}};
+        for (int step = 0; step < 6; step++) {
+            options_open = step == 1 || step == 4, right_held = step >= 4;
+            context.x[0] = 64, context.x[1] = 2, context.x[2] = 16, context.x[30] = 0x1234;
+            G32(16) = NPAD_NO1;
+            npad_states(&context);
+            now_ns += 16666667;
+            if (step == 2) CHECK(tapped[0] == 0);
+        }
+        CHECK(!strcmp(tapped, "0:B/80"));
+        printf("PASS: our tabs left with the right button are the game's Back too %s\n", name);
+        free(memory);
+        return 0;
+    }
+    if (!strcmp(name, "walk")) {
+        /* (Triforce) The Walk key row. The script holds A and the left stick up; the pad holds B and its stick 12000 to
+           the left; the keys hold P (X) and D (move right). Off, D pushes the stick all the way. Caps Lock chosen and not
+           held: the same. Held: D pushes it 0.51 of the way, the row's default, and the script's push up is as it was;
+           0.90 the same way; at 0.20 the pad's 12000 is the further of the two and is what the game gets, as of any two
+           sticks. Off again with the key still held: all the way */
+        const uint64_t all = (1ULL << B_A) | (1ULL << B_B) | (1ULL << B_X);
+        front = 1;
+        packet(all, 32767, 32767, 8000);
+        walk_row = 1;
+        packet(all, 32767, 32767, 8000);
+        walk_held = 1;
+        packet(all, 16711, 32767, 8000);
+        walk_scale = 90;
+        packet(all, 29490, 32767, 8000);
+        walk_scale = 20;
+        packet(all, -12000, 32767, 8000);
+        walk_row = 0;
+        packet(all, 32767, 32767, 8000);
+        walk_row = 2, walk_scale = 0;   /* (Shift is the walk key, and it is Caps Lock that is held: no walk) */
+        packet(all, 32767, 32767, 8000);
+        CHECK(bootstrap_polls == 1);
+        printf("PASS: the walk key scales the movement keys' stick alone %s\n", name);
         free(memory);
         return 0;
     }

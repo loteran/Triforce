@@ -14,6 +14,7 @@
    Ioctl numbers are Linux-style: nr bits 0-7, group 8-15, size 16-29, direction 30-31. Structures and values follow
    suyu's nvdrv (src/core/hle/service/nvdrv, GPL-2.0-or-later) and switchbrew "NV services". */
 #include "hos.h"
+#include "guest_bounds.h"   /* ((Triforce) hos_range_ok: MAP_BUFFER_EX's remap check) */
 #include <stdio.h>
 #include <stdlib.h>
 #define WIN32_LEAN_AND_MEAN
@@ -407,7 +408,10 @@ static uint32_t ioctl_as_gpu(uint32_t nr, uint64_t p, uint64_t size) {
             const uint64_t va = G64(p + 32);
             LOCK();
             const int i = map_floor(va);
-            const int ok = i >= 0 && va + G64(p + 16) + G64(p + 24) <= maps[i].va + maps[i].size;
+            /* ((Triforce) inside the mapping counted from its start: va + offset + size wrapped past 2^64 for a huge
+               offset or size and passed) */
+            const uint64_t at = i >= 0 ? va - maps[i].va : 0, off = G64(p + 16), size = G64(p + 24);
+            const int ok = i >= 0 && hos_range_ok(at, off, maps[i].size) && hos_range_ok(at + off, size, maps[i].size);
             UNLOCK();
             MAP_LOG("nvdrv: remap GPU %#llx +%#llx size %#llx kind %#x: %s", (unsigned long long)va,
                     (unsigned long long)G64(p + 16), (unsigned long long)G64(p + 24), G32(p + 4), ok ? "ok" : "no mapping");

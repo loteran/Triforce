@@ -68,18 +68,18 @@ mg_spec.loader.exec_module(make_game)
 calls = []
 reported = []   # (whether each call was given a progress(done, total): the check says how far it is, #1764)
 sys.modules["nup"] = type(sys)("nup")
-sys.modules["nup"].stand_in_damaged = lambda romfs, progress=None: calls.append(romfs) or reported.append(callable(progress)) or []
+sys.modules["nup"].stand_in_damaged = lambda romfs, progress=None, known=None: calls.append(romfs) or reported.append(callable(progress)) or []
 with tempfile.TemporaryDirectory() as out:
     romfs = os.path.join(out, "romfs")
     os.makedirs(romfs)
     make_game.stand_in_damaged_files(out, romfs)
     check("no stamp: not the builder's romfs", calls, [])
-    with open(os.path.join(out, ".hookshot_romfs"), "w") as f:
+    with open(os.path.join(out, ".triforce_romfs"), "w") as f:
         f.write("unpacked by this builder: game.nup 1\n")
     make_game.stand_in_damaged_files(out, romfs)
     make_game.stand_in_damaged_files(out, romfs)
     check("checked once", calls, [romfs])
-    with open(os.path.join(out, ".hookshot_romfs"), "w") as f:
+    with open(os.path.join(out, ".triforce_romfs"), "w") as f:
         f.write("unpacked by this builder: other.nup 2\n")
     make_game.stand_in_damaged_files(out, romfs)
     check("checked again for another unpack", calls, [romfs, romfs])

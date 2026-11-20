@@ -37,7 +37,7 @@ elif mode == 'killed':
     os.kill(os.getpid(), signal.SIGKILL)
 raise SystemExit(7)
 ''', encoding='utf-8')
-            env = dict(os=os, subprocess=subprocess, time=time, GATE=None, PLANNED={},
+            env = dict(os=os, subprocess=subprocess, time=time, GATE=None, PLANNED={}, MEM_LOG=False,
                        OBJ_CACHE=str(folder / 'cache'), no_throttle=lambda handle: None,
                        object_key=lambda src, flags, deps: hashlib.sha1(repr((src, flags, deps)).encode()).hexdigest())
             exec(compile(ast.Module(body=functions, type_ignores=[]), str(BUILD), 'exec'), env)

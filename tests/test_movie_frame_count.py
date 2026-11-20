@@ -58,6 +58,8 @@ typedef int SRWLOCK;
 static void AcquireSRWLockExclusive(SRWLOCK *l) { CHECK(!*l); *l = 1; }
 static void ReleaseSRWLockExclusive(SRWLOCK *l) { CHECK(*l); *l = 0; }
 volatile uint32_t hos_frame_seconds_bits;
+static int movies_seen;   /* (each update says a movie plays, for the frame pacing: host/nn_vi.c movie_seen, tests/test_pace_handoff.py) */
+static void movie_seen(void) { movies_seen++; }
 @HOST@
 /* (the lifted update with the patch, on a small guest: the count at +760 of the player) */
 typedef struct { uint64_t x[31]; } Ctx;
@@ -91,6 +93,7 @@ int main(int argc, char **argv) {
     seconds(0);
     for (int i = 0; i < 600; i++) n = update(0);
     CHECK(n == 600);
+    CHECK(movies_seen == 600);   /* (at a cap of 60 too: the pacing is told of every update) */
     CHECK(hos_movie_frames(0x5000) == 1 && hos_movie_frames(0x5000) == 1);
     /* 120 fps: half a 60th an update, a whole one every second update */
     seconds(1.0 / 120);

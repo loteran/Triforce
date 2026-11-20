@@ -16,9 +16,13 @@ Each is a runtime switch where it can be, so the game's own path stays reachable
   before any recompute. So the fixed path kept the dynamic path's last scale (0.75 docked: 1536x864 at every setting). Flag 1 now
   also asks for the recompute, and on the fixed path the flags +0xe20 bits 3/4 (a hardcoded 0.75 / 0.5 in place of the scale)
   are not looked at.
+- The OptimizeChangeBank thread's allocations tried again when their heap is full (host/oot_heap_retry.c): f_804566e0's two
+  calls of f_80522050, its GPU memory (GPU_ALLOC_SITES), and its two tryAllocs of CPU buffers (HEAP_ALLOC_SITES). They went on
+  with a null pointer and crashed writing through it (issue 1697). The supported build only.
 """
 import glob
 import os
+import re
 import sys
 import whole_write   # (rewrites written beside and moved over: issue 1197)
 
@@ -174,6 +178,27 @@ def patch_menu_tick(source):
     hook = "    hos_oot_menu_tick(c, c->x[0]);   /* (nx2/oot_patches.py: the menus' mouse) */\n"
     return (source[:at] + hook + source[at:]).replace(
         '#include "a64.h"\n', '#include "a64.h"\nextern void hos_oot_menu_tick(Ctx *c, uint64_t screen);\n', 1)
+
+
+MOD_SIZE_CALL = "c->x[30] = 0x801b64e4ULL; f_836e3d30(c);\n"
+MOD_SIZE_HOOK = ("    c->x[0] = hos_mods_table_size(c->x[0], recomp_load64(c, c->x[29] + 24));"
+                 "   /* (nx2/oot_patches.py: room for the mods' files, host/mods.c) */\n")
+
+
+def patch_mod_sizes(source):
+    """((Triforce) 11-17) f_801b6340 asks the ResourceSizeTable (RESTBL, f_836e3d30: the CRC of the path, a binary search) how
+    much memory a file's load needs; the file's resource heap is made that size (f_801b6840). A mod's file served instead of the
+    game's (host/mods.c) can need more than the table gives it: a model with more materials and shapes than the original fails
+    its gsys::ModelResource allocations, which the game does not check (the Dark Link mod's Deku Shield and Slingshot: a write
+    to address 0 on loading a child save). The host raises the size for a mod's file to its real size and room beside it
+    (hos_mods_table_size); the game's own files keep the table's"""
+    if MOD_SIZE_CALL not in source:
+        return source, 0
+    if "hos_mods_table_size(" in source:   # (made before: a lift patched again)
+        return source, 1
+    out = source.replace(MOD_SIZE_CALL, MOD_SIZE_CALL + MOD_SIZE_HOOK, 1)
+    out = out.replace('#include "a64.h"\n', '#include "a64.h"\nextern uint64_t hos_mods_table_size(uint64_t size, uint64_t path);\n', 1)
+    return out, 1
 
 
 TEXT_HEAD = "void f_80b1e140(Ctx *__restrict A64_NOESC c) {"
@@ -372,6 +397,42 @@ SOLVER_NEW = SOLVER_OLD.replace(
 SOLVER_DECL = "extern uint32_t hos_oot_solver_steps(uint32_t game, uint32_t scaled_bits, uint32_t per_frame_bits);\n"
 
 
+# Three more places that go wrong with a frame step under one frame (host/oot_high_fps.h has why and the logic; at a cap of 60 the
+# host hands back what the game computes). Found and fixed for this build by NX2navi (its recomp/patches-v111.txt, the sets
+# ofollow, owater and orecord: main+0x13d704, +0x13a064, +0x389ac20; +0x3876014, +0x38827f8, +0x632cfc; +0x32926c8, +0x3293410,
+# +0x3296b08, +0x3296da4; main is at 0x80020000 here), there as code words, here as hooks in the lifted C:
+# - the character controller's three follow-surface updates compare the physics' inverse step with 100.0 and keep a tenth of
+#   the floor's velocity above it: every update above 100 fps, so a moving platform slid out from under Link. The 100.0 comes
+#   from hos_oot_floor_cut (100 / the frame's 60 fps frames while that is under one).
+# - the two water managers and the interactive floors (the Deku Tree's ground webs) run seconds / (1/60 s), cut to whole,
+#   fixed steps: none in an update shorter than 1/60 s, so the surfaces stood still above 60 fps. Before the cut the quotient
+#   goes through hos_oot_sim_steps (x19 the object, each function's x0): the whole steps with the object's remainder kept.
+# - the ocarina recorder's clock adds (unsigned)frame step at four places: 0 above 60 fps, so a recording lost its rests.
+#   hos_oot_record_frames carries the fraction.
+FLOOR_HEADS = ("void f_8015d490(Ctx *__restrict A64_NOESC c) {\n", "void f_80159dc0(Ctx *__restrict A64_NOESC c) {\n",
+               "void f_838baa40(Ctx *__restrict A64_NOESC c) {\n")
+# (mov w8, #0x42c80000; fmov s1, w8: the 100.0 of the compare that follows)
+FLOOR_OLD = ("    c->x[8] = 0x42c80000ULL;\n    c->x[8] &= 0xFFFFFFFFULL;\n"
+             "    { a64_vset64(c->vreg[1],0); memcpy(&c->vreg[1][0],&c->x[8],4); }\n")
+FLOOR_NEW = FLOOR_OLD.replace("c->x[8] = 0x42c80000ULL;",
+                              "c->x[8] = hos_oot_floor_cut();   /* (nx2/oot_patches.py: a floor's carry above 100 fps) */", 1)
+FLOOR_DECL = "extern uint32_t hos_oot_floor_cut(void);\n"
+# (a function and the register its cut goes to: fdiv s0, s8, s0 then fcvtzs w<n>, s0, the function's one cut of s0 into that register)
+SIM_SITES = (("void f_83895f20(Ctx *__restrict A64_NOESC c) {\n", 8), ("void f_838a2660(Ctx *__restrict A64_NOESC c) {\n", 8),
+             ("void f_80652cb0(Ctx *__restrict A64_NOESC c) {\n", 22))
+SIM_OLD = "    c->x[%d]=recomp_fp_to_int(c->vreg[0][0]&UINT64_C(0xffffffff),32,32,1,3,c->fpcr,&c->fpsr);\n"
+SIM_HOOK = ("    a64_vset64(c->vreg[0],hos_oot_sim_steps(c->x[19], (uint32_t)c->vreg[0][0]));"
+            "   /* (nx2/oot_patches.py: fixed steps above 60 fps) */\n")
+SIM_DECL = "extern uint32_t hos_oot_sim_steps(uint64_t object, uint32_t quotient_bits);\n"
+# (a function and how many times it adds the step to the clock: fcvtzu w8, s0)
+RECORD_SITES = (("void f_832b2690(Ctx *__restrict A64_NOESC c) {\n", 1), ("void f_832b32b0(Ctx *__restrict A64_NOESC c) {\n", 1),
+                ("void f_832b6840(Ctx *__restrict A64_NOESC c) {\n", 2))
+RECORD_OLD = "    c->x[8]=recomp_fp_to_int(c->vreg[0][0]&UINT64_C(0xffffffff),32,32,0,3,c->fpcr,&c->fpsr);\n"
+RECORD_NEW = ("    c->x[8]=hos_oot_record_frames((uint32_t)c->vreg[0][0]);"
+              "   /* (nx2/oot_patches.py: the ocarina recorder's clock above 60 fps) */\n")
+RECORD_DECL = "extern uint32_t hos_oot_record_frames(uint32_t step_bits);\n"
+
+
 def _function(s, head_text):
     """(start, end) of the function whose head is head_text, or None"""
     head = s.find(head_text)
@@ -420,6 +481,180 @@ def patch_solver_steps(s):
     return s, done
 
 
+def patch_floor_carry(s):
+    """The follow-surface updates' compare: (s, how many of the three are in s with the hook, made now or before)"""
+    done = 0
+    for head_text in FLOOR_HEADS:
+        at = _function(s, head_text)
+        if at is None:
+            continue
+        head, end = at
+        body = s[head:end]
+        if body.count(FLOOR_NEW) == 1:
+            done += 1
+        elif body.count(FLOOR_OLD) == 1:
+            s = s[:head] + body.replace(FLOOR_OLD, FLOOR_NEW, 1) + s[end:]
+            done += 1
+    if done and FLOOR_DECL not in s:
+        s = s.replace('#include "a64.h"\n', '#include "a64.h"\n' + FLOOR_DECL, 1)
+    return s, done
+
+
+def patch_sim_steps(s):
+    """The height-field surfaces' fixed steps: (s, how many of the three places are in s with the hook, made now or before)"""
+    done = 0
+    for head_text, reg in SIM_SITES:
+        at = _function(s, head_text)
+        if at is None:
+            continue
+        head, end = at
+        body = s[head:end]
+        old = SIM_OLD % reg
+        if body.count(SIM_HOOK + old) == 1:
+            done += 1
+        elif body.count(old) == 1 and SIM_HOOK not in body:
+            s = s[:head] + body.replace(old, SIM_HOOK + old, 1) + s[end:]
+            done += 1
+    if done and SIM_DECL not in s:
+        s = s.replace('#include "a64.h"\n', '#include "a64.h"\n' + SIM_DECL, 1)
+    return s, done
+
+
+def patch_record_clock(s):
+    """The ocarina recorder's clock: (s, how many of its four adds are in s with the hook, made now or before). A function
+    whose adds are not as many as RECORD_SITES says (another game version) is left as it is."""
+    done = 0
+    for head_text, count in RECORD_SITES:
+        at = _function(s, head_text)
+        if at is None:
+            continue
+        head, end = at
+        body = s[head:end]
+        if body.count(RECORD_NEW) == count and RECORD_OLD not in body:
+            done += count
+        elif body.count(RECORD_OLD) == count and RECORD_NEW not in body:
+            s = s[:head] + body.replace(RECORD_OLD, RECORD_NEW) + s[end:]
+            done += count
+    if done and RECORD_DECL not in s:
+        s = s.replace('#include "a64.h"\n', '#include "a64.h"\n' + RECORD_DECL, 1)
+    return s, done
+
+
+# The sprint button (host/oot_sprint.h has the rules, host/oot_sprint.c the game's addresses; after NX2navi's set "sprint").
+# Link sprints while his input flags hold the dash input (bit 4), which the game sets only out of a roll. Two functions load
+# those flags and test the bit: his movement update f_804caa80 (to start the sprint and to keep it), and the update of his
+# stance and camera f_80c225d0 (the low byte). After each load the host gets the flags and gives them back, with the bit
+# while the button's sprint is on. With the Sprint button row off the call returns what it got.
+SPRINT_LINK_HEAD = "void f_804caa80(Ctx *__restrict A64_NOESC c) {\n"
+SPRINT_LINK_OLD = ("    c->x[10]=recomp_load64(c,c->x[19] + 80);\n"
+                   "    c->x[9]=recomp_load32(c,c->x[19] + 44);\n"
+                   "    c->x[10]=recomp_load64(c,c->x[10] + 0);\n")
+SPRINT_LINK_ADD = "    c->x[10]=hos_oot_sprint_link(c,c->x[19],c->x[10]);   /* (nx2/oot_patches.py: the sprint button) */\n"
+SPRINT_STANCE_HEAD = "void f_80c225d0(Ctx *__restrict A64_NOESC c) {\n"
+SPRINT_STANCE_OLD = ("    c->x[8]=recomp_load64(c,c->x[19] + 80);\n"
+                     "    c->x[8]=recomp_load8(c,c->x[8] + 0);\n"
+                     "if (((c->x[8] >> 4) & 1)) { goto L_80c27f54; }\n")
+SPRINT_STANCE_NEW = ("    c->x[8]=recomp_load64(c,c->x[19] + 80);\n"
+                     "    c->x[8]=recomp_load8(c,c->x[8] + 0);\n"
+                     "    c->x[8]=hos_oot_sprint_stance(c,c->x[19],c->x[8]);   /* (nx2/oot_patches.py: the sprint button) */\n"
+                     "if (((c->x[8] >> 4) & 1)) { goto L_80c27f54; }\n")
+SPRINT_DECL = ("extern uint64_t hos_oot_sprint_link(Ctx *c, uint64_t link, uint64_t flags);\n"
+               "extern uint64_t hos_oot_sprint_stance(Ctx *c, uint64_t link, uint64_t flags);\n")
+
+
+def patch_sprint(s):
+    """The sprint button's two calls: (s, how many of the two are in s, made now or before). A function whose code differs
+    (another game version) is left as it is."""
+    done = 0
+    for head_text, old, new in ((SPRINT_LINK_HEAD, SPRINT_LINK_OLD, SPRINT_LINK_OLD + SPRINT_LINK_ADD),
+                                (SPRINT_STANCE_HEAD, SPRINT_STANCE_OLD, SPRINT_STANCE_NEW)):
+        at = _function(s, head_text)
+        if at is None:
+            continue
+        head, end = at
+        body = s[head:end]
+        if body.count(new) == 1:
+            done += 1
+        elif body.count(old) == 1:
+            s = s[:head] + body.replace(old, new) + s[end:]
+            done += 1
+    if done and SPRINT_DECL not in s:
+        s = s.replace('#include "a64.h"\n', '#include "a64.h"\n' + SPRINT_DECL, 1)
+    return s, done
+
+
+# (Triforce) The host's zstd decoder (host/host_zstd.h has what the two functions are and the rules; HOS_HOST_ZSTD, off unless
+# set). The game's own zstd, linked into main: f_8010b380 (main+0xeb380) is ZSTD_decompressMultiFrame, f_80115c80 (main+0xf5c80)
+# the stream feed its loading threads decode through. At the head of each the host is asked first: it answers the call (x0 the
+# result, the function returns) or says 0 and the game's code runs as it is. hos_host_zstd is 0 once the switch was read as off,
+# and the call is no longer made. A switch at run time, so that it takes no new translation to turn on or off.
+# Only the supported build's: the heads are found by address, and by lines only these two functions have (their shape below), so
+# a function of that name with other code (another game version, a changed lift) is left as it is.
+# (Triforce) The shapes are matched with the store marks' spellings taken out (_unmarked, below). The page marks of a group of
+# stores (a64_lift.mark_groups) are made after these patches (nx2/chunks.py edit_c): a store of a group becomes
+# recomp_storeN_sp( and an A64_MARK line follows the group. The lift as it stands on disk has them, these patches see the text
+# before them. The stream feed's begin stores (+48 and +0 through x19) are such a group: its shape, read from the lift on disk,
+# was never in the text the patch saw, and every build said "found at 1 of 2 places" (the stream feed left out). The lines are
+# written as the text is before the marks, the text the patch sees (tests/test_host_zstd.py holds them to that).
+ZSTD_SITES = (
+    ("void f_8010b380(Ctx *__restrict A64_NOESC c) {\n", "hos_zstd_multiframe",
+     # (the eighth argument kept and tested, and the dictionary read from a DDict's +8 and +16)
+     ("    recomp_store64_sp(c,c->x[31] + 104,c->x[7]);\nif (c->x[7] != 0) { goto L_8010fd78; }\n",
+      "L_8010fd78:;\n    c->x[8]=recomp_load64(c,c->x[31] + 104);\n"
+      "    { uint64_t _b=c->x[8]; int64_t _o=8; { uint64_t _p0,_p1; recomp_ldp64(c,(_b+_o),&_p0,&_p1); c->x[5]=_p0; c->x[6]=_p1; } }\n")),
+    ("void f_80115c80(Ctx *__restrict A64_NOESC c) {\n", "hos_zstd_stream",
+     # (the phase read from the state, the "done" result, the error code asked of zstd, and the stores of a begin. (Triforce)
+     # And every field host/host_zstd.h reads or writes, at its offset: the output and its room (+8, +16) read in phase 2, the
+     # DCtx's "bytes expected next" (HZ_DCTX_EXPECTED, 28776) read first there, the workspace (+24) read at the begin before
+     # the content size goes to +20; the DCtx to +48 and the phase to +0 at its end)
+     ("    c->x[8]=recomp_load8(c,c->x[0] + 0);\n",
+      "    c->x[0] = 0xfffffffdULL;\n",
+      "c->x[30] = 0x8011629cULL; f_80d5ba00(c);\n",
+      "    c->x[22]=recomp_load64(c,c->x[21] + 28776);\n",
+      "    c->x[23]=recomp_load64(c,c->x[19] + 8);\n"
+      "    { uint64_t _r = (uint64_t)(int64_t)(int32_t)recomp_load32(c,c->x[19] + 16); c->x[2] = _r; }\n",
+      "    c->x[21]=recomp_load64(c,c->x[19] + 24);\n    recomp_store32(c,c->x[19] + 20,c->x[8]);\n",
+      "    recomp_store64(c,c->x[19] + 48,c->x[21]);\n    recomp_store8(c,c->x[19] + 0,c->x[8]);\n")),
+)
+ZSTD_HOOK = "    if (hos_host_zstd && %s(c)) return;   /* (nx2/oot_patches.py: the host's zstd decoder, HOS_HOST_ZSTD) */\n"
+ZSTD_DECL = ("extern volatile int hos_host_zstd;\nextern int hos_zstd_multiframe(Ctx *c);\n"
+             "extern int hos_zstd_stream(Ctx *c);\n")
+# (a64_lift.MG_MARK's line, and the _sp spelling of a marked store: mark_groups_lines, stack_stores, frame_stores)
+MARK_LINE = re.compile(r"^    A64_MARK\(\(c->x\[\d+\] \+ \(uint64_t\)\(int64_t\)\(-?\d+\)\), \d+\);\n", re.M)
+MARK_SP = re.compile(r"\brecomp_(store8|store16|store32|store64|stp32|stp64)_sp\(")
+
+
+def _unmarked(text):
+    """(Triforce) text without the store marks' spellings: a group's A64_MARK lines out, recomp_storeN_sp( as recomp_storeN(.
+    The code's shape alone, the same before a64_lift.mark_groups and after it (a second run over a finished lift), and with
+    A64_MARK_EACH, A64_MARK_STACK or A64_MARK_FRAME at lift time. They change only where a store's page is marked, never what
+    the guest's code does, so a shape can count on everything else"""
+    return MARK_SP.sub(r"recomp_\1(", MARK_LINE.sub("", text))
+
+
+def patch_host_zstd(s):
+    """The host decoder's two calls: (s, how many of the two heads are in s with their call, made now or before). A function
+    whose code is not the decoder's (another game version) is left as it is."""
+    done = 0
+    for head_text, name, shape in ZSTD_SITES:
+        at = _function(s, head_text)
+        if at is None:
+            continue
+        head, end = at
+        body = s[head:end]
+        hook = ZSTD_HOOK % name
+        if body.startswith(head_text + hook):
+            done += 1
+        elif hook not in body:
+            plain = _unmarked(body)
+            if all(plain.count(_unmarked(line)) == 1 for line in shape):
+                s = s[:head] + head_text + hook + body[len(head_text):] + s[end:]
+                done += 1
+    if done and ZSTD_DECL not in s:
+        s = s.replace('#include "a64.h"\n', '#include "a64.h"\n' + ZSTD_DECL, 1)
+    return s, done
+
+
 def patch_text_speed(s):
     """The scale at the head of the letters' block of f_80b1e140; None when the file has no such function, s unchanged when the
     function is there but its code differs (another game version)."""
@@ -458,6 +693,46 @@ def patch_scene_format(s):
     return s.replace(RGBA16F_OLD, RGBA16F_NEW, 1).replace('#include "a64.h"\n', '#include "a64.h"\n' + RGBA16F_DECL, 1)
 
 
+# (from TomShafford/Hookshot 55d68e8cd6 and 65c1998222) f_804566e0's two calls of f_80522050, the GPU memory a model's material
+# block is made with, made through host/oot_heap_retry.c hos_oot_gpu_alloc, which calls the game's own and tries a full heap's
+# failure again in the heap's parents. f_80522050's other callers stay as they are.
+GPU_ALLOC_SITES = (0x80456f1c, 0x80457098)   # (the calls' return addresses)
+GPU_ALLOC_OLD = "c->x[30] = %#xULL; f_80522050(c);"
+GPU_ALLOC_NEW = "c->x[30] = %#xULL; hos_oot_gpu_alloc(c, f_80522050);   /* (nx2/oot_patches.py: host/oot_heap_retry.c) */"
+GPU_ALLOC_DECL = "void hos_oot_gpu_alloc(Ctx *A64_NOESC c, A64Fn game);\n"
+# f_804566e0's tryAllocs of the CPU buffers at its MatBlock's +200 (its bump allocator's memory) and +168, each sized for the
+# model (x0 the heap, x1 the size, x2 the alignment): a null result tried in the heap's parents (hos_oot_heap_retry)
+HEAP_ALLOC_SITES = (0x80456910, 0x80456da4)
+HEAP_ALLOC_OLD = "{ uint64_t _t = c->x[8]; c->x[30] = %#xULL; A64_ICALL(c, _t); }\n"
+HEAP_ALLOC_NEW = ("{ const uint64_t _hh = c->x[0], _hn = c->x[1], _ha = c->x[2];   /* (nx2/oot_patches.py: host/oot_heap_retry.c) */\n"
+                  "  if (hos_oot_heap_refuse()) c->x[0] = 0;\n"
+                  "  else { uint64_t _t = c->x[8]; c->x[30] = %#xULL; A64_ICALL(c, _t); }\n"
+                  "  if (!c->x[0]) hos_oot_heap_retry(c, _hh, _hn, _ha, %#xULL); }\n")
+HEAP_ALLOC_DECL = "int hos_oot_heap_refuse(void);\nvoid hos_oot_heap_retry(Ctx *c, uint64_t heap, uint64_t size, uint64_t align, uint64_t lr);\n"
+
+
+def patch_heap_retry(s):
+    """The four places above in one file's text: (text, [GPU sites, CPU sites] made now or found made). apply() wants
+    [2, 2] over the whole lift and warns otherwise"""
+    found = [0, 0]
+    decls = []
+    for kind, sites, old, new, decl in ((0, GPU_ALLOC_SITES, GPU_ALLOC_OLD, GPU_ALLOC_NEW, GPU_ALLOC_DECL),
+                                        (1, HEAP_ALLOC_SITES, HEAP_ALLOC_OLD, HEAP_ALLOC_NEW, HEAP_ALLOC_DECL)):
+        for lr in sites:
+            o, n = old % lr, (new % lr if kind == 0 else new % (lr, lr))
+            if n in s:
+                found[kind] += 1
+            elif s.count(o) == 1 and s.count('#include "a64.h"\n') == 1:
+                s = s.replace(o, n, 1)
+                found[kind] += 1
+                if decl not in decls:
+                    decls.append(decl)
+    for decl in decls:
+        if decl not in s:
+            s = s.replace('#include "a64.h"\n', '#include "a64.h"\n' + decl, 1)
+    return s, found
+
+
 def apply(gen, *, protect_hearts=False, required=False):
     """required: the lift of the supported build (LIFE_BUILD_ID), whole: a missing output-size edit stops it (apply_output_size).
     The other patches only warn when their place is not found once."""
@@ -476,6 +751,11 @@ def apply(gen, *, protect_hearts=False, required=False):
     step_sites, step_files = 0, []   # (the divides with the hook, and the files that have it)
     whole_sites = 0   # (the counters of WHOLE_SITES with the whole frames: patch_whole_frames)
     sound_jobs = solver_sites = 0   # (patch_sound_job, patch_solver_steps: the places found with their hooks)
+    floor_sites = sim_sites = record_sites = 0   # (patch_floor_carry, patch_sim_steps, patch_record_clock: the same)
+    sprint_sites = 0   # (patch_sprint: its two calls)
+    zstd_sites = 0   # (patch_host_zstd: its two calls, the supported build's alone)
+    mod_size_sites = 0   # ((Triforce) patch_mod_sizes: its one call, the supported build's alone)
+    heap_sites = [0, 0]   # (the GPU memory's sites, the CPU buffers': patch_heap_retry, the supported build only)
     for path in sorted(glob.glob(os.path.join(glob.escape(gen), "code_*.c"))):
         with open(path, encoding="utf-8", newline="") as f:
             s = f.read()
@@ -547,6 +827,12 @@ def apply(gen, *, protect_hearts=False, required=False):
             step_files.append(path)
         if sites:
             print("oot_patches: the frame's time at %d step divide(s) in %s" % (sites, os.path.basename(path)))
+        heap, found = patch_heap_retry(out) if protect_hearts else (out, [0, 0])
+        heap_sites[0] += found[0]
+        heap_sites[1] += found[1]
+        if heap != out:
+            print("oot_patches: heap-full retries of the OptimizeChangeBank allocations in", os.path.basename(path))
+        out = heap
         out, whole = patch_whole_frames(out)
         whole_sites += out.count(WHOLE_MARK)   # (made now, or by an earlier run over this file)
         if whole:
@@ -561,12 +847,59 @@ def apply(gen, *, protect_hearts=False, required=False):
         if solver != out:
             print("oot_patches: the solver steps rounded up above 60 fps in", os.path.basename(path))
         out = solver
+        floor, found = patch_floor_carry(out)
+        floor_sites += found
+        if floor != out:
+            print("oot_patches: a floor's carry above 100 fps in", os.path.basename(path))
+        out = floor
+        sim, found = patch_sim_steps(out)
+        sim_sites += found
+        if sim != out:
+            print("oot_patches: the water and floor surfaces' fixed steps above 60 fps in", os.path.basename(path))
+        out = sim
+        record, found = patch_record_clock(out)
+        record_sites += found
+        if record != out:
+            print("oot_patches: the ocarina recorder's clock above 60 fps in", os.path.basename(path))
+        out = record
+        sprinted, found = patch_sprint(out)
+        sprint_sites += found
+        if sprinted != out:
+            print("oot_patches: the sprint button in", os.path.basename(path))
+        out = sprinted
+        if protect_hearts:   # (found by address: the supported build's functions)
+            zstd, found = patch_host_zstd(out)
+            zstd_sites += found
+            if zstd != out:
+                print("oot_patches: the host's zstd decoder's call(s) in", os.path.basename(path))
+            out = zstd
+            sized, found = patch_mod_sizes(out)
+            mod_size_sites += found
+            if sized != out:
+                print("oot_patches: room for the mods' files in", os.path.basename(path))
+            out = sized
         if out != s:
             whole_write.write_whole(path, out, newline="")
     if sound_jobs != 1:   # (without it, above 60 fps sounds and then the music can stop after a few loading zones)
         print("oot_patches: WARNING: the sound job was found %d times, not once" % sound_jobs)
     if solver_sites != len(SOLVER_HEADS):   # (without them, above 60 fps moving platforms can drop Link)
         print("oot_patches: WARNING: the solver step count was found at %d of %d places" % (solver_sites, len(SOLVER_HEADS)))
+    if floor_sites != len(FLOOR_HEADS):   # (without them, above 100 fps a moving platform carries Link at a tenth of its speed)
+        print("oot_patches: WARNING: a floor's carry was found at %d of %d places" % (floor_sites, len(FLOOR_HEADS)))
+    if sim_sites != len(SIM_SITES):   # (without them, above 60 fps the water and web surfaces stand still)
+        print("oot_patches: WARNING: the surfaces' fixed steps were found at %d of %d places" % (sim_sites, len(SIM_SITES)))
+    if record_sites != sum(n for _, n in RECORD_SITES):   # (without them, above 60 fps a recorded song loses its rests)
+        print("oot_patches: WARNING: the ocarina recorder's clock was found at %d of %d places"
+              % (record_sites, sum(n for _, n in RECORD_SITES)))
+    if sprint_sites != 2:   # (without them the Sprint button row does nothing)
+        print("oot_patches: WARNING: the sprint button's calls were found at %d of 2 places" % sprint_sites)
+    if protect_hearts and mod_size_sites != 1:   # (without it a mod's bigger model can crash the game: host/mods.c)
+        print("oot_patches: WARNING: the resource size table's lookup was found at %d of 1 place" % mod_size_sites)
+    if protect_hearts and zstd_sites != len(ZSTD_SITES):   # (without them HOS_HOST_ZSTD does nothing, or half: host/hos_zstd.c)
+        print("oot_patches: WARNING: the host's zstd decoder's calls were found at %d of %d places" % (zstd_sites, len(ZSTD_SITES)))
+    if protect_hearts and heap_sites != [len(GPU_ALLOC_SITES), len(HEAP_ALLOC_SITES)]:   # (the supported build's functions)
+        print("oot_patches: WARNING: the OptimizeChangeBank allocations were found %s times, not once each: a full heap is "
+              "not tried again" % heap_sites)
     for what, n in done.items():
         if n != 1:
             print("oot_patches: WARNING: the %s was found %d times" % (what, n))

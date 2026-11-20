@@ -1,11 +1,12 @@
 """A Debug row read before the menu loads (gpu/vk/vk_draw.cpp menu_env_on): Descriptor reuse on by default from options_version 4.
 
 The real menu_env_on from gpu/vk/vk_draw.cpp is compiled over a stub game path (the fixture's folder); each case writes a
-hookshot_options.ini (or none) and checks the answer for descriptor_reuse (on by default since options_version 4: an older
-file wrote its 0 as the off default it then was) and sampler_cache (off by default, no version rule):
+triforce_options.ini (or none) and checks the answer for descriptor_reuse (on by default since options_version 4: an older
+file wrote its 0 as the off default it then was) and sampler_cache (on by default since options_version 5, the same rule):
 
 - no file: the default; a file without the line: the default;
 - options_version 3 with descriptor_reuse=0: on (the old default, moved); 4 with 0: off (chosen); 4 with 1: on;
+- sampler_cache=0 before options_version 5: on (the old default, moved); 5 with 0: off (chosen); 5 with 1: on;
 - RX_VK_DESC_SLOTGEN over all of it.
 
 python -I -B tests/test_menu_env_on.py [--cxx clang++]
@@ -43,7 +44,7 @@ BODY
 int main(int argc, char **argv) {
     if (argc != 3) return 2;
     const bool reuse = menu_env_on("RX_VK_DESC_SLOTGEN", "descriptor_reuse", true, 4);
-    const bool sampler = menu_env_on("RX_VK_SAMPLER_CACHE", "sampler_cache");
+    const bool sampler = menu_env_on("RX_VK_SAMPLER_CACHE", "sampler_cache", true, 5);
     if (reuse != (atoi(argv[1]) != 0) || sampler != (atoi(argv[2]) != 0)) {
         fprintf(stderr, "FAIL: descriptor_reuse %d (want %s), sampler_cache %d (want %s)\n", reuse, argv[1], sampler, argv[2]);
         return 1;
@@ -52,17 +53,20 @@ int main(int argc, char **argv) {
 }
 """
 
-# (hookshot_options.ini's text or None for no file, RX_VK_DESC_SLOTGEN or None, descriptor reuse, sampler cache)
+# (triforce_options.ini's text or None for no file, RX_VK_DESC_SLOTGEN or None, descriptor reuse, sampler cache)
 CASES = (
-    (None, None, 1, 0),
-    ("output_res=1\noptions_version=4\n", None, 1, 0),
-    ("descriptor_reuse=0\nsampler_cache=0\noptions_version=3\n", None, 1, 0),
+    (None, None, 1, 1),
+    ("output_res=1\noptions_version=4\n", None, 1, 1),
+    ("descriptor_reuse=0\nsampler_cache=0\noptions_version=3\n", None, 1, 1),
     ("descriptor_reuse=0\nsampler_cache=1\n", None, 1, 1),
     ("descriptor_reuse=0\nsampler_cache=1\noptions_version=4\n", None, 0, 1),
-    ("options_version=4\ndescriptor_reuse=1\n", None, 1, 0),
-    ("descriptor_reuse=0\noptions_version=4\n", "1", 1, 0),
-    ("descriptor_reuse=1\noptions_version=4\n", "0", 0, 0),
-    (None, "0", 0, 0),
+    ("descriptor_reuse=0\nsampler_cache=0\noptions_version=4\n", None, 0, 1),
+    ("descriptor_reuse=0\nsampler_cache=0\noptions_version=5\n", None, 0, 0),
+    ("sampler_cache=1\noptions_version=5\n", None, 1, 1),
+    ("options_version=4\ndescriptor_reuse=1\n", None, 1, 1),
+    ("descriptor_reuse=0\noptions_version=4\n", "1", 1, 1),
+    ("descriptor_reuse=1\noptions_version=4\n", "0", 0, 1),
+    (None, "0", 0, 1),
 )
 
 
@@ -78,7 +82,7 @@ def main():
         source.write_text(FIXTURE.replace("BODY", body), encoding="utf-8")
         subprocess.run([args.cxx, "-std=c++17", "-Wall", "-Wextra", "-Werror", str(source), "-o", str(exe)], check=True)
         for text, env_value, reuse, sampler in CASES:
-            ini = work / "hookshot_options.ini"
+            ini = work / "triforce_options.ini"
             if ini.exists():
                 ini.unlink()
             if text is not None:

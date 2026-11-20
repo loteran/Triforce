@@ -1,0 +1,26 @@
+#ifndef TRIFORCE_RENODX_SETTINGS_SLANGI
+#define TRIFORCE_RENODX_SETTINGS_SLANGI
+// (Triforce) The settings RenoDX's Zelda OoT mod has no place for in its own block (shared.h ShaderInjectData, set 1
+// binding 4): the gamma correction and what RenoDRT alone reads. gpu/vk/vk_renodx.cpp fills them from the Insert menu's rows
+// (struct Extra, the same six floats in the same order) and gives them to every program with one of RenoDX's stages as
+// set 1 binding 5.
+//
+// This file and the two beside it are Triforce's own. They hold none of RenoDX's code: scripts/renodx_shaders.py compiles
+// them together with RenoDX's sources as it fetched them (github.com/clshortfuse/renodx, MIT, Carlos Lopez), and what they
+// call of RenoDX is its library as it is there.
+#include "shared.h"   // (RenoDX's: its settings and, through renodx.hlsl, its library)
+
+struct TriforceSettings {
+    float gamma_correction;       // 0 none, 1 a display of gamma 2.2, 2 of 2.4 (triforce_output.slangi)
+    float highlight_saturation;   // RenoDRT: 1 unchanged
+    float blowout;                // RenoDRT: 0 none
+    float flare;                  // RenoDRT: 0 none
+    float hue_correction;         // RenoDRT: 1 the hue from before the tone mapper
+    float color_grade_strength;   // RenoDRT: 1 all of the game's own grading
+};
+
+layout(set = 1, binding = 5, scalar) uniform TriforceShaderConstants {
+    TriforceSettings settings;
+} triforce_constants;
+
+#endif

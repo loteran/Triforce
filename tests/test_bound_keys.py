@@ -2,9 +2,10 @@
 the Switch's buttons (host/nn_hid.c).
 
 host/nn_hid.c's binding table and its bound_down are compiled alone, against fake key states and a fake
-hookshot_options.ini: the defaults (WASD, the arrows, the mouse's left button Y and right button ZL), a mouse button
+triforce_options.ini: the defaults (WASD, the arrows, the mouse's left button Y and right button ZL), a mouse button
 only while the mouse is captured and only once the click that captured it was let go, key_move_up from the file, a
 pad_ line for a keys-only control ignored, a key taken from the control that had it, and Enter with Alt still no key.
+The walk key (the Insert menu's Walk key row, tests/test_walk_key.py) is no control's key while it is the walk key.
 python -I -B tests/test_bound_keys.py   (needs a C compiler)
 """
 import shutil
@@ -113,6 +114,21 @@ int main(int argc, char **argv) {
     /* Enter with Alt is fullscreen, not Plus */
     release(), held[VK_RETURN] = held[VK_MENU] = 1;
     CHECK(!bound_down(HOS_SW_PLUS, 0));
+    /* (Triforce) the walk key presses no button while it is the walk key, the other keys as they were; its binding is
+       kept, and counts again once it is the walk key no more */
+    release(), held[VK_SHIFT] = held[VK_SPACE] = 1;
+    CHECK(bound_down(HOS_SW_B, 0) && bound_down(HOS_SW_X, 0));
+    walk_vk = VK_SHIFT;
+    CHECK(!bound_down(HOS_SW_B, 0) && bound_down(HOS_SW_X, 0));
+    CHECK(hos_binding(HOS_BIND_KEY, HOS_SW_B, 0) == VK_SHIFT);
+    walk_vk = VK_TAB;   /* (one of a control's two keys: the other still presses it) */
+    release(), held[VK_TAB] = 1;
+    CHECK(!bound_down(HOS_SW_PLUS, 0));
+    release(), held[VK_RETURN] = 1;
+    CHECK(bound_down(HOS_SW_PLUS, 0));
+    walk_vk = 0;
+    release(), held[VK_SHIFT] = held[VK_TAB] = 1;
+    CHECK(bound_down(HOS_SW_B, 0) && bound_down(HOS_SW_PLUS, 0));
     hos_bind(HOS_BIND_KEY, -1, 0, 0);
     CHECK(hos_binding(HOS_BIND_KEY, HOS_KEY_MOVE_UP, 0) == 'W' && hos_binding(HOS_BIND_KEY, HOS_SW_A, 0) == 'E');
     if (!fails) printf("PASS\n");
@@ -137,7 +153,8 @@ class BoundKeysTests(unittest.TestCase):
         self.assertNotIn("key('W')", read, "read_input still reads WASD itself")
         with tempfile.TemporaryDirectory(prefix="hookshot-bound-keys-") as tmp:
             tmp = Path(tmp)
-            (tmp / "hookshot_options.ini").write_text("key_move_up=90,0\npad_move_up=0\n", encoding="utf-8")
+            # (the options file by its name now: as hookshot_options.ini, the name before, nothing read it)
+            (tmp / "triforce_options.ini").write_text("key_move_up=90,0\npad_move_up=0\n", encoding="utf-8")
             (tmp / "t.c").write_text(PRELUDE + code + MAIN, encoding="utf-8")
             binary = tmp / ("t.exe" if sys.platform == "win32" else "t")
             build = subprocess.run([compiler, "-std=gnu11", "-Wall", "-Wno-unused-function", "-I", str(ROOT / "gpu" / "vk"),
