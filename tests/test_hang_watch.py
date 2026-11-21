@@ -31,6 +31,23 @@ def check_source():
             ("pid == GetCurrentProcessId() && !IsIconic(w)", "a minimized window, or another program's, counts as in front")):
         if needle not in dump:
             raise SystemExit("gpu/vk/vk_hangdump.cpp: " + why)
+    # ((Triforce) the stacks asked for from outside: looked for every second before the stall's judgement, the file taken away
+    # before the report, the report as a stall's, the log written out, a few a run)
+    loop = dump[dump.index("hangwatch::Watch watch;"):dump.index("}).detach();")]
+    at = 0
+    for part in ("int asked = 0;", "Sleep(1000);", "const std::string ask_path = path + hangwatch::kAskSuffix;", "if (!ask_stuck && game_path_there(ask_path)) {",
+                 "if (!ask_take(ask_path)) {", "ask_stuck = true;", "} else if (hangwatch::ask(asked)) {", "dump(path.c_str(), true)", "host->log_flush();",
+                 "hangwatch::step(watch, presents, by_name || window_in_front(), sec)"):
+        found = loop.find(part, at)
+        if found < 0:
+            raise SystemExit("gpu/vk/vk_hangdump.cpp: the asked-for stacks: %r is missing or out of order" % part)
+        at = found + len(part)
+    take = dump[dump.index("bool ask_take(const std::string& path) {"):dump.index("/// The game's own window")]
+    if "DeleteFileW(" not in take or "MultiByteToWideChar(CP_UTF8" not in take or "remove(" in take:
+        raise SystemExit("gpu/vk/vk_hangdump.cpp: the ask's file is not taken away by its UTF-8 path with DeleteFileW")
+    header = (ROOT / "gpu/vk/hang_watch.h").read_text(encoding="utf-8")
+    if 'constexpr const char* kAskSuffix = ".now";' not in header:
+        raise SystemExit("gpu/vk/hang_watch.h: the ask's file is no longer the report's name with .now")
     if "if (presents == 1) hang_watch_start();" not in replay:
         raise SystemExit("gpu/vk/vk_replay.cpp no longer starts the hang watch at the first present")
     # (nothing is logged or allocated while a thread is suspended: the log's lines come after every ResumeThread)

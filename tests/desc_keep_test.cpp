@@ -56,6 +56,8 @@ struct World {
 Texture textures[16];
 thread_local bool view_slot_known = true;
 thread_local bool upload_defer_ok = false;
+thread_local bool draw_may_defer = true;   // ((Triforce, redrawn.h) set by vk_draw.cpp draw: may this draw leave textures)
+bool texture_owes(const Texture*) { return false; }   // ((Triforce) no texture here still owes bytes)
 uint32_t texture_slot_version(int slot) { return w.version[(uint32_t)slot]; }
 uint64_t sampler_registrations_generation() { return w.samp; }
 uint64_t texture_destroy_generation() { return w.destroy; }
@@ -64,7 +66,7 @@ uint32_t texture_epoch() { return (uint32_t)w.epoch; }
 uint64_t gpu_bind_stamp() { return w.stamp; }
 uint64_t ub_generation() { return w.ub; }
 VkImageView texture_view_of(uint32_t h, VkImageViewType vt, ViewUse use, VkFormat f, Texture** tex) {
-    CHECK(use == ViewUse::Sample && f == VK_FORMAT_UNDEFINED && upload_defer_ok == (test != "compute"));
+    CHECK(use == ViewUse::Sample && f == VK_FORMAT_UNDEFINED && upload_defer_ok == (test != "compute" && draw_may_defer));
     w.views++;
     const uint32_t slot = h & 0xFFFFF;
     view_slot_known = w.known;
@@ -77,10 +79,10 @@ VkImageView texture_view_of(uint32_t h, VkImageViewType vt, ViewUse use, VkForma
     *tex = &textures[slot & 15];
     return handle<VkImageView>(v | 1);
 }
-VkSampler sampler_for(int id, bool compare) {
+VkSampler sampler_for(int id, bool compare, bool scene) {   // ((Triforce, S8) scene: the jittered scene's, biased)
     w.samplers++;
     if (w.sampler_fail) return VK_NULL_HANDLE;
-    return handle<VkSampler>(0x7000000ull | (uint64_t)id << 8 | (uint64_t)compare << 4 | w.samp << 32 | w.bias);
+    return handle<VkSampler>(0x7000000ull | (uint64_t)id << 8 | (uint64_t)scene << 5 | (uint64_t)compare << 4 | w.samp << 32 | w.bias);
 }
 struct RecordingRes {
     struct Stream { VkBuffer buffer; };
@@ -107,10 +109,11 @@ Stage vs{0}, fs{1};
 NvnState s{};
 desc_keep::Prog* kp() { return &desc_keep::prog_of(kept_descs(), &prog, 8); }
 struct Tex { VkSampler smp; VkImageView view; Texture* tex; bool known; };
-Tex tex_of(uint32_t h, VkImageViewType vt = VK_IMAGE_VIEW_TYPE_2D, bool compare = false, size_t j = 4, bool keep = true) {
+Tex tex_of(uint32_t h, VkImageViewType vt = VK_IMAGE_VIEW_TYPE_2D, bool compare = false, size_t j = 4, bool keep = true,
+           bool scene = false) {
     Tex t{};
     view_slot_known = !w.known;   // (the taken path must say what the lookup said)
-    t.smp = kept_texture(keep ? kp() : nullptr, j, h, vt, compare, test == "compute", &t.view, &t.tex);
+    t.smp = kept_texture(keep ? kp() : nullptr, j, h, vt, compare, test == "compute", scene, &t.view, &t.tex);
     t.known = view_slot_known;
     CHECK(!upload_defer_ok);
     return t;
@@ -120,9 +123,10 @@ bool operator==(const VkDescriptorBufferInfo& a, const VkDescriptorBufferInfo& b
     return a.buffer == b.buffer && a.offset == b.offset && a.range == b.range;
 }
 /// Resolved (the sampler and, for a handle, the view looked up) or taken (nothing looked up)
-bool tex_resolved(uint32_t h, Tex* out = nullptr, VkImageViewType vt = VK_IMAGE_VIEW_TYPE_2D, bool compare = false) {
+bool tex_resolved(uint32_t h, Tex* out = nullptr, VkImageViewType vt = VK_IMAGE_VIEW_TYPE_2D, bool compare = false,
+                  bool scene = false) {
     const int v0 = w.views, s0 = w.samplers;
-    const Tex t = tex_of(h, vt, compare);
+    const Tex t = tex_of(h, vt, compare, 4, true, scene);
     if (out) *out = t;
     CHECK((w.views - v0) == (h ? w.samplers - s0 : 0));
     return w.samplers != s0;
@@ -213,6 +217,15 @@ int run() {
         CHECK(!tex_resolved(h));   // (and what was kept is still there)
         return 0;
     }
+    if (test == "texture-scene") {   // ((Triforce, S8) a draw into the scene and one into a shadow map: each its own sampler)
+        Tex a, b, c;
+        CHECK(tex_resolved(h, &a) && !tex_resolved(h));
+        CHECK(tex_resolved(h, &b, VK_IMAGE_VIEW_TYPE_2D, false, true) && b.smp != a.smp && b.view == a.view);
+        CHECK(((uint64_t)(uintptr_t)b.smp >> 5 & 1) == 1 && ((uint64_t)(uintptr_t)a.smp >> 5 & 1) == 0);   // (scene passed on)
+        CHECK(!tex_resolved(h, &c, VK_IMAGE_VIEW_TYPE_2D, false, true) && c == b);   // (kept for the scene)
+        CHECK(tex_resolved(h, &c) && c == a && !tex_resolved(h));   // (and back: the other pass's again)
+        return 0;
+    }
     if (test == "texture-moved") {   // (a destroy while the lookup ran: what it gave is kept with the generation before it)
         w.move_destroy = true;
         CHECK(tex_resolved(h));
@@ -229,6 +242,24 @@ int run() {
         w.known = true;   // (a registered slot whose texture is not there yet: the same)
         w.version[0x123]++;
         CHECK(tex_resolved(h, &a) && a.known && !a.view && !tex_resolved(h, &b) && a == b);
+        return 0;
+    }
+    if (test == "texture-dummy-redrawn") {   // ((Triforce, redrawn.h) a registered slot's kept dummy: taken by a draw that may
+        // leave textures for later, looked up again by one that may not, so that its texture is made now)
+        w.dummy_slot = true, w.known = true;
+        Tex a, b;
+        CHECK(tex_resolved(h, &a) && a.known && !a.view && !a.tex);
+        CHECK(!tex_resolved(h, &b) && a == b);   // (a draw into the scene: the kept dummy stands for the frame)
+        draw_may_defer = false;                  // (a draw into a text box composed for the first time)
+        CHECK(tex_resolved(h, &b) && a == b);    // (looked up, not taken)
+        CHECK(tex_resolved(h, &b));              // (again: never taken by such a draw)
+        draw_may_defer = true;
+        w.dummy_slot = false;                    // (the texture there now: a real view, which any draw may take)
+        w.version[0x123]++;
+        CHECK(tex_resolved(h, &a) && a.view);
+        draw_may_defer = false;
+        CHECK(!tex_resolved(h, &b) && a == b);
+        draw_may_defer = true;
         return 0;
     }
     if (test == "texture-no-sampler") {   // (a failed sampler is not kept: the draw is left out and the next one tries again)

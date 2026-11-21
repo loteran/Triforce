@@ -98,11 +98,14 @@ def check_source():
     draw = (ROOT / "gpu/vk/vk_draw.cpp").read_text(encoding="utf-8")
     # (every creation given the cache: through the gate. Left as they were: the prepare's and warm pass's, before play and
     # joined before it begins)
-    allowed_raw = ("void warm_libraries(", "bool prepare_run(")
+    # ((Triforce) and prepare_compute_pipeline: prepare_run's warm, and the carry's rebuild of it (warm_kept_computes), both
+    # in prepare_run before play)
+    allowed_raw = ("void warm_libraries(", "bool prepare_run(", "bool prepare_compute_pipeline(")
     for m in re.finditer(r"guarded_compute\((pcache\b[^,]*),", draw):
         if m.group(1) == "pcache_use().cache":
             continue
         owner = max((draw.rfind("\n" + f, 0, m.start()), f) for f in ("bool prepare_run(", "void precompile_run(",
+                                                                       "bool prepare_compute_pipeline(",
                                                                        "void warm_libraries(", "bool fallback_compute_pipelines(",
                                                                        "VkPipeline clear_pipeline(", "void dispatch("))
         if owner[1] not in allowed_raw:
@@ -114,7 +117,7 @@ def check_source():
     if "vkCreateGraphicsPipelines(dev.device, pcache," in draw or "vkCreateComputePipelines(dev.device, pcache," in draw:
         raise SystemExit("a pipeline is made with the cache past its gate")
     pre = between(draw, "void precompile_run(", "\n}\n")
-    if "guarded_compute(pcache_use().cache, &ci, &made)" not in pre:
+    if "cached_compute(pcache_use().cache, &ci, &made)" not in pre:
         raise SystemExit("the precompile's computes, which may run on after the game starts, do not take the gate")
     build = between(draw, "VkPrimitiveTopology topo, int part, bool* cold) {", "\n}\n")
     # ((Triforce) cached_graphics: the guard's creation through the play cache, tests/test_pcache_play.py)

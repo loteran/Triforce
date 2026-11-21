@@ -79,6 +79,10 @@ static VkImageView texture_view_of(uint32_t handle,int type,ViewUse use,int form
    every recording thread shares) */
 static int lock_depth;
 struct ParLock { ParLock(){lock_depth++;} ~ParLock(){lock_depth--;} };
+/* ((Triforce, FG-2) the picture it wrote, taken for frame generation after the upscale: outside the lock, when it drew) */
+static int hudless_calls, hudless_lock_depth = -1;
+static uint64_t hudless_key;
+static void hudless_after_dispatch(VkCommandBuffer,uint64_t key){++hudless_calls;hudless_key=key;hudless_lock_depth=lock_depth;}
 static bool typed_upscale(VkCommandBuffer cmd,VkImageView input,VkImageView output,Texture* out,uint32_t level,uint64_t key,const char* text,bool temporal){
     if(lock_depth<=0) return false;   /* (not under the lock: the upscale is refused, and the checks of its calls fail) */
     ++upscale_calls;forwarded_cmd=cmd;forwarded_input=input;forwarded_output=output;forwarded_texture=out;
@@ -122,9 +126,13 @@ int main(int argc,char** argv){
         handle_value=0;rejected("no handle");handle_value=5;
         resolve_image=false;rejected("no resolved image");resolve_image=true;
         texture.format=0;rejected("wrong output format");texture.format=VK_FORMAT_B10G11R11_UFLOAT_PACK32;
+        check(hudless_calls==0,"a rejected invocation takes no picture for frame generation");
         auto accepted=[&](const char* text,bool result){
             key_reads=0;int prior=upscale_calls;upscale_result=result;
+            const int hudless_before=hudless_calls;
             check(taau_stand_in(19,state,program)==result,"eligible helper result forwarded");
+            check(hudless_calls==hudless_before+(result?1:0) && (!result || (hudless_key==target && hudless_lock_depth==0)),
+                  "the picture it drew is taken for frame generation, outside the recording lock, and only when it drew");
             check(upscale_calls==prior+1 && key_reads==(configured_keys?2:1),"eligible invocation retains per-call lookup count");
             check(forwarded_cmd==19 && forwarded_input==11 && forwarded_output==44 && forwarded_texture==&texture && forwarded_level==7 && forwarded_key==target && forwarded_temporal,"eligible arguments preserved");
             check(forwarded_text==text,"current key text forwarded verbatim");

@@ -75,7 +75,12 @@ bool sampler_of(int id, nvn_samp_par* p) {
     if (policy == "standard-border") std::fill(std::begin(p->border), std::end(p->border), 1.0f);
     if (policy == "reduction" || policy == "compare-reduction" || policy == "custom-reduction") p->reduction = 1;
     if (policy == "wrap") p->ws = NVN_WRAP_MODE_REPEAT, p->wt = NVN_WRAP_MODE_MIRRORED_REPEAT, p->wr = NVN_WRAP_MODE_CLAMP_TO_BORDER;
+    // ((Triforce, 11-18) anisotropy is raised only on samplers whose U and V repeat (EstebanGGM's aniso_tiled): a tiled one, and
+    // a clamped one that stays as the game has it)
+    if (policy == "anisotropy") p->ws = NVN_WRAP_MODE_REPEAT, p->wt = NVN_WRAP_MODE_MIRRORED_REPEAT;
     if (policy == "lod-clamp") p->lod_bias = 100, p->lod_min = -3, p->lod_max = -1;
+    // ((Triforce, v0.5.2) the anisotropy only where U and V repeat: a clamped one (anisotropy-clamped) reads a screen buffer
+    if (policy == "anisotropy") p->ws = NVN_WRAP_MODE_REPEAT, p->wt = NVN_WRAP_MODE_MIRRORED_REPEAT;
     return true;
 }
 const char* getenv(const char* name) {
@@ -83,7 +88,7 @@ const char* getenv(const char* name) {
     if (!std::strcmp(name, "RX_VK_PUSH_ALL") && descriptor_policy == "descriptor-whole") return "1";
     if (!std::strcmp(name, "RX_VK_SAMPLER_CACHE") && cache_off) return "0";
     if (!std::strcmp(name, "RX_VK_SHADOW_PCF") && policy == "compare-pcf-off") return "0";
-    if (!std::strcmp(name, "RX_VK_ANISO") && policy == "anisotropy") return "16";
+    if (!std::strcmp(name, "RX_VK_ANISO") && policy.find("anisotropy") == 0) return "16";
     if (!std::strcmp(name, "RX_VK_FORCE_LINEAR") && policy == "force-linear") return "1";
     return nullptr;
 }
@@ -168,8 +173,8 @@ void vkCmdBindDescriptorSets(VkCommandBuffer, VkPipelineBindPoint, VkPipelineLay
 std::array<Pushed, 2>& pushed() { static std::array<Pushed, 2> state; return state; }
 
 std::string route;
-VkSampler get(int id = 0, bool compare = false) {
-    return route == "make" ? sampler_make(id, compare) : sampler_for(id, compare);
+VkSampler get(int id = 0, bool compare = false, bool scene = false) {
+    return route == "make" ? sampler_make(id, compare, scene) : sampler_for(id, compare, scene);
 }
 void valid(VkSampler sampler) { assert(sampler && live.count(sampler)); }
 void retry(const std::string& test) {
@@ -243,14 +248,14 @@ void run(const std::string& test) {
         // A distinct ID forces the parameter acceleration insertion.
         // Use sampler_make directly to test this cache even when the outer ID table is bypassed.
         if (!cache_off) {
-            fail_cache = Seen; auto next = sampler_make(1, false); valid(next); assert(allocation_faults == 1);
+            fail_cache = Seen; auto next = sampler_make(1, false, false); valid(next); assert(allocation_faults == 1);
             assert(live.at(next).ci.mipLodBias == 0.25f && live.at(next).ci.maxLod == 8);
         } else valid(get(1));
         assert(destroyed == 0); return;
     }
     if (test == "mine-commit") {
-        auto first = sampler_make(0, false); valid(first);
-        fail_cache = Mine; assert(sampler_make(0, false) == first);
+        auto first = sampler_make(0, false, false); valid(first);
+        fail_cache = Mine; assert(sampler_make(0, false, false) == first);
         assert(allocation_faults == 1 && creates == 1 && destroyed == 0 && live.size() == 1); return;
     }
     if (test == "valid-after-failure" || test == "failure-commit") {
@@ -264,6 +269,23 @@ void run(const std::string& test) {
     if (test == "registration") {
         auto first = get(); valid(first); generation++; registration_lod_max = 3;
         auto second = get(); valid(second); assert(second != first && creates == 2 && live.at(second).ci.maxLod == 3); return;
+    }
+    // ((Triforce, S8) the upscaler's texture LOD bias: added only for a draw into the jittered scene (scene), on a wrapping,
+    // trilinear sampler; the other passes' sampler of the same id is its own, unbiased, and neither is taken for the other)
+    if (test == "scene-bias" || test == "scene-clamped" || test == "scene-off") {
+        policy = test == "scene-bias" ? "wrap" : "";
+        upscale_lod_bias = test == "scene-off" ? 0.0f : -1.5f;
+        const VkSampler other = get(4), scene = get(4, false, true);   // (id 4: the game's own bias 1)
+        valid(other); valid(scene);
+        assert(live.at(other).ci.mipLodBias == 1.0f);
+        if (test == "scene-bias") {
+            assert(scene != other && creates == 2 && live.at(scene).ci.mipLodBias == -0.5f);
+            assert(get(4, false, true) == scene && get(4) == other && creates == 2);   // (each kept apart)
+            assert(get(4, true, true) != scene);   // (a depth compare: never biased, another sampler)
+            assert(live.at(get(4, true, true)).ci.mipLodBias == 1.0f && live.at(get(4, true)).ci.mipLodBias == 1.0f);
+        } else   // (clamped, or no bias in use: the same sampler for both)
+            assert(scene == other && creates == 1 && live.at(scene).ci.mipLodBias == 1.0f);
+        return;
     }
     if (test == "shared-thread") {
         auto first = get(); valid(first); VkSampler other{};
@@ -290,6 +312,7 @@ void run(const std::string& test) {
     if (test == "reduction" || test == "custom-reduction") assert(saved.reduced && saved.reduction == VK_SAMPLER_REDUCTION_MODE_MIN);
     if (test == "compare-reduction") assert(!saved.reduced);
     if (test == "anisotropy") assert(ci.anisotropyEnable && ci.maxAnisotropy == 8);
+    if (test == "anisotropy-clamped") assert(!ci.anisotropyEnable);
 }
 } // namespace fixture
 int main(int argc, char** argv) {

@@ -152,10 +152,78 @@ int main() {
                                                              ur::resolution_fixed(ur::FSR3_AA) && !ur::resolution_fixed(ur::FSR3) &&
                                                              !ur::resolution_fixed(DLSS) && !ur::resolution_fixed(ur::FSR4) &&
                                                              !ur::resolution_fixed(GAME));
-    // the Window scaling filter: needed only when the window is not the picture's size (unknown: needed)
-    CHECK("filter not needed at the output's size", !ur::filter_needed(2560, 1440, 2560, 1440));
-    CHECK("filter needed otherwise", ur::filter_needed(2048, 1152, 2560, 1440) && ur::filter_needed(2560, 1440, 2560, 1080) &&
-                                         ur::filter_needed(0, 0, 0, 0) && ur::filter_needed(2560, 1440, 0, 0));
+    // ((Triforce, options_version 7) the window's filter, the Window scaling filter row's choice made by the sizes: none at the
+    // picture's own size (or before the sizes are known), AMD FSR 1 enlarging, the plain copy making smaller or another
+    // shape, and the plain copy with HDR Native, whose 10-bit picture framegen_scale's 8-bit images would cut)
+    CHECK("no filter at the picture's size", ur::auto_filter(2560, 1440, 2560, 1440) == 0 && ur::auto_filter(3413, 1440, 3413, 1440) == 0);
+    CHECK("no filter before the sizes are known", ur::auto_filter(0, 0, 0, 0) == 0 && ur::auto_filter(2560, 1440, 0, 0) == 0 &&
+                                                      ur::auto_filter(0, 0, 2560, 1440) == 0);
+    CHECK("FSR 1 enlarging", ur::auto_filter(2048, 1152, 2560, 1440) == 3 && ur::auto_filter(1536, 864, 3840, 2160) == 3 &&
+                                 ur::auto_filter(2560, 1440, 2560, 2160) == 3);
+    CHECK("the plain copy making smaller", ur::auto_filter(3840, 2160, 2560, 1440) == 0 && ur::auto_filter(2560, 1440, 1920, 1440) == 0 &&
+                                              ur::auto_filter(2560, 1080, 1920, 1440) == 0 && ur::auto_filter(2048, 1152, 1280, 720) == 0);
+    CHECK("the plain copy with HDR Native", ur::window_filter(2560, 1440, 3360, 1440, true) == 0 &&
+                                                ur::window_filter(2048, 1152, 3840, 2160, true) == 0 &&
+                                                ur::window_filter(2560, 1440, 3360, 1440, false) == 3);
+    // ((Triforce, options_version 7) the Upscaler row names the engine, and an engine's native AA is the Render resolution's
+    // Native (100%): the saved values 2, 5 and 6 stay what they were)
+    {
+        using ur::FSR3;
+        using ur::FSR3_AA;
+        using ur::FSR4;
+        using ur::FSR4_AA;
+        const unsigned every = ur::bit(GAME) | ur::dlss_bits(true) | ur::fsr3_bits(true) | ur::fsr4_bits(true);
+        CHECK("engines", ur::engine(DLAA) == DLSS && ur::engine(FSR4_AA) == FSR4 && ur::engine(FSR3_AA) == FSR3 &&
+                             ur::engine(DLSS) == DLSS && ur::engine(GAME) == GAME && ur::engine(-1) == GAME && ur::engine(9) == GAME);
+        CHECK("native AAs", ur::native_of(DLSS) == DLAA && ur::native_of(FSR4) == FSR4_AA && ur::native_of(FSR3) == FSR3_AA &&
+                                ur::native_of(GAME) == GAME);
+        // the Upscaler: Game, DLSS, FSR 3.1, FSR 4 and back, the resolution left to snap
+        ur::Scaling s = ur::step_engine(GAME, 3, 1, every);
+        CHECK("game to DLSS", s.upscaler == DLSS && s.resolution == 3);
+        s = ur::step_engine(DLSS, 4, 1, every);
+        CHECK("DLSS to FSR 3.1", s.upscaler == FSR3 && s.resolution == 4);
+        s = ur::step_engine(FSR3, 6, 1, every);
+        CHECK("FSR 3.1 to FSR 4", s.upscaler == FSR4 && s.resolution == 6);
+        s = ur::step_engine(FSR4, 6, 1, every);
+        CHECK("FSR 4 to the game's", s.upscaler == GAME && s.resolution == 6);
+        s = ur::step_engine(GAME, 0, -1, every);
+        CHECK("the game's to FSR 4, Left", s.upscaler == FSR4 && s.resolution == 0);
+        // Native (100%) goes with it: DLAA to FSR 3.1's native AA, FSR 4's to the game's own at 100%, and back
+        s = ur::step_engine(DLAA, 3, 1, every);
+        CHECK("DLAA to FSR 3.1's native AA", s.upscaler == FSR3_AA && s.resolution == 3);
+        s = ur::step_engine(FSR4_AA, 6, 1, every);
+        CHECK("FSR 4's native AA to the game's at 100%", s.upscaler == GAME && s.resolution == 1);
+        s = ur::step_engine(GAME, 1, 1, every);
+        CHECK("the game's at 100% to DLAA", s.upscaler == DLAA && s.resolution == 1);
+        // only what runs here; a saved engine that cannot run here steps as the game's own
+        s = ur::step_engine(GAME, 4, 1, ur::bit(GAME) | ur::fsr4_bits(true));
+        CHECK("FSR 4 alone", s.upscaler == FSR4);
+        s = ur::step_engine(FSR4_AA, 4, 1, ur::bit(GAME) | ur::fsr4_bits(true));
+        CHECK("FSR 4 alone, back", s.upscaler == GAME && s.resolution == 1);
+        s = ur::step_engine(DLSS, 4, 1, ur::bit(GAME) | ur::fsr3_bits(true));
+        CHECK("a saved DLSS where it cannot run", s.upscaler == FSR3);
+        // the Render resolution: the game's own steps as before; DLSS and FSR Auto, Native (100%), Quality ... Ultra Performance
+        s = ur::step_resolution(GAME, 0, 1);
+        CHECK("the game's own: Auto to 100%", s.upscaler == GAME && s.resolution == 1);
+        s = ur::step_resolution(FSR4, 0, 1);
+        CHECK("FSR 4: Auto to Native", s.upscaler == FSR4_AA && s.resolution == 0);
+        s = ur::step_resolution(FSR4_AA, 0, 1);
+        CHECK("FSR 4: Native to Quality", s.upscaler == FSR4 && s.resolution == 3);
+        s = ur::step_resolution(DLAA, 4, -1);
+        CHECK("DLSS: Native to Auto", s.upscaler == DLSS && s.resolution == 0);
+        s = ur::step_resolution(DLSS, 3, -1);
+        CHECK("DLSS: Quality to Native", s.upscaler == DLAA && s.resolution == 3);
+        s = ur::step_resolution(FSR3, 6, 1);
+        CHECK("FSR 3.1: Ultra Performance wraps to Auto", s.upscaler == FSR3 && s.resolution == 0);
+        s = ur::step_resolution(FSR3, 0, -1);
+        CHECK("FSR 3.1: Auto wraps to Ultra Performance", s.upscaler == FSR3 && s.resolution == 6);
+        s = ur::step_resolution(FSR4, 4, 1);
+        CHECK("FSR 4: Performance to Ultra Performance", s.upscaler == FSR4 && s.resolution == 6);
+        s = ur::step_resolution(DLSS, 2, 1);
+        CHECK("DLSS from the game's 75%", s.upscaler == DLSS && s.resolution == 3);
+        CHECK("the 3D at full size", ur::native_size(DLAA, 3) && ur::native_size(GAME, 1) && !ur::native_size(GAME, 2) &&
+                                         !ur::native_size(DLSS, 1));
+    }
     // the DLSS model row: its presets (NVIDIA's numbers, K = 11), RX_VK_DLSS_PRESET over it, and when it applies
     CHECK("model presets", ur::model_preset(ur::MODEL_K) == 11 && ur::model_preset(ur::MODEL_M) == 13 &&
                                ur::model_preset(ur::MODEL_L) == 12 && ur::model_preset(ur::MODEL_DEFAULT) == 0);

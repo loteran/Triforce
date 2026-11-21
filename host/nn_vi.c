@@ -760,6 +760,11 @@ static void present_trace(int64_t frame, int64_t now) {
         flushed = now;
     }
 }
+/* (qsort: longest interval first) */
+static int cmp_i64_desc(const void *a, const void *b) {
+    const int64_t x = *(const int64_t *)a, y = *(const int64_t *)b;
+    return x < y ? 1 : x > y ? -1 : 0;
+}
 void hos_vi_native_presented(void) {
     static long long scan_n;
     scan_dt(++scan_n);
@@ -771,6 +776,7 @@ void hos_vi_native_presented(void) {
     /* (a cap under 60 paces by itself, whatever interval the game asked for while Monitor's rate was not known yet) */
     const int interval = fps_max() < 60 ? 1 : present_interval;
     const int64_t now = hos_now_ns();
+    { void hos_bench_present(int64_t now); hos_bench_present(now); }   /* ((Triforce) benchmark mode: every present's interval) */
     /* ((Triforce) the Steady frame rate row: a period this PC holds in the scene, never shorter than the cap's) */
     const int64_t period = steady_period(1000000000LL / fps_max() * interval, now);
     pace_period_ns = period;   /* (Triforce: what another limiter is given to hold in this file's place, pace_handed) */
@@ -802,8 +808,13 @@ void hos_vi_native_presented(void) {
        distance from it, the frame-time spread a change of the pacing shows in) */
     static int rel[6];
     static int64_t off_sum;
+    /* ((Triforce) the window's present-to-present intervals themselves, for its 1% low: the launcher's benchmark reads that
+       line. 4096 at most: 5 s at over 800 fps fills it, and the slowest one in a hundred of what it holds is still the low) */
+    static int64_t lows[4096];
+    static int lows_n;
     if (last_present) {
         const int64_t d = now - last_present, off = d > period ? d - period : period - d;
+        if (lows_n < (int)(sizeof lows / sizeof lows[0])) lows[lows_n++] = d;
         hist[d < 15500000 ? 0 : d < 17800000 ? 1 : d < 22000000 ? 2 : d < 30000000 ? 3 : d < 40000000 ? 4 : 5]++;
         rel[d * 4 < period * 3 ? 0 : d * 20 < period * 19 ? 1 : d * 20 <= period * 21 ? 2 : d * 4 <= period * 5 ? 3 : d <= period * 2 ? 4 : 5]++;
         off_sum += off;
@@ -818,6 +829,12 @@ void hos_vi_native_presented(void) {
         hos_log("vi: frame intervals against the paced period of %.3f ms: under 0.75 of it %d, 0.75-0.95 %d, 0.95-1.05 %d, "
                 "1.05-1.25 %d, 1.25-2 %d, over 2 %d; %.3f ms from it on average", period / 1e6, rel[0], rel[1], rel[2], rel[3],
                 rel[4], rel[5], counted ? off_sum / 1e6 / counted : 0.0);
+        if (lows_n >= 100) {   /* (as the performance overlay's rule: no 1% low under 100 frames) */
+            qsort(lows, (size_t)lows_n, sizeof lows[0], cmp_i64_desc);
+            const int64_t at = lows[lows_n / 100];   /* (nearest rank: the interval the slowest 1 % reach) */
+            hos_log("vi: 1%% low %.1f fps over the last %.1f s (%d frames)", at > 0 ? 1e9 / (double)at : 0.0, (now - window_start) / 1e9, lows_n);
+        }
+        lows_n = 0;
         memset(hist, 0, sizeof hist);
         memset(rel, 0, sizeof rel), off_sum = 0;
         window_start = now, frames_in_window = 0;

@@ -1,0 +1,24 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- Triforce.Logic's own tests: a console program (exit 0 = all passed). Everything runs inside TRIFORCE_TEST_ROOT temp folders and
+       a fake release server on 127.0.0.1; it never starts a real build or the real game, never touches the registry, the real
+       shortcuts or Steam, and only reads D:\src\lab-game-merge98, D:\src\triforce-test-game and the NX2navi .nup.
+       The exe doubles as the fakes it needs (Program.cs Fakes): a "python" that plays make_game.py's lines, and a new
+       "TriforceSetup.exe" for the self-update. -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AssemblyName>Triforce.LogicTests</AssemblyName>
+    <RootNamespace>Triforce.LogicTests</RootNamespace>
+    <InvariantGlobalization>true</InvariantGlobalization>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Logic\Triforce.Logic.csproj" />
+    <!-- (the game's media decoders, for the music loop's tests: on sounds the tests make, never a game's) -->
+    <ProjectReference Include="..\Core\Triforce.Core.csproj" />
+  </ItemGroup>
+
+</Project>

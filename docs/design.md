@@ -109,8 +109,7 @@ second game.
    pipeline compiles share it, and extra helper threads have lowered fps before. Thread counts are measured, never
    raised by default (`HOS_VCORES`, `RX_VK_CAPTURE_THREADS`, `HOS_THREAD_TIMES=<seconds>`, the `HOS_SAMPLE` profiler
    with `scripts/prof.py`). The one exception, by the owner's choice (2026-11-15): the Replay helper threads row is
-   Automatic unless set, which is none on every PC since 2026-11-17 (the helper threads slowed the game's own threads in the
-   owner's play); a count set on the row keeps its threads only where trials in play measure the
+   Automatic unless set, none with four cores or fewer, and its threads are kept only where trials in play measure the
    frames shorter, or, without a trial, where the replay is plainly the frame's limit by a margin over the GPU's time
    (the rule in `gpu/vk/replay_threads.h`, fitted to the owner's logs; a trial that finds them slower holds it).
 

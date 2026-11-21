@@ -1,0 +1,241 @@
+/* v3 (11-19): the title screen. The player's newest save fills the window like the game's own title scene; the game's
+   own logo, glow and button ornament (read from the player's game files at run time, never shipped) sit over it; the
+   files run along the bottom in gold frames. Loaded after ui.css and theme.css. */
+.scene { position: absolute; inset: 0; overflow: hidden; }
+.scene .img { position: absolute; inset: -4%; background: url(img/save3.jpg) center 38% / cover no-repeat;
+  filter: blur(10px) saturate(1.2) contrast(1.05) brightness(.78); transform: scale(1.06); }
+/* film grain: hides the save picture's low resolution and gives the light some texture */
+.grain { position: absolute; inset: 0; opacity: .16; mix-blend-mode: overlay; background-image:
+  url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='220' height='220'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.9' numOctaves='2' stitchTiles='stitch'/%3E%3CfeColorMatrix values='0 0 0 0 .5 0 0 0 0 .5 0 0 0 0 .5 0 0 0 1.6 -.3'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E"); }
+.grade { position: absolute; inset: 0; background:
+  radial-gradient(120% 90% at 72% 40%, rgba(10, 9, 8, 0) 30%, rgba(10, 9, 8, .55) 100%),
+  linear-gradient(90deg, rgba(10, 9, 8, .86) 0%, rgba(10, 9, 8, .55) 30%, rgba(10, 9, 8, .05) 60%),
+  linear-gradient(180deg, rgba(10, 9, 8, .55) 0%, rgba(10, 9, 8, 0) 18%, rgba(10, 9, 8, 0) 52%, rgba(10, 9, 8, .82) 74%, #0a0908 100%),
+  linear-gradient(180deg, rgba(var(--gold-warm-rgb), .07), rgba(var(--gold-warm-rgb), 0) 50%); }
+
+/* the game's own logo with its own aura behind it */
+.logo { position: absolute; left: 38px; top: 58px; width: 470px; height: 362px; }
+.logo .aura { position: absolute; left: 50%; top: 50%; width: 760px; height: 760px; transform: translate(-50%, -50%);
+  background: url(img/game/TitleLogoAura_00.png) center / contain no-repeat; mix-blend-mode: screen; opacity: .55;
+  filter: sepia(1) saturate(2.2) hue-rotate(-6deg); -webkit-mask: radial-gradient(closest-side, #000 35%, transparent 100%); mask: radial-gradient(closest-side, #000 35%, transparent 100%); }
+.logo img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain;
+  filter: drop-shadow(0 14px 28px rgba(0, 0, 0, .7)); }
+
+.cont { position: absolute; left: 72px; top: 410px; width: 560px; }
+.cont .eb { font-family: 'Cormorant Garamond', Georgia, serif; font-style: italic; font-weight: 600; font-size: 21px; color: var(--gold-hi); }
+.cont h1 { margin-top: 2px; font-size: 46px; text-shadow: 0 2px 18px rgba(0, 0, 0, .75); }
+.cont .meta { margin-top: 8px; font-size: 15.5px; color: var(--text2); text-shadow: 0 1px 8px rgba(0, 0, 0, .8); }
+
+/* Play: the gold bar with chamfered ends, an inner hairline, and the game's own ornament on each side */
+.playrow { position: absolute; left: 30px; top: 540px; display: flex; align-items: center; }
+.orn { width: 74px; height: 74px; background: url(img/game/TitleBtnDeco_00.png) center / contain no-repeat;
+  mix-blend-mode: screen; filter: sepia(1) saturate(3.2) hue-rotate(-10deg) brightness(1.05); opacity: .95; }
+.orn.r { transform: scaleX(-1); }
+.play { position: relative; width: 300px; height: 66px; margin: 0 -6px; display: grid; place-items: center;
+  clip-path: polygon(16px 0, calc(100% - 16px) 0, 100% 50%, calc(100% - 16px) 100%, 16px 100%, 0 50%);
+  background: linear-gradient(180deg, rgb(var(--gold-bar-lit-rgb)) 0%, rgb(var(--gold-bar-hi-rgb)) 14%, rgb(var(--gold-bar-rgb)) 50%, rgb(var(--gold-bar-low-rgb)) 100%);
+  font-family: 'Cormorant Garamond', Georgia, serif; font-weight: 700; font-size: 32px; letter-spacing: .01em; color: var(--gold-ink2); z-index: 1;
+  text-shadow: 0 1px 0 rgba(var(--gold-emboss-rgb), .5); }
+.play::before { content: ''; position: absolute; inset: 4px; clip-path: inherit;
+  background: linear-gradient(180deg, rgba(255, 255, 255, .0), rgba(255, 255, 255, 0)); box-shadow: inset 0 0 0 1px rgba(var(--gold-bar-edge-rgb), .45); }
+.play::after { content: ''; position: absolute; inset: 0; background: linear-gradient(100deg, rgba(255, 255, 255, 0) 8%, rgba(255, 255, 255, .22) 16%, rgba(255, 255, 255, 0) 26%); }
+.glow { position: absolute; left: 120px; top: 548px; width: 260px; height: 60px; border-radius: 50%; background: rgba(var(--gold-glow-rgb), .22); filter: blur(30px); }
+.links { position: absolute; left: 112px; top: 612px; display: flex; gap: 26px; font-size: 14px; color: var(--text2); }
+.links span b { color: var(--gold); font-weight: 600; }
+
+/* the dock: a gold hairline with the ornament at its centre, the files, and what's new */
+.dock { position: absolute; left: 0; right: 0; bottom: 0; height: 156px; }
+.rule { position: absolute; left: 64px; right: 64px; top: 0; height: 1px;
+  background: linear-gradient(90deg, rgba(var(--gold-rgb), 0), rgba(var(--gold-rgb), .55) 18%, rgba(var(--gold-rgb), .55) 82%, rgba(var(--gold-rgb), 0)); }
+.rule i { position: absolute; top: -14px; width: 28px; height: 28px; background: url(img/game/TitleBtnDeco_00.png) center / contain no-repeat;
+  mix-blend-mode: screen; filter: sepia(1) saturate(3.2) hue-rotate(-10deg); }
+.rule i.a { left: calc(50% - 30px); } .rule i.b { left: calc(50% + 2px); transform: scaleX(-1); }
+.files { position: absolute; left: 64px; top: 30px; }
+.files h4, .whatsnew h4 { font-family: 'Cormorant Garamond', Georgia, serif; font-style: italic; font-weight: 600; font-size: 18px; color: var(--gold-hi); }
+.strip { display: flex; gap: 12px; margin-top: 10px; }
+.f { position: relative; width: 118px; height: 66px; border-radius: 4px; overflow: hidden; outline: 1px solid rgba(var(--gold-rgb), .35); outline-offset: 0; }
+.f img { width: 100%; height: 100%; object-fit: cover; display: block; filter: saturate(.85) brightness(.82); }
+.f small { position: absolute; left: 7px; bottom: 5px; font-size: 11px; font-weight: 700; text-shadow: 0 1px 3px #000; }
+.f.on { outline: 2px solid var(--gold-hi); box-shadow: 0 0 22px rgba(var(--gold-hi-rgb), .35); transform: translateY(-3px); }
+.f.on img { filter: none; }
+.whatsnew { position: absolute; left: 862px; right: 64px; top: 30px; }
+.whatsnew p { margin-top: 8px; font-size: 13.5px; color: var(--text2); line-height: 1.35; }
+.whatsnew p b { color: var(--text); font-weight: 650; }
+.whatsnew p::before { content: ''; display: inline-block; width: 5px; height: 5px; margin: 0 9px 2px 0; background: var(--gold); transform: rotate(45deg); }
+.bar { z-index: 2; }
+
+/* the save's own picture, sharp, framed in gold with the game's ornament at the top of the frame */
+.frame { position: absolute; left: 672px; top: 118px; width: 544px; height: 306px; }
+.frame .pic { position: absolute; inset: 0; background: url(img/save3.jpg) center / cover; box-shadow: 0 40px 90px rgba(0, 0, 0, .7); }
+.frame .pic::after { content: ''; position: absolute; inset: 0; background: radial-gradient(120% 120% at 50% 40%, rgba(0, 0, 0, 0) 55%, rgba(10, 9, 8, .45) 100%); }
+.frame .edge { position: absolute; inset: -9px; border: 1px solid rgba(var(--gold-rgb), .55); }
+.frame .edge::before { content: ''; position: absolute; inset: 4px; border: 1px solid rgba(var(--gold-rgb), .22); }
+.frame .top { position: absolute; left: calc(50% - 46px); top: -32px; width: 92px; height: 46px; display: flex; }
+.frame .top i { flex: 1; background: url(img/game/TitleBtnDeco_00.png) center / 46px no-repeat; mix-blend-mode: screen; filter: sepia(1) saturate(3.2) hue-rotate(-10deg); }
+.frame .top i + i { transform: scaleX(-1); }
+.frame .cap { position: absolute; left: 0; right: 0; top: 322px; display: flex; justify-content: space-between; font-size: 13.5px; color: var(--text2); }
+.frame .cap b { font-family: 'Cormorant Garamond', Georgia, serif; font-size: 19px; font-weight: 700; color: var(--text); font-style: italic; }
+/* sound: the speaker in the bar, and its panel (Music, Sounds, what is playing) */
+.spk { width: 40px; height: 34px; display: grid; place-items: center; margin-left: 10px; border-radius: 17px; border: 1px solid var(--line); background: rgba(10, 9, 8, .6); color: var(--text); }
+.spk svg { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width: 1.6; stroke-linecap: round; stroke-linejoin: round; }
+.spk.on { border-color: var(--gold); color: var(--gold-hi); box-shadow: 0 0 0 3px rgba(var(--gold-rgb), .14); }
+.vol { position: absolute; right: 150px; top: 60px; width: 318px; padding: 18px 20px 16px; z-index: 5; background: rgba(16, 14, 10, .96);
+  border: 1px solid rgba(var(--gold-rgb), .45); box-shadow: 0 24px 60px rgba(0, 0, 0, .65); }
+.vol::before { content: ''; position: absolute; right: 22px; top: -7px; width: 12px; height: 12px; background: rgba(16, 14, 10, .96);
+  border-left: 1px solid rgba(var(--gold-rgb), .45); border-top: 1px solid rgba(var(--gold-rgb), .45); transform: rotate(45deg); }
+.vol h5 { font-family: 'Cormorant Garamond', Georgia, serif; font-style: italic; font-weight: 600; font-size: 18px; color: var(--gold-hi); }
+.vrow { display: grid; grid-template-columns: 62px 1fr 36px; align-items: center; gap: 12px; margin-top: 14px; font-size: 14px; color: var(--text2); }
+.vrow b { font-weight: 600; color: var(--text); } .vrow span { text-align: right; font-variant-numeric: tabular-nums; }
+.slider { position: relative; height: 4px; background: #262017; }
+.slider i { position: absolute; left: 0; top: 0; bottom: 0; background: linear-gradient(90deg, var(--gold-deep), var(--gold)); }
+.slider u { position: absolute; top: 50%; width: 14px; height: 14px; margin: -7px 0 0 -7px; background: var(--gold-hi); transform: rotate(45deg); box-shadow: 0 0 0 3px rgba(10, 9, 8, .9); }
+.nowp { margin-top: 16px; padding-top: 12px; border-top: 1px solid var(--line-soft); display: flex; align-items: center; gap: 10px; font-size: 13px; color: var(--text3); }
+.nowp em { font-style: italic; font-family: 'Cormorant Garamond', Georgia, serif; font-size: 16px; color: var(--text2); }
+.eq { display: flex; gap: 2px; align-items: flex-end; height: 14px; } .eq i { width: 3px; background: var(--gold); }
+.mute { margin-top: 12px; display: flex; justify-content: space-between; font-size: 13px; color: var(--text3); } .mute b { color: var(--gold); font-weight: 600; }
+
+/* ---- v3 for the other screens (11-19) ---- */
+/* the hall before a game is read: warm dark, a soft light from above; the crest is our own art */
+.hall { position: absolute; inset: 0; background: radial-gradient(900px 560px at 50% -12%, #2a2112 0%, #15110b 42%, #0a0908 72%); }
+.hall::after { content: ''; position: absolute; inset: 0; opacity: .14; mix-blend-mode: overlay; background-image:
+  url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='220' height='220'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.9' numOctaves='2' stitchTiles='stitch'/%3E%3CfeColorMatrix values='0 0 0 0 .5 0 0 0 0 .5 0 0 0 0 .5 0 0 0 1.6 -.3'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E"); }
+.seal { position: absolute; left: calc(50% - 46px); top: 74px; width: 92px; height: 86px; background: url(img/crest.png) center / contain no-repeat;
+  filter: drop-shadow(0 10px 24px rgba(0, 0, 0, .7)); }
+/* the game's own logo, once the build has read the game's files */
+.mini { position: absolute; left: calc(50% - 150px); top: 64px; width: 300px; height: 231px; }
+.mini img { width: 100%; height: 100%; object-fit: contain; filter: drop-shadow(0 12px 26px rgba(0, 0, 0, .75)); }
+.mini .aura { position: absolute; left: 50%; top: 50%; width: 560px; height: 560px; transform: translate(-50%, -50%);
+  background: url(img/game/TitleLogoAura_00.png) center / contain no-repeat; mix-blend-mode: screen; opacity: .5;
+  filter: sepia(1) saturate(2.2) hue-rotate(-6deg); -webkit-mask: radial-gradient(closest-side, #000 35%, transparent 100%); }
+
+/* steps of the first run: gold diamonds on a hairline */
+.path { position: absolute; left: 0; right: 0; display: flex; justify-content: center; align-items: center; gap: 0; font-size: 14px; color: var(--text3); }
+.path span { display: flex; align-items: center; gap: 10px; }
+.path span + span::before { content: ''; width: 64px; height: 1px; margin: 0 16px; background: linear-gradient(90deg, rgba(var(--gold-rgb), .15), rgba(var(--gold-rgb), .5), rgba(var(--gold-rgb), .15)); }
+.path i { width: 11px; height: 11px; transform: rotate(45deg); border: 1px solid var(--text3); }
+.path .done { color: var(--text2); } .path .done i { background: var(--gold); border-color: var(--gold); }
+.path .now { color: var(--gold-hi); font-weight: 600; } .path .now i { border-color: var(--gold-hi); box-shadow: 0 0 0 3px rgba(var(--gold-hi-rgb), .18); background: rgba(var(--gold-hi-rgb), .25); }
+
+.center { position: absolute; left: 230px; width: 820px; text-align: center; }
+.center .eb { font-family: 'Cormorant Garamond', Georgia, serif; font-style: italic; font-weight: 600; font-size: 21px; color: var(--gold-hi); }
+.center h1 { font-size: 60px; margin-top: 4px; text-shadow: 0 2px 18px rgba(0,0,0,.6); }
+.center .lead { margin-top: 10px; font-size: 16.5px; color: var(--text2); }
+
+/* a framed box: two gold hairlines, as the picture frame */
+.fbox { position: relative; background: rgba(18, 16, 12, .82); border: 1px solid rgba(var(--gold-rgb), .42); text-align: left; }
+.fbox::before { content: ''; position: absolute; inset: 4px; border: 1px solid rgba(var(--gold-rgb), .14); pointer-events: none; }
+.fbox .row2 { display: grid; grid-template-columns: 200px 1fr auto; align-items: center; gap: 18px; padding: 17px 26px; }
+.fbox .row2 + .row2 { border-top: 1px solid var(--line-soft); }
+.fbox label { font-family: 'Cormorant Garamond', Georgia, serif; font-style: italic; font-weight: 600; font-size: 18px; color: var(--gold-hi); }
+.fbox b { font-size: 16px; font-weight: 600; color: var(--text); } .fbox small { display: block; font-size: 13px; color: var(--text3); margin-top: 3px; }
+.fbox .ch { font-size: 14px; font-weight: 600; color: var(--gold); }
+.gamefile { display: flex; align-items: center; gap: 20px; padding: 20px 26px; }
+.gamefile .nup { width: 50px; height: 62px; display: grid; place-items: end center; padding-bottom: 8px; font-size: 11px; font-weight: 800; color: var(--gold);
+  background: linear-gradient(180deg, rgba(var(--gold-rgb), .16), rgba(var(--gold-rgb), .04)); border: 1px solid rgba(var(--gold-rgb), .45); }
+.gamefile b { font-family: 'Cormorant Garamond', Georgia, serif; font-size: 23px; font-weight: 700; }
+.gamefile .ok { font-size: 14px; }
+
+/* the chamfered gold bar at another size, and the quiet button with a gold hairline */
+.play.sm { width: 240px; height: 56px; font-size: 26px; }
+.qbtn { height: 48px; padding: 0 24px; display: inline-grid; place-items: center; font-size: 15px; font-weight: 600; color: var(--text);
+  background: rgba(243, 234, 213, .06); border: 1px solid rgba(var(--gold-rgb), .35); }
+.qlink { font-size: 15px; font-weight: 600; color: var(--text2); }
+.act { position: absolute; display: flex; align-items: center; gap: 22px; }
+
+/* the build: the time left, a gold line with a spark at its head, the steps with their times */
+.gline { position: relative; height: 6px; margin: 30px auto 0; width: 820px; background: #262017; }
+.gline i { position: absolute; left: 0; top: 0; bottom: 0; background: linear-gradient(90deg, var(--gold-deep), var(--gold) 75%, var(--gold-lit)); }
+.gline u { position: absolute; top: 50%; width: 16px; height: 16px; margin: -8px 0 0 -8px; transform: rotate(45deg); background: var(--gold-lit);
+  box-shadow: 0 0 14px 4px rgba(var(--gold-hi-rgb), .55); }
+.gline::before, .gline::after { content: ''; position: absolute; top: -4px; width: 9px; height: 9px; transform: rotate(45deg); border: 1px solid var(--gold); background: #0a0908; }
+.gline::before { left: -16px; } .gline::after { right: -16px; }
+.stepl { width: 820px; margin: 26px auto 0; text-align: left; }
+.stepl div { display: grid; grid-template-columns: 34px 1fr auto; align-items: center; padding: 12px 4px; font-size: 16px; color: var(--text3); border-top: 1px solid var(--line-soft); }
+.stepl div:first-child { border-top: 0; }
+.stepl em { width: 11px; height: 11px; transform: rotate(45deg); border: 1px solid var(--text3); margin-left: 4px; }
+.stepl .d { color: var(--text2); } .stepl .d em { background: var(--emerald); border-color: var(--emerald); }
+.stepl .n { color: var(--text); } .stepl .n em { background: var(--gold); border-color: var(--gold); box-shadow: 0 0 10px rgba(var(--gold-hi-rgb), .6); }
+.stepl b { font-weight: 600; } .stepl span { font-size: 14px; } .stepl .n span { color: var(--gold-hi); font-weight: 600; }
+.nowmusic { position: absolute; right: 64px; bottom: 26px; display: flex; align-items: center; gap: 10px; font-size: 13px; color: var(--text3); }
+.nowmusic em { font-family: 'Cormorant Garamond', Georgia, serif; font-style: italic; font-size: 16px; color: var(--text2); }
+
+/* saves: framed pictures in two rows */
+.sgrid { position: absolute; left: 64px; top: 196px; display: grid; grid-template-columns: repeat(3, 258px); gap: 34px 26px; }
+.sc { position: relative; }
+.sc .p { position: relative; width: 258px; height: 145px; background-size: cover; background-position: center; }
+.sc .p::after { content: ''; position: absolute; inset: -6px; border: 1px solid rgba(var(--gold-rgb), .45); }
+.sc.on .p::after { border-color: var(--gold-hi); box-shadow: 0 0 24px rgba(var(--gold-hi-rgb), .3); }
+.sc .t { margin-top: 12px; display: flex; justify-content: space-between; align-items: baseline; }
+.sc .t b { font-family: 'Cormorant Garamond', Georgia, serif; font-size: 20px; font-weight: 700; }
+.sc .t span { font-size: 12.5px; color: var(--text3); }
+.sc .m { font-size: 13px; color: var(--text2); margin-top: 1px; }
+.sc .n { position: absolute; left: -2px; top: -18px; font-family: 'Cormorant Garamond', Georgia, serif; font-style: italic; font-size: 15px; color: var(--gold-hi); }
+.sside { position: absolute; right: 64px; top: 196px; width: 300px; }
+.sside .fbox { padding: 22px 24px; } .sside .fbox + .fbox { margin-top: 18px; }
+.sside h3 { font-family: 'Cormorant Garamond', Georgia, serif; font-size: 24px; font-weight: 700; }
+.sside p { margin: 6px 0 16px; font-size: 13.5px; color: var(--text2); }
+.sside .play.sm { width: 100%; font-size: 23px; height: 52px; }
+
+/* benchmark results */
+.bench { position: absolute; left: 64px; right: 64px; top: 210px; display: grid; grid-template-columns: 1fr 470px; gap: 40px; }
+.places { display: grid; grid-template-columns: repeat(2, 1fr); gap: 16px; }
+.place { position: relative; height: 112px; background-size: cover; background-position: center; }
+.place::after { content: ''; position: absolute; inset: 0; background: linear-gradient(180deg, rgba(10,9,8,.1), rgba(10,9,8,.86)); }
+.place::before { content: ''; position: absolute; inset: -5px; border: 1px solid rgba(var(--gold-rgb), .38); z-index: 1; }
+.place div { position: absolute; left: 14px; right: 14px; bottom: 10px; z-index: 1; display: flex; justify-content: space-between; align-items: baseline; }
+.place b { font-family: 'Cormorant Garamond', Georgia, serif; font-size: 19px; font-weight: 700; }
+.place span { font-size: 13px; color: var(--text2); } .place span strong { font-size: 22px; color: var(--text); font-weight: 700; }
+.verdict { margin-top: 22px; font-size: 14.5px; color: var(--text2); } .verdict b { color: var(--emerald); font-weight: 650; }
+.recs .fbox { padding: 6px 0; }
+.rec { display: grid; grid-template-columns: 1fr auto 20px auto; gap: 12px; align-items: center; padding: 12px 24px; font-size: 14.5px; }
+.rec + .rec { border-top: 1px solid var(--line-soft); }
+.rec b { font-weight: 600; } .rec s { color: var(--text3); text-decoration: none; } .rec em { font-style: normal; color: var(--gold); text-align: center; }
+.rec strong { color: var(--gold-hi); font-weight: 650; } .rec.same strong, .rec.same s { color: var(--text3); } .rec.same em { color: var(--text3); }
+.recs h3 { font-family: 'Cormorant Garamond', Georgia, serif; font-style: italic; font-size: 20px; font-weight: 600; color: var(--gold-hi); margin-bottom: 12px; }
+
+/* (the window pinned to the viewport: a page whose content runs past 800 px was scrolled in the headless render) */
+.win { position: fixed; left: 0; top: 0; }
+.sc .n { top: -25px; left: 0; }
+
+/* ---- v4 first run (11-19, "the setup still looks like the old launcher"): a stage, a drop, a reveal ---- */
+.stage { position: absolute; inset: 0; background: #070605; }
+.stage::before { content: ''; position: absolute; left: 50%; top: 52%; width: 1100px; height: 640px; transform: translate(-50%, -50%);
+  background: radial-gradient(closest-side, rgba(var(--gold-rgb), .13), rgba(var(--gold-rgb), .04) 55%, rgba(0, 0, 0, 0)); }
+.welcome { position: absolute; left: 96px; top: 120px; width: 520px; }
+.welcome .k { font-size: 14px; font-weight: 600; color: var(--gold); }
+.welcome h1 { font-size: 64px; margin-top: 10px; line-height: 1; }
+.welcome p { margin-top: 18px; font-size: 16.5px; color: var(--text2); line-height: 1.5; }
+.welcome p + p { margin-top: 10px; font-size: 14px; color: var(--text3); }
+.portal { position: absolute; left: 660px; top: 120px; width: 524px; height: 520px; display: grid; place-items: center; text-align: center;
+  background: linear-gradient(180deg, rgba(24, 20, 13, .9), rgba(12, 10, 7, .9)); }
+.portal::before { content: ''; position: absolute; inset: 0; border: 1px solid rgba(var(--gold-rgb), .55); }
+.portal::after { content: ''; position: absolute; inset: 10px; border: 1px dashed rgba(var(--gold-rgb), .32); }
+.portal .c { position: absolute; width: 22px; height: 22px; border-color: var(--gold-hi); border-style: solid; border-width: 0; }
+.portal .c1 { left: -1px; top: -1px; border-left-width: 2px; border-top-width: 2px; } .portal .c2 { right: -1px; top: -1px; border-right-width: 2px; border-top-width: 2px; }
+.portal .c3 { left: -1px; bottom: -1px; border-left-width: 2px; border-bottom-width: 2px; } .portal .c4 { right: -1px; bottom: -1px; border-right-width: 2px; border-bottom-width: 2px; }
+.portal .ic { width: 66px; height: 82px; margin: 0 auto; position: relative; border: 1.5px solid var(--gold); background: rgba(var(--gold-rgb), .06); }
+.portal .ic::before { content: ''; position: absolute; right: -1.5px; top: -1.5px; width: 20px; height: 20px; background: #070605; border-left: 1.5px solid var(--gold); border-bottom: 1.5px solid var(--gold); }
+.portal .ic::after { content: '.nup'; position: absolute; left: 0; right: 0; bottom: 10px; font-size: 12px; font-weight: 800; color: var(--gold); }
+.portal h2 { font-size: 34px; margin-top: 26px; } .portal p { margin-top: 8px; font-size: 14.5px; color: var(--text2); }
+.portal .or { margin-top: 26px; display: flex; gap: 14px; justify-content: center; }
+.foot4 { position: absolute; left: 96px; right: 96px; bottom: 34px; display: flex; justify-content: space-between; font-size: 13px; color: var(--text3); }
+.foot4 b { color: var(--gold); font-weight: 600; }
+
+/* the reveal: the game's own title, its glow, the two choices and the build in one row */
+.reveal { position: absolute; inset: 0; background: radial-gradient(1000px 620px at 50% 30%, #2a200f 0%, #120e09 48%, #070605 78%); }
+.rlogo { position: absolute; left: calc(50% - 300px); top: 46px; width: 600px; height: 462px; }
+.rlogo .aura { position: absolute; left: 50%; top: 50%; width: 1000px; height: 1000px; transform: translate(-50%, -50%);
+  background: url(img/game/TitleLogoAura_00.png) center / contain no-repeat; mix-blend-mode: screen; opacity: .42;
+  filter: sepia(1) saturate(2.4) hue-rotate(-8deg) blur(6px); -webkit-mask: radial-gradient(closest-side, #000 30%, transparent 100%); }
+.rlogo .glowl { position: absolute; inset: -6% -4%; background: url(img/game/Logo_GlowL_USEU_00.png) center / contain no-repeat; mix-blend-mode: screen; opacity: .55; }
+.rlogo img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; filter: drop-shadow(0 18px 34px rgba(0, 0, 0, .8)); }
+.found4 { position: absolute; left: 0; right: 0; top: 500px; text-align: center; font-size: 15px; color: var(--text2); }
+.found4 b { color: var(--emerald); font-weight: 650; } .found4 em { font-style: normal; color: var(--text3); }
+.choices { position: absolute; left: 150px; right: 150px; top: 556px; display: grid; grid-template-columns: 1fr 1.6fr; border-top: 1px solid rgba(var(--gold-rgb), .35); border-bottom: 1px solid rgba(var(--gold-rgb), .35); }
+.choices > div { padding: 16px 24px; display: flex; align-items: center; justify-content: space-between; }
+.choices > div + div { border-left: 1px solid var(--line-soft); }
+.choices label { font-family: 'Cormorant Garamond', Georgia, serif; font-style: italic; font-weight: 600; font-size: 17px; color: var(--gold-hi); display: block; }
+.choices b { font-size: 15.5px; font-weight: 600; } .choices small { font-size: 12.5px; color: var(--text3); margin-left: 8px; }
+.choices .ch { font-size: 14px; font-weight: 600; color: var(--gold); }
+.buildrow { position: absolute; left: 0; right: 0; top: 678px; display: flex; justify-content: center; align-items: center; }
+.under { position: absolute; left: 0; right: 0; top: 752px; text-align: center; font-size: 13px; color: var(--text3); }

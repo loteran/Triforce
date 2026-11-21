@@ -55,6 +55,8 @@ def block(text, marker):
 FIXTURE = r"""
 #include "ini_merge.h"
 #include "file_whole.h"
+#include "merged_rows.h"   // ((Triforce, options_version 7) the lines save no longer writes, and the file's version)
+namespace merged_rows = mkwvk::merged_rows;
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>

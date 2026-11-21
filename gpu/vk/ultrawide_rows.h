@@ -14,6 +14,10 @@ static inline float ultrawide_row_ratio(int row) {
     return row == 2 ? (float)(64.0 / 27.0) : (float)(32.0 / 9.0);
 }
 
+/* Whether the row's shape is wider than the game's 16:9: 21:9 and 32:9 (16:10 is narrower, 1.6). The HUD position and the
+   menu sides act only on such a picture's sides (gpu/vk/vk_menu.cpp row_shown) */
+static inline int ultrawide_row_wider(int row) { return ultrawide_row_ratio(row) > (float)(16.0 / 9.0); }
+
 /* The row whose shape is nearest a screen's (by ratio: the larger over the smaller); 0 (16:9) while the screen is not known */
 static inline int ultrawide_row_nearest(int screen_w, int screen_h) {
     if (screen_w <= 0 || screen_h <= 0) return 0;

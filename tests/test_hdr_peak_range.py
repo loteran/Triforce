@@ -31,7 +31,7 @@ def nits(y, white, peak, knee=0.6):
 
 def main():
     menu = (ROOT / "gpu/vk/vk_menu.cpp").read_text(encoding="utf-8")
-    row = re.search(r'\{TAB_DISPLAY, "HDR peak brightness", &opts\.hdr_peak, (\d+), (\d+), (\d+), tx_nits,', menu)
+    row = re.search(r'\{TAB_DISPLAY, "Peak brightness", &opts\.hdr_peak, (\d+), (\d+), (\d+), tx_nits,', menu)
     check(row, "vk_menu.cpp: the HDR peak brightness row is missing")
     lo, hi, step = (int(v) for v in row.groups())
     check((lo, hi) == (400, PEAK), "the HDR peak brightness row is %d to %d nits, not 400 to 10,000" % (lo, hi))
@@ -84,7 +84,7 @@ def main():
             codes = [pq(v) for v in ys]
             check(all(a <= b for a, b in zip(codes, codes[1:])) and codes[-1] <= 1.0, "white %d, peak %d: the PQ codes" % (white, peak))
     readme = (ROOT / "readme.md").read_text(encoding="utf-8")
-    check("peak brightness 400 to 10,000 nits" in readme, "readme.md's settings table does not say the HDR peak's range")
+    check("Peak brightness 400 to 10,000 nits" in readme, "readme.md's settings table does not say the HDR peak's range")
     guide = (ROOT / "docs/development.md").read_text(encoding="utf-8")
     check("| `hdr_paper_white`, `hdr_peak_brightness` | nits: 80 to 400, and 400 to 10,000 |" in guide,
           "docs/development.md's options table does not say the HDR rows' ranges")

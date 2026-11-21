@@ -1,9 +1,9 @@
 """Who holds the frame limit while NVIDIA DLSS frame generation runs: Reflex's sleep or the game's own wait (no game, no GPU).
 
 With DLSS frame generation the game's frame waited twice: the host's wait where the frame starts (host/nn_vi.c) and Reflex's
-sleep on the replay's thread after a present. With the Display tab's Reflex frame limit row on, Reflex's sleep holds the
-frame rate cap and the host's wait steps aside (gpu/vk/vk_dlssg.cpp pace, after NX2navi's vk_dlssg_pace). The rule is
-gpu/vk/dlssg_pace.h.
+sleep on the replay's thread after a present. With the Reflex frame limit on ((Triforce, options_version 7) no row:
+RX_VK_REFLEX_LIMIT=1, off otherwise until it has been played), Reflex's sleep holds the frame rate cap and the host's wait
+steps aside (gpu/vk/vk_dlssg.cpp pace, after NX2navi's vk_dlssg_pace). The rule is gpu/vk/dlssg_pace.h.
 
 Compiles and runs the rule (tests/test_dlssg_pace.c, as C and as C++: vk_dlssg.cpp includes it), and reads the source for
 what cannot run without the game and NVIDIA's files: that the row is off by default and pace() does nothing then, that
@@ -43,12 +43,20 @@ def check_source():
     real = src[src.index("#else", src.index("#ifndef HOOKSHOT_DLSSG")):]
     stubs = src[src.index("#ifndef HOOKSHOT_DLSSG"):src.index("#else", src.index("#ifndef HOOKSHOT_DLSSG"))]
     check("bool pace(int64_t) { return false; }" in stubs, "a build without Streamline no longer answers that the host waits")
+    # ((Triforce, options_version 7) the Reflex frame limit row is gone and an older file's line is dropped. Its value stays
+    # off, the old row's default and what nearly every file held, until Reflex holding the cap with DLSS frame generation has
+    # been played on an RTX 40/50 card; RX_VK_REFLEX_LIMIT=1 turns it on for a run, as it does Reflex's hold without it)
     menu_h = (ROOT / "gpu/vk/vk_menu.h").read_text(encoding="utf-8")
-    check("int reflex_limit = 0;" in menu_h, "the Reflex frame limit row is not off by default")
+    check("int reflex_limit = 0;" in menu_h, "the Reflex frame limit is on although nobody has played it")
     menu = (ROOT / "gpu/vk/vk_menu.cpp").read_text(encoding="utf-8")
-    check('{TAB_DISPLAY, "Reflex frame limit", &opts.reflex_limit, 0, 1, 1, tx_onoff,' in menu, "the row is not on the Display tab")
-    check(menu.index('"Game frame rate cap"') < menu.index('"Reflex frame limit"') < menu.index('{TAB_DISPLAY, "VSync"'),
-          "the row is not beside the Game frame rate cap")
+    check('"Reflex frame limit"' not in menu, "the Reflex frame limit row is still there")
+    check([line.strip() for line in menu.splitlines() if "opts.reflex_limit" in line and not line.strip().startswith("//")] ==
+          ['if (const char* e = getenv("RX_VK_REFLEX_LIMIT")) opts.reflex_limit = atoi(e) != 0;'],
+          "the menu sets the Reflex frame limit other than from RX_VK_REFLEX_LIMIT")
+    init = menu[menu.index("void menu_init() {"):]
+    check('opts.reflex_limit = atoi(e) != 0;' in init[:init.index("\n}\n")], "RX_VK_REFLEX_LIMIT is not read at menu_init")
+    merged = (ROOT / "gpu/vk/merged_rows.h").read_text(encoding="utf-8")
+    check('"reflex_frame_limit"' in merged[merged.index("constexpr const char* kDropped[]"):], "an old reflex_frame_limit= line is kept")
 
     pace = block(real, "bool pace(int64_t period_ns) {")
     # (the row off, and nothing of it left over: nothing decided, nothing asked of Streamline)
@@ -91,7 +99,8 @@ def check_source():
     replay = (ROOT / "gpu/vk/vk_replay.cpp").read_text(encoding="utf-8")
     check("if (id == HOS_OPT_PACE_START) return pace::frame_start();" in replay and
           "if (id == HOS_OPT_PACE_PERIOD) return pace::set_period_ns(value);" in replay, "the renderer no longer answers the host")
-    for doc, needle in (("readme.md", "| Reflex frame limit |"), ("docs/development.md", "`HOS_PACE_HANDOFF=0`")):
+    for doc, needle in (("readme.md", "holds the frame rate cap where each frame starts in place of the game's own wait"),
+                        ("docs/development.md", "`HOS_PACE_HANDOFF=0`")):
         check(needle in (ROOT / doc).read_text(encoding="utf-8"), doc + " does not say " + needle)
 
 

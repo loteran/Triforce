@@ -12,10 +12,11 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def preset_exempt(menu, value):
-    """the menu's row for opts.<value> leaves the quality preset alone (Row::preset_exempt, which set_row checks)"""
+    """the menu has no quality preset that a change of the row's could reset ((Triforce, options_version 7) the Quality preset
+    row is gone, and with it the memory budget it set: the card's own), and the row is on its tab"""
     start = menu.index("&opts.%s," % value, menu.index("Row rows[] = {"))
     row = menu[start:menu.index("},", start)]
-    return row.rstrip().endswith(", true") and "if (!r.preset_exempt)" in menu
+    return bool(row) and "opts.preset" not in menu and "void apply_preset" not in menu
 
 
 def main():
@@ -30,12 +31,12 @@ def main():
                       ("menu_set_gpu_count((int)valid_gpus.size())", "the row offers only the usable GPUs"),
                       ("p.apiVersion >= VK_API_VERSION_1_3", "only Vulkan 1.3 GPUs are listed"),
                       ('getenv("RX_VK_DEVICE")', "RX_VK_DEVICE wins over the row"),
-                      ("gpu_choice::menu_device(opts.gpu_device, (int)valid_gpus.size())", "the row's choice is taken")):
+                      ("gpu_choice::pick(menu_gpu_name(), gpu_device_names, opts.gpu_device)", "the row's choice is taken, by its saved name first")):
         if need not in pick:
             raise SystemExit("pick_device: %s is missing (%s)" % (need, why))
-    if pick.index("menu_init()") > pick.index("gpu_choice::menu_device"):
+    if pick.index("menu_init()") > pick.index("gpu_choice::pick("):
         raise SystemExit("pick_device reads the GPU row before menu_init")
-    if pick.index('getenv("RX_VK_DEVICE")') > pick.index("gpu_choice::menu_device"):
+    if pick.index('getenv("RX_VK_DEVICE")') > pick.index("gpu_choice::pick("):
         raise SystemExit("pick_device takes the GPU row before RX_VK_DEVICE")
     menu = (vk / "vk_menu.cpp").read_text(encoding="utf-8")
     if not preset_exempt(menu, "gpu_device"):

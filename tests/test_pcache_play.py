@@ -121,13 +121,16 @@ SAVE = r"""
 #ifdef _WIN32
 #include <windows.h>
 #else
-constexpr unsigned MOVEFILE_REPLACE_EXISTING = 1;
+constexpr unsigned MOVEFILE_REPLACE_EXISTING = 1, MOVEFILE_WRITE_THROUGH = 8;
 int MoveFileExA(const char* from, const char* to, unsigned) { std::remove(to); return std::rename(from, to) == 0; }
 #endif
 #include "file_whole.h"   // ((Triforce, handoff §8) the .for files whole)
+#include "warm_checkpoint.h"   // ((Triforce) a checkpoint's fetch with room: not here, pcache_checkpoint_now unset)
 using VkResult = int;
 using VkPipelineCache = int;
-constexpr VkResult VK_SUCCESS = 0;
+constexpr VkResult VK_SUCCESS = 0, VK_INCOMPLETE = 5;
+thread_local bool pcache_checkpoint_now = false;
+bool pcache_file_flush(FILE* f) { return std::fflush(f) == 0; }
 struct { int device = 1; } dev;
 VkPipelineCache pcache_play_cache = 0;
 std::string pcache_play_path;

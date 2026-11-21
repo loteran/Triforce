@@ -59,10 +59,14 @@ static int fails;
 @@ENUM@@
 static GcMap census;
 static uint64_t census_touched, census_zeroed, census_discarded;
+static int64_t census_game_bytes;   /* (hos_mem_used's count: tests/test_mem_limit.py) */
 static int locks, unlocks;
 #define CENSUS_LOCK() (locks++)
 #define CENSUS_UNLOCK() (unlocks++)
 int hos_mem_census_on(void) { return 1; }
+/* ((Triforce) HOS_MEM_LIMIT: the bare region's rule and the discard's core hand-off are only with the limit on) */
+static int64_t fixture_limit = 1;
+static int64_t hos_mem_limit(void) { return fixture_limit; }
 uint64_t hos_large_lo, hos_large_hi;
 /* (guest addresses: window_lo is at scratch, for the one place that writes there, Linux's zeroing under an import) */
 static unsigned char scratch[1 << 20];
@@ -88,6 +92,10 @@ static int nregions, lock_depth;
 static int hos_guest_range(uint64_t a, uint64_t n) { (void)a, (void)n; return 1; }
 static int hos_guest_io_begin(const void *p, uint64_t n) { (void)p, (void)n; return 0; }
 static void hos_guest_io_end(int io) { (void)io; }
+/* ((Triforce) the discard's virtual core: given up for the call, taken back after it, once each) */
+static int cores_away, cores_back, core_away_at_discard;
+static int hos_vcore_away(void) { cores_away++; return 1; }
+static void hos_vcore_back(void) { cores_back++; }
 /* A discard as it happens: whether a listed region still holds its pages (so that hos_region_alloc would not hand them out
    meanwhile), and whether the regions' lock is held */
 static int seen, seen_listed, seen_locked;
@@ -103,7 +111,7 @@ typedef void *PVOID;
 #define ERROR_SUCCESS 0
 #define MEM_RESET 0x80000
 #define PAGE_READWRITE 4
-static DWORD fake_discard(PVOID p, SIZE_T n) { discard_seen(guest_of(p), guest_of(p) + n); return ERROR_SUCCESS; }
+static DWORD fake_discard(PVOID p, SIZE_T n) { core_away_at_discard = cores_away - cores_back; discard_seen(guest_of(p), guest_of(p) + n); return ERROR_SUCCESS; }
 static void *GetModuleHandleA(const char *name) { (void)name; return (void *)1; }
 static void *GetProcAddress(void *module, const char *name) { (void)module, (void)name; return (void *)fake_discard; }
 static void *VirtualAlloc(void *p, SIZE_T n, unsigned type, unsigned protect) {
@@ -111,7 +119,7 @@ static void *VirtualAlloc(void *p, SIZE_T n, unsigned type, unsigned protect) {
     discard_seen(guest_of(p), guest_of(p) + n);
     return p;
 }
-/* (Linux: asked first whether an import holds the pages) */
+/* (Linux, and Windows since 11-19: asked first whether an import holds the pages) */
 static int imported_now;
 int rx_guest_imported(uint64_t lo, uint64_t hi) { discard_seen(lo, hi); return imported_now; }
 
@@ -292,6 +300,20 @@ static void test_give_back(void) {
 /* ---- the production notes and census_release */
 static void test_production(void) {
     memset(&census, 0, sizeof census);
+    census_game_bytes = 0;
+    {   /* ((Triforce, 11-19) the budget's count: a page the game maps over one it has already counts once; it goes when let go) */
+        const uint64_t g = 9 * GB;
+        hos_mem_note(HOS_MEM_PAGES, g, 0x10000);
+        hos_mem_note(HOS_MEM_MAPPED, g + 0x8000, 0x10000);   /* (half over the pages above) */
+        CHECK(census_game_bytes == 0x18000 && (uint64_t)census_game_bytes == gc_count(&census, GC_GAME, 0, GC_SPACE),
+              "the game's pages counted %lld, the map holds %llu", (long long)census_game_bytes, (unsigned long long)gc_count(&census, GC_GAME, 0, GC_SPACE));
+        hos_mem_note(HOS_MEM_DECOMMITTED, g, 0x8000);
+        hos_mem_note(HOS_MEM_ZEROED, g + 0x8000, 0x4000);
+        hos_mem_note(HOS_MEM_DISCARDED, g + 0xC000, 0x40000);   /* (more than is there) */
+        CHECK(census_game_bytes == 0 && !gc_count(&census, GC_GAME, 0, GC_SPACE), "the game's pages let go still counted: %lld", (long long)census_game_bytes);
+        memset(&census, 0, sizeof census);
+        census_game_bytes = 0, census_zeroed = census_discarded = 0;
+    }
     const uint64_t a = 5 * GB - 0x10000;   /* (across a chunk's end) */
     hos_mem_note(HOS_MEM_COMMITTED, a, 0x30000);
     CHECK(gc_count(&census, GC_HELD, 0, GC_SPACE) == 0x30000, "committed: %llu held", (unsigned long long)gc_count(&census, GC_HELD, 0, GC_SPACE));
@@ -418,10 +440,21 @@ static void test_region_free(void) {
     const uint64_t discarded = census_discarded, zeroed = census_zeroed;
     seen = 0, lock_depth = 0;
     hos_region_free(r);
-    CHECK(seen == 1 && seen_listed && !seen_locked, "a freed region's discard: %d seen, %s, %s", seen,
+#ifdef FIXTURE_POSIX
+    const int seen_want = 1;   /* (the import question; Linux's discard is not a seen one here) */
+#else
+    const int seen_want = 2;   /* (the import question, then the discard) */
+#endif
+    CHECK(seen == seen_want && seen_listed && !seen_locked, "a freed region's discard: %d seen, %s, %s", seen,
           seen_listed ? "listed" : "no longer listed (a region asked for meanwhile could be given its pages)",
           seen_locked ? "under the regions' lock" : "not under the lock");
     CHECK(nregions == 1 && regions[0].addr == other && lock_depth == 0, "the freed region still listed (%d listed)", nregions);
+#ifndef FIXTURE_POSIX
+    CHECK(core_away_at_discard == 1 && cores_away == cores_back, "the discard made with the thread's virtual core held (%d away, %d back)",
+          cores_away, cores_back);
+#else
+    (void)core_away_at_discard;   /* (Linux's discard is the memfd's: no virtual core is given up for it) */
+#endif
 #ifdef FIXTURE_POSIX
     CHECK(!gc_count(&census, GC_KEPT, r, r + 0x40000) && !gc_count(&census, GC_HELD, r, r + 0x40000) && census_discarded == discarded,
           "Linux's discard noted as discarded too: %llu kept, %llu counted discarded",
@@ -440,6 +473,23 @@ static void test_region_free(void) {
     (void)zeroed;
     CHECK(gc_count(&census, GC_KEPT, r, r + 0x40000) == 0x40000 && census_discarded == discarded + 0x40000 &&
           !gc_count(&census, GC_HELD, r, r + 0x40000), "a discarded region not kept");
+    /* ((Triforce, 11-19) pages an import holds: zeroed in place and kept as zeroed, not discarded (the discard was slow there and
+       gave nothing back), still while the region is listed and not under the lock) */
+    {
+        const uint64_t discarded2 = census_discarded, zeroed2 = census_zeroed;
+        memset(&list[1], 0, sizeof list[1]);
+        list[1].addr = r, list[1].size = 0x40000, nregions = 2, imported_now = 1, window_lo = r;
+        hos_mem_note(HOS_MEM_COMMITTED, r, 0x40000);
+        seen = 0;
+        hos_region_free(r);
+        CHECK(seen == 1 && seen_listed && !seen_locked && nregions == 1, "Windows' zeroing under an import: %d seen, %s, %s", seen,
+              seen_listed ? "listed" : "no longer listed", seen_locked ? "under the lock" : "not under the lock");
+        CHECK(gc_count(&census, GC_KEPT, r, r + 0x40000) == 0x40000 && census_zeroed == zeroed2 + 0x40000 && census_discarded == discarded2,
+              "Windows' zeroing under an import: %llu kept, %llu counted zeroed, %llu discarded",
+              (unsigned long long)gc_count(&census, GC_KEPT, r, r + 0x40000), (unsigned long long)(census_zeroed - zeroed2),
+              (unsigned long long)(census_discarded - discarded2));
+        imported_now = 0, window_lo = 0;
+    }
     /* (the heap's large pages are not discarded: left held, not noted) */
     hos_large_lo = r, hos_large_hi = r + 64 * MB;
     memset(&list[1], 0, sizeof list[1]);
@@ -455,6 +505,58 @@ static void test_region_free(void) {
     seen = 0;
     hos_region_free(r);   /* (freed already: nothing) */
     CHECK(seen == 0 && nregions == 1, "a region freed twice discarded twice");
+    /* ((Triforce) a region the game asked for itself, freed with none of its pages in it (it was refused them, HOS_MEM_LIMIT):
+       nothing to discard, and its pages noted let go as a discard notes them) */
+    memset(&census, 0, sizeof census);
+    memset(&list[1], 0, sizeof list[1]);
+    list[1].addr = r, list[1].size = 0x40000, list[1].game = 1, nregions = 2;
+    hos_mem_note(HOS_MEM_COMMITTED, r, 0x40000);
+    const int64_t bare = region_frees_bare;
+    seen = 0, decommits = 0;
+    hos_region_free(r);
+    CHECK(seen == 0 && decommits == 0 && region_frees_bare == bare + 1,
+          "a region of the game's own with none of its pages was discarded (%d discards, %d decommits)", seen, decommits);
+    CHECK(nregions == 1 && regions[0].addr == other && lock_depth == 0, "the bare region still listed (%d listed)", nregions);
+    CHECK(gc_count(&census, GC_KEPT, r, r + 0x40000) == 0x40000 && !gc_count(&census, GC_HELD, r, r + 0x40000),
+          "a bare region's pages not noted let go: %llu kept, %llu held", (unsigned long long)gc_count(&census, GC_KEPT, r, r + 0x40000),
+          (unsigned long long)gc_count(&census, GC_HELD, r, r + 0x40000));
+    {   /* (the same bare region without the limit: discarded, as upstream does) */
+        memset(&census, 0, sizeof census);
+        memset(&list[1], 0, sizeof list[1]);
+        list[1].addr = r, list[1].size = 0x40000, list[1].game = 1, nregions = 2;
+        hos_mem_note(HOS_MEM_COMMITTED, r, 0x40000);
+        fixture_limit = 0, seen = 0, decommits = 0;
+        hos_region_free(r);
+        CHECK((seen || decommits) && region_frees_bare == bare + 1, "without the limit a bare region of the game's was not discarded");
+        fixture_limit = 1;
+    }
+    /* (with one page of the game's in it: discarded whole, as any region) */
+    memset(&census, 0, sizeof census);
+    memset(&list[1], 0, sizeof list[1]);
+    list[1].addr = r, list[1].size = 0x40000, list[1].game = 1, nregions = 2;
+    hos_mem_note(HOS_MEM_COMMITTED, r, 0x40000);
+    hos_mem_note(HOS_MEM_PAGES, r + 0x3000, 0x1000);
+    seen = 0, decommits = 0;
+    hos_region_free(r);
+    CHECK((seen || decommits) && region_frees_bare == bare + 1 && !gc_count(&census, GC_GAME, r, r + 0x40000),
+          "a region with a page of the game's not discarded (%d discards, %d decommits)", seen, decommits);
+#ifndef FIXTURE_POSIX
+    {   /* (without the limit: upstream's discard, the core kept) */
+        memset(&census, 0, sizeof census);
+        memset(&list[1], 0, sizeof list[1]);
+        list[1].addr = r, list[1].size = 0x40000, nregions = 2;
+        hos_mem_note(HOS_MEM_COMMITTED, r, 0x40000);
+        fixture_limit = 0, cores_away = cores_back = 0, seen = 0;
+        hos_region_free(r);
+        CHECK(seen >= 1 && cores_away == 0, "without the limit the discard gave the core up (%d away)", cores_away);   // (>= 1: the import look before it, rx_guest_imported, notes the range too)
+        fixture_limit = 1;
+    }
+#endif
+    /* (the rule: only the game's own region, only with the census, only with none of its pages) */
+    CHECK(!hos_region_discard_needed(1, 1, 0), "a bare region of the game's is discarded");
+    CHECK(hos_region_discard_needed(0, 1, 0) && hos_region_discard_needed(1, 0, 0) && hos_region_discard_needed(1, 1, 1) &&
+          hos_region_discard_needed(1, 1, 0x40000) && hos_region_discard_needed(0, 0, 0), "a region that needs its discard gets none");
+    memset(&census, 0, sizeof census);
     regions = NULL, nregions = 0;
 }
 
@@ -483,6 +585,24 @@ MUTATIONS = [
     ("hos_region_free", "regions[i].freeing = 1;",
      "regions[i].freeing = 1, memmove(&regions[i], &regions[i + 1], (nregions - i - 1) * sizeof(Range)), nregions--;",
      "a freed region unlisted before its discard: a region asked for meanwhile may be given the pages it then takes away"),
+    ("hos_region_discard_needed", "return !(game_region && census_on && !game_pages);", "return !(game_region && census_on) + 0 * (int)game_pages;",
+     "a region with pages of the game's in it is freed without its discard: the next one there reads what they held"),
+    ("hos_region_discard_needed", "return !(game_region && census_on && !game_pages);", "return !(census_on && !game_pages) + 0 * game_region;",
+     "a region the host asked for itself (written without pages) is freed without its discard"),
+    ("hos_region_discard_needed", "return !(game_region && census_on && !game_pages);", "return !(game_region && !game_pages) + 0 * census_on;",
+     "without the census nothing says which pages are the game's: every region bare"),
+    ("hos_region_discard_needed", "return !(game_region && census_on && !game_pages);", "return 1 + 0 * (game_region + census_on + (int)game_pages);",
+     "every region discarded again: the refused game's stutter (HOS_MEM_LIMIT)"),
+    ("hos_region_free", "        hos_mem_note(HOS_MEM_DISCARDED, addr, freed_size);\n", "",
+     "a region freed bare stays noted held: counted as handed out for good"),
+    ("hos_region_free", "game = regions[i].game;", "game = 0;", "the game's own regions are not known as such: every free a discard"),
+    ("hos_region_free", "hos_region_discard_needed(game && hos_mem_limit(),", "hos_region_discard_needed(game,",
+     "a bare region freed without its discard with the limit off: the default path is no longer upstream's"),
+    ("discard_pages", "    const int away = hos_mem_limit() ? hos_vcore_away() : 0;\n", "    const int away = hos_vcore_away();\n",
+     "the discard gives its core up with the limit off: the default path is no longer upstream's"),
+    ("discard_pages", "    const int away = hos_mem_limit() ? hos_vcore_away() : 0;\n", "    const int away = 0;\n",
+     "the discard made with the thread's virtual core held: the threads of its core wait out the kernel's milliseconds"),
+    ("discard_pages", "    if (away) hos_vcore_back();\n", "    (void)away;\n", "the core given up for a discard and never taken back"),
     ("discard_pages", "    if (hi <= lo || keep) return;\n", "    if (hi <= lo || keep) return;\n    hos_mem_note(HOS_MEM_DISCARDED, lo, hi - lo);\n",
      "the discard noted before the large pages are left alone, and before Linux's own note"),
     ("hos_mem_note", "gc_change(&census, GC_KEPT, lo, hi, 0);\n        CENSUS_UNLOCK();", "CENSUS_UNLOCK();",
@@ -496,8 +616,8 @@ MUTATIONS = [
     ("census_release", "if (lo < (1ULL << 32)) return 0;", "", "pages below 4 GB, handed out without a commit, are decommitted"),
     ("hos_mem_note", "gc_move(&census, GC_HELD, GC_KEPT, lo, hi)", "gc_change(&census, GC_KEPT, lo, hi, 1)",
      "a discarded region's pages never committed count as kept"),
-    ("hos_mem_note", "gc_change(&census, GC_HELD, lo, hi, 0);\n        gc_change(&census, GC_GAME, lo, hi, 0);\n        __atomic_add_fetch(&census_zeroed",
-     "gc_change(&census, GC_GAME, lo, hi, 0);\n        __atomic_add_fetch(&census_zeroed",
+    ("hos_mem_note", "gc_change(&census, GC_HELD, lo, hi, 0);\n        __atomic_sub_fetch(&census_game_bytes, (int64_t)gc_change(&census, GC_GAME, lo, hi, 0), __ATOMIC_RELAXED);\n        __atomic_add_fetch(&census_zeroed",
+     "__atomic_sub_fetch(&census_game_bytes, (int64_t)gc_change(&census, GC_GAME, lo, hi, 0), __ATOMIC_RELAXED);\n        __atomic_add_fetch(&census_zeroed",
      "zeroed pages stay held: never given back"),
 ]
 # (and of guest_census.h)
@@ -573,7 +693,12 @@ def main():
                                          "host/hos_mem.c"),
              "pages_mark_used_locked": block(mem, "static void pages_mark_used_locked(", "host/hos_mem.c"),
              "discard_pages": block(mem, "static void discard_pages(", "host/hos_mem.c"),
+             "hos_region_discard_needed": block(mem, "int hos_region_discard_needed(int game_region, int census_on, uint64_t game_pages)",
+                                                "host/hos_mem.c"),
+             "region_frees_bare": "static int64_t region_frees_bare;",
              "hos_region_free": block(mem, "void hos_region_free(uint64_t addr)", "host/hos_mem.c")}
+    if mem.count("static int64_t region_frees_bare;") != 1:
+        raise SystemExit("FAIL: host/hos_mem.c's region_frees_bare not found once")
     range_t = re.findall(r"^typedef struct \{[^}]*\} Range;$", mem, re.M)
     pages_used = re.findall(r"^static uint64_t pages_used\[[^\n]*\];$", mem, re.M)
     if len(range_t) != 1 or len(pages_used) != 1:

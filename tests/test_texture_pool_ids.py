@@ -79,9 +79,9 @@ def main():
           "const bool known = texture_of((int)(handle & 0xFFFFF), &t, &v, &has_view);"])
     # ((Triforce) the sampled textures' sampler through kept_texture, the per-binding reuse: the whole handle its input)
     need("vk_draw.cpp: kept_texture()", block(draw, "VkSampler kept_texture("),
-         ["const VkSampler smp = sampler_for((int)(handle >> 20), compare);", "in = handle | (uint64_t)vt << 32"])
+         ["const VkSampler smp = sampler_for((int)(handle >> 20), compare, scene);", "in = handle | (uint64_t)vt << 32"])
     need("vk_draw.cpp", draw, ["kept_texture(kp, jb + k, handle, vt, d.is_depth,", "dw().imgs.push_back({smp, view, VK_IMAGE_LAYOUT_GENERAL});",
-                               "if (!on || id < 0 || id >= 4096) return sampler_make(id, compare);"])
+                               "if (!on || id < 0 || id >= 4096) return sampler_make(id, compare, scene);"])
     for where, text in [("vk_draw.cpp", draw), ("vk_bank.cpp", bank), ("vk_replay.cpp", replay)]:
         for mask in re.findall(r"handle & (0x[0-9A-Fa-f]+)", text):
             if int(mask, 16) != 0xFFFFF:

@@ -38,6 +38,7 @@
 #include <unistd.h>
 #endif
 
+#include "temporal_rules.h"   // ((Triforce, FSR4-9, FSR4-10) plan_context, frame_ms)
 #include "vk_paths.h"
 #include "vk_texture.h"
 
@@ -60,7 +61,16 @@ int env_switch(const char* name) {   // (-1: unset)
 }
 // (what is known of FSR on this device: -1 not yet, else an FsrWhy. Set when AMD's library has been asked)
 std::atomic<int> g_why{-1};
+// ((Triforce, FSR4-7) the names the menu shows, by the version AMD's library runs here: "AMD FSR 4.1" and "AMD FSR 4.1
+// Native AA". Written once by load() before g_named is set, read on any thread without a lock (the menu never waits)
+char g_name[2][40] = {"AMD FSR 4", "AMD FSR 4 Native AA"};
+std::atomic<bool> g_named{false};
 }  // namespace
+
+const char* fsr4_name(bool native_aa) {
+    static const char* const plain[2] = {"AMD FSR 4", "AMD FSR 4 Native AA"};
+    return g_named.load(std::memory_order_acquire) ? g_name[native_aa ? 1 : 0] : plain[native_aa ? 1 : 0];
+}
 
 FsrWhy fsr4_why() {
     if (!fsr4_built()) return FSR_NOT_BUILT;
@@ -110,12 +120,19 @@ Library& lib() {
 struct Context {
     ffxCreateBackendVKDesc backend{};
     ffxOverrideVersion version{};
+    // ((Triforce, FSR4-4) the API version this program was built with, which the SDK asks every upscale context to say
+    // (ffx_upscale.h: "must be set to FFX_UPSCALER_VERSION"), as NX2navi's does)
+    ffxCreateContextDescUpscaleVersion built{};
 #ifndef _WIN32
     ffxCreateBackendVKDesc_DEPRECATED legacy_backend{};   // (linux) the backend description a Vulkan FSR 4 build like fsr4-vk reads
 #endif
     ffxCreateContextDescUpscale upscale{};
     ffxContext context = nullptr;
-    uint32_t width = 0, height = 0;   // (its output, which is also the most the render size can be)
+    uint32_t width = 0, height = 0;   // (its output)
+    // ((Triforce, FSR4-9) the render size it was made for: with drs any size up to the output's (the game's dynamic
+    // resolution), else that one alone, as AMD's sample makes them)
+    uint32_t render_w = 0, render_h = 0;
+    bool drs = false;
     bool hdr = false;                 // (made for linear HDR colour: the other kind of colour makes it again)
     uint64_t memory = 0;              // (what AMD's library says it holds)
     ~Context() {
@@ -127,9 +144,13 @@ struct Context {
 struct State {
     std::shared_ptr<Context> context;
     uint32_t in_w = 0, in_h = 0;   // (the inputs' size under this context: the largest render size it has had)
+    // ((Triforce, FSR4-9) the render size changed under an output: the game's dynamic resolution, one context for every size
+    // from then on)
+    bool dynamic = false;
     std::chrono::steady_clock::time_point last{};
     uint64_t evals = 0;
     int told_resets = 0;
+    float told_sharpness = -1.0f;   // ((Triforce, S1) the sharpness the log last said)
 };
 State& st() {
     static State& s = *new State;   // (never destroyed: lib()'s note)
@@ -259,18 +280,32 @@ bool load() {
         }
     }
     if (!l.version_id) {
-        logf("vk: AMD FSR 4: no FSR 4 for this GPU (AMD's library has: %s)", listed.c_str());
+        // ((Triforce, FSR4-7) on a Radeon RX 6000 or 7000 the driver decides: AMD's 26.10.1 or newer brings FSR 4 there)
+        logf("vk: AMD FSR 4: no FSR 4 for this GPU and driver (AMD's library has: %s; FSR 4 needs a Radeon RX 6000, 7000 or "
+             "9000 and AMD's driver 26.10.1 or newer)", listed.c_str());
         return no(FSR_NO_MODEL);
     }
     logf("vk: AMD FSR 4: upscalers %s; using %u.%u.%u", listed.c_str(), best[0], best[1], best[2]);
+    // ((Triforce, FSR4-7) the menu's name for it: its major and minor, as NX2navi's bd7d526 shows it)
+    snprintf(g_name[0], sizeof g_name[0], "AMD FSR %u.%u", best[0], best[1]);
+    snprintf(g_name[1], sizeof g_name[1], "AMD FSR %u.%u Native AA", best[0], best[1]);
+    g_named.store(true, std::memory_order_release);
     l.ok = true;
     g_why = FSR_OK;
     return true;
 }
 
-/// A context for outputs of w x h, any render size up to that (the game's dynamic resolution and the Render resolution row
-/// change it every so often: one context takes them all)
-std::shared_ptr<Context> make_context(uint32_t w, uint32_t h, bool hdr) {
+/// (Triforce) RX_VK_FSR4_AUTO_EXPOSURE=0: an HDR context without FFX_UPSCALE_ENABLE_AUTO_EXPOSURE (FSR takes the colour's
+/// exposure as 1), to compare with the default where the colour is the tone mapped picture (FSR4-3)
+bool hdr_auto_exposure() {
+    static const bool on = env_switch("RX_VK_FSR4_AUTO_EXPOSURE") != 0;
+    return on;
+}
+
+/// A context for outputs of ow x oh. drs: any render size up to the output's (the game's dynamic resolution); else the
+/// render size rw x rh alone, as AMD's sample makes them ((Triforce, FSR4-9): NX2navi's 7e938ec saw AMD's driver fail in the
+/// dispatch on an RX 7900 XT when the render size changed under one context, and moved to one context a render size)
+std::shared_ptr<Context> make_context(uint32_t rw, uint32_t rh, uint32_t ow, uint32_t oh, bool drs, bool hdr) {
     Library& l = lib();
     auto c = std::make_shared<Context>();
     c->backend.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_BACKEND_VK;
@@ -278,6 +313,9 @@ std::shared_ptr<Context> make_context(uint32_t w, uint32_t h, bool hdr) {
     c->version.header.type = FFX_API_DESC_TYPE_OVERRIDE_VERSION;
     c->version.versionId = l.version_id;
     c->backend.header.pNext = &c->version.header;
+    c->built.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE_VERSION;
+    c->built.version = FFX_UPSCALER_VERSION;
+    c->version.header.pNext = &c->built.header;
 #ifndef _WIN32
     // (linux) fsr4-vk looks for the SDK's older backend description, not ffxCreateBackendVKDesc: without it, it finds no device
     // and creation returns FFX_API_RETURN_ERROR_PARAMETER. Both stay chained
@@ -285,30 +323,30 @@ std::shared_ptr<Context> make_context(uint32_t w, uint32_t h, bool hdr) {
     c->legacy_backend.vkDevice = l.device_context.vkDevice;
     c->legacy_backend.vkPhysicalDevice = l.device_context.vkPhysicalDevice;
     c->legacy_backend.vkDeviceProcAddr = l.device_context.vkDeviceProcAddr;
-    c->version.header.pNext = &c->legacy_backend.header;
+    c->built.header.pNext = &c->legacy_backend.header;
 #endif
     c->upscale.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE;
     c->upscale.header.pNext = &c->backend.header;
     // (the chain's colour is tonemapped and square-root encoded already: LDR, perceptual, no auto exposure; depth not
-    // inverted. The render size changes under the one context)
-    c->upscale.flags = FFX_UPSCALE_ENABLE_NON_LINEAR_COLORSPACE | FFX_UPSCALE_ENABLE_DYNAMIC_RESOLUTION;
-    // (hdr, the chain before the game's bloom and tone mapping: the scene's linear HDR light, before the game's exposure,
-    // so FSR finds the exposure itself)
-    if (hdr)
-        c->upscale.flags = FFX_UPSCALE_ENABLE_HIGH_DYNAMIC_RANGE | FFX_UPSCALE_ENABLE_AUTO_EXPOSURE |
-                           FFX_UPSCALE_ENABLE_DYNAMIC_RESOLUTION;
-    c->upscale.maxRenderSize = {w, h};
-    c->upscale.maxUpscaleSize = {w, h};
+    // inverted)
+    c->upscale.flags = FFX_UPSCALE_ENABLE_NON_LINEAR_COLORSPACE;
+    // (hdr, linear HDR colour: the chain before the game's bloom and tone mapping, the scene's light before the game's
+    // exposure, so FSR finds the exposure itself; or (Triforce, FSR4-3) an RGBA16F picture's, RenoDX's HDR Native)
+    if (hdr) c->upscale.flags = FFX_UPSCALE_ENABLE_HIGH_DYNAMIC_RANGE | (hdr_auto_exposure() ? FFX_UPSCALE_ENABLE_AUTO_EXPOSURE : 0);
+    if (drs) c->upscale.flags |= FFX_UPSCALE_ENABLE_DYNAMIC_RESOLUTION;
+    c->upscale.maxRenderSize = drs ? FfxApiDimensions2D{ow, oh} : FfxApiDimensions2D{rw, rh};
+    c->upscale.maxUpscaleSize = {ow, oh};
     c->upscale.fpMessage = &on_message;
     const auto t0 = std::chrono::steady_clock::now();
     const ffxReturnCode_t r = l.create(&c->context, &c->upscale.header, nullptr);
     const double made_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     if (r != FFX_API_RETURN_OK || !c->context) {
-        logf("vk: AMD FSR 4: its upscaler was not made (%d) for %ux%u", (int)r, w, h);
+        logf("vk: AMD FSR 4: its upscaler was not made (%d) for %ux%u -> %ux%u%s", (int)r, rw, rh, ow, oh,
+             drs ? " (any render size)" : "");
         c->context = nullptr;
         return nullptr;
     }
-    c->width = w, c->height = h, c->hdr = hdr;
+    c->width = ow, c->height = oh, c->render_w = drs ? ow : rw, c->render_h = drs ? oh : rh, c->drs = drs, c->hdr = hdr;
     FfxApiEffectMemoryUsage usage{};
     ffxQueryDescUpscaleGetGPUMemoryUsage mem{};
     mem.header.type = FFX_API_QUERY_DESC_TYPE_UPSCALE_GPU_MEMORY_USAGE;
@@ -317,9 +355,21 @@ std::shared_ptr<Context> make_context(uint32_t w, uint32_t h, bool hdr) {
     ffxQueryGetProviderVersion provider{};
     provider.header.type = FFX_API_QUERY_DESC_TYPE_GET_PROVIDER_VERSION;
     const bool known = l.query(&c->context, &provider.header) == FFX_API_RETURN_OK && provider.versionName;
-    logf("vk: AMD FSR 4: FSR %s made for outputs of %ux%u, %s colour (frame %llu, %.1f ms of CPU; its own %llu MB)",
-         known ? provider.versionName : "?", w, h, hdr ? "HDR" : "LDR", (unsigned long long)texture_frame_no(), made_ms,
-         (unsigned long long)(c->memory >> 20));
+    logf("vk: AMD FSR 4: FSR %s made for %s%ux%u -> %ux%u, %s colour%s (frame %llu, %.1f ms of CPU; its own %llu MB)",
+         known ? provider.versionName : "?", drs ? "render sizes up to " : "", c->render_w, c->render_h, ow, oh,
+         hdr ? "HDR" : "LDR", hdr && !hdr_auto_exposure() ? " without auto exposure" : "", (unsigned long long)texture_frame_no(),
+         made_ms, (unsigned long long)(c->memory >> 20));
+    // ((Triforce, FSR4-8) the provider asked for the version it runs: anything but a 4.x means the loader gave another upscaler
+    // in FSR 4's place, which is never shown under its name (NX2navi's vk_ffx4.cpp does the same). The context goes with c)
+    if (known && atoi(provider.versionName) < 4) {
+        logf("vk: AMD FSR 4: the context runs FSR %s, not FSR 4: FSR 4 off for this run", provider.versionName);
+        {
+            std::lock_guard lk(l.mu);
+            l.ok = false;
+        }
+        g_why = FSR_NO_MODEL;
+        return nullptr;
+    }
     return c;
 }
 
@@ -390,9 +440,22 @@ int prepare(VkCommandBuffer, uint32_t rw, uint32_t rh, uint32_t ow, uint32_t oh,
             uint32_t* in_w, uint32_t* in_h, const char** why) {
     State& s = st();
     int made = 1;
-    if (!s.context || s.context->width != ow || s.context->height != oh || s.context->hdr != hdr) {
+    // ((Triforce, FSR4-9) a fixed share has a context of its own size; the first time the render size changes under an output
+    // (the game's dynamic resolution: Auto), one context for any size up to the output's from then on. RX_VK_FSR4_DRS=1:
+    // that one from the start, as before)
+    static const bool drs_env = env_switch("RX_VK_FSR4_DRS") > 0;
+    const Context* const c = s.context.get();
+    const temporal_rules::ContextPlan plan =
+        c ? temporal_rules::plan_context(true, c->width, c->height, c->render_w, c->render_h, c->drs, c->hdr, rw, rh, ow, oh,
+                                         hdr, s.dynamic, drs_env)
+          : temporal_rules::plan_context(false, 0, 0, 0, 0, false, false, rw, rh, ow, oh, hdr, s.dynamic, drs_env);
+    if (plan.went_dynamic)
+        logf("vk: AMD FSR 4: the render size went from %ux%u to %ux%u: one context for every render size from now on (the "
+             "game's dynamic resolution)", c->render_w, c->render_h, rw, rh);
+    s.dynamic = plan.dynamic;
+    if (plan.remake) {
         release();
-        s.context = make_context(ow, oh, hdr);
+        s.context = make_context(rw, rh, ow, oh, plan.drs, hdr);
         if (!s.context) return *why = "its upscaler was not made", -1;
         s.in_w = s.in_h = 0;
         made = 2;
@@ -412,7 +475,9 @@ bool evaluate(VkCommandBuffer cmd, const TemporalFrame& f) {
     if (!unit_exposure(cmd, exposure)) return false;
 #endif
     const auto now = std::chrono::steady_clock::now();
-    const float frame_ms = s.evals ? std::chrono::duration<float, std::milli>(now - s.last).count() : 1000.0f / 30.0f;
+    // ((Triforce, FSR4-10) under 100 ms, else a 60th, as the frame generation's below: a single long hitch, or the first
+    // frame, is no rate for FSR's history to follow)
+    const float frame_ms = temporal_rules::frame_ms(!s.evals, std::chrono::duration<float, std::milli>(now - s.last).count());
     s.last = now;
 
     constexpr VkImageLayout G = VK_IMAGE_LAYOUT_GENERAL, R = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
@@ -437,10 +502,21 @@ bool evaluate(VkCommandBuffer cmd, const TemporalFrame& f) {
     d.motionVectorScale = {1.0f, 1.0f};             // (render pixels already, towards the frame before)
     d.renderSize = {f.render_w, f.render_h};
     d.upscaleSize = {f.output.width, f.output.height};
-    // (the FSR sharpening row: AMD's own RCAS, raised below a 75% render share; off at 0, the default. The Sharpness row sharpens at the window,
-    // after the HUD, whatever this says)
-    d.enableSharpening = fsr_sharpen::enabled(opts.fsr_sharpness);
-    d.sharpness = fsr_sharpen::strength(opts.fsr_sharpness, f.render_w, f.output.width);
+    // ((Triforce, S1) the Sharpness row as FSR 4's own sharpening, in AMD's meaning (0 none, 1 the most), on the 3D before
+    // the HUD: the window pass then sharpens nothing (vk_temporal.h temporal_sharpens_3d). It was off here, the row sharpening
+    // the finished picture at the window, the HUD and text with it, and FSR 4's picture stayed as soft as it came)
+    // (linux fork: the FSR sharpening row, when set, is AMD's RCAS strength over the Sharpness row's, raised below a 75% render
+    // share: fsr_sharpen.h)
+    const float sharpness = fsr_sharpen::enabled(opts.fsr_sharpness)
+                                ? fsr_sharpen::strength(opts.fsr_sharpness, f.render_w, f.output.width)
+                                : temporal_sharpness();
+    d.enableSharpening = sharpness > 0.0f;
+    d.sharpness = sharpness;
+    if (sharpness != s.told_sharpness) {
+        s.told_sharpness = sharpness;
+        if (sharpness > 0.0f) logf("vk: AMD FSR 4: its own sharpening at %.2f, before the HUD", sharpness);
+        else logf("vk: AMD FSR 4: its own sharpening off");
+    }
     d.frameTimeDelta = frame_ms;
     d.preExposure = 1.0f;
     d.reset = f.reset;
@@ -499,7 +575,9 @@ bool fsr4_wants_descriptor_buffer() {
 //
 // AMD's frame generation context, of the same FidelityFX SDK 2.4 as the upscaler. Its loader picks the provider for the
 // card: the machine-learned FSR Frame Generation 4.x on the Radeon cards AMD lists it for (RX 9000), FSR Frame Generation
-// 3.1.x on every other, which is not taken under FSR 4's name (framegen_rows.h pick_version).
+// 3.1.x on every other. ((Triforce, FG-1) Both are taken now, 4.x first where listed (framegen_rows.h pick_version), and the
+// row names the version: "AMD FSR (3.1.6)" on an RX 7900 XT. Before, 3.1.x was refused and the row never offered AMD's
+// frame generation on RX 6000 and 7000.)
 //
 // How it is driven. AMD's API has two ways to get the made frame on screen. One is a swapchain of AMD's in the window's
 // place (ffxCreateContextDescFrameGenerationSwapChainVK), which presents and paces the frames on queues and threads of its
@@ -513,13 +591,24 @@ bool fsr4_wants_descriptor_buffer() {
 // with this choice, AMD's library has no thread of its own to stop at the exit, and a present it does not take gets the
 // renderer's own made frame.
 //
-// The HUD: the picture given is the game's finished one, HUD included, since this renderer has no picture without it yet
-// (as FSR 3.1's frame interpolation here, vk_fsr3fi.cpp, whose made frames moved the HUD with the scene). AMD's
-// ffxConfigureDescFrameGeneration::HUDLessColor is where such a picture would go.
+// ((Triforce, FG-3) Why the swapchain-less way is kept. AMD's header describes the flag as a supported mode, "the context
+// should only run frame interpolation and not modify the swapchain"; the generation's description
+// (ffxDispatchDescFrameGeneration: a command list, the present colour, up to four outputs, the frame id) is a public
+// dispatch type, and the very one AMD's swapchain hands its frameGenerationCallback, whose default in AMD's samples is
+// ffxDispatch of it on the same context. Taking AMD's swapchain instead (NX2navi's runtime/vk_fg4.cpp) would put AMD's present
+// and acquire queues and threads in place of this renderer's window, HDR, scaling, overlays and display thread, with the queue
+// family work NX2navi 293731d needed on AMD's driver: a far larger change, for the same three calls. Not yet seen on a card:
+// every way the library refuses is logged (fail, and the first frame's "the first made frame" line), and a refusal leaves
+// the renderer's own interpolation.)
 //
-// Not run by anyone: no PC here has a card AMD's library lists an FSR 4 frame generation for. The calls and their order
-// (configuration, preparation, generation, for a frame id that goes up by one) follow AMD's header and NX2navi's use of
-// the same library; that the library takes them without its swapchain rests on the header's flag alone.
+// The HUD ((Triforce, FG-2)): the picture given is the game's finished one, HUD included, and with it, as
+// ffxConfigureDescFrameGeneration::HUDLessColor, the same picture without the HUD: the gameplay upscale's output before the
+// HUD is drawn into it, encoded as the game's last pass encodes it (vk_framegen.cpp hudless_for). AMD's library moves the
+// scene by that one and keeps what differs between the two, the HUD, where the game drew it. No frame is made without it
+// (GAME: the game's frame alone, NX2navi 5bdf583's rule): FSR 3.1's frame interpolation here (vk_fsr3fi.cpp), without
+// one, moved the HUD with the scene (#1635). Nor in HDR Native, whose picture without the HUD the game alone could encode,
+// nor in a run with RenoDX's RGBA16F scene: those hold for every present (held()), and there the renderer's own
+// interpolation makes the one frame, as at 2x, as a saved 9 ran before AMD's FSR 3.1 frame generation was offered.
 #ifdef _WIN32
 namespace fsr4fg {
 namespace {
@@ -541,6 +630,7 @@ struct Fg {
     ffxContext context = nullptr;
     // (what the context was made from: the API asks that it stays until the context is destroyed)
     ffxCreateContextDescFrameGeneration desc{};
+    ffxCreateContextDescFrameGenerationHudless hudless{};   // ((Triforce, FG-2) the picture without the HUD's format)
     ffxCreateContextDescFrameGenerationVersion api{};
     ffxCreateBackendVKDesc backend{};
     ffxOverrideVersion pin{};
@@ -556,6 +646,9 @@ struct Fg {
     bool have_pose = false;
     uint64_t presents = 0, used_at = 0;   // (present_tick's count, and its value at the last frame handed over)
     uint64_t n_made = 0, n_skipped = 0, n_cuts = 0;
+    // ((Triforce) each way a present is refused said once: no depth and motion, no picture without the HUD, HDR Native)
+    bool told_bare = false, told_held[fgr::HELD_COUNT] = {};
+    uint64_t n_held[fgr::HELD_COUNT] = {};
 };
 Fg& fg() {
     static Fg& f = *new Fg;   // (never destroyed: lib()'s note)
@@ -566,7 +659,7 @@ std::atomic<bool> g_fg_failed{false};   // (it failed in this run: off until the
 std::atomic<bool> g_fg_exiting{false};  // (HOS_OPT_EXITING: nothing of AMD's is called any more)
 std::atomic<bool> g_fg_live{false};     // (a context exists: present_tick has something to look after)
 
-int fg_env() {   // (RX_VK_FSR4_FG: 0 never, 1 any version AMD's library lists counts; -1 unset)
+int fg_env() {   // (RX_VK_FSR4_FG: 0 never; 4 FSR 4's alone, as before (FG-1); 1 or unset (-1): the newest AMD's library lists)
     static const int e = env_switch("RX_VK_FSR4_FG");
     return e;
 }
@@ -607,15 +700,19 @@ fgr::Why probe(Fg& s) {
     }
     std::string listed;
     for (uint64_t i = 0; i < count; i++) listed += (listed.empty() ? "" : ", ") + std::string(names[i] ? names[i] : "?");
-    const int at = fgr::pick_version(names.data(), (int)count, fg_env() == 1);
+    const bool only4 = fg_env() == 4;
+    const int at = fgr::pick_version(names.data(), (int)count, only4);
     if (at < 0) {
-        logf("vk: AMD FSR 4 frame generation: no FSR 4 frame generation for this GPU (AMD's library has: %s)", listed.c_str());
+        logf("vk: AMD FSR 4 frame generation: no frame generation it can take for this GPU (AMD's library has: %s%s)",
+             listed.c_str(), only4 ? "; RX_VK_FSR4_FG=4: FSR 4's alone" : "");
         return fgr::FG_NO_MODEL;
     }
     s.version_id = ids[at];
     snprintf(s.version, sizeof s.version, "%s", names[at]);
-    logf("vk: AMD FSR 4 frame generation: AMD's library has %s; using %s%s", listed.c_str(), s.version,
-         fg_env() == 1 ? " (RX_VK_FSR4_FG=1: any version)" : "");
+    unsigned v[3];
+    const bool fsr31 = fgr::parse_version(s.version, v) && v[0] < 4;
+    logf("vk: AMD FSR 4 frame generation: AMD's library has %s; using %s%s (the Frame generation row's AMD FSR)", listed.c_str(),
+         s.version, fsr31 ? ", FSR 3.1's frame generation: AMD lists FSR 4's for RX 9000 alone" : "");
     return fgr::FG_OK;
 }
 
@@ -670,7 +767,10 @@ struct AtExit {
 void release(Fg& s, const char* why) {
     if (!s.context && !s.out) return;
     logf("vk: AMD FSR 4 frame generation: its context is let go (%s; %llu frames made, %llu not made at a new history, %llu "
-         "camera cuts among them)", why, (unsigned long long)s.n_made, (unsigned long long)s.n_skipped, (unsigned long long)s.n_cuts);
+         "camera cuts among them; the game's frame alone %llu times without a picture without the HUD; %llu HDR Native "
+         "pictures to the renderer's own)",
+         why, (unsigned long long)s.n_made, (unsigned long long)s.n_skipped, (unsigned long long)s.n_cuts,
+         (unsigned long long)s.n_held[fgr::HELD_NO_HUDLESS], (unsigned long long)s.n_held[fgr::HELD_HDR_NATIVE]);
     Down d{s};
     fgr::teardown(d, false);
     s.key = {}, s.have_pose = false, s.sequence = 0;
@@ -712,9 +812,14 @@ bool make(Fg& s, const fgr::ContextKey& key) {
     s.api.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATION_VERSION;
     s.api.version = FFX_FRAMEGENERATION_VERSION;
     s.api.header.pNext = &s.backend.header;
+    // ((Triforce, FG-2) the picture without the HUD, given each frame as HUDLessColor: 8 bits of sRGB as the picture is)
+    s.hudless = {};
+    s.hudless.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATION_HUDLESS;
+    s.hudless.hudlessBackBufferFormat = ffxApiGetSurfaceFormatVK(VK_FORMAT_R8G8B8A8_UNORM);
+    s.hudless.header.pNext = &s.api.header;
     s.desc = {};
     s.desc.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATION;
-    s.desc.header.pNext = &s.api.header;
+    s.desc.header.pNext = &s.hudless.header;
     // (the depth it is given is reversed, 1 at the near plane: vk_fsr3_inputs.h. The picture is the presented one, 8 bits
     // of sRGB or of HDR10 codes: not the linear HDR that flag is for)
     s.desc.flags = FFX_FRAMEGENERATION_ENABLE_DEPTH_INVERTED | (key.infinite_depth ? FFX_FRAMEGENERATION_ENABLE_DEPTH_INFINITE : 0);
@@ -742,7 +847,8 @@ bool make(Fg& s, const fgr::ContextKey& key) {
     provider.header.type = FFX_API_QUERY_DESC_TYPE_GET_PROVIDER_VERSION;
     const bool known = l.query(&s.context, &provider.header) == FFX_API_RETURN_OK && provider.versionName;
     logf("vk: AMD FSR 4 frame generation: FSR frame generation %s made for pictures of %ux%u, scenes up to %ux%u, the far "
-         "plane %s (%.1f ms of CPU; its own %llu MB)", known ? provider.versionName : "?", key.width, key.height,
+         "plane %s, with a picture without the HUD, no swapchain of AMD's (%.1f ms of CPU; its own %llu MB)",
+         known ? provider.versionName : "?", key.width, key.height,
          key.max_render_width, key.max_render_height, key.infinite_depth ? "at infinity" : "finite", made_ms,
          (unsigned long long)(s.memory >> 20));
     return true;
@@ -775,17 +881,45 @@ framegen_rows::Why why_known() {
 
 bool frames_wanted() {
     // (the row first: AMD's library is not asked anything, and nothing is logged, while the row is elsewhere)
-    return opts.framegen == fgr::FSR4 && fgr::fsr4_asked(opts.framegen, why(), dlssg::active());
+    // ((Triforce) nor while HDR Native or an RGBA16F scene holds it from every present: no depth, motion or picture without
+    // the HUD is made for frames AMD's library cannot be given, and the renderer's own makes the frame, as at 2x)
+    return opts.framegen == fgr::FSR4 && fgr::fsr4_asked(opts.framegen, why(), dlssg::active()) &&
+           !fgr::held_whole_run(held());
 }
 
 const char* version() { return g_fg_why.load(std::memory_order_relaxed) == fgr::FG_OK ? fg().version : ""; }
 
 framegen_rows::Made generate(VkCommandBuffer cmd, const Inputs& in) {
     if (!cmd || !frames_wanted()) return fgr::OWN;
-    if (!in.color || !in.depth || !in.motion || !in.width || !in.height || !in.render_width || !in.render_height) return fgr::OWN;
     Fg& s = fg();
+    if (!in.color || !in.depth || !in.motion || !in.width || !in.height || !in.render_width || !in.render_height) {
+        std::lock_guard lk(s.mu);
+        if (!s.told_bare)   // ((Triforce) the lab's fgprobe1 run had no line for this, the reason AMD made no frame there)
+            s.told_bare = true, logf("vk: AMD FSR 4 frame generation: a present without the scene's depth and motion (a menu, a movie, "
+                                     "or no upscale's inputs made): the renderer's own interpolation makes its frame");
+        return fgr::OWN;
+    }
     std::lock_guard lk(s.mu);
     if (g_fg_exiting.load() || g_fg_failed.load()) return fgr::OWN;
+    // ((Triforce, FG-2, FG-5) never a made frame with the HUD in the picture it moves. Without this frame's picture without
+    // the HUD, the game's frame alone (GAME). In HDR Native (the game's own HDR encoding, which no picture without the HUD can
+    // follow; frames_wanted already says no while present_native_pq is on, in.pq is this present's own word for it), the
+    // renderer's own makes the frame (OWN, held_made), as a saved 9 ran on a card without AMD's frame generation
+    const fgr::Held held = fgr::held_for(in.pq, false, in.hudless != VK_NULL_HANDLE);
+    if (held != fgr::HELD_NONE) {
+        s.n_held[held]++;
+        if (!s.told_held[held]) {
+            s.told_held[held] = true;
+            logf("vk: AMD FSR 4 frame generation: %s (first at present %llu)",
+                 held == fgr::HELD_HDR_NATIVE
+                     ? "paused with HDR Native (the game encodes its HDR picture itself, and AMD's frame generation needs that "
+                       "picture without the HUD, which only the game could encode): the renderer's own makes the frame, as at 2x"
+                     : "no picture without the HUD this frame (it is taken at the gameplay upscale's output, before the HUD): "
+                       "no made frame, the game's frame alone",
+                 (unsigned long long)s.presents);
+        }
+        return fgr::held_made(held);
+    }
     Library& l = lib();
     s.made = false;
     const bool infinite = !(in.far_plane < 1e8f);
@@ -795,7 +929,7 @@ framegen_rows::Made generate(VkCommandBuffer cmd, const Inputs& in) {
     bool reset = in.reset || !s.context || in.sequence != s.sequence + 1;
     if (!s.context && !make(s, fgr::context_for(in.width, in.height, in.render_width, in.render_height, infinite))) return fgr::OWN;
     const fgr::Pose pose = fgr::pose_of(in.view);
-    if (!reset && s.have_pose && fgr::camera_cut(s.pose, pose, in.frame_ms)) {
+    if (!reset && s.have_pose && fgr::camera_cut(s.pose, pose, in.frame_ms, fgr::kFrameGenCut)) {
         reset = true;
         if (s.n_cuts++ < 24)
             logf("vk: AMD FSR 4 frame generation: a camera cut (from %.1f %.1f %.1f to %.1f %.1f %.1f in %.1f ms): no made frame, a "
@@ -822,6 +956,8 @@ framegen_rows::Made generate(VkCommandBuffer cmd, const Inputs& in) {
     c.flags = FFX_FRAMEGENERATION_FLAG_NO_SWAPCHAIN_CONTEXT_NOTIFY;
     c.generationRect = {0, 0, (int32_t)in.width, (int32_t)in.height};
     c.frameID = s.frame_id;
+    // ((Triforce, FG-2) the same picture without the HUD: what differs from it is kept where the game drew it, not moved)
+    c.HUDLessColor = image_resource(in.hudless, VK_FORMAT_R8G8B8A8_UNORM, in.width, in.height, kInUsage, 0);
     ffxReturnCode_t r = l.configure(&s.context, &c.header);
     if (r != FFX_API_RETURN_OK) return fail(s, "the configuration", r), fgr::OWN;
 
@@ -934,5 +1070,14 @@ void exiting() {}
 }  // namespace fsr4fg
 
 #endif
+
+// ((Triforce) in every build: the menu's Frame generation line reads it, and frames_wanted above)
+extern std::atomic<bool> present_native_pq;   // (vk_replay.cpp: the game's picture is HDR10 codes, HDR Native)
+framegen_rows::Held fsr4fg::held() {
+    if (present_native_pq.load(std::memory_order_relaxed)) return framegen_rows::HELD_HDR_NATIVE;
+    // (the run's scene is RGBA16F: decided at the start and kept for the run, whatever the HDR row says now)
+    if (temporal_scene_format(VK_FORMAT_R16G16B16A16_SFLOAT)) return framegen_rows::HELD_HDR_SCENE;
+    return framegen_rows::HELD_NONE;
+}
 
 }  // namespace mkwvk

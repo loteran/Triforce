@@ -22,6 +22,14 @@
 // game files at run time). The Debug tab is always shown (11-15, the owner: "make debug on by default and remove the alt+g
 // shortcut"; Alt+G unlocked it before). The Menu size row is gone: the game's menus have one size. The FPS counter is a HUD counter (the
 // HUD's own digits, no plate). tests/ui_preview.cpp draws all of it into pictures without the game.
+// (Triforce, options_version 7, the owner: "group them correctly, such as HDR should be its own group, the upscaling should be
+// its own group ... Add the in-game filigree to group them" and "multiple settings that do multiple things and they contradict
+// each other ... If a setting can be implemented in some other way, then remove the setting entirely") Each tab's rows come in
+// groups, each under a heading drawn as the game's list separator with the group's title (MENU_HEADING, ui::heading); a row
+// that does nothing with the others as they are is not shown (row_shown). The rows that chose one thing twice are one row each
+// (merged_rows.h: HDR with RenoDX, Frame generation with DLSS's, Frame pacing with Steady, Low latency for Reflex or Anti-Lag
+// 2, the Upscaler's native AA as the Render resolution's Native (100%)), and the Quality preset, the Window scaling filter,
+// the Reflex frame limit, the Handheld profile and the shared Stick dead zone are gone, their jobs done otherwise.
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -43,7 +51,6 @@
 #include "vk_draw.h"   // (pipeline_cache_save: Restart now keeps what was built)
 #include "oot_cheat_items.h"
 #include "debug_names.h"   // ((Triforce) the Debug tab's name pages: their lists, and oot_debug_link.h's lines)
-#include "debug_tab_layout.h"   // ((Triforce) the Debug tab's cells' widths)
 #include "debug_pending.h"      // ((Triforce) the Inventory's change waiting for the game)
 #include "vk_progress.h"   // (StartupView, version_text: the start-up screen)
 #if __has_include("vk_startup_draw.h")   // (the shader-screen branch's file: with it the start-up screen is its drawing)
@@ -67,6 +74,10 @@
 #include "vk_reflex.h"
 #include "vk_antilag.h"
 #include "upscaler_rows.h"
+#include "vk_present_rect.h"   // ((Triforce, options_version 7) where the picture goes in the window: the filter it takes)
+#include "text_spread.h"   // ((Triforce, 11-19) the title entry's shadow and glow as the game's entries'
+#include "game_grid.h"   // ((Triforce, 11-19) where the game's layouts are in the window: the Mods entry on its list)
+#include "merged_rows.h"   // ((Triforce, options_version 7) the rows that each choose two saved values, and the older files' migration)
 #include "aa_rows.h"        // (Triforce, the Anti-aliasing row: its choices, and when it does not apply)
 #include "vk_aa.h"          // (...RX_VK_AA over it, and whether the game's pass was there to replace)
 #include "tex_detail.h"     // (the Texture detail row: the levels' names, RX_VK_TEX_DETAIL)
@@ -77,6 +88,8 @@
 #include "menu_restart.h"
 #include "mod_cheat_rows.h"   // (Triforce: the System tab's rows for the cheats of the mods' cheat files)
 #include "menu_sound_events.h"   // (Triforce: the options' own sounds: which one a tick asks for, and their queue to the host)
+#include "mods_entry_anim.h"     // ((Triforce, 11-19) the Mods entry under the title's list: the game's entries' animations)
+#include "focus_anim.h"          // ((Triforce, 11-19) Mods and Quit under the System list, Quit's dialog: the game's buttons' and dialogs')
 #include "vk_mods.h"   // (Triforce: the Mods page's engine, GameBanana's list and the installs)
 #include "vk_salesman.h"   // (Triforce: the Happy Mask Salesman beside the cards)
 #include "imgui_internal.h"   // (RegisterUserTexture: the mods' pictures)
@@ -116,7 +129,8 @@ enum MenuTab {
     TAB_COUNT = 6,
     TAB_MOTION = TAB_COUNT,   // (hookshot: not a tab of the strip, the Motion page that the Controls tab's Motion row
                               // opens: one past the strip's tabs, so a tab added before TAB_COUNT moves it along)
-    TAB_PAGE = TAB_MOTION + 1   // (hookshot: the Controls page's rows, above its grid; no tab shows them)
+    TAB_PAGE = TAB_MOTION + 1,   // (hookshot: the Controls page's rows, above its grid; no tab shows them)
+    TAB_HIDDEN = TAB_PAGE + 1    // ((Triforce, options_version 7) saved values a merged row stands for: never shown, merged_rows.h)
 };
 
 struct Row {
@@ -131,8 +145,9 @@ struct Row {
     // menu keeps the height of the tallest: measure_help)
     const char* (*hint)(int v, int variant) = nullptr;
     bool restart = false;   // (read once, at the start: a change applies after a restart)
-    bool preset_exempt = false;   // (a change here leaves the Quality preset alone: the controls, the window, the counter,
-                                  // frame generation)
+    // (a change here left the Quality preset alone: the controls, the window, the counter, frame generation. (Triforce,
+    // options_version 7) The preset is gone and nothing reads it; the rows keep their shape)
+    bool preset_exempt = false;
     signed char cheat = -1;   // (a debug tool, on the Debug tab with the tools on: its index in the cheat_ tables, -1 none)
     bool heading = false;     // (a section's title on its tab, not a row: the selection steps over it)
 };
@@ -147,9 +162,13 @@ const char* hint_in(const char* const* t, int n, int lo, int v, int variant) {
     }
 const char* tx_framegen(int v) {
     // (Triforce: the last is AMD's frame generation library, vk_fsr4.h fsr4fg. A saved AMD FSR 4 on a PC where the library
-    // cannot make the frames shows what runs there, 2x: framegen_rows.h shown)
-    static const char* t[] = {"Off", "Auto", "2x", "3x", "4x", "5x", "6x", "7x", "8x", "AMD FSR 4"};
-    return t[std::clamp(framegen_rows::shown(v, fsr4fg::offered_known()), 0, (int)framegen_rows::kRowMax)];   // ((Triforce) as known: menu_ahead)
+    // cannot make the frames shows what runs there, 2x: framegen_rows.h shown. (FG-1) Named by the version AMD's library makes
+    // the frames with: "AMD FSR (3.1.6)" on an RX 6000 or 7000, "AMD FSR (4.0.2)" on an RX 9000)
+    static const char* t[] = {"Off", "Auto", "2x", "3x", "4x", "5x", "6x", "7x", "8x", "AMD FSR"};
+    const int shown = std::clamp(framegen_rows::shown(v, fsr4fg::offered_known()), 0, (int)framegen_rows::kRowMax);   // ((Triforce) as known: menu_ahead)
+    if (shown != framegen_rows::FSR4) return t[shown];
+    static char label[32];
+    return framegen_rows::row_label(label, sizeof label, fsr4fg::version());
 }
 const char* tx_onoff(int v) { return v ? "On" : "Off"; }
 const char* tx_dlssg(int v) { return v == 1 ? "2x" : v == 2 ? "3x" : v == 3 ? "4x" : "Off"; }
@@ -160,22 +179,19 @@ const char* hn_dlssg(int v, int variant) {
     if (!v) return "Off.";
     return mkwvk::dlssg::asked() ? mkwvk::dlssg::status() : "Starts with the next start of the game.";
 }
-/// (Triforce) The Reflex frame limit row: what holds the frames now. Variant 0 stands for the longest line
-/// (Triforce) RivaTuner Statistics Server, where it holds the frames, is the limiter whatever this row says (vk_pace.cpp)
-const char* hn_reflex_limit(int v, int variant) {
-    static const char* const off = "The game's own wait holds every frame, or RivaTuner where it is the game's limiter.";
-    static const char* const none = "DLSS frame generation does not run in this session: the game's own wait holds every frame.";
-    static const char* const rtss = "RivaTuner Statistics Server holds the frames now, and Reflex is given no limit.";
-    if (variant > 0) return nullptr;
-    if (variant == 0) return none;
-    if (v && mkwvk::pace::owner() == mkwvk::pace::RTSS) return rtss;
-    return !v ? off : mkwvk::dlssg::active() ? "Reflex holds the frames while they are generated." : none;
-}
 const char* tx_menu_shortcut(int v) {
     static const char* const names[] = {"Insert or F1", "F1 only"};   // (F1 is never turned off: the menu is always one key away)
     return names[v ? 1 : 0];
 }
 const char* tx_hdr(int v) { return v == 1 ? "Expanded" : v == 2 ? "Native" : "Off"; }   // ((Triforce, 11-16) "Native", the owner's word)
+namespace mr7 = merged_rows;
+/// ((Triforce, options_version 7) the HDR row: opts.hdr with RenoDX HDR as its fourth value, merged_rows.h)
+const char* tx_hdr_mode(int v) { return v == mr7::HDR_RENODX ? "Native + RenoDX" : tx_hdr(v); }
+MENU_HINTS(hn_hdr_mode, 0, "The usual SDR picture.",
+           "The game's SDR picture shown on an HDR display: its white at Paper white, its highlights up to Peak brightness.",
+           "The game's own HDR, told your display's Paper white and Peak brightness.",
+           "The game's own HDR with RenoDX's tone mapping, eye adaptation and color grading in place of the game's (the RenoDX "
+           "rows below). RenoDX is by Carlos Lopez (clshortfuse), under the MIT license.")
 const char* tx_nits(int v) {
     static char b[24];
     snprintf(b, sizeof b, "%d nits", v);
@@ -196,6 +212,16 @@ const char* tx_fps_cap(int v) {
 }
 // (Triforce) The Steady frame rate row (host/pace_steady.h's PACE_STEADY_*)
 const char* tx_steady_fps(int v) { return v == 1 ? "Any rate" : v == 2 ? "Refresh steps" : "Off"; }
+/// ((Triforce, options_version 7) the Frame pacing row: Frame pacing and Steady frame rate in one, merged_rows.h)
+const char* tx_pacing(int v) {
+    static const char* const t[] = {"Off", "Even", "Steady, any rate", "Steady, refresh steps"};
+    return t[std::clamp(v, 0, 3)];
+}
+MENU_HINTS(hn_pacing, 0, "Each frame as soon as it is ready.", "Frames at an even interval: less stutter, at up to a frame of delay.",
+           "The game paced to a rate this PC holds here, under the Frame rate cap, each frame shown evenly: for a display with "
+           "G-SYNC or FreeSync, or VSync off. Applies after a restart.",
+           "As Steady, any rate, kept to whole divisions of the refresh rate (at 240 Hz: 120, 80, 60): for VSync without G-SYNC or "
+           "FreeSync. Applies after a restart.")
 // (Triforce) The VSync row (opts.vsync; present_mode.h has what On and Off ask for): the line under its help says what the
 // choice came to on this driver, by the present mode of the swapchain there is, or which switch decides for the run.
 // Variants (every one): each mode the value can come to, then the two switches
@@ -237,45 +263,35 @@ const char* tx_sens(int v) {
     snprintf(b, sizeof b, "%.2f", v / 100.0);
     return b;
 }
-// (the game's picture and the window it is shown in, as the last present had them: menu_note_present_sizes)
+// (the game's picture and the window it is shown in, as the last present had them: menu_note_present_sizes. (Triforce,
+// options_version 7) The Window scaling filter row is gone: those sizes choose the filter there, upscaler_rows.h auto_filter)
 std::atomic<uint64_t> present_sizes{0};
-bool filter_needed() {
-    const uint64_t v = present_sizes.load(std::memory_order_relaxed);
-    return upscaler_rows::filter_needed((unsigned)(v >> 48), (unsigned)(v >> 32) & 0xffff, (unsigned)(v >> 16) & 0xffff,
-                                        (unsigned)v & 0xffff);
+// ((Triforce, options_version 7) The Low latency row: NVIDIA Reflex on an NVIDIA card, AMD Anti-Lag 2 on an AMD one, one row
+// for either (merged_rows.h); none where neither runs. With DLSS frame generation Reflex is Streamline's)
+mr7::Vendor latency_vendor() {
+    return reflex_available() || mkwvk::dlssg::reflex_on() ? mr7::LATENCY_NVIDIA : antilag_available() ? mr7::LATENCY_AMD : mr7::LATENCY_NONE;
 }
-const char* tx_upscale(int v) {
-    static const char* t[] = {"Off", "Catmull-Rom", "Lanczos", "AMD FSR 1"};
-    if ((unsigned)v >= sizeof t / sizeof t[0]) return t[0];   // (a setting past the row: the label, not the next bytes)
-    return t[v];
-}
-/// The Window scaling filter row's value: its filter, or that none is needed (the saved value stays, for another window size)
-const char* tx_filter(int v) { return filter_needed() ? tx_upscale(v) : "Not needed (window = output)"; }
-const char* tx_reflex(int v) {
+const char* tx_latency(int v) {
     static const char* t[] = {"Off", "On", "On + Boost"};
     // ((Triforce, 11-16: the owner saw Off and "not available" with DLSS frame generation on an NVIDIA card) With DLSS frame
     // generation Reflex is Streamline's and always on (vk_dlssg.cpp reflex_apply): its Off shows On, Boost as chosen
     if (mkwvk::dlssg::reflex_on()) return t[std::clamp(v, 1, 2)];
-    return t[reflex_available() ? std::clamp(v, 0, 2) : 0];
+    return t[std::clamp(v, 0, mr7::latency_hi(latency_vendor()))];
 }
-/// Reflex: on the value, that it runs through Streamline with DLSS frame generation, or that it is not available here (the
-/// row shows Off)
-const char* hn_reflex(int v, int variant) {
-    static const char* const t[] = {"The game as without it.", "The driver paces the frames for less latency.",
-                                    "As On, and the GPU's clocks are kept up as well."};
-    static const char* const none = "Not available here: it needs an NVIDIA GPU whose driver has VK_NV_low_latency2.";
+/// Low latency: the value with NVIDIA Reflex (variants 0 to 2: each value's line), with AMD Anti-Lag 2 (3), or that Reflex runs
+/// through Streamline with DLSS frame generation (4)
+const char* hn_latency(int v, int variant) {
+    static const char* const nv[] = {"Off.", "NVIDIA Reflex: each frame starts as late as it can, for less input delay.",
+                                     "As On, and the graphics card's clocks are kept up as well."};
+    static const char* const amd[] = {"Off.", "AMD Anti-Lag 2: each frame starts as late as it can, for less input delay. Not "
+                                              "used with frame generation."};
     static const char* const sl = "With DLSS frame generation Reflex runs through NVIDIA Streamline and stays on, as frame "
-                                  "generation needs it. On + Boost keeps the GPU's clocks up as well.";
-    if (variant < 0) return mkwvk::dlssg::reflex_on() ? sl : reflex_available() ? t[std::clamp(v, 0, 2)] : none;
-    return variant == 0 ? t[std::clamp(v, 0, 2)] : variant == 1 ? none : variant == 2 ? sl : nullptr;
-}
-const char* tx_antilag(int v) { return antilag_available() && v ? "On" : "Off"; }
-/// Anti-Lag 2: on the value, or that it is not available here (the row shows Off)
-const char* hn_antilag(int v, int variant) {
-    static const char* const t[] = {"The game as without it.", "The driver delays each frame's start for less latency."};
-    static const char* const none = "Not available here: it needs an AMD GPU whose driver has VK_AMD_anti_lag.";
-    if (variant < 0) return antilag_available() ? t[v ? 1 : 0] : none;
-    return variant == 0 ? t[v ? 1 : 0] : variant == 1 ? none : nullptr;
+                                  "generation needs it. On + Boost keeps the graphics card's clocks up as well.";
+    if (variant < 0) {
+        if (mkwvk::dlssg::reflex_on()) return sl;
+        return latency_vendor() == mr7::LATENCY_AMD ? amd[std::clamp(v, 0, 1)] : nv[std::clamp(v, 0, 2)];
+    }
+    return variant == 0 ? nv[std::clamp(v, 0, 2)] : variant == 1 ? amd[std::clamp(v, 0, 1)] : variant == 2 ? sl : nullptr;
 }
 // The Upscaler (opts.dlss): what scales the 3D up to the output. DLSS and DLAA only where dlss_why() lets them run, FSR 3.1
 // only where vk_fsr3.cpp says it does, FSR 4 and its native AA only where fsr4_why() does; the menu shows (and steps from)
@@ -289,27 +305,31 @@ unsigned upscalers_available() {
 /// (FSR 3.1 has inputs of its own, at the Render resolution's mode or as its Native AA; DLSS and FSR 4 run on the frame
 /// chain they share, temporal_mode)
 int upscaler() { return fsr3_wanted() ? (int)(fsr3_native() ? ur::FSR3_AA : ur::FSR3) : temporal_mode(); }
+/// ((Triforce, options_version 7) the engine alone: an engine's native AA is the Render resolution row's Native (100%))
 const char* tx_upscaler(int) {
-    static const char* t[ur::kUpscalers] = {"Game", "NVIDIA DLSS", "NVIDIA DLAA", "AMD FSR 3.1", "AMD FSR 4",
-                                            "AMD FSR 4 Native AA", "AMD FSR 3.1 Native AA"};
-    return t[std::clamp(upscaler(), 0, ur::kUpscalers - 1)];
+    static const char* t[ur::kUpscalers] = {"Game", "NVIDIA DLSS", "NVIDIA DLSS", "AMD FSR 3.1", "AMD FSR 4", "AMD FSR 4",
+                                            "AMD FSR 3.1"};
+    // ((Triforce, FSR4-7) FSR 4 by the version AMD's library runs here, "AMD FSR 4.1", once it has been asked. up is the
+    // engine (ur::engine), so FSR 4's Native AA reads as its engine too, "AMD FSR 4.1": the Render resolution says Native)
+    const int up = ur::engine(std::clamp(upscaler(), 0, ur::kUpscalers - 1));
+    if (ur::is_fsr4(up)) return fsr4_name(up == ur::FSR4_AA);
+    return t[up];
 }
 /// The Upscaler: the one shown (what runs, upscaler()), and with the game's own, why DLSS and FSR are not offered. Variants
 /// (every one): each value, then the game's own with each of DLSS's reasons, then with each of FSR's
 const char* hn_upscaler(int v, int variant) {
     static const char* const t[ur::kUpscalers] = {
-        "The game's own network.",
-        "NVIDIA's, from a smaller 3D. Softer than the game's own: set Sharpness to around 80%. Things that move by "
+        // ((Triforce, options_version 7) one line per engine: an engine's native AA is the Render resolution's Native (100%),
+        // whose own line says so, and its value reads as its engine here (v = ur::engine(v) below). (S7) DLSS's line, DLAA's
+        // too, names AMD's RCAS before the HUD; (FSR3-03) FSR 3.1 gives what moves by itself its own motion: no trails said)
+        "The game's own upscaler.",
+        "NVIDIA's, on RTX graphics cards. Sharpness sharpens its 3D before the HUD, with AMD's RCAS. Things that move by "
         "themselves can trail for now.",
-        "NVIDIA's, the 3D at full size with its edges smoothed; the slowest. Softer than the game's own: set Sharpness to "
-        "around 80%. Things that move by themselves can trail for now.",
-        "AMD's, from a smaller 3D, on any GPU: built from AMD's own shaders. Things that move by themselves can trail for "
-        "now.",
-        "AMD's machine-learned upscaler, from a smaller 3D, with AMD's files beside the game. Things that move by themselves "
-        "can trail for now.",
-        "AMD's machine-learned upscaler, the 3D at full size with its edges smoothed; the slowest.",
-        "AMD's, the 3D at full size with its edges smoothed, on any GPU: built from AMD's own shaders. Slower than FSR 3.1 "
-        "from a smaller 3D; the 3D takes its full size at the next start. Things that move by themselves can trail for now.",
+        nullptr,
+        "AMD's, on any graphics card, built from AMD's own shaders.",
+        "AMD's machine-learned upscaler, with AMD's files beside the game. Things that move by themselves can trail for now.",
+        nullptr,
+        nullptr,
     };
     static const char* const dlss_no[DLSS_WHY_COUNT] = {
         nullptr,
@@ -326,20 +346,34 @@ const char* hn_upscaler(int v, int variant) {
         "AMD FSR 4: not in this build (see the readme).",
         "AMD FSR 4: off for this run (RX_VK_FSR4=0).",
         "AMD FSR 4: AMD's files were not found beside the game (see the readme).",
-        "AMD FSR 4: AMD's files have no FSR 4 for this GPU.",
+        "AMD FSR 4: AMD's files have no FSR 4 for this GPU and driver: it needs a Radeon RX 6000, 7000 or 9000 and AMD's "
+        "driver 26.10.1 or newer.",
+    };
+    // ((Triforce, FSR4-1) the engine chosen, off after failing again and again: the game's own stands in for it. FSR 4 by the
+    // version AMD's library ran, as the Upscaler row names it (fsr4_name: "AMD FSR 4.1"; "AMD FSR 4" until it was asked).
+    // (The reasons above are for an FSR 4 that does not run here, whose version no library has given: its plain name)
+    static char fsr4_stood_in[160];
+    snprintf(fsr4_stood_in, sizeof fsr4_stood_in, "The game's own stands in: %s failed four times in a row (the log says "
+             "why). Set the Upscaler again to try it anew.", fsr4_name(false));
+    const char* const stood_in[2] = {
+        "The game's own stands in: NVIDIA DLSS failed four times in a row (the log says why). Set the Upscaler again to try "
+        "it anew.",
+        fsr4_stood_in,
     };
     // (now: the value shown and what runs here, with both engines' reasons; every one: as said above)
     int d = 0, f = 0;
     if (variant < 0) {
         v = std::clamp(upscaler(), 0, ur::kUpscalers - 1), d = (int)dlss_why(), f = (int)fsr4_why();
+        if (const int in = temporal_stood_in(); v == ur::GAME && in != ur::GAME) return stood_in[ur::is_fsr4(in) ? 1 : 0];
     } else if (v == ur::GAME) {
         if (variant < DLSS_WHY_COUNT) d = variant;
         else if (variant < DLSS_WHY_COUNT + FSR_WHY_COUNT - 1) f = variant - DLSS_WHY_COUNT + 1;
+        else if (variant < DLSS_WHY_COUNT + FSR_WHY_COUNT + 1) return stood_in[variant - (DLSS_WHY_COUNT + FSR_WHY_COUNT - 1)];
         else return nullptr;
     } else if (variant > 0) {
         return nullptr;
     }
-    v = std::clamp(v, 0, ur::kUpscalers - 1);
+    v = ur::engine(v);   // ((Triforce, options_version 7) a native AA is its engine's: the Render resolution says Native)
     // (the reasons are said only where the engine is in the build: one without FSR does not tell an NVIDIA user why)
     const char* dn = dlss_built() || variant >= 0 ? dlss_no[d] : nullptr;
     const char* fn = fsr4_built() || variant >= 0 ? fsr_no[f] : nullptr;
@@ -364,8 +398,8 @@ const char* tx_dlss_model(int v) {
     }
     return t[std::clamp(v, 0, ur::kModels - 1)];
 }
-/// The DLSS model: the value chosen; variant 1: the game's own upscales (the row waits for DLSS or DLAA); variant 2: set for
-/// this run by RX_VK_DLSS_PRESET
+/// The DLSS model: the value chosen; variant 1: set for this run by RX_VK_DLSS_PRESET. ((Triforce, options_version 7) The row
+/// shows only while NVIDIA DLSS is the Upscaler: row_shown)
 const char* hn_dlss_model(int v, int variant) {
     static const char* const t[] = {
         "NVIDIA's transformer model: the one tested most here.",
@@ -373,11 +407,9 @@ const char* hn_dlss_model(int v, int variant) {
         "The second-generation transformer as NVIDIA tuned it for Ultra Performance, the smallest Render resolutions.",
         "Lets DLSS's runtime pick for each mode: what it picks can change with a runtime update.",
     };
-    static const char* const unused = "Used by NVIDIA DLSS and DLAA: choose one in the Upscaler row.";
     static const char* const env = "Set for this run by RX_VK_DLSS_PRESET.";
-    if (variant < 0) variant = dlss_preset_env() ? 2 : upscaler() == ur::GAME ? 1 : 0;
-    if (variant == 1) return unused;
-    if (variant == 2) return env;
+    if (variant < 0) variant = dlss_preset_env() ? 1 : 0;
+    if (variant == 1) return env;
     return variant == 0 ? t[std::clamp(v, 0, ur::kModels - 1)] : nullptr;
 }
 /// The FSR sharpening row (opts.fsr_sharpness): AMD's own sharpening inside FSR 3.1 (through AMD's library) and FSR 4
@@ -509,20 +541,21 @@ struct Out {
 };
 // ((Triforce, 11-16, the owner: "Add a resolution of 5120x2160 before 5120x2880") 6 is 5120x2160, after the others so that the
 // saved numbers keep their sizes; kOutputOrder shows it between 5120x1440 and 5120x2880)
-constexpr Out kOutputs[] = {{2048, 1152}, {2560, 1440}, {3840, 2160}, {1920, 1080}, {5120, 1440}, {5120, 2880}, {5120, 2160}};
+// ((Triforce, options_version 7) 7 is 1536x864, the game's handheld profile, which was a row of its own (Handheld profile) that
+// overrode this one: host/nn_applet.c runs the game undocked for it. kOutputOrder shows it first, the smallest)
+constexpr Out kOutputs[] = {{2048, 1152}, {2560, 1440}, {3840, 2160}, {1920, 1080}, {5120, 1440}, {5120, 2880}, {5120, 2160}, {1536, 864}};
 constexpr int kLastOutput = std::size(kOutputs) - 1;
+static_assert(kLastOutput == merged_rows::kHandheldOutput, "the Output resolution row's handheld profile is merged_rows.h's");
 int output_choice(int v) { return v >= 0 && v <= kLastOutput ? v : 0; }
 // Display the sizes from smallest to largest while keeping the IDs used by saved settings.
-constexpr int kOutputOrder[] = {3, 0, 1, 2, 4, 6, 5};
+constexpr int kOutputOrder[] = {7, 3, 0, 1, 2, 4, 6, 5};
 static_assert(std::size(kOutputOrder) == std::size(kOutputs));
 int step_output_choice(int id, int dir) {
     const int* pos = std::find(std::begin(kOutputOrder), std::end(kOutputOrder), output_choice(id));
     const int next = std::clamp((int)(pos - std::begin(kOutputOrder)) + dir, 0, kLastOutput);
     return kOutputOrder[next];
 }
-Out shown_output() {
-    return opts.handheld ? Out{1536, 864} : kOutputs[output_choice(opts.output_res)];
-}
+Out shown_output() { return kOutputs[output_choice(opts.output_res)]; }
 // The size the game draws the 3D at for a fixed scale of its output, a twelfth of it: every twelfth asked came out exact at the three
 // outputs (2048x1152: 0.58 drew 1195x672, 0.6667 1366x768). So the scale the game is given is the twelfth too: 0.67 drew 2615x1471 at
 // 3840x2160, not the 2560x1440 of 8/12.
@@ -535,9 +568,7 @@ void game_size(float scale, uint32_t& w, uint32_t& h) {
 const char* tx_resolution(int v) {
     static char b[48];
     const int up = upscaler();
-    if (up == ur::DLAA) return "Native (DLAA)";
-    if (up == ur::FSR4_AA) return "Native (FSR 4)";
-    if (up == ur::FSR3_AA) return "Native (FSR 3.1)";
+    if (ur::full_scale(up)) return "Native (100%)";   // ((Triforce, options_version 7) DLAA, FSR 4's and FSR 3.1's native AA)
     if (!ur::percent(v)) return "Auto (dynamic)";
     if (const char* mode = ur::scales_by_mode(up) ? ur::dlss_mode_name(v) : nullptr) {
         snprintf(b, sizeof b, "%s (%d%%)", mode, ur::percent(v));
@@ -552,23 +583,18 @@ const char* tx_resolution(int v) {
 const char* hn_resolution(int v, int variant) {
     const int up = variant < 0 ? std::clamp(upscaler(), 0, ur::kUpscalers - 1) : variant;
     if (up >= ur::kUpscalers) return nullptr;
-    if (up == ur::DLAA)
-        return "DLAA draws the 3D at full size: nothing to set here. Choose DLSS or the game's own upscaler to draw it "
-               "smaller.";
-    if (up == ur::FSR4_AA)
-        return "FSR 4's native AA draws the 3D at full size: nothing to set here. Choose FSR 4 or the game's own upscaler "
-               "to draw it smaller.";
-    if (up == ur::FSR3_AA)
-        return "FSR 3.1's native AA draws the 3D at full size: nothing to set here. Choose FSR 3.1 or the game's own "
-               "upscaler to draw it smaller.";
+    if (ur::full_scale(up))   // ((Triforce, options_version 7) Native (100%): the engine's native anti-aliasing)
+        // ((Triforce, FSR4-2) chosen in play, the engine scales the smaller 3D up to the output until the next start)
+        return "The 3D at the output's full size, its edges smoothed by the upscaler: the sharpest, and the slowest. The 3D "
+               "takes its full size at the next start.";
     const int p = ur::percent(v);
     if (up == ur::DLSS) {
         switch (p) {
-        case 0: return "The game lowers it when the GPU is busy, and DLSS follows. Set Sharpness to around 80%.";
-        case 67: return "DLSS's sharpest mode. Set Sharpness to around 80%.";
-        case 58: return "Between Quality and Performance. Set Sharpness to around 80%.";
-        case 50: return "Faster, and softer. Set Sharpness to around 80%.";
-        case 33: return "DLSS's fastest mode, and its softest. Set Sharpness to around 80%.";
+        case 0: return "The game lowers it when the GPU is busy, and DLSS follows.";
+        case 67: return "DLSS's Quality mode: its sharpest from a smaller 3D.";
+        case 58: return "DLSS's Balanced mode, between Quality and Performance.";
+        case 50: return "DLSS's Performance mode: faster, and softer.";
+        case 33: return "DLSS's Ultra Performance mode: its fastest, and its softest.";
         default: return nullptr;   // (not one of DLSS's steps: the row moves to one)
         }
     }
@@ -603,9 +629,10 @@ const char* hn_aa(int v, int variant) {
         "FXAA in place of the game's SMAA: a fast smoothing of the finished 3D's edges, a little softer on fine detail.",
         "SMAA at its highest preset in place of the game's own: long and diagonal edges smoother, for more GPU time."};
     static const char* const own[2] = {
-        "NVIDIA DLSS and DLAA smooth the 3D's edges themselves: nothing to set here. The choice is kept for the game's own "
-        "upscaler.",
-        "AMD FSR smooths the 3D's edges itself: nothing to set here. The choice is kept for the game's own upscaler."};
+        "NVIDIA DLSS and DLAA smooth the 3D's edges themselves, from frames the game's SMAA has not been over: nothing to set "
+        "here. The choice is kept for the game's own upscaler.",
+        "AMD FSR smooths the 3D's edges itself, from frames the game's SMAA has not been over: nothing to set here. The choice "
+        "is kept for the game's own upscaler."};
     static const char* const env = "Set for this run by RX_VK_AA, whatever is chosen here.";
     static const char* const missing =
         "No frame of the last minute had the game's own anti-aliasing pass to replace (a screen without the 3D, or another "
@@ -627,18 +654,18 @@ const char* hn_aa(int v, int variant) {
 }
 /// A row with nothing else to choose here: shown without its arrows, Left and Right leave it (and the saved value) alone
 bool row_fixed(const int* value) {
-    return (value == &opts.reflex && !reflex_available() && !mkwvk::dlssg::reflex_on()) ||
-           (value == &opts.antilag && !antilag_available()) ||
-           (value == &opts.aa && aa_rows::fixed(upscaler(), aa_env_choice() >= 0)) ||
+    // ((Triforce, options_version 7) the rows that showed fixed where they could do nothing (Reflex, Anti-Lag, the window's
+    // filter, the Render resolution with a native AA) are hidden there, or gone: row_shown)
+    return (value == &opts.aa && aa_rows::fixed(upscaler(), aa_env_choice() >= 0)) ||
            (value == &opts.dlss && ur::upscaler_fixed(upscalers_available())) ||
-           (value == &opts.resolution && ur::resolution_fixed(upscaler())) || (value == &opts.upscale && !filter_needed()) ||
            (value == &opts.dlss_model && ur::model_fixed(upscaler(), dlss_preset_env() != nullptr)) ||
-           (value == &opts.fsr_sharpness && ur::fsr_sharpen_fixed(upscaler(), ffx3_usable())) ||
+           (value == &opts.fsr_sharpness && ur::fsr_sharpen_fixed(upscaler(), ffx3_usable())) ||   // (linux fork)
            (value == &opts.fg_engine && ngxfg::vendor_env_set());
 }
 const char* tx_output_res(int v) {
     static char b[32];
     v = output_choice(v);
+    if (v == merged_rows::kHandheldOutput) return "1536x864 (handheld)";
     const Out o = kOutputs[v];
     snprintf(b, sizeof b, "%ux%u", o.w, o.h);   // ((Triforce, 11-16) the size alone; the hint says which is the game's own)
     return b;
@@ -678,6 +705,9 @@ const char* tx_pad_layout(int v);
 constexpr int kMaxMics = 16;
 constexpr size_t kMicNameKept = 60;
 std::string mic_want;      // (the chosen microphone's name, cut to kMicNameKept; empty: Off or the default chosen)
+// ((Triforce) 11-20) the GPU device row's card by its name (triforce_options.ini gpu_device_name, written beside the number by
+// the launcher and by save below; empty: none saved, or Auto). pick_device finds the card by it (gpu_choice.h pick)
+std::string gpu_want;
 bool mic_missing = false;  // (mic_want is not plugged in: the row's last entry, 2 + mic_listed, stands for it)
 int mic_listed = 0;        // (the microphones as the host last listed them)
 bool can_mic() { return host && host->mic_count && host->mic_name && host->mic_select; }
@@ -773,12 +803,9 @@ const char* tx_menu_size(int v) {
     if (v == 0) return auto_large(dev.swap_extent.height) ? "Auto (Large)" : "Auto (Medium)";
     return (unsigned)v < 4 ? t[v] : t[0];
 }
-const char* tx_stick_dead_zone(int v) {
-    static const char* t[] = {"Default (24%)", "5%", "10%", "15%", "20%", "30%"};
-    return (unsigned)v < 6 ? t[v] : t[0];
-}
-// (Triforce) a stick's own dead zone: none of its own (the Stick dead zone row's), or 0% to 50%
-const char* tx_own_dead_zone(int v) { return v < 0 ? "As Stick dead zone" : tx_percent(v); }
+// (Triforce) a stick's own dead zone: XInput's own (~24%, the default), or 0% to 50%. ((Triforce, options_version 7) The shared
+// Stick dead zone row is gone: an older file's is each stick's own now, merged_rows.h migrate)
+const char* tx_own_dead_zone(int v) { return v < 0 ? "Default (24%)" : tx_percent(v); }
 // (Triforce) the Walk key row's keys, in host/nn_hid.c walk_key_code's order
 const char* tx_walk_key(int v) {
     static const char* t[] = {"Off", "Caps Lock", "Shift", "Ctrl", "Tab"};
@@ -827,90 +854,35 @@ const char* hn_replay_threads(int v, int variant) {
     }
     return variant < 2 || (variant == 2 && automatic) ? t[variant] : nullptr;
 }
-const char* tx_preset(int v) {
-    static const char* t[] = {"Custom", "Minimum (6GB)", "Low (8GB)", "Balanced (12GB)", "High (16GB)", "Ultra (20GB+)"};
-    return t[std::min(std::max(v, 0), 5)];
-}
-// ((Triforce, 11-15, the owner: "make these say minimum 6gb low 8gb balanced 12gb high 16gb"; Ultra 20GB+, their choice) Each
-// preset's budgets are those of its card's size: the 6 GB ones Low (6GB) had, the 8 GB ones Balanced (8GB) had, the 12 GB ones
-// High (12GB) had, the 16 GB ones Ultra (16GB+) had, and Ultra's own for 20 GB and more. vk_memory.cpp preset_caps_memory has
-// the same sizes)
-void sync_preset_budgets(int p) {
-    switch (p) {
-    case 1: opts.vram_mb = 3600;  opts.mirror_mb = 512;  break;
-    case 2: opts.vram_mb = 4800;  opts.mirror_mb = 1024; break;
-    case 3: opts.vram_mb = 7500;  opts.mirror_mb = 2048; break;
-    case 4: opts.vram_mb = 11000; opts.mirror_mb = 3072; break;
-    case 5: opts.vram_mb = 14000; opts.mirror_mb = 3072; break;
-    default: opts.vram_mb = 0;    opts.mirror_mb = 0;    break;
-    }
-}
-// (Sharpness: tuned for the window pass's neighbours one picture pixel apart, each about the old setting's sharpening on a
-// 3840 x 2160 window at that preset's picture, 2048 x 1152 or the handheld profile's 1536 x 864: same frame, mean |Laplacian|
-// of the window and of the picture, on the slider's steps)
-void apply_preset(int p) {
-    switch (p) {
-    case 1: // Minimum (6GB VRAM / iGPU)
-        opts.resolution = 4; opts.upscale = 2; opts.sharpness = 30;
-        opts.pace = 1;    opts.realtime = 1; opts.handheld = 1;
-        break;
-    case 2: // Low (8GB VRAM)
-        opts.resolution = 2; opts.upscale = 2; opts.sharpness = 30;
-        opts.pace = 1;    opts.realtime = 1; opts.handheld = 1;
-        break;
-    case 3: // Balanced (12GB VRAM)
-        opts.resolution = 1; opts.upscale = 1; opts.sharpness = 30;
-        opts.pace = 1;    opts.realtime = 1; opts.handheld = 0;
-        break;
-    case 4: // High (16GB VRAM)
-        opts.resolution = 1; opts.upscale = 2; opts.sharpness = 40;
-        opts.pace = 1;    opts.realtime = 1; opts.handheld = 0;
-        break;
-    case 5: // Ultra (20GB+ VRAM)
-        opts.resolution = 1; opts.upscale = 2; opts.sharpness = 50;
-        opts.pace = 1;    opts.realtime = 1; opts.handheld = 0;
-        break;
-    default:
-        break;
-    }
-    // (the Upscaler, Frame generation, its engine and FSR sharpening are the player's: a preset never turns DLSS or made frames on or off. With DLSS
-    // its resolution is DLSS's nearest mode)
-    if (p > 0) opts.resolution = ur::snap(upscaler(), opts.resolution);
-    // ((Triforce, 11-15, the owner: each preset sets the Texture detail, "default texture detail respectively") Minimum Low,
-    // Low Reduced, Balanced, High and Ultra Full: each preset's texture budget is for its card's size, and the smaller ones keep
-    // the textures smaller so the budget does not evict and make again what Full would keep asking for. Custom leaves it)
-    static const int detail[] = {0, 3, 2, 1, 1, 1};
-    if (p > 0 && p <= 5) opts.tex_detail = detail[p];
-    sync_preset_budgets(p);
-}
-
-MENU_HINTS(hn_preset, 0, "Each row as you set it. Changing most rows yourself comes back to Custom.",
-           "Resolution 50% (with DLSS its nearest mode), Lanczos, Sharpness 30%, Handheld profile.",
-           "Resolution 75% (with DLSS its nearest mode), Lanczos, Sharpness 30%, Handheld profile.",
-           "Resolution 100% (with DLSS its nearest mode), Catmull-Rom, Sharpness 30%.",
-           "Resolution 100% (with DLSS its nearest mode), Lanczos, Sharpness 40%.",
-           "Resolution 100% (with DLSS its nearest mode), Lanczos, Sharpness 50%.")
 MENU_HINTS(hn_gpu, 0, "The best dedicated GPU.")
 /// (Triforce) The Frame generation row's AMD FSR 4 (framegen_rows.h FSR4): what makes the frame, or, for a choice saved
 /// where it could, why AMD's library cannot here (fsr4fg::why) and what makes the frame in its place. Variants: every line
 /// it can show
 const char* hn_framegen_fsr4(int variant) {
-    static const char* const ok = "One made frame between each two of the game's, by AMD's FSR 4 library from the scene's depth "
-                                  "and motion. The HUD is part of the picture it works from.";
+    // ((Triforce, FG-1, FG-2, FG-5) AMD's library of either version, the HUD kept out of what it moves, and paused while
+    // HDR Native or RenoDX's RGBA16F scene holds it from every present (fsr4fg::held, not the HDR row alone: HDR Native
+    // without an HDR display is no pause, and RenoDX's scene stays for the run whatever the row says now). There the
+    // renderer's own makes the frame, as at 2x (framegen_rows.h held_made). The last variant is that pause)
+    static const char* const ok = "One made frame between each two of the game's, by AMD's frame generation library (its version "
+                                  "is on the row) from the scene's depth and motion, the HUD kept where the game drew it.";
+    static const char* const native = "Paused with HDR Native or RenoDX: AMD's needs the picture without the HUD, which only the "
+                                      "game encodes there. The renderer's own makes the one frame, as at 2x; HDR Expanded works.";
     static const char* const no[framegen_rows::FG_WHY_COUNT] = {
         nullptr,
-        "AMD FSR 4 is not in this build: the renderer's own makes the one frame, as at 2x.",
-        "AMD FSR 4 is switched off for this run (RX_VK_FSR4_FG=0 or RX_VK_FSR4=0): the renderer's own makes the frame.",
+        "AMD FSR is not in this build: the renderer's own makes the one frame, as at 2x.",
+        "AMD's frame generation is switched off for this run (RX_VK_FSR4_FG=0 or RX_VK_FSR4=0): the renderer's own makes the frame.",
         "Not known yet: asked of AMD's library once the game's picture is up.",
         "AMD's files were not found beside the game: the renderer's own makes the one frame, as at 2x.",
         "AMD's frame generation library was not found beside the game: the renderer's own makes the frame.",
-        "AMD's library has no FSR 4 frame generation for this GPU and driver: the renderer's own makes the frame.",
+        "AMD's library has no frame generation for this GPU and driver: the renderer's own makes the frame.",
         "AMD's frame generation failed in this run (the log says where): the renderer's own makes the frame."};
     if (variant < 0) {
         const int w = (int)fsr4fg::why_known();   // ((Triforce) as known: "not known yet" until menu_ahead has asked)
-        return w == framegen_rows::FG_OK ? ok : no[std::clamp(w, 1, (int)framegen_rows::FG_WHY_COUNT - 1)];
+        if (w == framegen_rows::FG_OK) return framegen_rows::held_whole_run(fsr4fg::held()) ? native : ok;
+        return no[std::clamp(w, 1, (int)framegen_rows::FG_WHY_COUNT - 1)];
     }
-    return variant == 0 ? ok : variant < (int)framegen_rows::FG_WHY_COUNT ? no[variant] : nullptr;
+    return variant == 0 ? ok : variant < (int)framegen_rows::FG_WHY_COUNT ? no[variant]
+                                                                           : variant == (int)framegen_rows::FG_WHY_COUNT ? native : nullptr;
 }
 /// Frame generation: how many frames are made for each of the game's
 const char* hn_framegen(int v, int variant) {
@@ -952,31 +924,40 @@ const char* hn_framegen(int v, int variant) {
     if (v == 2) return variant == 1 ? own : variant == 2 ? lib : variant == 3 ? nvidia(v) : nullptr;
     return variant == 1 ? nvidia(v) : nullptr;
 }
-MENU_HINTS(hn_pace, 0, "As soon as it is ready.", "At an even interval: less stutter, at up to one frame of delay.")
+/// ((Triforce, options_version 7) The Frame generation row: the renderer's own and AMD FSR 4's (opts.framegen), then NVIDIA
+/// DLSS 2x to 4x (opts.dlssg), which was a row of its own: merged_rows.h)
+const char* tx_framegen_row(int v) {
+    static const char* const dlss[] = {"NVIDIA DLSS 2x", "NVIDIA DLSS 3x", "NVIDIA DLSS 4x"};
+    return v >= mr7::FG_DLSS ? dlss[std::clamp(v - mr7::FG_DLSS, 0, 2)] : tx_framegen(v);
+}
+/// Frame generation: the renderer's own and AMD FSR 4's lines (hn_framegen), and for NVIDIA DLSS what runs, or that it starts
+/// with the next start (hn_dlssg)
+const char* hn_framegen_row(int v, int variant) {
+    if (v < mr7::FG_DLSS) return hn_framegen(v, variant);
+    if (variant > 1) return nullptr;
+    if (variant == 0) return "NVIDIA DLSS frame generation, from the scene's depth and motion, with NVIDIA Reflex: RTX 40 and 50 cards.";
+    if (variant == 1) return hn_dlssg(1, 0);
+    return mkwvk::dlssg::asked() ? mkwvk::dlssg::status() : "Starts with the next start of the game.";
+}
 MENU_HINTS(hn_output_res, 0, "The game's own size.",
            "The sharpest on a 2560x1440 screen: nothing to scale to the window.",
            "The sharpest on a 3840x2160 screen. The game's render targets get a bigger GPU pool, so a full-size 3D fits.",
            "The sharpest on a 1920x1080 screen: the HUD and text pixel for pixel, nothing to scale to the window.",
            "The sharpest on a 5120x1440 ultrawide screen: the whole frame pixel for pixel. The game's render targets get a bigger GPU pool, so a full-size 3D fits.",
            "The sharpest on a 5120x2880 (5K) screen: the whole frame pixel for pixel. The game's render targets get a bigger GPU pool, so a full-size 3D fits.",
-           "The sharpest on a 5120x2160 ultrawide screen: the whole frame pixel for pixel. The game's render targets get a bigger GPU pool, so a full-size 3D fits.")
-/// The Window scaling filter: its filter, or that none is needed at this window's size
-const char* hn_filter(int v, int variant) {
-    static const char* const t[] = {"The plain copy.", "Sharper.", "Sharper still; can ring on edges.",
-                                    "AMD FSR 1: rebuilds edges as it enlarges, with Sharpness as its own sharpening."};
-    static const char* const none = "The window is the Output resolution's size: nothing to scale. The choice is kept for "
-                                    "another size.";
-    if (variant < 0) return filter_needed() ? t[std::clamp(v, 0, 3)] : none;
-    return variant == 0 ? t[std::clamp(v, 0, 3)] : variant == 1 ? none : nullptr;
-}
-/// Sharpness: with DLSS or DLAA, the amount that suits them
+           "The sharpest on a 5120x2160 ultrawide screen: the whole frame pixel for pixel. The game's render targets get a bigger GPU pool, so a full-size 3D fits.",
+           "The game's handheld profile, as if the console were undocked: lighter on the graphics card, and softer.")
+// ((Triforce, options_version 7) the Window scaling filter row is gone, and with it its hint: the sizes choose the filter,
+// upscaler_rows.h window_filter. FSR 1's RCAS follows the Sharpness row: none at 0, vk_framegen.cpp framegen_scale)
+/// Sharpness: off at 0; ((Triforce, S1, S7) else where it sharpens: the upscaler's 3D before the HUD (variant 1), or the
+/// finished picture at the window (2). Variants: every line it can show
 const char* hn_sharpness(int v, int variant) {
-    static const char* const dlss = "DLSS and DLAA look softer than the game's own upscaler: around 80% suits them.";
-    const bool with_dlss = variant < 0 ? upscaler() == ur::DLSS || upscaler() == ur::DLAA : variant == 1;
-    if (variant > 1) return nullptr;
-    return with_dlss ? dlss : v == 0 ? "Off: the picture as it is." : nullptr;
+    static const char* const t[3] = {"Off: the picture as it is.",
+                                     "The upscaler sharpens the 3D before the HUD: the HUD and text stay as they are.",
+                                     "The finished picture at the window, the HUD and text with it."};
+    if (variant < 0) variant = v == 0 ? 0 : temporal_sharpens_3d() ? 1 : 2;
+    return variant < 3 ? t[variant] : nullptr;
 }
-MENU_HINTS(hn_handheld, 0, "Docked: the Output resolution's size.", "Lower resolutions, lighter on the GPU.")
 MENU_HINTS(hn_ultrawide, 0, "The game's own shape.",
            "A 16:10 picture whatever the screen (as a 1920x1200 or 2560x1600 screen), the world a little narrower at the sides: "
            "the window opens in that shape, and a screen of another shape shows it between black bars.",
@@ -1024,11 +1005,12 @@ MENU_HINTS(hn_pad_layout, 0, "The Switch's order: A on the right, B at the botto
            "Bindings of your own, from the Controls page.")
 // ((Triforce) Auto's choice is host/prompts.c auto_face's; the keyboard and mouse face is nx2/prompt_keys.py's)
 MENU_HINTS(hn_prompts, 0,
-           "Those of the first controller, from its name (SDL's). The keys' and the mouse's when the game starts with no "
-           "controller; the Switch's for a controller that has no name, as with XInput alone.",
+           "Those of the first controller, from its name (SDL's); the Xbox's for a controller that has no name, as with "
+           "XInput alone. When the game starts with no controller: those of the device you used last in the game before, "
+           "the keys' and the mouse's the first time.",
            nullptr, nullptr, nullptr, nullptr, nullptr,
            "Each button shows the first key or mouse button bound to it on this page, moving shows the movement keys, and "
-           "the camera shows the mouse.")
+           "the camera shows the mouse. These menus show the buttons of a controller you use.")
 // (Triforce) what each walk key is bound to out of the box (host/nn_hid.c key_default), which it stops pressing while chosen
 MENU_HINTS(hn_walk_key, 0, "The movement keys always push the stick all the way: Link runs.",
            "Caps Lock presses no button by default. The system still switches capitals on and off with each press.",
@@ -1060,146 +1042,113 @@ int mod_cheat_slot(const char* name) { return mod_cheats.slot_of(name); }
     MOD_CHEAT_ROW(i + 6) MOD_CHEAT_ROW(i + 7)
 static_assert(mod_cheat_rows::kSlots == 96, "MOD_CHEAT_ROWS8 below is used twelve times: a row for every slot");
 
+// ((Triforce, options_version 7) The rows that each choose two saved values (merged_rows.h): their values as the rows show
+// them, made from the saved ones before each tick and each drawing (merged_sync) and written back to them by set_row
+// (merged_store). Never saved themselves (ini_row): the saved values keep their own keys, in the hidden rows below)
+struct Merged {
+    int hdr = 0, framegen = 0, pacing = 0, latency = 0;
+};
+Merged merged;
+bool is_merged(const int* v) { return v == &merged.hdr || v == &merged.framegen || v == &merged.pacing || v == &merged.latency; }
+
+// ((Triforce, options_version 7, the owner: "group them correctly, such as HDR should be its own group, the upscaling should be
+// its own group, etc. Add the in-game filigree to group them, separate them") A group's heading: the game's separator with
+// the group's title under it (ui::heading). The selection steps over it, the mouse has nothing on it, and it is hidden while
+// every row of its group is (row_shown). The Debug tab has its own layout and its one heading, Developer (debug_rows)
+#define MENU_HEADING(tab, title) {tab, title, nullptr, 0, 0, 0, nullptr, nullptr, nullptr, false, true, -1, true}
+
 Row rows[] = {
-    {TAB_DISPLAY, "Screen", nullptr, 0, 0, 0, nullptr, nullptr, nullptr, false, true, -1, true},   // ((Triforce) 11-17: a section)
-    // Display: the window and the screen
+    // ---- Display ----
+    MENU_HEADING(TAB_DISPLAY, "Screen"),
     {TAB_DISPLAY, "Fullscreen", &opts.fullscreen, 0, 1, 1, tx_onoff,
-     "Fills the whole screen with the game, without the window's border. The same as F10 or Alt+Enter.", nullptr, false, true},
-    // (the picture's way, top to bottom: the output's size, what fills it from the 3D, the 3D's size, then the window)
+     "The game fills the whole screen, without the window's border. F10 and Alt+Enter do the same.", nullptr, false, true},
     {TAB_DISPLAY, "Output resolution", &opts.output_res, 0, kLastOutput, 1, tx_output_res,
-     "The game's whole frame, HUD included, before it is scaled to the window. Docked only. Applies after a restart.",
+     "The size of the game's whole frame, HUD included, before it is scaled to the window. Applies after a restart.",
      hn_output_res, true},
     {TAB_DISPLAY, "GPU device", &opts.gpu_device, 0, 8, 1, tx_gpu,
      "Which graphics card the game runs on. Applies after a restart.", hn_gpu, true, true},
-    {TAB_DISPLAY, "Widescreen", nullptr, 0, 0, 0, nullptr, nullptr, nullptr, false, true, -1, true},   // ((Triforce) 11-17: a section)
-    {TAB_DISPLAY, "Ultrawide", &opts.ultrawide, 0, 3, 1, tx_ultrawide,
-     "The camera's shape: the game's own 16:9, or a fixed 16:10, 21:9 or 32:9 for a screen or a window of that shape. A screen "
-     "of another shape shows the picture between black bars. Applies after a restart.", hn_ultrawide, true},
-    // (Triforce: host/oot_wide_hud.c)
-    {TAB_DISPLAY, "Ultrawide HUD", &opts.wide_hud, 0, 1, 1, tx_wide_hud,
-     "With Ultrawide: where the hearts, the item slot and the map sit on a screen wider than 16:9. Middle: in the "
-     "middle 16:9, as on a normal screen. Screen edges: out in the screen's corners. Applies after a restart.", nullptr,
-     true, true},
-    {TAB_DISPLAY, "Ultrawide menus", &opts.wide_menus, 0, 2, 1, tx_wide_menus,
-     "With Ultrawide: the pause, item and map menus, and what shows beside them. Loading screens and pre-rendered movies, "
-     "which draw no world either, get the same sides; a fade always covers the whole screen. Changes at once.", hn_wide_menus},
-    {TAB_DISPLAY, "Frame rate", nullptr, 0, 0, 0, nullptr, nullptr, nullptr, false, true, -1, true},   // ((Triforce) 11-17: a section)
-    {TAB_DISPLAY, "Game frame rate cap", &opts.fps_cap, -3, 6, 1, tx_fps_cap,   // (6: Monitor's rate, fps_cap.h kMonitor)
-     "Limits frames rendered by the game. Generated frames are additional. Takes a restart. "
-     "30, 40 and 45 are for a PC or handheld that holds one of them steadily where 60 swings; the game keeps its speed. "
-     "Past 60 is experimental: the game keeps real time, but some cutscenes and bosses can misbehave (Gohma, the intro's "
-     "narration). 60 is the safe choice. Monitor's rate is the refresh rate of the screen the game starts on, from 30 to 240.",
-     nullptr, true, true},
-    // (Triforce: host/pace_steady.h, host/nn_vi.c steady_period. Off until chosen: nobody has run it in the game)
-    {TAB_DISPLAY, "Steady frame rate", &opts.steady_fps, 0, 2, 1, tx_steady_fps,
-     "Paces the game to a frame rate this PC holds where you are, under the Game frame rate cap, and shows each frame a "
-     "period after the last, so that frames come evenly instead of each as soon as it is ready. It goes down quickly where "
-     "frames run late and back up slowly where there is room; loads and single hitches do not move it. Gives up some frame "
-     "rate for steadiness. Any rate suits a screen with variable refresh (G-SYNC, FreeSync) or VSync off; Refresh steps keeps "
-     "to whole divisions of the refresh rate (at 240 Hz: 120, 80, 60 ...) for VSync without variable refresh. Takes a restart.",
-     nullptr, true, true},
-    // (Triforce, after NX2navi's reflex_limit: vk_dlssg.cpp pace, dlssg_pace.h. Off until chosen: nobody has run it in the game)
-    {TAB_DISPLAY, "Reflex frame limit", &opts.reflex_limit, 0, 1, 1, tx_onoff,
-     "With DLSS frame generation: NVIDIA Reflex holds the Game frame rate cap where each frame starts, in place of the "
-     "game's own wait, so a frame waits once and the controls are read later. The game's own wait is back whenever no "
-     "frame is being generated. Where RivaTuner Statistics Server is the game's limiter it holds the frames instead. "
-     "Changes at once.", hn_reflex_limit, false, true},
-    // (Triforce, after NX2navi's VSync switch: the swapchain's present mode, made again at once. present_mode.h, vk_main.cpp)
-    {TAB_DISPLAY, "VSync", &opts.vsync, 0, 1, 1, tx_onoff,
-     "Whether a finished frame waits for the screen's next refresh. Off shows it at once: a little less delay, and the picture "
-     "can tear. Neither changes the frame rate, which the Game frame rate cap limits. Changes at once.", hn_vsync, false, true},
+    MENU_HEADING(TAB_DISPLAY, "Ultrawide"),
+    {TAB_DISPLAY, "Aspect ratio", &opts.ultrawide, 0, 3, 1, tx_ultrawide,
+     "The shape of the picture: the game's own 16:9, or 16:10, 21:9 or 32:9 for a screen of that shape. A screen of another "
+     "shape shows it between black bars. Applies after a restart.", hn_ultrawide, true},
+    // (Triforce: host/oot_wide_hud.c. Shown with a shape wider than 16:9: row_shown)
+    {TAB_DISPLAY, "HUD position", &opts.wide_hud, 0, 1, 1, tx_wide_hud,
+     "Where the hearts, the item buttons and the map sit. Middle: in the middle 16:9, as on a normal screen. Screen edges: "
+     "in the screen's corners. Applies after a restart.", nullptr, true, true},
+    {TAB_DISPLAY, "Menu sides", &opts.wide_menus, 0, 2, 1, tx_wide_menus,
+     "What is beside the pause, item and map menus, loading screens and movies, which are 16:9. Changes at once.",
+     hn_wide_menus},
+    MENU_HEADING(TAB_DISPLAY, "HDR"),
+    // (HDR and RenoDX HDR in one row: merged_rows.h. Off, Expanded and Native change at once, as the HDR row did; Native +
+    // RenoDX, which the scene's format and RenoDX's shaders are chosen for at the start (host/nn_vi.c hos_scene_rgba16f),
+    // after a restart: restart_value_of)
+    {TAB_DISPLAY, "HDR", &merged.hdr, 0, 3, 1, tx_hdr_mode,
+     "HDR10 on an HDR display (Windows: Use HDR on in the display settings). Native + RenoDX applies after a restart.",
+     hn_hdr_mode, true, true},
+    {TAB_DISPLAY, "Paper white", &opts.hdr_white, 80, 400, 10, tx_nits,
+     "How bright white is: around 200 nits for a normal room, higher for a bright one.", nullptr, false, true},
+    // (Triforce: up to HDR10's own 10,000 nits, as NX2navi's hdr_peak_nits; it stopped at 4,000. Every reader takes that much)
+    {TAB_DISPLAY, "Peak brightness", &opts.hdr_peak, 400, 10000, 100, tx_nits,
+     "The brightest highlights: set it to your display's peak brightness.", nullptr, false, true},
+    {TAB_DISPLAY, "UI brightness", &opts.rdx_ui_white, 80, 400, 10, tx_nits,
+     "How bright the HUD's and the menus' white is with RenoDX. The scene's white is Paper white.", nullptr, false, true},
+    // (local, RenoDX port: vk_renodx.cpp. Shown with HDR Native + RenoDX, where its shaders run; the rows of one tone mapper
+    // while it is chosen, rdx_applies. Ranges and steps as NX2navi's menu has them)
+    MENU_HEADING(TAB_DISPLAY, "RenoDX"),
+    {TAB_DISPLAY, "Tonemapper", &opts.rdx_tonemap, 0, 2, 1, tx_rdx_tonemap,
+     "How the scene's light is brought to the display. Vanilla: the game's own curve. PsychoV35: keeps hue and saturation "
+     "into the highlights. RenoDRT: carries the game's SDR look up to the peak brightness.", nullptr, false, true},
+    {TAB_DISPLAY, "Gamma correction", &opts.rdx_gamma, 0, 2, 1, tx_rdx_gamma,
+     "Shows the picture as a 2.2 or BT.1886 (2.4) display would, as the game was made to be seen: darker shadows. Off keeps "
+     "the sRGB curve.", nullptr, false, true},
+    {TAB_DISPLAY, "Color space", &opts.rdx_space, 0, 2, 1, tx_rdx_space,
+     "The colors the picture is taken to be in. Vanilla: the game's own. BT.709: as the SDR picture. DCI-P3: more "
+     "saturated.", nullptr, false, true},
+    {TAB_DISPLAY, "Exposure", &opts.rdx_exposure, 0, 200, 5, tx_percent,
+     "The scene's brightness before tone mapping. 100% is the game's.", nullptr, false, true},
+    {TAB_DISPLAY, "Middle gray", &opts.rdx_midgray, 0, 2, 1, tx_rdx_midgray,
+     "What the scene's middle gray is held to. Render: as rendered. Vanilla: where the game's curve puts it. Eye "
+     "adaptation: it follows what is on screen over a few seconds.", nullptr, false, true},
+    {TAB_DISPLAY, "Match tone slope", &opts.rdx_match_slope, 0, 1, 1, tx_onoff,
+     "PsychoV35: the mid tones get the contrast of the game's own curve. Off: PsychoV35's own, softer.", nullptr, false, true},
+    {TAB_DISPLAY, "Tone slope", &opts.rdx_tone_slope, 0, 100, 1, tx_rdx_grade,
+     "PsychoV35: how steep the tone curve is through middle gray. 50 leaves it unchanged.", nullptr, false, true},
+    {TAB_DISPLAY, "Hue clip", &opts.rdx_hue_clip, 0, 100, 5, tx_percent,
+     "PsychoV35: how much bright colors turn as they do where the SDR picture clips, fire towards yellow and white. 0% "
+     "keeps their hue.", nullptr, false, true},
+    {TAB_DISPLAY, "Highlight saturation", &opts.rdx_highlight_sat, 0, 100, 1, tx_rdx_grade,
+     "RenoDRT: how strong the colors of the brightest parts are. 50 leaves them unchanged.", nullptr, false, true},
+    {TAB_DISPLAY, "Blowout", &opts.rdx_blowout, 0, 100, 1, tx_rdx_grade,
+     "RenoDRT: turns the brightest parts towards white. 0 keeps their color.", nullptr, false, true},
+    {TAB_DISPLAY, "Flare", &opts.rdx_flare, 0, 100, 1, tx_rdx_grade,
+     "RenoDRT: lifts the darkest parts as a little stray light would. 0 keeps black black.", nullptr, false, true},
+    {TAB_DISPLAY, "Hue correction", &opts.rdx_hue, 0, 100, 5, tx_percent,
+     "RenoDRT: how much bright colors keep the hue they had before tone mapping.", nullptr, false, true},
+    {TAB_DISPLAY, "Color grading", &opts.rdx_grade, 0, 100, 5, tx_percent,
+     "RenoDRT: how much of the game's own color grading is kept. 0% is the scene without it.", nullptr, false, true},
+    {TAB_DISPLAY, "Highlights", &opts.rdx_highlights, 0, 100, 5, tx_rdx_grade,
+     "The bright parts of the scene. 50 is neutral.", nullptr, false, true},
+    {TAB_DISPLAY, "Shadows", &opts.rdx_shadows, 0, 100, 5, tx_rdx_grade,
+     "The dark parts of the scene. 50 is neutral.", nullptr, false, true},
+    {TAB_DISPLAY, "Contrast", &opts.rdx_contrast, 0, 100, 5, tx_rdx_grade, "The scene's contrast. 50 is neutral.", nullptr,
+     false, true},
+    {TAB_DISPLAY, "Saturation", &opts.rdx_saturation, 0, 100, 5, tx_rdx_grade, "The scene's color. 50 is neutral.",
+     nullptr, false, true},
+    {TAB_DISPLAY, "Bloom", &opts.rdx_bloom, 0, 100, 5, tx_rdx_grade,
+     "The glow around bright things. 50 is the game's. RenoDX is by Carlos Lopez (clshortfuse), under the MIT license.",
+     nullptr, false, true},
+    MENU_HEADING(TAB_DISPLAY, "Overlay"),
     // (Triforce, after NX2navi's perf_overlay: a third value, Full, NX2navi's full performance overlay: perf_sample, draw_perf)
     {TAB_DISPLAY, "FPS counter", &opts.show_fps, 0, 2, 1, tx_perf,
-     "On: frames per second in the top right corner. Full: a performance overlay in its place, with the GPU's and the CPU's load, "
-     "temperatures and memory, the frame rate and its 1% and 0.1% lows, the frame times and their graph, the waits per frame "
-     "and the picture's settings.", hn_fps, false, true},
-    {TAB_DISPLAY, "High dynamic range", nullptr, 0, 0, 0, nullptr, nullptr, nullptr, false, true, -1, true},   // ((Triforce) 11-17: a section)
-    {TAB_DISPLAY, "HDR", &opts.hdr, 0, 2, 1, tx_hdr,
-     "HDR10 out on an HDR display (Windows: Use HDR on in the display settings). Expanded: the game's SDR picture, its white at "
-     "the paper white and its highlights up to the peak. Native: the game's own HDR, told the display's peak and paper white.",
-     nullptr, false, true},
-    {TAB_DISPLAY, "HDR paper white", &opts.hdr_white, 80, 400, 10, tx_nits,
-     "How bright the picture's white is with HDR on. Around 200 for a normal room; higher in a bright one.", nullptr, false, true},
-    // (Triforce: up to HDR10's own 10,000 nits, as NX2navi's hdr_peak_nits; it stopped at 4,000. Every reader takes that much)
-    {TAB_DISPLAY, "HDR peak brightness", &opts.hdr_peak, 400, 10000, 100, tx_nits,
-     "The brightest highlights with HDR on: set it to your display's peak brightness.", nullptr, false, true},
-    {TAB_DISPLAY, "RenoDX", nullptr, 0, 0, 0, nullptr, nullptr, nullptr, false, true, -1, true},   // ((Triforce) 11-17: a section)
-    // (Triforce, 11-13: RenoDX is in every build and off until this row turns it on. The scene's format is chosen at the
-    // start, host/nn_vi.c hos_scene_rgba16f: a restart)
-    {TAB_DISPLAY, "RenoDX HDR", &opts.renodx, 0, 1, 1, tx_onoff,
-     "With HDR set to Native: RenoDX's tone mapping, eye adaptation and colour grading in place of the game's own, and its "
-     "rows below. Off: the game's own HDR. Applies after a restart. RenoDX is by Carlos Lopez (clshortfuse), under the MIT "
-     "license.", nullptr, true, true},
-    // (local, RenoDX port: vk_renodx.cpp. Shown with HDR Native, where its shaders run)
-    // (Triforce: RenoDRT, the third tone mapper NX2navi's HDR has; the rows of one tone mapper show while it is chosen,
-    // rdx_applies. Ranges and steps as NX2navi's menu has them)
-    {TAB_DISPLAY, "RenoDX tonemapper", &opts.rdx_tonemap, 0, 2, 1, tx_rdx_tonemap,
-     "With HDR Native: how the scene's light is brought to the display. Vanilla: the game's own curve. PsychoV35: RenoDX's, "
-     "which keeps hue and saturation into the highlights, up to the peak brightness. RenoDRT: RenoDX's, which carries the "
-     "game's SDR look up to the peak by brightness. RenoDX is by Carlos Lopez (clshortfuse), under the MIT license.",
-     nullptr, false, true},
-    {TAB_DISPLAY, "RenoDX gamma correction", &opts.rdx_gamma, 0, 2, 1, tx_rdx_gamma,
-     "Shows the picture as a 2.2 or BT.1886 (2.4) display would, as the game was made to be seen: darker shadows. Off keeps "
-     "the sRGB curve. With every tonemapper. PsychoV35 and RenoDRT still end at the peak brightness; Vanilla's highlights "
-     "are the game's own, which 2.2 dims a little and 2.4 brightens a little.",
-     nullptr, false, true},
-    {TAB_DISPLAY, "RenoDX midgray", &opts.rdx_midgray, 0, 2, 1, tx_rdx_midgray,
-     "With PsychoV35: what the scene's middle grey is held to. Render: as rendered. Vanilla: where the game's own curve puts it. "
-     "Eye adaptation: it follows what is on screen over a few seconds, weighted towards the middle of the view, as eyes adjust.",
-     nullptr, false, true},
-    {TAB_DISPLAY, "RenoDX match tone slope", &opts.rdx_match_slope, 0, 1, 1, tx_onoff,
-     "With PsychoV35: gives the mid tones the contrast of the game's own curve. Off: PsychoV35's own, softer.", nullptr, false, true},
-    {TAB_DISPLAY, "RenoDX tone slope", &opts.rdx_tone_slope, 0, 100, 1, tx_rdx_grade,
-     "With PsychoV35: the steepness of the tone curve through middle grey. 50 leaves it unchanged.", nullptr, false, true},
-    {TAB_DISPLAY, "RenoDX hue clip", &opts.rdx_hue_clip, 0, 100, 5, tx_percent,
-     "With PsychoV35: how much bright colours turn as they do where the game's SDR picture clips: fire towards yellow and "
-     "white. 0% keeps their hue.", nullptr, false, true},
-    {TAB_DISPLAY, "RenoDX UI brightness", &opts.rdx_ui_white, 80, 400, 10, tx_nits,
-     "How bright the menus' and the HUD's white is with RenoDX's tonemapper. The scene's follows HDR paper white.", nullptr, false, true},
-    {TAB_DISPLAY, "RenoDX color space", &opts.rdx_space, 0, 2, 1, tx_rdx_space,
-     "The colours the picture is taken to be in before HDR10's. Vanilla: the game's own matrix. BT.709: as the SDR picture. "
-     "DCI-P3: more saturated.", nullptr, false, true},
-    {TAB_DISPLAY, "RenoDX exposure", &opts.rdx_exposure, 0, 200, 5, tx_percent,
-     "The scene's brightness before RenoDX's tone mapping. 100% is the game's.", nullptr, false, true},
-    {TAB_DISPLAY, "RenoDX highlights", &opts.rdx_highlights, 0, 100, 5, tx_rdx_grade,
-     "RenoDX's colour grading: the bright parts of the scene. 50 is neutral.", nullptr, false, true},
-    {TAB_DISPLAY, "RenoDX shadows", &opts.rdx_shadows, 0, 100, 5, tx_rdx_grade,
-     "RenoDX's colour grading: the dark parts of the scene. 50 is neutral.", nullptr, false, true},
-    {TAB_DISPLAY, "RenoDX contrast", &opts.rdx_contrast, 0, 100, 5, tx_rdx_grade,
-     "RenoDX's colour grading: the scene's contrast. 50 is neutral.", nullptr, false, true},
-    {TAB_DISPLAY, "RenoDX saturation", &opts.rdx_saturation, 0, 100, 5, tx_rdx_grade,
-     "RenoDX's colour grading: the scene's saturation. 50 is neutral.", nullptr, false, true},
-    {TAB_DISPLAY, "RenoDX highlight saturation", &opts.rdx_highlight_sat, 0, 100, 1, tx_rdx_grade,
-     "With RenoDRT: the strength of the colours of the brightest parts. 50 leaves it unchanged.", nullptr, false, true},
-    {TAB_DISPLAY, "RenoDX blowout", &opts.rdx_blowout, 0, 100, 1, tx_rdx_grade,
-     "With RenoDRT: turns the brightest parts towards white. 0 keeps their colour.", nullptr, false, true},
-    {TAB_DISPLAY, "RenoDX flare", &opts.rdx_flare, 0, 100, 1, tx_rdx_grade,
-     "With RenoDRT: lifts the darkest parts as a little stray light would. 0 keeps black black.", nullptr, false, true},
-    {TAB_DISPLAY, "RenoDX hue correction", &opts.rdx_hue, 0, 100, 5, tx_percent,
-     "With RenoDRT: how much bright colours keep the hue they have before the tonemapper. 0% lets them shift as the curve "
-     "takes them.", nullptr, false, true},
-    {TAB_DISPLAY, "RenoDX color grading", &opts.rdx_grade, 0, 100, 5, tx_percent,
-     "With RenoDRT: how much of the game's own colour grading the HDR picture keeps. 0% is the scene without it.",
-     nullptr, false, true},
-    {TAB_DISPLAY, "RenoDX bloom", &opts.rdx_bloom, 0, 100, 5, tx_rdx_grade,
-     "How strong the glow around bright things is. 50 is the game's.", nullptr, false, true},
-    {TAB_GRAPHICS, "Quality", nullptr, 0, 0, 0, nullptr, nullptr, nullptr, false, true, -1, true},   // ((Triforce) 11-17: a section)
-    // Graphics: the picture, top to bottom (the Upscaler only in a build with DLSS, or where AMD FSR 3.1 runs: row_shown)
-    {TAB_GRAPHICS, "Quality preset", &opts.preset, 0, 5, 1, tx_preset,
-     "Sets the scaling rows and memory limits for a GPU with that much memory. The Upscaler and Frame generation stay yours.",
-     hn_preset},
-    // (Triforce: read once, at the start (host/nn_vi.c): Auto -> 100% in game left the 3D at the dynamic path's size)
-    {TAB_GRAPHICS, "Render resolution", &opts.resolution, 0, ur::kValues - 1, 1, tx_resolution,
-     "The share of the output the 3D is drawn at; the Upscaler fills in the rest. Applies after a restart.", hn_resolution, true},
-    // (Triforce, after NX2navi's texture_detail: tex_detail.h, vk_texture.cpp texture_detail_level. Read at the first texture)
-    {TAB_GRAPHICS, "Texture detail", &opts.tex_detail, 0, 3, 1, tx_tex_detail,
-     "How large the game's textures are kept in video memory. Automatic suits the graphics card; a Quality preset sets it "
-     "for its card's size. Applies after a restart.", hn_tex_detail, true},
-    {TAB_GRAPHICS, "Texture filtering", &opts.aniso, 0, 4, 1, tx_aniso,   // (Triforce: vk_draw.cpp sampler_for)
-     "Anisotropic filtering: keeps ground, paths and walls sharp where they slope away from the camera. Game's is what the game "
-     "asks for; 16x is the sharpest, at a small cost."},
-    {TAB_GRAPHICS, "Upscaling and edges", nullptr, 0, 0, 0, nullptr, nullptr, nullptr, false, true, -1, true},   // ((Triforce) 11-17: a section)
-    {TAB_GRAPHICS, "Upscaler", &opts.dlss, 0, ur::kUpscalers - 1, 1, tx_upscaler, "What scales the 3D up to the Output resolution.",
+     "Frames per second in the top right corner. Full: a performance panel in its place: the GPU's and the CPU's load, "
+     "temperatures and memory, the frame rate and its lows, the frame times and their graph, the waits per frame and the "
+     "picture's settings.", hn_fps, false, true},
+
+    // ---- Graphics: the picture, top to bottom ----
+    MENU_HEADING(TAB_GRAPHICS, "Upscaling"),
+    // (the Upscaler only in a build with DLSS or FSR 4, or where AMD FSR 3.1 runs: row_shown. An engine's native anti-aliasing
+    // is the Render resolution's Native (100%), upscaler_rows.h)
+    {TAB_GRAPHICS, "Upscaler", &opts.dlss, 0, ur::kUpscalers - 1, 1, tx_upscaler, "What draws the 3D up to the Output resolution.",
      hn_upscaler},
     {TAB_GRAPHICS, "DLSS model", &opts.dlss_model, 0, ur::kModels - 1, 1, tx_dlss_model,
      "Which of NVIDIA's DLSS networks draws the picture.", hn_dlss_model, false, true},
@@ -1207,185 +1156,194 @@ Row rows[] = {
     {TAB_GRAPHICS, "FSR sharpening", &opts.fsr_sharpness, 0, 100, 5, tx_fsr_sharpness,
      "AMD FSR 3.1 (through AMD's library) and FSR 4: how much of FSR's own sharpening is used. Off leaves the picture as it is.",
      hn_fsr_sharpness, false, true},
-    // (Triforce, 11-13: vk_temporal.cpp pre_wanted, off until asked)
+    // (Triforce: read once, at the start (host/nn_vi.c): Auto -> 100% in game left the 3D at the dynamic path's size)
+    {TAB_GRAPHICS, "Render resolution", &opts.resolution, 0, ur::kValues - 1, 1, tx_resolution,
+     "The size the 3D is drawn at; the upscaler fills in the rest. Applies after a restart.", hn_resolution, true},
+    // (Triforce, 11-13: vk_temporal.cpp pre_wanted. Shown with DLSS or FSR: row_shown)
     {TAB_GRAPHICS, "Upscale before bloom", &opts.upscale_pre, 0, 1, 1, tx_onoff,
-     "With NVIDIA DLSS, DLAA or AMD FSR as the Upscaler: On, it works on the scene before the game's glow and tone mapping, "
-     "so both are made from the sharpened scene. Off: on the finished picture, as before. Applies after a restart.",
-     nullptr, true, true},
-    // (Triforce, after NX2navi's aa setting: aa_rows.h, vk_aa.cpp. Taken at each frame; not a Quality preset's)
-    {TAB_GRAPHICS, "Anti-aliasing", &opts.aa, 0, aa_rows::kValues - 1, 1, tx_aa,
-     "How the 3D's edges are smoothed before it is scaled up: by the game's own SMAA, not at all, by FXAA, or by SMAA at "
-     "its Ultra preset. Changes at once.", hn_aa, false, true},
+     "On: the upscaler works on the scene before the game's glow and tone mapping, which are then made at full size. "
+     "Applies after a restart.", nullptr, true, true},
     {TAB_GRAPHICS, "Sharpness", &opts.sharpness, 0, 100, 10, tx_percent,
-     "Sharpens the picture as it goes to the window, with any filter. Too much shows halos around edges.", hn_sharpness},
-    {TAB_GRAPHICS, "Window scaling filter", &opts.upscale, 0, 3, 1, tx_filter,   // (Triforce: 3 = AMD FSR 1, vk_framegen.cpp)
-     "How the finished picture is scaled to the window, when its size differs from the Output resolution.", hn_filter},
-    {TAB_GRAPHICS, "Smoothness", nullptr, 0, 0, 0, nullptr, nullptr, nullptr, false, true, -1, true},   // ((Triforce) 11-17: a section)
-    // (Triforce: 9 is AMD FSR 4, framegen_rows.h FSR4, there only where AMD's library can make the frames: framegen_row_sync)
-    {TAB_GRAPHICS, "Frame generation", &opts.framegen, 0, 9, 1, tx_framegen,
-     "Makes frames between the game's own, for smoother motion, at a little input delay. Fast motion or camera cuts can "
-     "show artifacts.", hn_framegen, false, true},
+     "With DLSS, DLAA or AMD FSR as the Upscaler, the 3D before the HUD (FSR's own sharpening; AMD's RCAS for DLSS); with "
+     "the game's own upscaler, the picture at the window. 0 is off. Too much shows halos around edges.", hn_sharpness},
+    // (Triforce, after NX2navi's aa setting: aa_rows.h, vk_aa.cpp. Taken at each frame. Shown with the game's own upscaler:
+    // DLSS and FSR smooth the edges themselves)
+    MENU_HEADING(TAB_GRAPHICS, "Anti-aliasing"),
+    {TAB_GRAPHICS, "Anti-aliasing", &opts.aa, 0, aa_rows::kValues - 1, 1, tx_aa,
+     "How the 3D's edges are smoothed: the game's own SMAA, none, FXAA, or SMAA at its Ultra preset. Changes at once.", hn_aa,
+     false, true},
+    MENU_HEADING(TAB_GRAPHICS, "Frame generation"),
+    // (Frame generation and DLSS frame generation in one row, merged_rows.h: the renderer's own, AMD FSR 4 where its library
+    // makes the frames, NVIDIA DLSS where it can run (vk_dlssg.cpp: read at the start, so it takes a restart))
+    {TAB_GRAPHICS, "Frame generation", &merged.framegen, 0, mr7::FG_DLSS_LAST, 1, tx_framegen_row,
+     "Makes frames between the game's own, for smoother motion, at a little input delay. Fast motion and camera cuts can "
+     "show artifacts. NVIDIA DLSS applies after a restart.", hn_framegen_row, true, true},
     // (Triforce: the engine that makes the made frames; RX_VK_FRAMEGEN_VENDOR over it. A change is taken at the next present, through the
     // engine switch (framegen_engine_tick: the swapchain made again where AMD's library comes or goes))
     {TAB_GRAPHICS, "Frame generation engine", &opts.fg_engine, 0, fgengine::kEngineRows - 1, 1, tx_fg_engine,
      "Which engine makes the made frames: Auto picks the best that runs on this PC.", hn_fg_engine, false, true},
-    {TAB_GRAPHICS, "Frame pacing", &opts.pace, 0, 1, 1, tx_onoff, "When each frame is shown.", hn_pace},
-    {TAB_GRAPHICS, "Latency", nullptr, 0, 0, 0, nullptr, nullptr, nullptr, false, true, -1, true},   // ((Triforce) 11-17: a section)
-    {TAB_GRAPHICS, "NVIDIA Reflex", &opts.reflex, 0, 2, 1, tx_reflex,
-     "NVIDIA GPUs: each frame starts as late as it can, for less input delay. With DLSS frame generation it runs through "
-     "NVIDIA Streamline; not used with the other frame generation.", hn_reflex},
-    {TAB_GRAPHICS, "AMD Anti-Lag 2", &opts.antilag, 0, 1, 1, tx_antilag,
-     "AMD GPUs: each frame starts as late as it can, for less input delay. Not used with frame generation.", hn_antilag},
-    {TAB_GRAPHICS, "Advanced", nullptr, 0, 0, 0, nullptr, nullptr, nullptr, false, true, -1, true},   // ((Triforce) 11-17: a section)
-    {TAB_GRAPHICS, "Handheld profile", &opts.handheld, 0, 1, 1, tx_onoff,
-     "Runs the game as if the console were undocked. Applies after a restart.", hn_handheld, true},
-    {TAB_GRAPHICS, "Robust buffers", &opts.robust, 0, 2, 1, tx_robust,
-     "Bounds-checked buffer reads: a read past a buffer's end is dropped instead of stopping the GPU. Applies after a "
-     "restart.", hn_robust, true},
-    // ((Triforce, 11-18) a player's RX 7700S: glowing doors and walls with native mesh shaders, gone with the compute fallback
-    // (#bug-tracker). The row's key, mesh_shaders, is read where the device is made: vk_main.cpp)
+    MENU_HEADING(TAB_GRAPHICS, "Frame rate & latency"),
+    {TAB_GRAPHICS, "Frame rate cap", &opts.fps_cap, -3, 6, 1, tx_fps_cap,   // (6: Monitor's rate, fps_cap.h kMonitor)
+     "The most frames the game renders a second; made frames come on top. 60 is the safe choice: past it some cutscenes and "
+     "bosses can misbehave. 30, 40 and 45 are for a PC that holds one of them where 60 swings. Monitor's rate: the refresh "
+     "rate of the screen the game starts on. Applies after a restart.", nullptr, true, true},
+    // (Triforce, after NX2navi's VSync switch: the swapchain's present mode, made again at once. present_mode.h, vk_main.cpp)
+    {TAB_GRAPHICS, "VSync", &opts.vsync, 0, 1, 1, tx_onoff,
+     "Whether a finished frame waits for the screen's next refresh. Off: a little less delay, and the picture can tear. "
+     "Changes at once.", hn_vsync, false, true},
+    // (Frame pacing and Steady frame rate in one row, merged_rows.h: host/pace_steady.h, host/nn_vi.c steady_period)
+    {TAB_GRAPHICS, "Frame pacing", &merged.pacing, 0, 3, 1, tx_pacing,
+     "When each frame is shown. Steady paces the game to a rate this PC holds where you are: steadier, at some frame rate.",
+     hn_pacing, true},
+    // (NVIDIA Reflex and AMD Anti-Lag 2 in one row, by the card's maker, merged_rows.h; none where neither runs)
+    {TAB_GRAPHICS, "Low latency", &merged.latency, 0, 2, 1, tx_latency,
+     "Each frame starts as late as it can, for less input delay: NVIDIA Reflex on NVIDIA cards, AMD Anti-Lag 2 on AMD ones.",
+     hn_latency},
+    MENU_HEADING(TAB_GRAPHICS, "Textures"),
+    {TAB_GRAPHICS, "Texture filtering", &opts.aniso, 0, 4, 1, tx_aniso,   // (Triforce: vk_draw.cpp sampler_for)
+     "Keeps ground, paths and walls sharp where they slope away from the camera. Game: what the game asks for; 16x is the "
+     "sharpest, at a small cost."},
+    // (Triforce, after NX2navi's texture_detail: tex_detail.h, vk_texture.cpp texture_detail_level. Read at the first texture)
+    {TAB_GRAPHICS, "Texture detail", &opts.tex_detail, 0, 3, 1, tx_tex_detail,
+     "How large the game's textures are kept in video memory. Automatic suits the graphics card. Applies after a restart.",
+     hn_tex_detail, true},
+    // ((Triforce, 11-18, v0.5.1) a player's RX 7700S: glowing doors and walls with native mesh shaders, gone with the compute
+    // fallback (#bug-tracker). The row's key, mesh_shaders, is read where the device is made: vk_main.cpp. Its own group, as
+    // v0.5.1's Advanced section had it, after the picture's)
+    MENU_HEADING(TAB_GRAPHICS, "Advanced"),
     {TAB_GRAPHICS, "Mesh shaders", &opts.mesh_mode, 0, 1, 1, tx_mesh,
      "How the game's mesh-shader draws run. Try Compute fallback on an AMD card that shows glowing walls or loses the GPU. "
      "Applies after a restart.", hn_mesh, true},
-    {TAB_SYSTEM, "Game", nullptr, 0, 0, 0, nullptr, nullptr, nullptr, false, true, -1, true},   // ((Triforce) 11-17: a section)
 
+    // ---- System: the game's ----
+    MENU_HEADING(TAB_SYSTEM, "Game"),
     // (Triforce: language.txt's choice, not the options file's. Its entries are counted when the file is read: lang_load)
     {TAB_SYSTEM, "Game language", &opts.language, 0, 0, 1, tx_language,
-     "The language of the game's texts. Kept in language.txt in the game folder, which lists the languages the game has. "
-     "Applies after a restart.", hn_language, true, true},
-    {TAB_SYSTEM, "Game speed", &opts.realtime, 0, 1, 1, tx_speed, "How the game keeps time when it runs below 60 fps.",
-     hn_speed},
+     "The language of the game's texts, of those your game has (language.txt in the game folder). Applies after a restart.",
+     hn_language, true, true},
     {TAB_SYSTEM, "Text speed", &opts.text_speed, 0, 3, 1, tx_text_speed,
      "How fast the letters of dialogue and other messages appear.", hn_text_speed},
-    {TAB_SYSTEM, "Discord status", &opts.discord, 0, 1, 1, tx_onoff,
-     "Shows \"Playing Triforce\" and the time played in your Discord status, while Discord runs on this PC.", nullptr, false,
+    // (host/nn_vi.c realtime_step, hos_vi_native_interval: Per frame is the console's, paced to the game's own interval)
+    {TAB_SYSTEM, "Game speed", &opts.realtime, 0, 1, 1, tx_speed, "How the game keeps time when it runs below 60 fps.",
+     hn_speed},
+    // ---- Audio ----
+    MENU_HEADING(TAB_AUDIO, "Sound"),
+    // (Triforce, after NX2navi's volume row: over the game's own mix, host/nn_audio.c; the game's own Options have none)
+    {TAB_AUDIO, "Master volume", &opts.volume, 0, 100, 5, tx_volume,
+     "How loud the game is, in percent of its own volume.", nullptr, false, true},
+    // (Triforce, after NX2navi's menu_sound_volume: the options' own sounds, host/menu_sound.c; under the Master volume)
+    {TAB_AUDIO, "Menu sounds", &opts.menu_sounds, 0, 100, 5, tx_menu_sounds,
+     "How loud these options' own sounds are, the game's interface sounds from your game files.", nullptr, false, true},
+    {TAB_AUDIO, "Audio output", &opts.audio_output, 0, 2, 1, tx_audio_output,
+     "The speakers the game mixes its sound for. Applies after a restart.", hn_audio_output, true, true},
+    MENU_HEADING(TAB_AUDIO, "Microphone"),
+    {TAB_AUDIO, "Microphone", &opts.mic, 0, 2 + kMaxMics, 1, tx_mic,
+     "What the ocarina hears when the game's microphone option is on (playing an instrument, or humming).", hn_mic, false,
      true},
-    {TAB_SYSTEM, "Saves", nullptr, 0, 0, 0, nullptr, nullptr, nullptr, false, true, -1, true},   // ((Triforce) 11-17: a section)
+    MENU_HEADING(TAB_SYSTEM, "Saves & reports"),
     // (Triforce, after NX2navi's save rows: they act on a press, share_row; the host does the work, host/save_share.c)
     {TAB_SYSTEM, "Export save", nullptr, 0, 0, 0, nullptr,
      "Writes your save as a zip into your Downloads folder: to keep, or to give to someone. No game file is in it."},
     {TAB_SYSTEM, "Export save for a bug report", nullptr, 0, 0, 0, nullptr,
      "The same zip with the game's logs, its settings and its freeze report added: what to send with a problem report."},
     {TAB_SYSTEM, "Import a save", nullptr, 0, 0, 0, nullptr,
-     "Takes a save export of Triforce or NX2navi: a zip you put into the game folder's save-import folder. It becomes your "
-     "save at the next start, and the save it replaces is kept. For an emulator's save: Convert saves in Triforce Setup."},
-    {TAB_SYSTEM, "Tools", nullptr, 0, 0, 0, nullptr, nullptr, nullptr, false, true, -1, true},   // ((Triforce) 11-17: a section)
+     "Takes a save export of Triforce or NX2navi that you put into the game folder's save-import folder. It becomes your "
+     "save at the next start; the save it replaces is kept. For an emulator's save: Convert saves in Triforce Setup."},
     // (Triforce, after NX2navi's F8: host/bug_capture.c writes the folder, vk_bugshot.cpp its picture)
     {TAB_SYSTEM, "Bug capture (F8)", nullptr, 0, 0, 0, nullptr,
-     "Writes what a problem report needs into a folder of its own under captures in the game folder: a picture of the frame, "
-     "your settings, the end of the log and your save. F8 does the same while you play."},
+     "Writes what a problem report needs into a folder of its own under captures in the game folder: a picture, your "
+     "settings, the end of the log and your save. F8 does the same while you play."},
+    MENU_HEADING(TAB_SYSTEM, "Online"),
+    {TAB_SYSTEM, "Discord status", &opts.discord, 0, 1, 1, tx_onoff,
+     "Shows \"Playing Triforce\" and the time played in your Discord status, while Discord runs on this PC.", nullptr, false,
+     true},
     // (Triforce, after NX2navi's Cheats tab: the cheats of the mods' cheat files, a row each once the host has named them)
-    {TAB_SYSTEM, "Mod cheats", nullptr, 0, 0, 0, nullptr, nullptr, nullptr, false, true, -1, true},   // (kModCheatHeading)
+    MENU_HEADING(TAB_SYSTEM, "Mod cheats"),   // (kModCheatHeading)
     MOD_CHEAT_ROWS8(0) MOD_CHEAT_ROWS8(8) MOD_CHEAT_ROWS8(16) MOD_CHEAT_ROWS8(24) MOD_CHEAT_ROWS8(32) MOD_CHEAT_ROWS8(40)
     MOD_CHEAT_ROWS8(48) MOD_CHEAT_ROWS8(56) MOD_CHEAT_ROWS8(64) MOD_CHEAT_ROWS8(72) MOD_CHEAT_ROWS8(80) MOD_CHEAT_ROWS8(88)
-    // (Triforce, after NX2navi's volume row: over the game's own mix, host/nn_audio.c; the game's own Options have none)
-    {TAB_AUDIO, "Master volume", &opts.volume, 0, 100, 5, tx_volume,
-     "How loud the game is, in percent of its own volume. The game's sounds and music keep their balance.", nullptr, false,
-     true},
-    // (Triforce, after NX2navi's menu_sound_volume: the options' own sounds, host/menu_sound.c; under the Master volume)
-    {TAB_AUDIO, "Menu sounds", &opts.menu_sounds, 0, 100, 5, tx_menu_sounds,
-     "How loud these options' own sounds are: the game's interface sounds, played from your game files as you move through "
-     "the tabs and rows. Off is silent. The Master volume is over them too.", nullptr, false, true},
-    {TAB_AUDIO, "Audio output", &opts.audio_output, 0, 2, 1, tx_audio_output,
-     "The speakers the game mixes its sound for. Applies after a restart.", hn_audio_output, true, true},
-    {TAB_AUDIO, "Microphone", &opts.mic, 0, 2 + kMaxMics, 1, tx_mic,
-     "What the ocarina hears when the game's microphone option is on (playing an instrument, or humming).", hn_mic, false,
-     true},
-    {TAB_CONTROLS, "Camera", nullptr, 0, 0, 0, nullptr, nullptr, nullptr, false, true, -1, true},   // ((Triforce) 11-17: a section)
+
+    // ---- Controls (Motion opens the 6 TAB_MOTION rows, Controls its page with the 2 TAB_PAGE rows) ----
+    MENU_HEADING(TAB_CONTROLS, "Controller"),
+    {TAB_CONTROLS, "Controller in background", &opts.pad_background, 0, 1, 1, tx_onoff,
+     "Whether the controller plays the game while another window has the focus.", hn_background},
+    // (Triforce, after NX2navi's lstick_deadzone and rstick_deadzone: host/nn_hid.c hos_stick_axis_own)
+    {TAB_CONTROLS, "Left stick dead zone", &opts.lstick_dead_zone, -1, 50, 1, tx_own_dead_zone,
+     "How far the left stick moves before the game sees it, in percent of its travel on each axis: lower for a precise "
+     "stick, higher for one that drifts. The game's own dead zone still follows.", nullptr, false, true},
+    {TAB_CONTROLS, "Right stick dead zone", &opts.rstick_dead_zone, -1, 50, 1, tx_own_dead_zone,
+     "How far the right stick moves before the game sees it, in percent of its travel on each axis: lower for a precise "
+     "stick, higher for one that drifts. The game's own dead zone still follows.", nullptr, false, true},
     // (Triforce: host/prompts.c build_camera)
     {TAB_CONTROLS, "Camera speed", &opts.camera_speed, 25, 300, 5, tx_sens,
-     "How fast the right stick turns the camera: times the game's own speed, at any Camera sensitivity of the game's "
-     "Options. The mouse keeps its own sensitivity. Applies after a restart.", nullptr, true, true},
+     "How fast the right stick turns the camera, times the game's own speed. Applies after a restart.", nullptr, true, true},
     {TAB_CONTROLS, "Invert camera X", &opts.invert_cam_x, 0, 1, 1, tx_onoff,
-     "Inverts horizontal look (left/right) on the right analog stick.", nullptr, false, true},
+     "Swaps left and right for the right stick's camera.", nullptr, false, true},
     {TAB_CONTROLS, "Invert camera Y", &opts.invert_cam_y, 0, 1, 1, tx_onoff,
-     "Inverts vertical look (up/down) on the right analog stick.", nullptr, false, true},
+     "Swaps up and down for the right stick's camera.", nullptr, false, true},
+    MENU_HEADING(TAB_CONTROLS, "Mouse & keyboard"),
     {TAB_CONTROLS, "Mouse camera", &opts.mouse_native, 0, 1, 1, tx_mousecam, "How the captured mouse turns the camera.",
      hn_mousecam, false, true},
     {TAB_CONTROLS, "Mouse sensitivity", &opts.mouse_sens, 10, 500, 10, tx_sens,
-     "How far the camera turns for a mouse movement, with either Mouse camera: at 1.00 native look turns 0.1 degree a "
-     "count. The - and = keys change it in game too.", nullptr, false, true},
+     "How far the camera turns for a mouse movement. The - and = keys change it in game too.", nullptr, false, true},
     {TAB_CONTROLS, "Invert mouse vertical", &opts.mouse_invert, 0, 1, 1, tx_onoff, "Swaps up and down for the mouse.",
      hn_mouse_invert, false, true},
-    {TAB_CONTROLS, "Sticks", nullptr, 0, 0, 0, nullptr, nullptr, nullptr, false, true, -1, true},   // ((Triforce) 11-17: a section)
-    {TAB_CONTROLS, "Stick dead zone", &opts.stick_dead_zone, 0, 5, 1, tx_stick_dead_zone,
-     "How far a stick moves before the game sees it, on each axis. Lower for a precise stick, higher for one that drifts. "
-     "The game's own dead zone still follows.", nullptr, false, true},
-    // (Triforce, after NX2navi's lstick_deadzone and rstick_deadzone: host/nn_hid.c hos_stick_axis_own)
-    {TAB_CONTROLS, "Left stick dead zone", &opts.lstick_dead_zone, -1, 50, 1, tx_own_dead_zone,
-     "The left stick's own dead zone, in percent of its travel on each axis, in place of Stick dead zone: a worn stick can "
-     "have a larger one than the other. 0% cuts nothing; the game's own dead zone still follows.", nullptr, false, true},
-    {TAB_CONTROLS, "Right stick dead zone", &opts.rstick_dead_zone, -1, 50, 1, tx_own_dead_zone,
-     "The right stick's own dead zone, in percent of its travel on each axis, in place of Stick dead zone: a worn stick can "
-     "have a larger one than the other. 0% cuts nothing; the game's own dead zone still follows.", nullptr, false, true},
-    {TAB_CONTROLS, "Movement", nullptr, 0, 0, 0, nullptr, nullptr, nullptr, false, true, -1, true},   // ((Triforce) 11-17: a section)
-    // (Triforce, after NX2navi's sprint button: host/oot_sprint.h)
-    {TAB_CONTROLS, "Sprint button", &opts.sprint_button, 0, 2, 1, tx_sprint,
-     "Link sprints from a button press, without rolling first. Left stick click: the game has no other use for it. B: sprints "
-     "only while Link moves, and puts the weapon away as usual otherwise (with the game's Swap Jump Controls B is the jump: "
-     "use the stick's click).", nullptr, false, true},
-    {TAB_CONTROLS, "Sprint mode", &opts.sprint_mode, 0, 1, 1, tx_sprint_mode,
-     "Toggle: a press starts the sprint and the next press, or stopping, ends it. Hold: Link sprints while the button is "
-     "held.", nullptr, false, true},
     // (Triforce, after NX2navi's walk_key and walk_scale: host/nn_hid.c walk_key_code, walk_keys)
     {TAB_CONTROLS, "Walk key", &opts.walk_key, 0, 4, 1, tx_walk_key,
-     "A key that makes Link walk on the keyboard: held with the movement keys, they push the left stick only as far as "
-     "Walk scale. While it is chosen the key presses nothing else.", hn_walk_key, false, true},
+     "A key that makes Link walk: held with the movement keys, they push the stick only as far as Walk scale. While it is "
+     "chosen the key presses nothing else.", hn_walk_key, false, true},
     {TAB_CONTROLS, "Walk scale", &opts.walk_scale, 20, 90, 1, tx_sens,
-     "How far the movement keys push the left stick while the Walk key is held: 1.00 would be all the way, lower walks "
-     "slower. A controller's stick and the camera's keys are not changed.", nullptr, false, true},
-    {TAB_CONTROLS, "Vibration", nullptr, 0, 0, 0, nullptr, nullptr, nullptr, false, true, -1, true},   // ((Triforce) 11-17: a section)
-    // (Triforce: to 300 as NX2navi's rumble_strength, 150 before)
-    {TAB_CONTROLS, "Rumble strength", &opts.rumble, 0, 300, 25, tx_rumble,
-     "How strongly the controller rumbles, in percent of the game's rumble. Off turns it off. Over 100% a rumble that "
-     "would pass the motors' full strength stops there.", nullptr, false, true},
-    // (Triforce, after NX2navi's rumble_curve: host/pad_sdl.c rumble_curve)
-    {TAB_CONTROLS, "Vibration curve", &opts.rumble_curve, 20, 150, 5, tx_sens,
-     "Shapes the rumble of a controller's two motors. 1.00 is the game's. Lower lifts the many weak rumbles so they can be "
-     "felt and hardly changes the strong ones; higher quiets them. A Switch controller's HD rumble is not changed by it.",
-     nullptr, false, true},
-    // (Triforce, after NX2navi's rumble_triggers: host/pad_sdl.c trigger_poll)
-    {TAB_CONTROLS, "Trigger vibration", &opts.rumble_triggers, 0, 1, 1, tx_onoff,
-     "Xbox One and Series controllers: the motors in the triggers rumble too, with the lighter of the two motors. "
-     "Controllers without them rumble as before.", nullptr, false, true},
-    {TAB_CONTROLS, "Other", nullptr, 0, 0, 0, nullptr, nullptr, nullptr, false, true, -1, true},   // ((Triforce) 11-17: a section)
-
-    // Controls (17 rows; Motion opens the 6 TAB_MOTION rows, Controls its page with the 2 TAB_PAGE rows)
-    {TAB_CONTROLS, "Controller in background", &opts.pad_background, 0, 1, 1, tx_onoff,
-     "Whether the controller plays the game while another window has the focus.", hn_background},
+     "How far the movement keys push the stick while the Walk key is held: 1.00 would be all the way.", nullptr, false, true},
     {TAB_CONTROLS, "Menu shortcut", &opts.menu_shortcut, 0, 1, 1, tx_menu_shortcut,
      "Which keys open and close these options from anywhere. F1 always does; F1 only leaves Insert free for an overlay.",
      nullptr, false, true},
-    {TAB_CONTROLS, "Motion", nullptr, 0, 0, 0, nullptr,   // (hookshot: opens the Motion page, the TAB_MOTION rows)
-     "Motion controls: aiming with the controller's gyroscope, its sensitivity and its inverts."},
-    {TAB_CONTROLS, "Controls", nullptr, 0, 0, 0, nullptr,   // (hookshot: opens its page)
-     "The layout preset, the button prompts, and which gamepad button and which keys press each of the Switch's "
-     "buttons."},
+    MENU_HEADING(TAB_CONTROLS, "Rumble"),
+    // (Triforce: to 300 as NX2navi's rumble_strength, 150 before)
+    {TAB_CONTROLS, "Rumble strength", &opts.rumble, 0, 300, 25, tx_rumble,
+     "How strongly the controller rumbles, in percent of the game's rumble. Off turns it off.", nullptr, false, true},
+    // (Triforce, after NX2navi's rumble_curve: host/pad_sdl.c rumble_curve)
+    {TAB_CONTROLS, "Vibration curve", &opts.rumble_curve, 20, 150, 5, tx_sens,
+     "Shapes the rumble: 1.00 is the game's. Lower makes the many weak rumbles easier to feel; higher quiets them. A Switch "
+     "controller's HD rumble is not changed.", nullptr, false, true},
+    // (Triforce, after NX2navi's rumble_triggers: host/pad_sdl.c trigger_poll)
+    {TAB_CONTROLS, "Trigger vibration", &opts.rumble_triggers, 0, 1, 1, tx_onoff,
+     "Xbox One and Series controllers: the motors in the triggers rumble too.", nullptr, false, true},
+    MENU_HEADING(TAB_CONTROLS, "Gameplay"),
+    // (Triforce, after NX2navi's sprint button: host/oot_sprint.h)
+    {TAB_CONTROLS, "Sprint button", &opts.sprint_button, 0, 2, 1, tx_sprint,
+     "Link sprints from a button press, without rolling first. Left stick click: the game has no other use for it. B: "
+     "sprints while Link moves (with the game's Swap Jump Controls B is the jump: use the stick's click).", nullptr, false,
+     true},
+    {TAB_CONTROLS, "Sprint mode", &opts.sprint_mode, 0, 1, 1, tx_sprint_mode,
+     "Toggle: a press starts the sprint, the next press or stopping ends it. Hold: Link sprints while the button is held.",
+     nullptr, false, true},
     {TAB_MOTION, "Motion controls", &opts.gyro, 0, 1, 1, tx_gyro,
-     "Aims and looks with the controller's gyroscope where the game uses motion, as on the Switch. Works with Switch Pro "
-     "controllers and pads in Switch mode, DualSense and DualShock 4. Shown beside it: whether the connected pad has one.", hn_gyro,
-     false, true},
+     "Aims and looks with the controller's gyroscope where the game uses motion, as on the Switch: Switch Pro controllers "
+     "and pads in Switch mode, DualSense and DualShock 4.", hn_gyro, false, true},
     {TAB_MOTION, "Motion sensitivity X", &opts.gyro_sens_x, 10, 600, 10, tx_percent,
-     "How far the aim moves left and right for a given turn of the controller. 100% is the console's own.", nullptr, false,
-     true},
+     "How far the aim moves left and right for a turn of the controller. 100% is the console's.", nullptr, false, true},
     {TAB_MOTION, "Motion sensitivity Y", &opts.gyro_sens_y, 10, 300, 10, tx_percent,
-     "How far the aim moves up and down for a given tilt of the controller. 100% is the console's own.", nullptr, false,
-     true},
-    {TAB_MOTION, "Invert motion X", &opts.gyro_inv_x, 0, 1, 1, tx_onoff, "Turns the motion aim's left and right around.",
-     nullptr, false, true},
-    {TAB_MOTION, "Invert motion Y", &opts.gyro_inv_y, 0, 1, 1, tx_onoff, "Turns the motion aim's up and down around.",
-     nullptr, false, true},
+     "How far the aim moves up and down for a tilt of the controller. 100% is the console's.", nullptr, false, true},
+    {TAB_MOTION, "Invert motion X", &opts.gyro_inv_x, 0, 1, 1, tx_onoff, "Swaps the motion aim's left and right.", nullptr,
+     false, true},
+    {TAB_MOTION, "Invert motion Y", &opts.gyro_inv_y, 0, 1, 1, tx_onoff, "Swaps the motion aim's up and down.", nullptr,
+     false, true},
     {TAB_MOTION, "Motion deadzone", &opts.gyro_deadzone, 0, 2, 1, tx_deadzone,
-     "How slow a turn counts as none, the console's three settings: Standard is its own. High steadies a pad that jitters "
-     "when held still; Low keeps the smallest movements.", nullptr, false, true},
+     "How slow a turn counts as none, the console's three settings: Standard is its own. High steadies a pad that jitters; "
+     "Low keeps the smallest movements.", nullptr, false, true},
+    MENU_HEADING(TAB_CONTROLS, "Motion & buttons"),
+    {TAB_CONTROLS, "Motion", nullptr, 0, 0, 0, nullptr,   // (hookshot: opens the Motion page, the TAB_MOTION rows)
+     "Aiming with the controller's gyroscope: on or off, its sensitivity and its inverts."},
     // (hookshot) the Controls page's own rows, above its grid (TAB_PAGE: no tab shows them)
     {TAB_PAGE, "Layout preset", &opts.pad_layout, 0, 3, 1, tx_pad_layout,
      "Which face button is which. Binding one yourself on the Controls page makes it Custom.", hn_pad_layout},
     {TAB_PAGE, "Button prompts", &opts.prompts, 0, HOS_PROMPT_N, 1, tx_prompts,
-     "The button icons the game shows, in its texts and menus: those of this controller, or the keyboard's and the "
-     "mouse's, for the buttons or keys your controls put each action on.", hn_prompts, true, true},
-    // Debug: the tools' switch, the tools themselves below it while they are on (cheat: menu_tick does what they do), then the
-    // developer's rows
+     "The button icons the game shows in its texts and menus: those of this controller, or the keyboard's and the mouse's.",
+     hn_prompts, true, true},
+    {TAB_CONTROLS, "Controls", nullptr, 0, 0, 0, nullptr,   // (hookshot: opens its page)
+     "The layout preset, the button prompts, and which button and keys press each of the Switch's buttons."},
+
+    // ---- Debug: the tools' switch, the tools themselves below it while they are on (cheat: menu_tick does what they do),
+    // then the developer's rows ----
     {TAB_DEBUG, "Debug tools", &opts.debug_tools, 0, 1, 1, tx_onoff,
      "Testing tools: no-clip flight, a free camera, teleport, Link's age, the inventory, the clock and heart protection. Off "
      "puts flight, the free camera and heart protection away.", nullptr, false, true},
@@ -1459,17 +1417,30 @@ Row rows[] = {
      "Keeps the game's large textures that have no transparency in half the video memory, with the same picture. Off: as "
      "before. Turn it off if textures look wrong. Applies after a restart.",
      hn_tex_bc1, true, true},
-    {TAB_SYSTEM, "Exit", nullptr, 0, 0, 0, nullptr, nullptr, nullptr, false, true, -1, true},   // ((Triforce) 11-17: a section)
-    // (Restart and Quit stay the table's last two: kRestartRow and kQuitRow count back from its end)
-    {TAB_SYSTEM, "Restart", nullptr, 0, 0, 0, nullptr,
-     "Starts the game again. Save your progress first. Press Enter or A twice to restart. Esc or B "
-     "cancels."},
-    {TAB_SYSTEM, "Quit", nullptr, 0, 0, 0, nullptr,
-     "Save your progress first. Press Enter or A twice to quit. Esc or B cancels."},
+    // ((Triforce) 11-19, the owner: Restart and Quit moved to the pause menu's System page, as the game's own button under
+    // Mods (draw_mods_row; its dialog draw_quit_ask)
+    {TAB_DEBUG, "Robust buffers", &opts.robust, 0, 2, 1, tx_robust,   // ((Triforce, options_version 7) from the Graphics tab)
+     "Bounds-checked buffer reads: a read past a buffer's end is dropped instead of stopping the GPU. Applies after a "
+     "restart. On AMD and Intel cards, changing it prepares every shader again at the next start (a long first start on "
+     "AMD); on NVIDIA cards it does not. Switching back is quick when the shaders of the setting before were kept (one "
+     "earlier set is kept when the disk has room for it).",
+     hn_robust, true},
+
+    // ---- (Triforce, options_version 7) The saved values the merged rows above stand for (merged_rows.h): no tab shows them.
+    // Each keeps its key in triforce_options.ini (the row's name: ini_key), loaded and saved as before, for the renderer and the
+    // host read them, some before the menu (host/nn_vi.c renodx_hdr= and steady_frame_rate=, vk_dlssg.cpp
+    // dlss_frame_generation=). Their merged rows take the restarts (restart_value_of) ----
+    {TAB_HIDDEN, "HDR", &opts.hdr, 0, 2, 1, tx_hdr, nullptr},
+    {TAB_HIDDEN, "RenoDX HDR", &opts.renodx, 0, 1, 1, tx_onoff, nullptr},
+    {TAB_HIDDEN, "Frame generation", &opts.framegen, 0, framegen_rows::kRowMax, 1, tx_framegen, nullptr},
+    {TAB_HIDDEN, "DLSS frame generation", &opts.dlssg, 0, 3, 1, tx_dlssg, nullptr},
+    {TAB_HIDDEN, "Frame pacing", &opts.pace, 0, 1, 1, tx_onoff, nullptr},
+    {TAB_HIDDEN, "Steady frame rate", &opts.steady_fps, 0, 2, 1, tx_steady_fps, nullptr},
+    {TAB_HIDDEN, "NVIDIA Reflex", &opts.reflex, 0, 2, 1, tx_latency, nullptr},
+    {TAB_HIDDEN, "AMD Anti-Lag 2", &opts.antilag, 0, 1, 1, tx_onoff, nullptr},
 
 };
-constexpr int kQuitRow = sizeof rows / sizeof rows[0] - 1;
-constexpr int kRestartRow = kQuitRow - 1;
+constexpr int kRowsEnd = sizeof rows / sizeof rows[0];   // (the table's end: tests read the table up to here)
 const Row* pending = nullptr;   // (Restart or Quit: shows Confirm until its second press)
 bool cheats_env = false;   // (HOS_OOT_CHEATS=1: on whatever the Debug tab says)
 /// The debug tools: the Debug tab's row, or HOS_OOT_CHEATS=1
@@ -1485,12 +1456,16 @@ int tabs_shown() { return debug_shown() ? TAB_COUNT : TAB_COUNT - 1; }
 // caption and guides are under the same plates, ours, which are opaque. Back on one of ours is the game's Back too
 // (host/nn_hid.c). TRIFORCE_OPTIONS_TABS=0: off (the game's Options as it is, ours through F1 alone)
 std::atomic<int64_t> game_options_ns{0};   // (prof_now at the last frame the host said so; 0 never)
+// ((Triforce, 11-20) that screen chosen from the pause menu (the host's word 2): its guides band may end sooner, game_grid.h
+// kPauseGuideBandRight)
+std::atomic<bool> game_options_from_pause{false};
 bool embed_open = false;                   // (our tabs are open from inside the game's Options: leaving them is its own tab again)
 int64_t embed_since = 0;                   // (when that screen was first seen running: the tabs fade in over its opening)
 constexpr int kGameTab = 99;               // (the tabs' hit for the game's own tab)
-// ((Triforce) the mouse over the tabs on the game's own tab (draw_game_tab): their shift in the window, as menu_ox is draw_menu's,
-// and whether the mouse has been read since the game's screen came: a click from before is not the tabs')
-float game_tab_ox = 0;
+// ((Triforce) the mouse over the tabs on the game's own tab (draw_game_tab): where they are in the window, as menu_map is
+// draw_menu's ((11-19) the game's grid: game_grid.h column_of), and whether the mouse has been read since the game's screen
+// came: a click from before is not the tabs')
+game_grid::Map game_tab_map;
 bool game_tab_read = false;
 bool hits_game_tab = false;   // (the hits are draw_game_tab's: its tabs were drawn last, not the open menu)
 // (Triforce) Mods: an entry of the tab strip after System (before Debug) that opens a page of its own, kModsPage (vk_mods.h:
@@ -1509,6 +1484,10 @@ constexpr int kModsCats = 6;
 const char* const kModsCatNames[kModsCats] = {"All", "Gameplay", "Models", "Audio", "Interface", "Installed"};
 int mods_cat = 0;
 int mods_cat_pick = -1;   // (a click on a category's tab: taken by the next tick)
+/// ((Triforce) 11-18) after a card's author and category: a WiP or a kit (a program of its own) says so
+std::string mods_kind(const mods::Mod& m) {
+    return m.kit ? "  \xC2\xB7  Own program" : m.wip ? "  \xC2\xB7  Work in progress" : "";
+}
 bool mods_in_cat(const mods::Mod& m, int cat) {
     auto has = [&m](const char* w) { return m.category.find(w) != std::string::npos; };
     switch (cat) {
@@ -1531,12 +1510,60 @@ constexpr int kModsRowPage = 9;
 std::atomic<int> mods_list_bits{0};        // (HOS_MODS_LIST_*, as the last report had them)
 std::atomic<int> mods_box[5];              // (the last button's box and the pitch, the layout's units: x0 x1 y0 y1 pitch)
 std::atomic<int64_t> mods_list_ns{0};      // (prof_now at the last report)
-std::atomic<int> mods_enter{0};            // (the host's word: 1 the cursor onto the entry, 2 a click on it)
+std::atomic<int64_t> mods_list_frame{0};   // ((Triforce, 11-19) and game_frames then: a slow game frame is not a list gone)
+std::atomic<int> mods_enter{0};            // (the host's word: 1 the cursor onto the entry, 2 a click on it; 3 a click on Quit,
+                                           // 4 the cursor onto Quit)
 std::atomic<int> mods_press{0};            // (presses the host passed on while Mods has the cursor: HOS_MODS_PRESS_*)
-bool mods_list_fresh() {
+// ((Triforce, 11-19) and the directions held at its last read (HOS_MODS_PRESS_DIRS bits), and when: repeated as a pad's are)
+std::atomic<int> mods_held_dirs{0};
+std::atomic<int64_t> mods_held_ns{0};
+// ((Triforce) 11-19, the owner: "I want quit and restart moved from our custom settings menu to [under Mods on the pause menu's
+// System page]. IT NEEDS TO LOOK NATIVE". One button fits under Mods at the list's own pitch above the prompts, so it is Quit,
+// as the game's own button, and its dialog asks Quit Game / Restart Game / Cancel (his choice). The title's list has Mods only)
+int mods_row_sel = 0;                      // (the entry with the cursor: 0 Mods, 1 Quit)
+bool quit_ask = false;                     // (Quit's dialog is open)
+int quit_sel = 0;                          // (its choice: 0 Quit Game, 1 Restart Game, 2 Cancel)
+// ((Triforce, 11-19) the owner: "the mods and quit tabs do not have any sound effects when selecting them, have no animations
+// either ... The quit menu submenu also has no animations and sound effects". Mods and Quit fade their cursor in and out as
+// the System list's own buttons do (focus_anim.h: PaCommonBtnThin_00's Select and UnSelect), and Quit's dialog opens and
+// closes as the game's SystemWindow_00 (In, Out), its buttons as the same part; it takes input once its In has played)
+focus_anim::Focus mods_focus[2];           // (Mods, Quit)
+focus_anim::Focus quit_focus[3];           // (the dialog's buttons)
+int64_t quit_open_ns = 0;                  // (prof_now when the dialog opened: its In; 0 shut)
+int64_t quit_shut_ns = 0;                  // (when B or Cancel closed it: its Out; 0 none playing)
+bool quit_fresh = false;                   // (just opened: its buttons as they stand, the first one chosen)
+bool quit_ended = false;                   // (Quit Game or Restart Game chosen at this tick: the game goes, no cursor sound after)
+/// (Quit's dialog opens: In from now, Quit Game chosen)
+void quit_open() { quit_ask = true, quit_sel = 0, quit_open_ns = prof_now(), quit_shut_ns = 0, quit_fresh = true; }
+/// (B or Cancel: it closes with its Out; Quit keeps the cursor)
+void quit_cancel() { quit_ask = false, quit_open_ns = 0, quit_shut_ns = prof_now(); }
+/// (it goes with the entries, their list gone or the menu shut: no Out)
+void quit_gone() { quit_ask = false, quit_open_ns = 0, quit_shut_ns = 0; }
+/// (its Out still playing)
+bool quit_closing() { return !quit_ask && quit_shut_ns && prof_now() - quit_shut_ns < focus_anim::kOutNs; }
+bool quit_entry_shown() { return (mods_list_bits.load(std::memory_order_relaxed) & HOS_MODS_LIST_TITLE) == 0; }
+std::atomic<int64_t> game_frames{0};   // (the game's frames shown: menu_note_frame)
+/// ((Triforce, 11-19) the lab's "one DOWN from Options on the title did nothing and logged nothing": with the game's window
+/// behind another one its frames came 80 to 235 ms apart, and a list told of at each of them counted as gone after 150 ms, so
+/// the host's word that the cursor goes onto Mods was dropped (and the host's own 80 ms, host/oot_menu.c hos_oot_mods_down,
+/// gave the Down to the game, which has nothing under its last button). A list told of at the game's last frame or the one
+/// before is there however long ago that was: the age the entry's animations take (0 then))
+int64_t mods_list_age() {
     const int64_t t = mods_list_ns.load(std::memory_order_relaxed);
-    return t && prof_now() - t < 150000000LL;
+    if (!t) return INT64_MAX;
+    const int64_t frames = game_frames.load(std::memory_order_relaxed) - mods_list_frame.load(std::memory_order_relaxed);
+    return frames >= 0 && frames <= 2 ? 0 : prof_now() - t;
 }
+bool mods_list_fresh() { return mods_list_age() < 150000000LL; }
+// ((Triforce, 11-19) the title's list, the owner: "make it the same as the other options, with the green filigree, the same
+// animations: when you select it, it just pops in". The entry is drawn as the game's own entries (draw_title_mods, with
+// mods_entry_anim.h's times): it fades with the list, and A on it plays the game's Decide before the Mods screen opens)
+bool mods_title_list() { return (mods_list_bits.load(std::memory_order_relaxed) & HOS_MODS_LIST_TITLE) != 0; }
+/// (the title's entry as it goes with its list: drawn a little past the list's last word, fading)
+bool mods_title_fading() { return mods_title_list() && mods_list_age() < mods_entry::kListShownNs; }
+int64_t mods_decide_ns = 0;   // (A on the title's entry: when, while its Decide plays; 0 none)
+float mods_entry_px[5] = {};   // (the Mods entry as last drawn, the menu's column's pixels: its hit x0 y0 x1 y1, and the pitch)
+bool mods_decided = false;     // (its Decide ended this tick: the Mods screen opened with no sound of its own, it had the press's)
 // ((Triforce) 11-17, his ask "We need a search bar for mods") The Mods screen's search: a bar above the cards (mods_choice -1 is
 // the bar), typed into from the keyboard anywhere on the screen (host/display.c: HOS_OPT_TEXT_CHAR), or from a keyboard of the
 // game's look on the screen for a controller (A on the bar). The text is searched 0.5 s after the typing stops, or at once
@@ -1800,12 +1827,24 @@ namespace mr = menu_restart;
 mr::State restart_state;
 int restart_slot[kRows];             // (a row's slot in restart_state, -1 none)
 const char* restart_names[mr::kMax];
+/// What of a row takes the restart: its value; ((Triforce, options_version 7) of a merged row only what of it is read at the
+/// start: HDR's Native + RenoDX (the scene's RGBA16F target and RenoDX's shaders, host/nn_vi.c hos_scene_rgba16f and
+/// vk_temporal.cpp, from hdr_at_start and renodx_at_start; Off, Expanded and Native change at once: the swapchain is made
+/// again at the next present, and the game asks nn::vi for the display's HDR as it goes), Frame generation's NVIDIA DLSS
+/// (vk_dlssg.cpp), Frame pacing's Steady (host/nn_vi.c), and the Render resolution's Native (100%) with its share
+int restart_value_of(const Row& r) {
+    if (r.value == &merged.hdr) return opts.hdr == 2 && opts.renodx ? 1 : 0;
+    if (r.value == &merged.framegen) return opts.dlssg;
+    if (r.value == &merged.pacing) return opts.steady_fps;
+    if (r.value == &opts.resolution) return opts.resolution + (ur::full_scale(opts.dlss) ? 100 : 0);
+    return *r.value;
+}
 void restart_init() {
     static bool done = false;
     if (done) return;
     done = true;
     for (int i = 0; i < kRows; i++) {
-        restart_slot[i] = rows[i].restart && rows[i].value ? restart_state.add(*rows[i].value) : -1;
+        restart_slot[i] = rows[i].restart && rows[i].value ? restart_state.add(restart_value_of(rows[i])) : -1;
         if (restart_slot[i] >= 0) restart_names[restart_slot[i]] = rows[i].name;
     }
 }
@@ -1813,11 +1852,11 @@ int restart_slot_of(const Row& r) { return restart_slot[&r - rows]; }
 /// A row that takes a restart, changed from what the game started with (a row past menu_restart.h's kMax has no slot: never)
 bool restart_changed(const Row& r) {
     const int slot = restart_slot_of(r);
-    return r.value && r.restart && slot >= 0 && *r.value != restart_state.start[slot];
+    return r.value && r.restart && slot >= 0 && restart_value_of(r) != restart_state.start[slot];
 }
 void restart_values(int* now) {
     for (int i = 0; i < kRows; i++)
-        if (restart_slot[i] >= 0) now[restart_slot[i]] = *rows[i].value;
+        if (restart_slot[i] >= 0) now[restart_slot[i]] = restart_value_of(rows[i]);
 }
 /// The rows whose value is not the one the game runs with (a bit a slot)
 unsigned restart_pending() {
@@ -1854,15 +1893,48 @@ bool rdx_applies(const int* v) {
         return opts.rdx_tonemap == 2;
     return true;
 }
-/// (Triforce) The Frame generation row ends at AMD FSR 4 only where AMD's library can make the frames (vk_fsr4.h fsr4fg,
-/// framegen_rows.h row_hi), and at 8x elsewhere, the row as it was. Asked when the menu opens, as the Upscaler's choices are.
-/// The table's own end is AMD FSR 4, so an options file with it loads as it is, before the graphics card is known; a saved
-/// AMD FSR 4 that cannot run here stays saved, shows as 2x (tx_framegen) and the arrows leave it for 8x or Off. (Triforce) As
-/// known: the library is asked off the menu's thread (menu_ahead), and the row is set again once it has answered
+/// (Triforce) The Frame generation row offers AMD FSR 4 only where AMD's library can make the frames (vk_fsr4.h fsr4fg), and
+/// ((Triforce, options_version 7) NVIDIA DLSS 2x to 4x, which was a row of its own, only where DLSS frame generation can run:
+/// a build with it, on an NVIDIA RTX card DLSS runs on, or where it was asked for at this start). Asked when the menu opens, as
+/// the Upscaler's choices are. The saved value's own row (TAB_HIDDEN) ends at AMD FSR 4, so an options file with it loads as
+/// it is, before the graphics card is known; a saved AMD FSR 4 that cannot run here stays saved, shows as 2x (tx_framegen)
+/// and the arrows step from it as from 8x. As known: the library is asked off the menu's thread (menu_ahead), and the row is
+/// set again once it has answered
+int framegen_list[mr7::FG_DLSS_LAST + 1];
+int framegen_count = 0;
+bool dlssg_offered() {
+    return mkwvk::dlssg::built() &&
+           (mkwvk::dlssg::asked() || (dev.device && dev.props.vendorID == 0x10DE && dlss_why() == DLSS_OK));
+}
 void framegen_row_sync() {
-    static_assert(framegen_rows::kRowMax == 9, "the Frame generation row's entry in rows[] ends at 9");
-    for (Row& r : rows)
-        if (r.value == &opts.framegen) r.hi = framegen_rows::row_hi(fsr4fg::offered_known());
+    static_assert(framegen_rows::kRowMax == 9 && mr7::FG_DLSS == framegen_rows::kRowMax + 1,
+                  "the Frame generation row's own values end at 9, NVIDIA DLSS's follow");
+    framegen_count = mr7::framegen_choices(framegen_list, fsr4fg::offered_known(), dlssg_offered());
+}
+/// ((Triforce, options_version 7) The merged rows' values, from the saved ones: before each tick's input and each drawing)
+void merged_sync() {
+    merged.hdr = mr7::hdr_row(opts.hdr, opts.renodx);
+    merged.framegen = mr7::framegen_row(opts.framegen, opts.dlssg);
+    merged.pacing = mr7::pacing_row(opts.pace, opts.steady_fps);
+    merged.latency = mr7::latency_row(latency_vendor(), opts.reflex, opts.antilag);
+}
+/// ...and a merged row's new value into the saved ones it stands for
+void merged_store(const int* v) {
+    if (v == &merged.hdr) mr7::hdr_set(merged.hdr, opts.hdr, opts.renodx);
+    if (v == &merged.framegen) mr7::framegen_set(merged.framegen, opts.framegen, opts.dlssg);
+    if (v == &merged.pacing) mr7::pacing_set(merged.pacing, opts.pace, opts.steady_fps);
+    if (v == &merged.latency) mr7::latency_set(merged.latency, latency_vendor(), opts.reflex, opts.antilag);
+}
+/// A merged row's next value from v (dir): its choices here
+int merged_step(const int* value, int v, int dir) {
+    if (value == &merged.framegen) {
+        if (!framegen_count) framegen_row_sync();
+        return mr7::step_in(framegen_list, framegen_count, v, dir);
+    }
+    int list[4], n = 0;
+    const int hi = value == &merged.hdr ? (renodx_built() ? 3 : 2) : value == &merged.pacing ? 3 : mr7::latency_hi(latency_vendor());
+    for (int k = 0; k <= hi; k++) list[n++] = k;
+    return mr7::step_in(list, n, v, dir);
 }
 // (Triforce) What the rows ask of NVIDIA's and AMD's libraries: whether DLSS, AMD FSR 4 and FSR 4's frame generation run
 // here. Asked at the menu's open on its thread (the presenting one), NGX's start and AMD's loader held the first open of
@@ -1898,18 +1970,30 @@ void menu_ahead() {
     int none = 0;
     if (ahead_state.compare_exchange_strong(none, 1)) std::thread(ahead_thread).detach();
 }
-bool heading_over_shown(int i);
+bool group_shown(int heading);
+/// A row on its tab: the debug tools only with them on, the Upscaler only in a build with DLSS or FSR 4, or where AMD FSR 3.1
+/// runs, ...; ((Triforce, options_version 7) a group's heading while a row of its group is shown, group_shown)
 bool row_shown(int i) {
+    const int up = rows[i].value == &opts.upscale_pre || rows[i].value == &opts.dlss_model || rows[i].value == &opts.aa ? upscaler() : ur::GAME;
     return (rows[i].cheat < 0 || cheats_on()) &&
-           // ((Triforce) 11-17, the tabs in sections: a heading only over a row shown, RenoDX's with no RenoDX build not left bare)
-           (!rows[i].heading || heading_over_shown(i)) &&
            (rows[i].value != &opts.dlss || ur::upscaler_shown(dlss_built() || fsr4_built(), fsr3::supported() || ffx3_usable())) &&
-           (rows[i].value != &opts.dlss_model || ur::model_shown(dlss_built())) &&
-           (rows[i].value != &opts.fsr_sharpness || ur::fsr_sharpen_shown(fsr4_built(), ffx3_usable())) &&
+           (rows[i].value != &opts.fsr_sharpness || ur::fsr_sharpen_shown(fsr4_built(), ffx3_usable())) &&   // (linux fork)
+           // ((Triforce, options_version 7) the DLSS model with NVIDIA DLSS as the Upscaler alone; Upscale before bloom with any
+           // upscaler but the game's own, which it does nothing with (vk_temporal.cpp pre_wanted); Anti-aliasing with the game's
+           // own alone: DLSS and FSR smooth the edges themselves (aa_rows.h))
+           (rows[i].value != &opts.dlss_model || (ur::model_shown(dlss_built()) && ur::is_dlss(up))) &&
+           (rows[i].value != &opts.upscale_pre || up != ur::GAME) && (rows[i].value != &opts.aa || up == ur::GAME) &&
            // (local, RenoDX port: its rows with HDR Native, in a build with its shaders; Triforce: and its own row on, and
-           // of the rows one tonemapper alone reads those of the one chosen)
+           // of the rows one tonemapper alone reads those of the one chosen. (options_version 7) The UI brightness is one of them:
+           // without RenoDX the HUD's white is the picture's, Paper white)
            (!rdx_row(rows[i].value) || (opts.hdr == 2 && renodx_built() && opts.renodx && rdx_applies(rows[i].value))) &&
-           (rows[i].value != &opts.renodx || renodx_built()) &&
+           // ((Triforce, options_version 7) Paper white and Peak brightness with HDR on; the Ultrawide's HUD and menu sides with a
+           // shape wider than 16:9 (21:9 and 32:9: 16:10 is narrower, ultrawide_rows.h); Sprint mode with a sprint button, Walk
+           // scale with a walk key; Low latency where Reflex or Anti-Lag 2 runs)
+           ((rows[i].value != &opts.hdr_white && rows[i].value != &opts.hdr_peak) || opts.hdr != 0) &&
+           ((rows[i].value != &opts.wide_hud && rows[i].value != &opts.wide_menus) || ultrawide_row_wider(opts.ultrawide)) &&
+           (rows[i].value != &opts.sprint_mode || opts.sprint_button != 0) && (rows[i].value != &opts.walk_scale || opts.walk_key != 0) &&
+           (rows[i].value != &merged.latency || latency_vendor() != mr7::LATENCY_NONE) &&
 #ifndef _WIN32   // (Triforce: the lazy write-back's fault handler pays on Windows only, vk_memory.cpp)
            rows[i].value != &opts.lazy_write_back &&
 #endif
@@ -1919,11 +2003,14 @@ bool row_shown(int i) {
            (rows[i].value != &opts.language || lang_count > 1) &&
            // (Triforce: the mods' cheats: as many rows as the host named, and their heading with them)
            (!rows[i].heading || strcmp(rows[i].name, kModCheatHeading) || mod_cheats.shown() > 0) &&
-           (mod_cheat_slot(rows[i].name) < 0 || mod_cheat_slot(rows[i].name) < mod_cheats.shown());
+           (mod_cheat_slot(rows[i].name) < 0 || mod_cheat_slot(rows[i].name) < mod_cheats.shown()) &&
+           (!rows[i].heading || rows[i].tab == TAB_DEBUG || group_shown(i));
 }
-bool heading_over_shown(int i) {   // (the rows of its tab after it, to the next heading: one of them shown)
-    for (int j = i + 1; j < kRows; j++) {
-        if (rows[j].tab != rows[i].tab) continue;
+/// ((Triforce, options_version 7) A group's heading is shown while a row of its group is: the rows of its tab after it, up to the
+/// next heading there. The Debug tab's Developer heading is debug_rows')
+bool group_shown(int heading) {
+    for (int j = heading + 1; j < kRows; j++) {
+        if (rows[j].tab != rows[heading].tab) continue;
         if (rows[j].heading) return false;
         if (row_shown(j)) return true;
     }
@@ -1971,10 +2058,24 @@ std::string ini_path() {
 }
 const char* ini_key(const Row& r) {
     if (r.value == &opts.output_res) return "output_res";   // (host/nn_applet.c reads it at the start)
-    // (rows renamed since their values were first saved keep their keys: an options file from before still loads)
+    // (rows renamed since their values were first saved keep their keys: an options file from before still loads, and the
+    // readers before the menu find them: host/hos_main.c ultrawide=, host/oot_wide_hud.c ultrawide_hud=. (Triforce,
+    // options_version 7) The rows renamed as their groups came, a group's name taken off theirs)
+    static const char* const kept[][2] = {   // (the row's name now, the key its value was saved under)
+        {"Aspect ratio", "ultrawide"}, {"HUD position", "ultrawide_hud"},
+        {"Menu sides", "ultrawide_menus"}, {"Paper white", "hdr_paper_white"}, {"Peak brightness", "hdr_peak_brightness"},
+        {"UI brightness", "renodx_ui_brightness"}, {"Tonemapper", "renodx_tonemapper"}, {"Gamma correction", "renodx_gamma_correction"},
+        {"Color space", "renodx_color_space"}, {"Exposure", "renodx_exposure"}, {"Middle gray", "renodx_midgray"},
+        {"Match tone slope", "renodx_match_tone_slope"}, {"Tone slope", "renodx_tone_slope"}, {"Hue clip", "renodx_hue_clip"},
+        {"Highlight saturation", "renodx_highlight_saturation"}, {"Blowout", "renodx_blowout"}, {"Flare", "renodx_flare"},
+        {"Hue correction", "renodx_hue_correction"}, {"Color grading", "renodx_color_grading"}, {"Highlights", "renodx_highlights"},
+        {"Shadows", "renodx_shadows"}, {"Contrast", "renodx_contrast"}, {"Saturation", "renodx_saturation"},
+        {"Bloom", "renodx_bloom"},
+    };
+    for (const auto& k : kept)
+        if (r.value && !strcmp(r.name, k[0])) return k[1];
     if (r.value == &opts.resolution) return "resolution";
     if (r.value == &opts.fps_cap) return "frame_rate_cap";   // (host/nn_vi.c reads it at the start)
-    if (r.value == &opts.upscale) return "upscaling";
     if (r.value == &opts.dlss) return "dlss";   // (as opts.dlss and RX_VK_DLSS)
     // ((Triforce) NX2navi's key, not the name cut at 31 letters; vk_replay.cpp tail_wanted reads it at the start)
     if (!strcmp(r.name, "Start next frame early")) return "tail_early";
@@ -1986,7 +2087,7 @@ const char* ini_key(const Row& r) {
 }
 /// (Triforce) A row kept in triforce_options.ini: every row with a value but the Game language, whose choice is
 /// language.txt's
-bool ini_row(const Row& r) { return r.value && r.value != &opts.language; }
+bool ini_row(const Row& r) { return r.value && r.value != &opts.language && !is_merged(r.value); }
 // ((Triforce, handoff §9) The options file's other writers. ini_base: what the game had for each of the file's lines when it last
 // read (menu_init) or wrote (save) the file; save merges each line it writes by its key with what the file has now
 // (ini_merge.h) and writes the file whole (file_whole.h: a reader at a start, the host's or the renderer's, never meets half a
@@ -2171,10 +2272,12 @@ void save() {
             const char* eq = strchr(line, '=');
             if (!eq || eq == line) continue;
             const std::string key(line, (size_t)(eq - line));
-            bool mine = key == "microphone_device" || key == "options_version" || key == "debug_tab";
+            bool mine = key == "microphone_device" || key == "options_version" || key == "debug_tab" || key == "gpu_device_name";
             // (Triforce: the RivaTuner limit row of the test builds is gone, RivaTuner being the limiter wherever it can be:
-            // its line is read by nothing and is not written again)
+            // its line is read by nothing and is not written again. (options_version 7) Nor are the lines of the rows whose job
+            // is done otherwise now: merged_rows.h kDropped, read once by menu_init's migration)
             mine |= key == "rivatuner_limit";
+            for (const char* dropped : merged_rows::kDropped) mine |= key == dropped;
             for (const Row& r : rows)
                 if (!mine && r.value && key == ini_key(r)) mine = true;
             if (!mine) others += line, others += others.back() == '\n' ? "" : "\n";
@@ -2194,12 +2297,21 @@ void save() {
     for (const Row& r : rows)
         if (ini_row(r)) put(ini_key(r), std::to_string(*r.value));
     if (!mic_want.empty()) put("microphone_device", mic_want);   // (hookshot: also while it is unplugged)
+    // ((Triforce) 11-20) the GPU device row's card by its name beside its number: the chosen card's as this run lists them;
+    // a choice past the list (the card taken out) keeps the name it had; Auto writes none
+    if (opts.gpu_device <= 0) gpu_want.clear();
+    else if ((size_t)opts.gpu_device <= gpu_device_names.size()) gpu_want = mic_key(gpu_device_names[(size_t)opts.gpu_device - 1].c_str());
+    if (!gpu_want.empty()) put("gpu_device_name", gpu_want);
     // (2: game_speed below 2 was only ever the old default, see menu_init; 3: the mouse's buttons are bindings, see
     // host/nn_hid.c binds_load; 4: Descriptor reuse on by default, see menu_init and vk_draw.cpp desc_slotgen_on; 5: Sampler
     // cache, Fast pipeline link, Lazy write-back, Opaque textures as BC1 and NVIDIA Reflex On + Boost by default, see menu_init;
     // (Triforce) 6: Start next frame early on by default, see menu_init and vk_replay.cpp tail_wanted; the Ultrawide row's 1 is
-    // 16:10, no longer the monitor's shape, see ultrawide_rows.h; (Triforce) 7: Frame pacing on by default, see menu_init)
-    out += "options_version=7\n";
+    // 16:10, no longer the monitor's shape, see ultrawide_rows.h; (Triforce) 7: Frame pacing on by default, see menu_init;
+    // 8: the rows merged and grouped, the handheld profile an Output resolution, the shared stick dead zone each stick's own,
+    // see merged_rows.h migrate (the 436f9ac-based builds wrote 7 for that: such a file has none of the dropped lines, so
+    // migrate leaves it as it is))
+    static_assert(merged_rows::kVersion == 8, "the options file's version as merged_rows.h migrates to it");
+    out += "options_version=8\n";
     out += others;
     if (!can_bind()) out += kept;
     for (int i = 0; i < HOS_KEY_N && can_bind(); i++) {   // (the keys-only controls, HOS_KEY_*, have no pad_ line)
@@ -2237,34 +2349,39 @@ void save() {
 void set_row(Row& r, int v, int dir, bool keep = true) {
     // (nothing else to choose: no change, no save. A saved choice that cannot run here is kept)
     if (row_fixed(r.value)) return;
-    // (the scaling rows: only what can run here; the Render resolution row through the Upscaler's own steps)
-    if (r.value == &opts.dlss) v = ur::step_upscaler(upscaler(), dir, upscalers_available());
-    if (r.value == &opts.resolution) v = ur::step(upscaler(), *r.value, dir);
-    if (r.value == &opts.fg_engine) v = fgengine::step_row(*r.value, dir, fg_engines_available());   // (what runs here)
+    // (the scaling rows: only what can run here. (Triforce, options_version 7) The Upscaler steps through the engines, the Render
+    // resolution through the Upscaler's own steps with Native (100%) among them, an engine's native AA: upscaler_rows.h)
+    int upscaler_now = -1;   // (the Upscaler's value the step chose with it, -1 none)
+    if (r.value == &opts.dlss) {
+        const ur::Scaling to = ur::step_engine(upscaler(), opts.resolution, dir, upscalers_available());
+        v = to.upscaler, opts.resolution = to.resolution;
+    }
+    if (r.value == &opts.resolution) {
+        const ur::Scaling to = ur::step_resolution(upscaler(), *r.value, dir);
+        v = to.resolution;
+        if (to.upscaler != upscaler()) upscaler_now = to.upscaler;   // (Native (100%) on or off: the engine's native AA)
+    }
+    if (r.value == &opts.fg_engine) v = fgengine::step_row(*r.value, dir, fg_engines_available());   // (linux fork: what runs here)
     if (r.value == &opts.output_res) {   // (smallest to largest: kOutputOrder)
         v = step_output_choice(*r.value, dir);
         if (v == *r.value) return;
     }
+    if (is_merged(r.value)) v = merged_step(r.value, *r.value, dir);   // ((Triforce, options_version 7) its choices here)
     if (stops_at_ends(r)) v = std::min(std::max(v, r.lo), r.hi);   // (a scale: it stops at its ends)
     if (r.value == &opts.pad_layout) {
         if (v > 2) v = dir > 0 ? 0 : 2;
         if (v < 0) v = 2;
         *r.value = v;
         apply_pad_layout(*r.value);
-    } else if (r.value == &opts.preset) {
-        *r.value = v > r.hi ? r.lo : v < r.lo ? r.hi : v;
-        apply_preset(*r.value);
     } else {
         *r.value = v > r.hi ? r.lo : v < r.lo ? r.hi : v;
+        if (upscaler_now >= 0) opts.dlss = upscaler_now;
         // (another Upscaler: the Render resolution moves to the nearest of its steps, DLSS's modes or the game's)
         if (r.value == &opts.dlss) opts.resolution = ur::snap(upscaler(), opts.resolution);
-        if (!r.preset_exempt) {   // (the controls, the window and the counter are not the preset's)
-            opts.preset = 0; // Custom
-            sync_preset_budgets(0);
-        }
+        if (is_merged(r.value)) merged_store(r.value), merged_sync();   // (the saved values it stands for)
     }
     if (r.value == &opts.mic && can_mic()) mic_chosen();   // (hookshot)
-    {   // (a row that takes a restart, or a preset that sets one: asked again at the next close)
+    {   // (a row that takes a restart: asked again at the next close)
         int now[mr::kMax];
         restart_values(now);
         restart_state.note(now);
@@ -2304,7 +2421,10 @@ const char* pad_name(int p) {
          "D-pad left", "D-pad right", "L2", "R2"},
         {"A", "B", "X", "Y", "View", "Steam", "Menu", "L3", "R3", "L1", "R1", "D-pad up", "D-pad down", "D-pad left",
          "D-pad right", "L2", "R2"}};
-    const int face = opts.prompts ? opts.prompts - 1 : host && host->prompt_face ? host->prompt_face() : -1;
+    int face = opts.prompts ? opts.prompts - 1 : host && host->prompt_face ? host->prompt_face() : -1;
+    // ((Triforce, 11-19) with the keys' face, the controller used last's names, as the overlay's icons (vk_imgui.cpp))
+    if ((face < 0 || face == HOS_PROMPT_KEYBOARD) && host && host->prompt_pad_face && host->prompt_pad_face() >= 0)
+        face = host->prompt_pad_face();
     return p >= 0 && p < HOS_PAD_N ? t[face >= 0 && face < HOS_PROMPT_KEYBOARD ? face + 1 : 0][p] : "None";
 }
 const char* key_name(int vk) {
@@ -2353,6 +2473,36 @@ const char* key_name(int vk) {
     }
     return snprintf(b, sizeof b, "Key %d", vk), b;
 }
+/// (Triforce) A key the menu has a use of its own for (menu_tick's keys, F8 the bug capture's): bound to the Switch's L, R or B
+/// it keeps that use in the menu
+bool menu_own_key(int vk) {
+    switch (vk) {
+    case VK_INSERT: case VK_UP: case VK_DOWN: case VK_LEFT: case VK_RIGHT: case VK_ESCAPE: case VK_F1: case VK_RETURN:
+    case VK_DELETE: case VK_BACK: case 'Q': case 'E': case VK_TAB: case VK_PRIOR: case VK_NEXT: case VK_HOME: case VK_END:
+    case VK_F8:
+        return true;
+    }
+    return false;
+}
+/// (Triforce) A key the menu takes as it is let go (menu_tick): Shift, Ctrl and Alt are held for other keys too (Shift+Tab)
+bool menu_modifier_key(int vk) { return vk == VK_SHIFT || vk == VK_CONTROL || vk == VK_MENU; }
+/// (Triforce) Whether the key k is the modifier vk itself or its left or right key (VK_LSHIFT, VK_RSHIFT for VK_SHIFT): held
+/// with vk, any other key makes vk no press of its own (menu_tick)
+bool menu_same_modifier(int vk, int k) {
+    switch (vk) {
+    case VK_SHIFT: return k == VK_SHIFT || k == VK_LSHIFT || k == VK_RSHIFT;
+    case VK_CONTROL: return k == VK_CONTROL || k == VK_LCONTROL || k == VK_RCONTROL;
+    case VK_MENU: return k == VK_MENU || k == VK_LMENU || k == VK_RMENU;
+    }
+    return k == vk;
+}
+/// (Triforce) The key in the slot of the Switch's button (HOS_SW_L, HOS_SW_R, HOS_SW_B) that the menu takes as that button too,
+/// as the game's own Options tab does: a key (not a mouse button: the mouse's clicks are the menu's own) the menu has no
+/// other use for. 0: none
+int menu_bound_key(int button, int slot) {
+    const int vk = host && host->binding ? host->binding(HOS_BIND_KEY, button, slot) : 0;
+    return vk >= 8 && vk < 256 && !menu_own_key(vk) ? vk : 0;
+}
 // the keys a binding can take (Esc cancels, Insert and F1 are the menu's, Delete clears)
 const std::vector<int>& bindable_keys() {
     static std::vector<int> k;
@@ -2372,6 +2522,10 @@ const std::vector<int>& bindable_keys() {
 }
 int page = 0;          // 0 the options, 1 the controls, 3 the teleport list, 4 the inventory, 5 the restart question (2: was the
                        // debug tools' own page, now on the Debug tab), 6 (Triforce) a name page: Game flags, Cutscenes, Scan amiibo
+/// (Triforce) Whether the Mods screen's search takes the keyboard's text now (mods_text_wanted): the keys bound to the Switch's
+/// L, R and B (R and Shift by default) type there, so they are not our tabs and Back then (menu_tick), and the guides name
+/// the menu's own Q, E and Esc (ui_ctx), as the Mods screen had them before the bound keys came
+bool menu_mods_typing() { return open_now.load() && page == kModsPage && mods_text_wanted.load(std::memory_order_relaxed); }
 int csel = 0, ccol = 0;   // the page's row (kTop first: its own rows, then the controls, then reset) and column (0 the
                           // gamepad, 1 the keyboard)
 const int kTop = tab_row_count(TAB_PAGE);   // (Layout preset and Button prompts: a preset shows in the grid at once)
@@ -2392,7 +2546,7 @@ std::mutex startup_mu;   // (the start-up screen's view, set from its own thread
 StartupView startup;
 std::atomic<bool> startup_on{false};
 std::atomic<float> startup_fade{0};   // (the start-up screen's fade to black at its end, 0 to 1: startup_fade_to)
-std::atomic<int64_t> game_frames{0}, shown_frames{0};
+std::atomic<int64_t> shown_frames{0};   // (game_frames: above, mods_list_age)
 char fps_text[48] = "";
 char fps_sub[32] = "";
 // (Triforce) The performance overlay, the FPS counter row on Full (opts.show_fps == 2; draw_perf): NX2navi's full panel. The
@@ -2464,6 +2618,19 @@ bool ease_live = false;  // ((Triforce) menu_record steps the easing: a window's
 ui::Ctx ui_ctx(uint32_t w, uint32_t h) {
     ui::Ctx c{ImGui::GetForegroundDrawList(), ui::fonts(), 1, (float)w, (float)h, 0, pad_last};
     c.confirm_dot = menu_keys::dot(pad_confirm), c.back_dot = menu_keys::dot(pad_back);
+    {   // ((Triforce) the keys the tab strip's ends and the guides name: those bound to the Switch's L, R and B where the menu
+        // takes them (menu_bound_key), as the game's own guides name the bindings; else the menu's own Q, E and Esc)
+        static char names[3][24];   // (fixed places: a Ctx made before keeps pointing at them)
+        static const int buttons[3] = {HOS_SW_L, HOS_SW_R, HOS_SW_B};
+        static const char* const own[3] = {"Q", "E", "Esc"};
+        const bool typing = menu_mods_typing();   // (the Mods search takes the bound keys as text: the menu's own then)
+        for (int b = 0; b < 3; b++) {
+            int vk = typing ? 0 : menu_bound_key(buttons[b], 0);
+            if (!vk && !typing) vk = menu_bound_key(buttons[b], 1);
+            snprintf(names[b], sizeof names[b], "%s", vk ? key_name(vk) : own[b]);
+        }
+        c.key_tab_l = names[0], c.key_tab_r = names[1], c.key_back = names[2];
+    }
     c.s = ui::unit((float)h, 0, false, false, &c.safe);
     // (the cursor's glow breathes, as the game's: a 2 s cycle; RX_VK_UI_STILL=1 holds it, for pictures that compare)
     static const bool still = getenv("RX_VK_UI_STILL") != nullptr;
@@ -2479,6 +2646,61 @@ ui::Ctx menu_ctx(uint32_t w, uint32_t h) {
 }
 /// The header's height (SystemOverlay_00's P_SystemHeader_00: 200 units)
 float banner_h(const ui::Ctx& c) { return ui::banner_height(c); }
+/// ((Triforce, 11-19) the draw list draw_menu has split while the Full panel goes between a page and its header (our tabs inside
+/// the game's Options screen, as on the game's own tab the panel is over the game's panes and under our header): the header
+/// into its channel 1, the rest of the page into 0. header_layer(c, true) before a page's header, false after it; nothing
+/// while the list is not split
+ImDrawList* header_split = nullptr;
+void header_layer(const ui::Ctx& c, bool on) {
+    if (header_split && header_split == c.d) c.d->ChannelsSetCurrent(on ? 1 : 0);
+}
+/// ((Triforce, 11-20) the Full panel while it waits to go between the page and its header (draw_menu's perf_between): window,
+/// the window's context it is drawn in; keep, the window's clip rectangle; v0 to v1 its vertices once drawn (in the window's
+/// pixels: put_on_grid leaves them)
+struct PanelWait {
+    ui::Ctx* window = nullptr;
+    ImVec4 keep;
+    int v0 = 0, v1 = 0;
+};
+PanelWait panel_wait;
+/// ((Triforce, 11-20) the draw list draw_menu has split while the Full panel waits: inside the game's Options screen the page
+/// in channel 0 and its header in 1 (header_split); over play the pages in 1, channel 0 left for the panel under them
+ImDrawList* panel_split = nullptr;
+void draw_perf(ui::Ctx& c);
+/// (the waiting Full panel drawn now, where the list's drawing is, in the window's clip and pixels)
+void panel_draw(ImDrawList* d) {
+    d->PushClipRect(ImVec2(panel_wait.keep.x, panel_wait.keep.y), ImVec2(panel_wait.keep.z, panel_wait.keep.w), false);   // (the window's)
+    panel_wait.v0 = d->VtxBuffer.Size;
+    draw_perf(*panel_wait.window);
+    panel_wait.v1 = d->VtxBuffer.Size;
+    d->PopClipRect();
+    panel_wait.window = nullptr;
+}
+/// ((Triforce, 11-20) the waiting Full panel at the page's end (draw_menu), into channel 0 and the list merged: inside the
+/// game's Options screen over the page and under its header (as on the game's own tab), over play under the pages (as
+/// NX2navi keeps its panel under its menu). A dialog's dim draws it before (dim_page): then this has nothing to do
+void panel_between(ImDrawList* d) {
+    if (!panel_wait.window || panel_wait.window->d != d || panel_split != d) return;
+    d->ChannelsSetCurrent(0);
+    panel_draw(d);
+    d->ChannelsMerge();
+    panel_split = header_split = nullptr;
+}
+/// ((Triforce, 11-20) a dialog's dim (dim_page): the page and its header made one list first, the panel still waiting, so
+/// that the dim goes over both; the panel then over the dim (panel_over), under the dialog's box. The game's own dialogs never
+/// dim our overlay (it is drawn over the game), and over Quit's dialog the panel was already bright (menu_record); the
+/// restart question's, the Mods dialogs' and the keyboard's dim went over it (26670c0): now bright over all of ours, as the
+/// FPS counter always was)
+void panel_merge(ImDrawList* d) {
+    if (panel_split != d) return;
+    d->ChannelsMerge();
+    panel_split = header_split = nullptr;
+}
+void panel_over(ImDrawList* d) {
+    if (panel_wait.window && panel_wait.window->d == d && panel_split != d) panel_draw(d);
+}
+/// (a dim over the whole page before a dialog: dim_page, after menu_map)
+void dim_page(ui::Ctx& c, ImU32 col);
 // (the caption's texts: PaGuideKey's 48 units for the help, a little smaller for the line about the value)
 // (the game's caption is 54 units, 65 as drawn; ours say more than its one line, so a little smaller: 57 and 50)
 constexpr float kHelpPt = 19.0f, kHintPt = 16.6f;
@@ -2570,8 +2792,10 @@ void scroll_bar(ui::Ctx& c, float x, float top, float bottom, int n, int shown, 
 }
 /// The header with a page's title in the middle (the Controls, Motion and list pages: as the game's "Load"), its height
 float title_banner(ui::Ctx& c, const char* title, const char* right) {
+    header_layer(c, true);
     ui::banner(c, 0, title);
     if (right) ui::text_mid_right(c, c.f.body, ui::lu(c, 50), ui::at(c, 1800, 0).x, ui::at(c, 0, 990).y, ui::kBannerInk, right);
+    header_layer(c, false);
     return banner_h(c);
 }
 /// The caption plate from (x0, y0) to x1 (what shows of it): a title when the page has one, the help, a line about the value
@@ -2635,7 +2859,9 @@ void caption(ui::Ctx& c, float hx0, float hx1, const char* title, const char* he
     const float content = std::max(min_h, th + nh) + (title ? 34 * s : 0) + (after_restart ? 30 * s : 0) + (gold_line ? 46 * s : 0);
     const float tall = std::max(ui::lu(c, 476), content + 2 * ui::lu(c, 56)), mid = ui::at(c, 0, -90).y;
     const float y0 = std::max(hh + 14 * s, mid - tall * 0.5f);
-    help_box(c, hx0, hx1, y0, title, help, hint, gold_line, tall, after_restart, hh + 14 * s, bar_top - 8 * s, ui::lu(c, 330));
+    // ((Triforce, 11-17) the plate's right end where the game's own ends on a window wider than 16:9 (measured at 3440 x 1440:
+    // 51 pixels short of ours), off a 16:9 screen as before. Only the plate: the text keeps its width, hx0 to hx1)
+    help_box(c, hx0, hx1, y0, title, help, hint, gold_line, tall, after_restart, hh + 14 * s, bar_top - 8 * s, ui::lu(c, 252));
 }
 /// A row's name on its plate; pending: a change that applies after a restart, the game's corner mark at its top left in
 /// gold (the help says it in words). The selected row's plate is as the others': the game's cursor alone marks it
@@ -2710,153 +2936,57 @@ std::string restart_line(ui::Ctx& c, float px, float width) {
 /// (hookshot) The Debug tab's order: the tools' rows by their group (Row::cheat), Up and Down walking them so; Inventory item
 /// and Change quantity are not shown (the Inventory page edits every amount)
 struct DebugGroup { const char* title; int from, to; };   // (debug_tools_order[from, to))
-// ((Triforce) Story & amiibo: the name pages' rows, under Player in the first column)
+// ((Triforce) Story & amiibo: the name pages' rows, after Player)
 constexpr int debug_tools_order[] = {0, 1, 9, 10, 11, 12, 13, 8, 2, 3, 7, 4};
 constexpr DebugGroup debug_groups[] = {{"Player", 0, 4}, {"Story & amiibo", 4, 7}, {"Travel", 7, 10}, {"Camera & world", 10, 12}};
-constexpr int kDebugSecondColumn = 2;   // (the first group of the second column, when two fit)
 constexpr int kDebugGroups = sizeof debug_groups / sizeof debug_groups[0];
-constexpr int kDebugTools = sizeof debug_tools_order / sizeof debug_tools_order[0];
-/// The Debug tab's rows as shown (its row numbers, tab_row_to_global's): the switch, the tools in debug_tools_order while they
-/// are on, then the Developer rows; *dev where those start, *dev_head the Developer heading's row (-1 none). Their count
-int debug_rows(int* out, int* dev, int* dev_head) {
+/// (Triforce) The Debug tab's list from the top, drawn as every other tab's (draw_options: the same column, rows and headings):
+/// the Debug tools switch; while the tools are on, each group of them under its heading (a group with no row shown has
+/// none, and nothing between the groups but their headings); the Developer heading and its rows. Each entry is a row of the
+/// tab (its number, tab_row_to_global's) or, -1 - g, group g's heading. Their count (kDebugList at most)
+constexpr int kDebugList = kRows + kDebugGroups;   // (every row of the tab, and the groups' headings)
+int debug_list(int* out) {
     const int count = tab_row_count(TAB_DEBUG);
     int n = 0;
-    *dev_head = -1;
     for (int k = 0; k < count; ++k)
         if (rows[tab_row_to_global(TAB_DEBUG, k)].value == &opts.debug_tools) out[n++] = k;
-    for (int t = 0; t < kDebugTools; ++t)
-        for (int k = 0; k < count; ++k)
-            if (rows[tab_row_to_global(TAB_DEBUG, k)].cheat == debug_tools_order[t]) out[n++] = k;
-    *dev = n;
+    for (int g = 0; g < kDebugGroups; ++g) {
+        const int head = n++;
+        for (int t = debug_groups[g].from; t < debug_groups[g].to; ++t)
+            for (int k = 0; k < count; ++k)
+                if (rows[tab_row_to_global(TAB_DEBUG, k)].cheat == debug_tools_order[t]) out[n++] = k;
+        if (n == head + 1) n = head;   // (no row of the group shown: no heading)
+        else out[head] = -1 - g;
+    }
+    int dev_head = -1;
+    bool dev_titled = false;
     for (int k = 0; k < count; ++k) {
         const Row& r = rows[tab_row_to_global(TAB_DEBUG, k)];
-        if (r.heading) *dev_head = k;
-        else if (*dev_head >= 0 && r.cheat < 0 && r.value != &opts.debug_tools) out[n++] = k;
+        if (r.heading) dev_head = k;
+        else if (dev_head >= 0 && r.cheat < 0 && r.value != &opts.debug_tools) {
+            if (!dev_titled) out[n++] = dev_head, dev_titled = true;   // (the Developer heading, over its first row)
+            out[n++] = k;
+        }
     }
     return n;
 }
-/// The Debug tab's row after sel (dir 1) or before it (dir -1), in debug_rows' order
+/// The Debug tab's row after sel (dir 1) or before it (dir -1), in debug_list's order, over the headings
 int debug_step(int sel, int dir) {
-    int order[64], dev = 0, head = -1;
-    const int n = debug_rows(order, &dev, &head);
+    int list[kDebugList], order[kDebugList], n = 0;
+    const int all = debug_list(list);
+    for (int j = 0; j < all; ++j)
+        if (list[j] >= 0 && !rows[tab_row_to_global(TAB_DEBUG, list[j])].heading) order[n++] = list[j];
+    if (!n) return sel;
     int at = 0;
     while (at < n && order[at] != sel) at++;
     if (at == n) return order[0];
     return order[(at + n + dir) % n];
 }
-/// (hookshot) The Debug tab's rows from top down to bottom, sel selected: Debug tools across the top; the tools under their
-/// headings, Player and Story & amiibo in the first column and Travel and Camera & world in the second when two fit (else
-/// one under another);
-/// the Developer rows across the foot. Each value cell a column's width, so their edges line up. The hits are the tab's row
-/// numbers, as the list's: menu_tick's clicks and keys are the other tabs'. top to bottom is where whole rows stand (what
-/// the scroll counts with); clip0 to clip1 is what shows of the column, as on the other tabs: a row scrolled past top or
-/// bottom goes under the header or toward the guides, and is not cut off in the middle of the column
-void draw_debug_rows(ui::Ctx& c, float cx0, float cx1, float top, float bottom, float clip0, float clip1, int sel) {
-    const float s = c.s, px = 18 * s, pitch = 48 * s, rh = 40 * s, gap = 24 * s;   // (the other tabs' rows: 40 high, 48 apart)
-    const float left = cx0 + 44 * s, right = cx1 - 44 * s, mid = (left + right) * .5f;
-    int order[64], dev = 0, dev_head = -1;
-    const int n = debug_rows(order, &dev, &dev_head);
-    // (two columns only when each fits its longest name whole (name_cell's room, the selected's bold) and its value cells at
-    // their narrowest; the cells then as wide as the room lets them, up to what they ask. (Triforce) In the Options screen's
-    // column they do not: each half is 317 of the layout's units wide at any window, for the layout scales with the window's
-    // height alone, and the columns ask 328 and 325 (forced, "Heart protection" and "Return to mark" are cut). So the tab is
-    // one column everywhere, and the two columns are for a wider column or shorter names)
-    const float halves_w = 2 * std::max(ui::size_of(c.f.strong, px, "Off").x, ui::size_of(c.f.strong, px, "On").x);
-    auto need = [&](const Row& r, bool tight) {
-        const float pad = (tight ? 36 : 64) * s;
-        if (r.cheat == 9 && age_shown(9))
-            return 2 * std::max(ui::size_of(c.f.strong, px, "Kid").x, ui::size_of(c.f.strong, px, "Adult").x) + pad;
-        if (r.value && r.hi - r.lo > r.step) {   // (Triforce: a Developer row with more than Off and On: its widest value, and the arrows)
-            float widest = 0;
-            for (int v = r.lo; v <= r.hi; v += r.step) widest = std::max(widest, ui::size_of(c.f.strong, px, r.text(v)).x);
-            return widest + (tight ? 56 : 68) * s;
-        }
-        if (r.cheat == 0 || r.cheat == 1 || r.cheat == 7 || r.value) return halves_w + pad;
-        const std::string v = cheat_value(r.cheat);
-        const char* const says[kCheatRows] = {"", "", "Mark", "Return", "", "", "", "", "Choose map", "Switch", "Edit items",
-                                              "Open list", "Open list", "Choose file"};
-        return ui::size_of(c.f.strong, px, v.empty() ? says[r.cheat] : v.c_str()).x + (cheat_chooses(r.cheat) ? 68 : tight ? 56 : 60) * s;   // (choice_cell keeps 48 for arrows either way)
-    };
-    float name_need[2] = {0, 0}, cell_full[2] = {halves_w + 64 * s, halves_w + 64 * s}, cell_tight[2] = {halves_w + 36 * s, halves_w + 36 * s};
-    for (int i = 1; i < dev; ++i) {
-        const Row& r = rows[tab_row_to_global(TAB_DEBUG, order[i])];
-        const int col = i - 1 >= debug_groups[kDebugSecondColumn].from ? 1 : 0;   // (Player and Story & amiibo in the first, the rest in the second)
-        name_need[col] = std::max(name_need[col], ui::size_of(c.f.strong, 18.5f * s, r.name).x + 40 * s);
-        cell_full[col] = std::max(cell_full[col], need(r, false)), cell_tight[col] = std::max(cell_tight[col], need(r, true));
-    }
-    const float col_w = (right - left - gap) * .5f;
-    // ((Triforce) the cells' widths, debug_tab_layout.h: a column's alike, and the switch's and the Developer rows', which span
-    // the columns, alike: the widest any of those asks, for a row of more than two values asks more than Off and On)
-    float span_need = 0;
-    for (int i = 0; i < n; ++i)
-        if (i == 0 || i >= dev) span_need = std::max(span_need, need(rows[tab_row_to_global(TAB_DEBUG, order[i])], false));
-    const debug_tab::Widths widths = debug_tab::widths(col_w, right - left, name_need, cell_full, cell_tight, span_need);
-    const bool two = widths.two;
-    const float cell_w[2] = {widths.cell[0], widths.cell[1]}, span_w = widths.span;
-    // (where each goes: a row number of the layout and a column)
-    int vrow[64] = {}, vcol[64] = {}, head_row[kDebugGroups] = {}, head_col[kDebugGroups] = {};
-    int next_row[2] = {1, 1};
-    const bool tools = dev > 1;
-    for (int g = 0; tools && g < kDebugGroups; ++g) {
-        const int col = two && g >= kDebugSecondColumn ? 1 : 0;
-        if (next_row[col] > 1) next_row[col]++;   // (a gap over a heading that follows another group)
-        head_row[g] = next_row[col]++, head_col[g] = col;
-        for (int t = debug_groups[g].from; t < debug_groups[g].to; ++t) vrow[1 + t] = next_row[col]++, vcol[1 + t] = col;
-    }
-    int foot = std::max(next_row[0], next_row[1]);
-    if (tools) foot++;
-    const int dev_row = foot;
-    for (int i = dev; i < n; ++i) vrow[i] = dev_row + 1 + (i - dev);
-    const int visual_count = n > dev ? dev_row + 1 + (n - dev) : foot;
-    int sel_at = 0;
-    for (int i = 0; i < n; ++i)
-        if (order[i] == sel) sel_at = vrow[i];
-    int shown = 0;
-    const float first = scroll_rows(TAB_DEBUG, visual_count, sel_at, top, bottom, pitch, &shown);
-    scroll_bar(c, cx0 + 20 * s, top, top + shown * pitch - (pitch - rh), visual_count, shown, first);
-    auto heading = [&](float x0, float x1, int row, const char* title) {   // (as the list's Developer heading: gold, a rule after)
-        const float y = top + (row - first) * pitch, ty = y + rh * 0.62f, tw = ui::size_of(c.f.heading, 19 * s, title).x;
-        if (y + pitch <= clip0 || y >= clip1) return;
-        ui::text_mid(c, c.f.heading, 19 * s, x0 + 2 * s, ty, ui::kGoldHi, title);
-        if (x0 + tw + 16 * s < x1) c.d->AddLine(ImVec2(x0 + tw + 16 * s, ty), ImVec2(x1, ty), ui::alpha(ui::kEdge, 0.9f), std::max(1.0f, s));
-    };
-    c.d->PushClipRect(ImVec2(cx0, clip0), ImVec2(cx1, std::max(clip0, clip1)), true);
-    for (int g = 0; tools && g < kDebugGroups; ++g)
-        heading(head_col[g] ? mid + gap * .5f : left, !two || head_col[g] ? right : mid - gap * .5f, head_row[g], debug_groups[g].title);
-    if (dev_head >= 0 && n > dev) heading(left, right, dev_row, rows[tab_row_to_global(TAB_DEBUG, dev_head)].name);
-    const char* const buttons[kCheatRows] = {"", "", "Mark", "Return", "", "", "", "", "Choose map", "Switch", "Edit items",
-                                             "Open list", "Open list", "Choose file"};
-    for (int i = 0; i < n; ++i) {
-        const int k = order[i];
-        const Row& r = rows[tab_row_to_global(TAB_DEBUG, k)];
-        const float y = top + (vrow[i] - first) * pitch;
-        if (y + pitch <= clip0 || y >= clip1) continue;
-        const bool in_tools = i > 0 && i < dev;
-        const float x0 = two && in_tools && vcol[i] ? mid + gap * .5f : left;
-        const float x1 = !two || !in_tools || vcol[i] ? right : mid - gap * .5f;
-        const bool selected = k == sel;
-        const float width = in_tools ? cell_w[vcol[i]] : span_w;
-        const ImVec2 va(x1 - width, y), vb(x1, y + rh);
-        name_cell(c, ImVec2(x0, y), ImVec2(va.x, y + rh), r.name, selected, restart_changed(r));   // (boxed, as on the other tabs)
-        const float vm = r.value ? (r.hi - r.lo > r.step ? 0 : halves_meet(va, vb))   // ((Triforce) the halves' meeting, for the mouse)
-                                 : r.cheat == 0 || r.cheat == 1 || r.cheat == 7 || age_shown(r.cheat) ? halves_meet(va, vb) : 0;
-        if (r.value && r.hi - r.lo > r.step) {   // (Triforce: a Developer row with more than two values: a choice, as on the other tabs)
-            const bool fixed = row_fixed(r.value);
-            choice_cell(c, va, vb, r.text(*r.value), selected, !fixed, !fixed, fixed);
-        } else if (r.value) {   // (Debug tools and the Developer rows: values of the options, Off and On)
-            halves_cell(c, va, vb, std::string(r.text(r.hi)).c_str(), std::string(r.text(r.lo)).c_str(), *r.value == r.lo, selected,
-                        row_fixed(r.value));
-        } else if (r.cheat == 0 || r.cheat == 1 || r.cheat == 7) {
-            halves_cell(c, va, vb, "On", "Off", cheat_value(r.cheat) != "On", selected, false);
-        } else if (age_shown(r.cheat)) {   // (Link's age now: the other half switches)
-            halves_cell(c, va, vb, "Kid", "Adult", link_age.load(std::memory_order_relaxed) == 1, selected, false);
-        } else {
-            const std::string v = cheat_value(r.cheat);
-            choice_cell(c, va, vb, v.empty() ? buttons[r.cheat] : v, selected, cheat_chooses(r.cheat), cheat_chooses(r.cheat), r.cheat == 9);
-        }
-        hits.add(x0, std::max(y, clip0), x1, std::min(y + rh, clip1), menu_hit::kRow, k, va.x, vb.x, 0, 0, 0, vm);
-    }
-    c.d->PopClipRect();
+/// (Triforce) A row that does something or opens a page (Export, Restart, Open list, Edit items...): its word on the game's
+/// orange plate with its arrow at the right, as the game's own rows that go on (its Targeting Type's). One style on every
+/// tab: the System tab's were the dark panel, the Debug tab's orange without the arrow. fixed: nothing to do here now, dim
+void action_cell(ui::Ctx& c, ImVec2 a, ImVec2 b, const std::string& word, bool sel, bool fixed = false) {
+    choice_cell(c, a, b, word, sel, false, !fixed, fixed);
 }
 
 /// The tabs across the header (as the pause menu's categories: MenuOverlay_00, 460 units apart, L and R at their ends; closer
@@ -2878,10 +3008,12 @@ void draw_tabs(ui::Ctx& c, int sel, bool game, bool hit) {
         const float x = tx0 + i * step;
         const bool shown = tab == sel;
         if (shown) {   // (the chosen category: the pause menu's own plate behind its name, MenuHeaderSelect: PaMenuCategory's
-            // 540 x 260 pane, 34 units under the header's middle line, in the brown the pause menu's System tab has)
-            const ImVec2 m = ui::at(c, 0, 966);
-            const float hw = std::min(ui::lu(c, 270), step * 0.5f + ui::lu(c, 40));
-            if (const ui::Art* t = ui::art("MenuHeaderSelect_00")) ui::image(c, t, ImVec2(x - hw, m.y - ui::lu(c, 130)), ImVec2(x + hw, m.y + ui::lu(c, 130)), ui::rgba(190, 125, 62));
+            // 540 x 260 pane, 34 units under the header's middle line, in the brown the pause menu's System tab has: the
+            // texture as P_PlusMenuBg_00 colours it, vk_game_tex.h tab_select; was the texture times a measured 190,125,62)
+            const ImVec2 m = ui::at(c, 0, 966), a(x - std::min(ui::lu(c, 270), step * 0.5f + ui::lu(c, 40)), m.y - ui::lu(c, 130));
+            const ImVec2 b(2 * x - a.x, m.y + ui::lu(c, 130));
+            if (const ui::Art* t = ui::art("tab_select")) ui::image(c, t, a, b);
+            else if (const ui::Art* g = ui::art("MenuHeaderSelect_00")) ui::image(c, g, a, b, ui::rgba(190, 125, 62));
             else c.d->AddRectFilled(ImVec2(x - step * 0.5f, 0), ImVec2(x + step * 0.5f, hh + ui::lu(c, 6)), ui::kTabInset);
         } else if (hit && tab >= 0 && tab == hover_tab) {
             c.d->AddRectFilled(ImVec2(x - step * 0.5f + 4 * s, ty - ui::lu(c, 60)), ImVec2(x + step * 0.5f - 4 * s, ty + ui::lu(c, 60)), ui::rgba(60, 42, 22, 70), 6 * s);
@@ -2895,9 +3027,10 @@ void draw_tabs(ui::Ctx& c, int sel, bool game, bool hit) {
             const char* code = i ? ui::kIconR : ui::kIconL;
             const ImVec2 sz = ui::size_of(c.f.glyph, ui::lu(c, 90), code);
             c.d->AddText(c.f.glyph, ui::lu(c, 90), ImVec2(x - sz.x * 0.5f, ty - sz.y * 0.5f + ui::lu(c, 2)), ui::kInk, code);
-        } else {   // (the keys: Q and E; inside the game's Options the keys bound to the Switch's L and R, which are its own there)
-            std::string label = c.pad ? (i ? "R" : "L") : (i ? "E" : "Q");
-            if (!c.pad && game && can_bind())
+        } else {   // (the keys: on our tabs the ones they take, as the guides name them (ui_ctx: the keys bound to the Switch's L and
+            // R, else Q and E); on the game's own tab the keys bound to L and R, which are its own there and open ours)
+            std::string label = c.pad ? (i ? "R" : "L") : (i ? c.key_tab_r : c.key_tab_l);
+            if (!c.pad && sel < 0 && can_bind())
                 if (const int vk = host->binding(HOS_BIND_KEY, i ? HOS_SW_R : HOS_SW_L, 0)) label = key_name(vk);
             const float kh = ui::lu(c, 62), kw = std::max(ui::lu(c, 62), ui::size_of(c.f.strong, ui::lu(c, 40), label.c_str()).x + ui::lu(c, 30));
             c.d->AddRectFilled(ImVec2(x - kw * 0.5f, ty - kh * 0.5f), ImVec2(x + kw * 0.5f, ty + kh * 0.5f), ui::kInk, ui::lu(c, 14));
@@ -2912,9 +3045,12 @@ void draw_tabs(ui::Ctx& c, int sel, bool game, bool hit) {
 /// apart, its name 840 left of the list's middle, its value's plate 820 x 116 at 500 right of it, the cursor round the
 /// value), the caption plate at the right with what the selected row is, the guides at the foot
 void draw_options(ui::Ctx& c) {
+    merged_sync();   // ((Triforce, options_version 7) as menu_tick: the merged rows as the saved values are now)
     const float s = c.s, hh = banner_h(c);
+    header_layer(c, true);   // ((Triforce, 11-19) over the Full panel inside the game's Options screen: draw_menu)
     ui::banner(c, hh);
     draw_tabs(c, cur_tab == TAB_MOTION ? TAB_CONTROLS : cur_tab, embed_open, true);   // (the Motion page: under Controls)
+    header_layer(c, false);
     // the rows, in the column; the caption beside it
     float cx0, cx1, hx0, hx1;
     bool narrow;
@@ -2931,7 +3067,7 @@ void draw_options(ui::Ctx& c) {
     static float help_tall = 0, help_tall_w = 0;
     if (help_tall_w != cap_w) help_tall_w = cap_w, help_tall = measure_help(c, cap_w);
     // (the guides: what the buttons do on this row, as the game's own say only that)
-    const bool confirms = &selr == &rows[kRestartRow] || &selr == &rows[kQuitRow];
+    const bool confirms = false;   // ((Triforce) 11-19: no Restart and Quit rows any more: the pause menu's Quit)
     ui::Prompt prompt_list[5] = {{ui::kLeftRight, "Change"}, {ui::kTabs, "Category"}, {ui::kBack, "Back"}};
     int prompts_n = 3;
     if (!selr.value) prompt_list[0] = {ui::kConfirm, confirms ? (pending == &selr ? "Confirm" : selr.name) : "Open"};
@@ -2954,26 +3090,32 @@ void draw_options(ui::Ctx& c) {
     const float rh = ui::lu(c, 124), pitch = ui::lu(c, 170), top = ui::at(c, 0, 736).y, bottom = ui::at(c, 0, -790).y;
     const float vx = rx + ui::lu(c, 500), vhw = ui::lu(c, 402), vhh = ui::lu(c, 54);
     const float clip0 = hh - ui::lu(c, 14), clip1 = bar_top + ui::lu(c, 50);
-    if (cur_tab == TAB_DEBUG) {   // (the Debug tab: its own layout of the same rows)
-        marquee_max = 0;
-        draw_debug_rows(c, cx0, cx1, top, bottom, clip0, clip1, sel);
-        ui::prompt_bar(c, prompt_list, prompts_n);
-        return;
-    }
+    // (the list from the top: the tab's rows in their order, headings among them. (Triforce) The Debug tab's the same way, in
+    // its own order (debug_list: its groups' headings among its rows), with the same column, rows, headings and buttons as
+    // every other tab: it had a layout of its own before, a plain rule for a heading, blank rows between its groups, other
+    // widths and orange buttons without their arrow)
+    static int list[kDebugList];
+    int listed = 0;
+    if (cur_tab == TAB_DEBUG) listed = debug_list(list);
+    else
+        for (int i = 0; i < count; i++) list[listed++] = i;
+    int sel_at = 0;
+    for (int j = 0; j < listed; j++)
+        if (list[j] == sel) sel_at = j;
     int shown = 0;
-    const float first = scroll_rows(cur_tab, count, sel, top, bottom, pitch, &shown);
-    scroll_bar(c, ui::at(c, kListX - 1102, 0).x, ui::at(c, 0, 100).y, ui::at(c, 0, -212).y, count, shown, first);   // (PaScrollBar: 56 under the middle)
+    const float first = scroll_rows(cur_tab, listed, sel_at, top, bottom, pitch, &shown);
+    scroll_bar(c, ui::at(c, kListX - 1102, 0).x, ui::at(c, 0, 100).y, ui::at(c, 0, -212).y, listed, shown, first);   // (PaScrollBar: 56 under the middle)
     marquee_max = 0;   // (set again below while the selected row's value is too long)
     c.d->PushClipRect(ImVec2(cx0, clip0), ImVec2(cx1, clip1), true);
-    for (int i = 0; i < count; i++) {
-        const float y = top + (i - first) * pitch, my = y + rh * 0.5f;
-        if (y + rh < clip0 || y > clip1) continue;
-        const Row& r = rows[tab_row_to_global(cur_tab, i)];
-        if (r.heading) {   // (a section: its name in gold, a rule after it, as the Debug tab's headings)
-            // ((Triforce) 11-17, the tabs in sections: the game's plain separator had no name on it)
-            const float hx = rx0 + ui::lu(c, 24), hpx = 19 * s, tw = ui::size_of(c.f.heading, hpx, r.name).x;
-            ui::text_mid(c, c.f.heading, hpx, hx, my, ui::kGoldHi, r.name);
-            if (hx + tw + 16 * s < rx1) c.d->AddLine(ImVec2(hx + tw + 16 * s, my), ImVec2(rx1, my), ui::alpha(ui::kEdge, 0.9f), std::max(1.0f, s));
+    for (int j = 0; j < listed; j++) {
+        const float y = top + (j - first) * pitch, my = y + rh * 0.5f;
+        // ((Triforce) a row whose top would be under the header is not drawn: the row above the first one in view slid under
+        // the tabs with its top cut off. Toward the guides a row may go on, as the game's own list goes off the screen)
+        if (y < clip0 || y > clip1) continue;
+        const int i = list[j];   // (the row on the tab; negative: a Debug group's heading, -1 - its group)
+        const Row& r = rows[tab_row_to_global(cur_tab, std::max(i, 0))];
+        if (i < 0 || r.heading) {   // (a group: the game's separator, its title under it in gold at the names' place; no hit)
+            ui::heading(c, ImVec2(rx0, y), ImVec2(rx1, y + rh), rx0 + ui::lu(c, 72), i < 0 ? debug_groups[-1 - i].title : r.name);
             continue;
         }
         const bool selected = i == sel;
@@ -2986,10 +3128,24 @@ void draw_options(ui::Ctx& c) {
                 halves_cell(c, va, vb, "On", "Off", !mod_cheats.is_on(cheat), selected, false);
                 vm = halves_meet(va, vb);
             }
+        } else if (r.cheat >= 0) {   // (a debug tool: On and Off, Link's age, a choice of its own, or a button that acts)
+            if (r.cheat == 0 || r.cheat == 1 || r.cheat == 7) {
+                halves_cell(c, va, vb, "On", "Off", cheat_value(r.cheat) != "On", selected, false);
+                vm = halves_meet(va, vb);
+            } else if (age_shown(r.cheat)) {   // (Link's age now: the other half switches)
+                halves_cell(c, va, vb, "Kid", "Adult", link_age.load(std::memory_order_relaxed) == 1, selected, false);
+                vm = halves_meet(va, vb);
+            } else {
+                static const char* const buttons[kCheatRows] = {"", "", "Mark", "Return", "", "", "", "", "Choose map", "Switch",
+                                                                "Edit items", "Open list", "Open list", "Choose file"};
+                const std::string v = cheat_value(r.cheat);
+                if (cheat_chooses(r.cheat)) choice_cell(c, va, vb, v, selected, true, true);
+                else action_cell(c, va, vb, v.empty() ? buttons[r.cheat] : v, selected, r.cheat == 9);   // (Switch age: none known yet)
+            }
         } else if (!r.value) {   // (a page, or Restart and Quit: Confirm until the second press)
-            const bool ends = &r == &rows[kRestartRow] || &r == &rows[kQuitRow];
+            const bool ends = false;
             if (pending == &r) choice_cell(c, va, vb, "Press again", selected, false, false);
-            else choice_cell(c, va, vb, ends ? r.name : share_row(r) ? share_label(share_row(r)) : "Open", selected, false, true, false, true);
+            else action_cell(c, va, vb, ends ? r.name : share_row(r) ? share_label(share_row(r)) : "Open", selected);
         } else {
             const bool fixed = row_fixed(r.value);
             if (is_slider(r)) {
@@ -3027,7 +3183,7 @@ void draw_controls(ui::Ctx& c) {
     const ui::Prompt idle[] = {{ui::kUpDown, "Choose"}, {ui::kLeftRight, "Column"}, {ui::kConfirm, "Bind"}, {ui::kKey, "Clear", "Del"},
                                {ui::kBack, "Back"}};
     const ui::Prompt option[] = {{ui::kUpDown, "Choose"}, {ui::kLeftRight, "Change"}, {ui::kBack, "Back"}};
-    const ui::Prompt wait[] = {{ui::kBack, "Cancel"}};
+    const ui::Prompt wait[] = {{ui::kKey, "Cancel", "Esc"}};   // ((Triforce) Esc alone while it waits: B's key may be the one bound)
     const float bar_top = ui::prompt_bar_top(c);   // (the strip itself drawn last, over all: below)
     const Row* page_row = sel_i < 0 ? &rows[tab_row_to_global(TAB_PAGE, csel)] : nullptr;
     const char* title = page_row ? page_row->name : sel_i < kControls ? controls[sel_i].name : "Reset to defaults";
@@ -3794,7 +3950,7 @@ void mods_picture(ui::Ctx& c, mods::Mod& m, ImVec2 a, ImVec2 b, int* made) {
 void mods_dialog(ui::Ctx& c, const char* title, const std::string& text, const char* const* labels, int n, float frac = -1,
                  const char* bar_left = nullptr, const char* bar_right = nullptr) {
     const float s = c.s;
-    c.d->AddRectFilled(ImVec2(0, 0), ImVec2(c.w, c.h), ui::rgba(8, 5, 2, 120));
+    dim_page(c, ui::rgba(8, 5, 2, 120));
     const float w = ui::lu(c, 1500), pad = ui::lu(c, 80), px = kHelpPt * s;
     const float th = ui::para(c, c.f.body, px, ImVec2(), 0, text.c_str(), w - 2 * pad, false);
     const float bar_h = frac >= 0 ? 74 * s : 0, btn_h = ui::lu(c, 144), btns = n ? n * (btn_h + ui::lu(c, 44)) : 0;
@@ -3944,7 +4100,7 @@ void mods_search_bar(ui::Ctx& c, ImVec2 a, ImVec2 b, const std::string& searched
 void mods_keyboard(ui::Ctx& c) {
     const float s = c.s, kw = 62 * s, kh = 50 * s, gap = 7 * s, pad = 24 * s, field_h = 52 * s;
     const float w = 10 * kw + 9 * gap + 2 * pad, h = pad + field_h + 16 * s + 5 * kh + 4 * gap + pad;
-    c.d->AddRectFilled(ImVec2(0, 0), ImVec2(c.w, c.h), ui::rgba(8, 5, 2, 120));   // (the page behind it darker)
+    dim_page(c, ui::rgba(8, 5, 2, 120));   // (the page behind it darker)
     const float x0 = std::floor((c.w - w) * 0.5f), y0 = std::max(banner_h(c) + 8 * s, ui::prompt_bar_top(c) - h - 16 * s);
     ui::box(c, ImVec2(x0, y0), ImVec2(x0 + w, y0 + h));
     mods_kbd_box[0] = x0, mods_kbd_box[1] = y0, mods_kbd_box[2] = x0 + w, mods_kbd_box[3] = y0 + h;
@@ -4090,7 +4246,7 @@ void draw_mods(ui::Ctx& c) {
         ui::text_mid(c, c.f.strong, 19 * s, tx, a.y + 22 * s, ui::kInkBright, m.name.c_str());
         c.d->PopClipRect();
         c.d->PushClipRect(ImVec2(tx, a.y), ImVec2(b.x - 12 * s, b.y), true);
-        const std::string by = "by " + m.author + (m.category.empty() ? "" : "  \xC2\xB7  " + m.category);
+        const std::string by = "by " + m.author + (m.category.empty() ? "" : "  \xC2\xB7  " + m.category) + mods_kind(m);
         ui::text_mid(c, c.f.body, 15 * s, tx, a.y + 48 * s, ui::kSoft, by.c_str());
         const std::string counts = mods_count(m.likes) + " likes  \xC2\xB7  " + mods_count(m.views) + " views";
         ui::text_mid(c, c.f.body, 13.5f * s, tx, a.y + 70 * s, ui::alpha(ui::kSoft, 0.72f), counts.c_str());
@@ -4098,10 +4254,11 @@ void draw_mods(ui::Ctx& c) {
         if (sel) ui::glow(c, a, b);
         hits.add(a.x, std::max(a.y, list_top), b.x, std::min(b.y, bottom), menu_hit::kListLine, i);
     }
-    if (n && (more || feed == mods::Feed::Loading)) {   // (the foot of the list: the next page comes when the choice is near it)
+    if (n && (more || feed == mods::Feed::Loading)) {   // ((Triforce) 11-18, the foot of the list: the pages come by themselves)
         const float y = list_top + n * pitch - at + 16 * s;
-        if (y < bottom) ui::text_mid_centre(c, c.f.body, 15 * s, (left + right) * 0.5f, y, ui::kDim,
-                                            feed == mods::Feed::Loading ? "Loading more..." : "More below");
+        if (y < bottom) ui::text_mid_centre(c, c.f.body, 15 * s, (left + right) * 0.5f, y, feed == mods::Feed::Failed ? ui::kAccent : ui::kDim,
+                                            feed == mods::Feed::Failed ? "GameBanana stopped answering: Confirm on the search bar tries again"
+                                                                       : "Loading more...");
     }
     c.d->PopClipRect();
     if (!n) {   // (no list yet: asking, or the answer that failed; (Triforce) a search's: asking, or none found)
@@ -4133,6 +4290,7 @@ void draw_mods(ui::Ctx& c) {
         files = (int)m.files.size();
         can_install = m.details_state == 2 && files > 0;
         install_label = m.update ? "Update" : m.installed ? "Reinstall" : "Install";
+        if (m.kit) install_label = m.update ? "Update and start" : m.installed ? "Start" : "Install and start";
         const float x0 = hx0, x1 = hx1, pad = ui::lu(c, 64), y0 = top, y1 = bar - 8 * s;
         ui::box(c, ImVec2(x0, y0), ImVec2(x1, y1));
         c.d->PushClipRect(ImVec2(x0, y0), ImVec2(x1, y1), true);
@@ -4142,7 +4300,7 @@ void draw_mods(ui::Ctx& c) {
         mods_picture(c, m, pa, pb, &made);
         y = pb.y + 16 * s;
         y += ui::para(c, c.f.strong, 20 * s, ImVec2(x0 + pad, y), ui::kInk, m.name.c_str(), w) + 4 * s;
-        const std::string by = "by " + m.author + (m.category.empty() ? "" : "  \xC2\xB7  " + m.category);
+        const std::string by = "by " + m.author + (m.category.empty() ? "" : "  \xC2\xB7  " + m.category) + mods_kind(m);
         ui::text(c, c.f.body, 15 * s, ImVec2(x0 + pad, y), ui::kAccent, by.c_str());
         y += 24 * s;
         std::string counts = mods_count(m.likes) + " likes  \xC2\xB7  " + mods_count(m.views) + " views";
@@ -4156,6 +4314,10 @@ void draw_mods(ui::Ctx& c) {
             ui::diamond(c, ImVec2(x0 + pad + 5 * s, y + 9 * s), 4 * s, ui::kGoldHi);
             y += ui::para(c, c.f.strong, 14 * s, ImVec2(x0 + pad + 16 * s, y), ui::kGoldHi, line.c_str(), w - 16 * s) + 2 * s;
             if (!f.description.empty()) y += ui::para(c, c.f.body, 13.5f * s, ImVec2(x0 + pad + 16 * s, y), ui::kSoft, f.description.c_str(), w - 16 * s);
+            if (m.kit)   // ((Triforce) 11-18) a program of its own, not a mod in the game's mods folder
+                y += ui::para(c, c.f.body, 13.5f * s, ImVec2(x0 + pad + 16 * s, y + 2 * s), ui::kAccent,
+                              "A program of its own: it goes into the kits folder beside the game and starts in a window of its own, "
+                              "where it shows its steps. No restart.", w - 16 * s) + 2 * s;
             y += 8 * s;
         }
         c.d->AddLine(ImVec2(x0 + pad, y), ImVec2(x1 - pad, y), ui::alpha(ui::kEdge, 0.8f), std::max(1.0f, s));
@@ -4223,6 +4385,14 @@ void draw_mods(ui::Ctx& c) {
         ui::prompt_bar(c, p, 1);
         return;
     }
+    if (inst.job == mods::Job::Done && inst.kit) {   // ((Triforce) 11-18) a kit: started in its own window, no restart
+        static const char* const labels[] = {"OK"};
+        mods_btn = 0;
+        mods_dialog(c, "Started!", inst.mod_name + "\n" + inst.message, labels, 1, 1, "Started", "In its own window");
+        const ui::Prompt p[] = {{ui::kConfirm, "OK"}};
+        ui::prompt_bar(c, p, 1);
+        return;
+    }
     if (inst.job == mods::Job::Done) {
         static const char* const labels[] = {"Restart Now", "Later"};
         mods_dialog(c, "Installed!", inst.mod_name + "\n" + inst.message + "\nRestart the game to play with it.", labels, 2, 1, "Installed", "Restart to apply");
@@ -4262,65 +4432,288 @@ void draw_mods(ui::Ctx& c) {
     ui::prompt_bar(c, prompts, pn);
 }
 
+/// (the menu's column in the window: its left edge (more than 0 only on a window wider than 16:9), and (Triforce, 11-19) with
+/// the Mods entry's page the game's grid it is drawn on (put_on_grid): menu_tick takes the mouse back through it)
+game_grid::Map menu_map;
+float menu_window_w = 0, menu_window_h = 0;   // ((Triforce, 11-20) the window draw_menu draws in, in its pixels: dim_page's)
+/// ((Triforce, 11-19) the game's layouts' grid in a w x h window (game_grid.h), from the picture the last present showed
+game_grid::Place menu_grid(float w, float h) {
+    const uint64_t ps = present_sizes.load(std::memory_order_relaxed);
+    const double aspect = host && host->aspect_ratio ? host->aspect_ratio() : 0.0;
+    return game_grid::of((uint32_t)(ps >> 48 & 0xffff), (uint32_t)(ps >> 32 & 0xffff), (uint32_t)w, (uint32_t)h, aspect);
+}
+/// ((Triforce, 11-20) a dim over the whole w x h window, drawn in m's pixels (back_x, back_y: a drawing put on the grid
+/// after): col over the game's picture g, black at col's alpha over the bars beside, above or below it (game_grid.h
+/// dim_parts). The lab's check 3 of 26670c0: the bars turned a dark brown under our dialogs (luminance about 9 where they
+/// were 0); over the picture the dim is as it was)
+void dim_window(ImDrawList* d, const game_grid::Map& m, const game_grid::Place& g, float w, float h, ImU32 col) {
+    game_grid::Rect r[5];
+    const int n = game_grid::dim_parts(g, w, h, r);
+    for (int i = 0; i < n; i++)
+        d->AddRectFilled(ImVec2(m.back_x(r[i].x0), m.back_y(r[i].y0)), ImVec2(m.back_x(r[i].x1), m.back_y(r[i].y1)), i ? (col & IM_COL32_A_MASK) : col);
+}
+/// ((Triforce, 11-20) a dialog's dim over the page (the restart question, the Mods page's dialogs and keyboard): the whole
+/// window in the column's pixels (menu_map, as draw_quit_ask's), over the page and its header wherever the grid is
+/// (panel_merge first); the bars black under it (dim_window) where the game's own black is under it: inside the game's Options
+/// screen (embed_open). ((Triforce, 11-20, a review of 408e2dc) Over play (F1, the Mods page from the game's lists) draw_menu
+/// covered the whole window with our own background first (ui::system_bg, or the flat dim) and our page and header are on
+/// the window's column, over the bars too: there one rectangle, in the dim's colour, as on 26670c0; cut at the picture's
+/// edges it left a straight step of the tint across our background and header (y 112 and 787 in a 1600 x 900 window with
+/// a 21:9 picture). The Full panel, if it waits, then over the dim (panel_over)
+void dim_page(ui::Ctx& c, ImU32 col) {
+    panel_merge(c.d);
+    const float w = menu_window_w > 0 ? menu_window_w : c.w, h = menu_window_h > 0 ? menu_window_h : c.h;
+    const bool game_black = embed_open || page == kModsRowPage;   // (the game's picture and its bars under our page)
+    dim_window(c.d, menu_map, game_black ? menu_grid(w, h) : game_grid::Place{}, w, h, col);
+    panel_over(c.d);
+}
+/// (the clip rectangle drawing goes on with now: the window's, put_on_grid's `keep`)
+ImVec4 clip_now(const ImDrawList* d) {
+    const ImVec2 a = d->GetClipRectMin(), b = d->GetClipRectMax();
+    return ImVec4(a.x, a.y, b.x, b.y);
+}
+/// (a drawing of the Mods entry's, from vtx0 and cmd0 on, made on the grid's 16:9 column (grid_ctx), put where the grid is.
+/// keep: the window's clip rectangle (clip_now before the drawing), which stays; the column's own ones move with it.
+/// ((Triforce, 11-19) the vertices from skip0 to skip1 stay where they are: the Full panel's, drawn among a page's in the
+/// window's own pixels (draw_menu). Was: every clip rectangle from the window's left edge to its right one kept, which also
+/// kept a column's own as wide as the window where the grid is lower than the window's top (16:9 picture, 16:10 window))
+void put_on_grid(ImDrawList* d, int vtx0, int cmd0, const game_grid::Map& m, const ImVec4& keep, int skip0 = 0, int skip1 = 0) {
+    for (int i = vtx0; i < d->VtxBuffer.Size; i++)
+        if (i < skip0 || i >= skip1) d->VtxBuffer[i].pos = ImVec2(m.x(d->VtxBuffer[i].pos.x), m.y(d->VtxBuffer[i].pos.y));
+    for (int i = std::max(0, cmd0 - 1); i < d->CmdBuffer.Size; i++) {   // (the column's clip rectangles with it; the window's stay)
+        ImVec4& r = d->CmdBuffer[i].ClipRect;
+        if (r.x == keep.x && r.y == keep.y && r.z == keep.z && r.w == keep.w) continue;
+        r = ImVec4(m.x(r.x), m.y(r.y), m.x(r.z), m.y(r.w));
+    }
+}
+/// ((Triforce, 11-19) the window's clip rectangle in a column's own pixels, pushed while a page draws on it: the page's own
+/// rectangles are cut to it, then put back on the window with them. On a grid narrower than 16:9 (squeezed across) the
+/// column is wider than the window, and the window's rectangle as it is would cut the page's right side)
+void push_window_clip(ImDrawList* d, const game_grid::Map& m, float window_w, float window_h) {
+    d->PushClipRect(ImVec2(m.back_x(0), m.back_y(0)), ImVec2(m.back_x(window_w), m.back_y(window_h)), false);
+}
+/// (the grid's 16:9 column, its own pixels from 0: as a window of the grid's height)
+ui::Ctx grid_ctx(const ui::Ctx& c, const game_grid::Place& g) {
+    ui::Ctx k = c;
+    k.h = g.h, k.w = game_grid::column_w(g);
+    k.s = ui::unit(g.h, 0, false, false, &k.safe);
+    return k;
+}
+/// ((Triforce, 11-19) our options' pages are over the game's own panes: our tabs open inside its Options screen (embed_open), or
+/// that screen showing with them shut (the bake ahead of their open: prebake, draw_menu's dry run), or its own tab's header
+bool pages_on_game() { return embed_open || (!open_now.load(std::memory_order_relaxed) && game_options_shown()); }
+/// (the column the options' pages are drawn on in a w x h window, and where it goes: game_grid.h column_of)
+game_grid::Column pages_column(float w, float h, bool on_game) {
+    return game_grid::column_of(on_game ? menu_grid(w, h) : game_grid::Place{}, w, h, on_game);
+}
+/// (a context for that column: its size and its unit)
+ui::Ctx column_ctx(const ui::Ctx& c, const game_grid::Column& col) {
+    ui::Ctx k = c;
+    k.w = col.w, k.h = col.h;
+    if (col.h != c.h) k.s = ui::unit(col.h, 0, false, false, &k.safe);
+    return k;
+}
+/// ((Triforce, 11-19) the title's entry, as each of the list's entries is the part PaCommonBtnTitle_00 (vk_game_tex.h
+/// make_title_skin, mods_entry_anim.h): in the part's own units round (cx, cy), times k, the list's scale (the last button's
+/// hit box, 60 units in the part). Not chosen: the text (65 x 0.8 units, the game's "Normal" font) in its cream, its shadow
+/// 2 units under it (T_BtnSh_00). Chosen: the dark band under it (W_Bg_00), the filigree either side (P_Deco_L_00 mirrored,
+/// P_Deco_R_00, each over its glow), the text white over its blue glow (P_BtnGlow_00, the text's own shape blurred). The
+/// filigree is placed by the part's alignment pane: beside the text however wide it is, and the band reaches past it as
+/// far. Measured from the lab's shot of the game's own chosen Continue (runs/pt-menu, 1440 high: 2/3 of a pixel a unit):
+/// the filigree's middles 93 units out from the text's ends, the band 198 past them and 144 high (W_Bg_00 is 160: its
+/// texture's band is 0.84 of that, and the shot's 120 is that with its wavy edges), the glow (120,140,255), the text 2 units
+/// above the band's middle (N_Text_00). The colours are the layout's materials', the glow's and the band's the shot's. ((11-19)
+/// The shadow's dark edge and the glow's reach: text_spread.h, fitted to the game's entries)
+constexpr float kTitleText = 65 * 0.8f, kTitleDecoGap = 93, kTitleBandPast = 198, kTitleBandH = 144, kTitleDeco = 128;
+constexpr ImU32 kTitleInk = ui::rgba(255, 254, 228);      // (T_Btn_01's material: the layout's colour 5, linear 1 0.988 0.776)
+constexpr ImU32 kTitleInkSel = ui::rgba(255, 255, 255);   // (T_Btn_02's: white)
+constexpr ImU32 kTitleDecoInk = ui::rgba(131, 115, 22);   // (P_Deco_*_00's: colour 4, linear 0.227 0.173 0.008)
+constexpr ImU32 kTitleGlow = ui::rgba(120, 140, 255);
+mods_entry::Anim title_anim;
+void draw_title_mods(ui::Ctx& c, bool sel, float cx, float cy, float k, float pitch) {
+    const int64_t now = prof_now(), age = mods_list_age();
+    title_anim.step(now, sel, std::min<int64_t>(age, mods_entry::kListShownNs));
+    const float show = title_anim.shown, f = title_anim.focus;
+    const ImVec2 m = ui::at(c, cx, cy);
+    const char* const label = "Mods";
+    const float px = ui::lu(c, kTitleText * ui::kType * k), tw = ui::size_of(c.f.body, px, label).x;
+    const float deco_x = tw * 0.5f + ui::lu(c, kTitleDecoGap * k);
+    const mods_entry::Decide d = mods_entry::decide_at(mods_decide_ns ? now - mods_decide_ns : -1);
+    if (f > 0 && show > 0) {
+        const float hw = deco_x + ui::lu(c, kTitleBandPast * k), hh = ui::lu(c, kTitleBandH * 0.5f * k);
+        const ImVec2 a(m.x - hw, m.y - hh), b(m.x + hw, m.y + hh);
+        if (const ui::Art* band = ui::art("title_band")) {
+            ui::image(c, band, a, b, ui::alpha(IM_COL32_WHITE, f * show));
+            const ui::Art* sparkle = ui::art("title_decide");
+            if (sparkle && d.flash > 0) ui::image(c, sparkle, a, b, ui::alpha(IM_COL32_WHITE, 0.5f * d.flash * show));   // (W_Bg_01)
+        } else {   // (no title textures in the game's files: a plain band, fading out at its ends)
+            const float core = hw * 0.7f;
+            const ImU32 dark = ui::rgba(8, 6, 12, (int)(205 * f * show)), none = ui::rgba(8, 6, 12, 0);
+            c.d->AddRectFilled(ImVec2(m.x - core, a.y), ImVec2(m.x + core, b.y), dark);
+            c.d->AddRectFilledMultiColor(a, ImVec2(m.x - core, b.y), none, dark, dark, none);
+            c.d->AddRectFilledMultiColor(ImVec2(m.x + core, a.y), b, dark, none, none, dark);
+        }
+        const ui::Art *deco = ui::art("TitleBtnDeco_00"), *glow = ui::art("TitleBtnDecoGlow_00");
+        const float strength = f * show * title_anim.loop(now);   // (LoopRandom: the filigree breathes)
+        for (int side = -1; deco && side <= 1; side += 2) {   // (the left one is the texture mirrored: its point to the text)
+            const float x = m.x + side * deco_x;
+            const float ds = ui::lu(c, kTitleDeco * 0.5f * k * d.deco), gs = ui::lu(c, kTitleDeco * 0.5f * k * d.glow);
+            if (glow) ui::image(c, glow, ImVec2(x - gs, m.y - gs), ImVec2(x + gs, m.y + gs), ui::alpha(kTitleDecoInk, 0.1f * strength), side < 0);
+            ui::image(c, deco, ImVec2(x - ds, m.y - ds), ImVec2(x + ds, m.y + ds), ui::alpha(kTitleDecoInk, strength), side < 0);
+        }
+    }
+    const float ty = m.y - ui::lu(c, 2 * k);
+    // (the text's top left: as text_mid_centre puts it. (Triforce, 11-20) On a whole pixel, where ImGui would put the text,
+    // so that the copies round it can be put at their own offsets from it)
+    const ImVec2 at(std::floor(m.x - tw * 0.5f), std::floor(ui::mid_top(c.f.body, px, ty)));
+    // (the text's own shape spread round it, ring after ring: T_BtnSh_00's dark edge, P_BtnGlow_00's glow (text_spread.h))
+    // ((Triforce, 11-19) each copy's alpha a whole step of 255 and the copies as many as keep the fit's coverage
+    // (text_spread::ring_drawn): ui::alpha's cut to a whole step took off most of the faint rings' alpha, some to 0)
+    // ((11-20) each copy at its offset from the text, a part of a pixel too (ImDrawListFlags_TextNoPixelSnap): snapped,
+    // ImGui cut each to the pixel left of and above it, and an offset under a pixel (the hard shadow's 2.5 units: 0.83 of a
+    // pixel at 720 lines, 0.42 at 1440) became 0 or 1 by where the entry was)
+    auto spread = [&](const text_spread::Spread& sp, ImU32 col, float amount) {
+        const float own = (float)(col >> IM_COL32_A_SHIFT & 0xFF) / 255.0f;
+        const ImU32 rgb = col & ~IM_COL32_A_MASK;
+        const ImDrawListFlags flags = c.d->Flags;
+        c.d->Flags |= ImDrawListFlags_TextNoPixelSnap;
+        text_spread::each_copy(sp, amount * own, [&](float dx, float dy, int a) {
+            c.d->AddText(c.f.body, px, ImVec2(at.x + ui::lu(c, dx * k), at.y + ui::lu(c, dy * k)), rgb | (ImU32)a << IM_COL32_A_SHIFT, label);
+        });
+        c.d->Flags = flags;
+    };
+    if (f < 1 && show > 0) {   // (N_TextUnSelect_00: the shadow, then the text)
+        // ((11-20) the hard shadow under the soft edge, and the text at the game's weight)
+        // ((Triforce, 11-20, lab check 3) per output (text_spread.h kLookHdr, kLookSdr): with HDR off the overlay blends in
+        // 8-bit code values, where the HDR fit's black copies darkened a third as much (the lab's "edge much too weak, Mods
+        // reads pale"). The weight by the text's size in pixels (its lines: 2160 units): copies across, a part of a unit out,
+        // that widen the strokes (two in place have the same coverage at every size: 1 pixel with grey beside it at 674
+        // lines, 20% light at 1440). On a 16:10 grid the copies are squeezed across with the text (put_on_grid's kx))
+        const float a = (1 - f) * show;
+        const text_spread::Look& look = text_spread::look_of(dev.hdr);
+        spread(look.core, ui::rgba(0, 0, 0), a);
+        spread(look.shadow, ui::rgba(0, 0, 0), a);
+        const ImU32 ink_rgb = kTitleInk & ~IM_COL32_A_MASK;
+        const ImDrawListFlags flags = c.d->Flags;
+        c.d->Flags |= ImDrawListFlags_TextNoPixelSnap;
+        text_spread::each_weight_copy(look.weight, ui::lu(c, 2160 * k), a, [&](float dx, float dy, int q) {
+            c.d->AddText(c.f.body, px, ImVec2(at.x + ui::lu(c, dx * k), at.y + ui::lu(c, dy * k)), ink_rgb | (ImU32)q << IM_COL32_A_SHIFT, label);
+        });
+        c.d->Flags = flags;
+    }
+    if (f > 0 && show > 0) {   // (N_TextSelect_00: the glow, then the text)
+        // ((Triforce, 11-20) the text kTextWeight times over itself here too: the chosen text is the same font at the same size
+        // (T_Btn_02), as bold as the game's chosen Continue and Options, and no step in weight across the Select's fade)
+        spread(text_spread::kGlow, kTitleGlow, f * show);
+        const ImU32 ink_sel = ui::alpha(kTitleInkSel, text_spread::weight_alpha(f * show));
+        for (int i = 0; i < text_spread::kTextWeight; i++) c.d->AddText(c.f.body, px, at, ink_sel, label);
+    }
+    // (the entry's hit: across the line as the host takes the game's (host/oot_menu.c list_boxes: 1100 wide), a pitch high)
+    const float hw = ui::lu(c, 550 * k), hh = ui::lu(c, pitch * 0.5f);
+    hits.add(m.x - hw, m.y - hh, m.x + hw, m.y + hh, menu_hit::kButton, 0);
+    mods_entry_px[0] = m.x - hw, mods_entry_px[1] = m.y - hh, mods_entry_px[2] = m.x + hw, mods_entry_px[3] = m.y + hh;
+    mods_entry_px[4] = ui::lu(c, pitch);
+}
+
 /// (Triforce) The Mods entry, under the game list's last button by the list's own pitch (host/oot_menu.c): on the pause menu's
 /// System page a button as the game's own (PaCommonBtnThin: the plate with the curls, 672 x 144 units, its text 54; the
-/// cursor round it when chosen), on the title its line of text as the game sets the list there (the chosen line on a dark
-/// band, its text glowing blue). c: the 16:9 column, where the layout's units are
+/// cursor round it when chosen, faded in and out as the part's Select and UnSelect: focus_anim.h), on the title as the list's
+/// own entries are (draw_title_mods). c: the 16:9 column, where the layout's units are
 void draw_mods_row(ui::Ctx& c, bool sel) {
     const float x0 = (float)mods_box[0].load(std::memory_order_relaxed), x1 = (float)mods_box[1].load(std::memory_order_relaxed);
     const float y0 = (float)mods_box[2].load(std::memory_order_relaxed), y1 = (float)mods_box[3].load(std::memory_order_relaxed);
     const float pitch = (float)mods_box[4].load(std::memory_order_relaxed);
     const float cx = (x0 + x1) * 0.5f, cy = (y0 + y1) * 0.5f - pitch;
     const bool title = (mods_list_bits.load(std::memory_order_relaxed) & HOS_MODS_LIST_TITLE) != 0;
-    const ImVec2 m = ui::at(c, cx, cy);
-    if (!title) {
-        const ImVec2 a = ui::at(c, cx - 336, cy + 72), b = ui::at(c, cx + 336, cy - 72);
-        ui::button(c, a, b, "Mods", sel);
-        hits.add(a.x, a.y, b.x, b.y, menu_hit::kButton, 0);
+    if (!title) {   // (Mods, then Quit under it by the list's own pitch: the game's own buttons)
+        static const char* const names[2] = {"Mods", "Quit"};
+        static const bool still = getenv("RX_VK_UI_STILL") != nullptr;   // (pictures that compare: as it stands)
+        const int64_t now = prof_now();
+        for (int i = 0; i < 2; i++) {
+            const float y = cy - pitch * i;
+            const ImVec2 a = ui::at(c, cx - 336, y + 72), b = ui::at(c, cx + 336, y - 72);
+            mods_focus[i].step(now, sel && mods_row_sel == i, !ease_live || still);
+            ui::button(c, a, b, names[i], mods_focus[i].shown);
+            hits.add(a.x, a.y, b.x, b.y, menu_hit::kButton, i);
+            if (i == 0) mods_entry_px[0] = a.x, mods_entry_px[1] = a.y, mods_entry_px[2] = b.x, mods_entry_px[3] = b.y;
+        }
+        mods_entry_px[4] = ui::lu(c, pitch);
         return;
     }
-    const float px = ui::lu(c, 78);
-    if (sel) {   // (the game's chosen line: a dark band fading out at its ends, the text glowing blue-white)
-        // ((Triforce) 11-17, his "it doesn't have the black underneath the lettering": the game's own band, as the lab's 1080p
-        // shot of its chosen Options line measures it: about 470 wide and 58 high, near black, solid but for its last ~60 at
-        // each end. It was 1120 x 100 at alpha 150 fading from the middle: too faint to see. In the layout's units, about 0.45
-        // of a 1080p pixel: the lab's shot of a first try of 524 units was 215 px wide)
-        const float core = ui::lu(c, 400), hw = ui::lu(c, 522), hh = ui::lu(c, 64);
-        const ImU32 dark = ui::rgba(8, 6, 12, 205), none = ui::rgba(8, 6, 12, 0);
-        c.d->AddRectFilled(ImVec2(m.x - core, m.y - hh), ImVec2(m.x + core, m.y + hh), dark);
-        c.d->AddRectFilledMultiColor(ImVec2(m.x - hw, m.y - hh), ImVec2(m.x - core, m.y + hh), none, dark, dark, none);
-        c.d->AddRectFilledMultiColor(ImVec2(m.x + core, m.y - hh), ImVec2(m.x + hw, m.y + hh), dark, none, none, dark);
-        for (int k = 0; k < 12; k++) {
-            const float ang = k * 0.5236f, r = ui::lu(c, 7) * (1 + 0.4f * c.pulse);
-            ui::text_mid_centre(c, c.f.body, px, m.x + std::cos(ang) * r, m.y + std::sin(ang) * r, ui::rgba(120, 140, 255, 26), "Mods");
-        }
-        ui::text_mid_centre(c, c.f.body, px, m.x, m.y, ui::rgba(214, 222, 255), "Mods");
-    } else {   // (as the game's other lines: white with a soft dark edge)
-        for (int k = 0; k < 8; k++) {
-            const float ang = k * 0.785398f, r = ui::lu(c, 3);
-            ui::text_mid_centre(c, c.f.body, px, m.x + std::cos(ang) * r, m.y + std::sin(ang) * r + ui::lu(c, 2), ui::rgba(20, 14, 6, 90), "Mods");
-        }
-        ui::text_mid_centre(c, c.f.body, px, m.x, m.y, ui::rgba(250, 248, 240), "Mods");
-    }
-    const float hw = ui::lu(c, 400), hh = ui::lu(c, pitch * 0.5f);
-    hits.add(m.x - hw, m.y - hh, m.x + hw, m.y + hh, menu_hit::kButton, 0);
+    // (the list's scale: the part's 60-unit hit box as the host finds it; one not told, the part's own size)
+    const float k = x1 - x0 > 6 && x1 - x0 < 600 ? (x1 - x0) / 60.0f : 1.0f;
+    draw_title_mods(c, sel, cx, cy, k, pitch);
 }
 
-/// (the entry while the menu is shut: in the 16:9 column, as draw_game_tab places its tabs)
+/// (the entry while the menu is shut: on the game's grid, where its list is (game_grid.h). (Triforce, 11-19) It was on a 16:9
+/// column of the window's whole height: with the picture between bars at the top and the bottom (a 21:9 picture in a 16:9
+/// window) it was larger than the list and under the picture)
 void draw_mods_row_shut(ui::Ctx& c) {
-    ui::Ctx k = c;
-    k.w = std::min(c.w, std::floor(c.h * 16.0f / 9.0f + 0.5f));
-    const float ox = std::floor((c.w - k.w) * 0.5f);
-    const int vtx0 = c.d->VtxBuffer.Size;
+    const game_grid::Place g = menu_grid(c.w, c.h);
+    ui::Ctx k = grid_ctx(c, g);
+    const int vtx0 = c.d->VtxBuffer.Size, cmd0 = c.d->CmdBuffer.Size;
+    const ImVec4 window_clip = clip_now(c.d);
     const menu_hit::Map saved = hits;   // (its hit is not the menu's: the host takes clicks on it while the menu is shut)
     draw_mods_row(k, false);
     hits = saved;
-    for (int i = vtx0; i < c.d->VtxBuffer.Size; i++) c.d->VtxBuffer[i].pos.x += ox;
+    put_on_grid(c.d, vtx0, cmd0, game_grid::map_of(g), window_clip);
+}
+
+/// ((Triforce) 11-19) Quit's dialog, as the game's own system dialogs: the game dimmed, the question, its buttons on
+/// PaCommonBtnThin's plate (as draw_ask), the chosen one with the game's cursor round it; A chooses, B is Cancel.
+/// (11-19) It opens and closes as SystemWindow_00 (focus_anim.h): the question and the buttons rise into place and fade in
+/// over the In's 20 frames, the dim fading with them; B or Cancel fades it all out over the Out's 2. Its buttons' cursor
+/// fades in and out as the System list's buttons' do. Its dim the whole window's (menu_window_w x _h, in c's pixels through menu_map)
+/// ((Triforce, 11-19) the lab's "the Quit banner text shows on top of the game's tab strip before the banner plate": it had a
+/// banner (ui::banner, "Quit") of its own over the pause menu's header. SystemWindow_00 has none: its panes are N_In_00 (the
+/// text and the three Pa_Button_*) under its RootPane, and its In curves N_In_00's alpha and height alone; the System page's
+/// own header (the game's tab strip) stays under the dialog, dimmed with the rest. So no banner: the question, the buttons
+/// and the dim, on N_In_00's one alpha)
+void draw_quit_ask(ui::Ctx& c) {
+    static const bool still = getenv("RX_VK_UI_STILL") != nullptr;   // (pictures that compare: open, as it stands)
+    const bool settle = !ease_live || still;
+    const int64_t now = prof_now();
+    const focus_anim::Window w = settle ? focus_anim::Window{}
+                               : quit_ask ? focus_anim::window_at(now - quit_open_ns) : focus_anim::window_at(now - quit_shut_ns, true);
+    const int vtx0 = c.d->VtxBuffer.Size;
+    // (the game behind dimmed as its own dialogs do it, deep enough that the Basic Controls panel's text does not show through:
+    // the whole window, the picture's sides too; ((11-20) the bars beside or above the picture black under it: dim_window)
+    dim_window(c.d, menu_map, menu_grid(menu_window_w, menu_window_h), menu_window_w, menu_window_h, ui::rgba(8, 5, 2, 220));
+    const int vtx_in = c.d->VtxBuffer.Size;   // (from here N_In_00's: the question and the buttons)
+    ui::text_mid_centre(c, c.f.body, ui::lu(c, 54 * ui::kType), c.w * 0.5f, ui::at(c, 0, 300).y, ui::kInk, "Quit the game?");
+    ui::text_mid_centre(c, c.f.body, ui::lu(c, 52), c.w * 0.5f, ui::at(c, 0, 200).y, ui::kSoft, "Progress since your last save is lost.");
+    const float bw = ui::lu(c, 336), bh = ui::lu(c, 72);
+    static const char* const labels[3] = {"Quit Game", "Restart Game", "Cancel"};
+    // ((Triforce, 11-19) while it is open or closing the mouse takes only its buttons: Mods and Quit under the dim are not
+    // there for it (a second click on Quit's place, the dialog fading in, was A on its Quit Game))
+    hits.clear(0, 0, c.w, c.h);
+    for (int i = 0; i < 3; i++) {
+        const float my = ui::at(c, 0, -10.0f - 188.0f * i).y;
+        const ImVec2 a(c.w * 0.5f - bw, my - bh), b(c.w * 0.5f + bw, my + bh);
+        quit_focus[i].step(now, i == quit_sel, settle || quit_fresh);
+        ui::button(c, a, b, labels[i], quit_focus[i].shown);
+        // (where it stands: no input is taken while it rises; while its Out plays none, it is going)
+        if (quit_ask) hits.add(a.x, a.y, b.x, b.y, menu_hit::kButton, 10 + i);
+    }
+    quit_fresh = false;
+    // (no prompts of its own: the pause menu's Select and Back stay under it, and say the same)
+    const float drop = ui::lu(c, w.drop);
+    for (int i = vtx_in; drop > 0 && i < c.d->VtxBuffer.Size; i++) c.d->VtxBuffer[i].pos.y += drop;
+    for (int i = vtx0; w.alpha < 1 && i < c.d->VtxBuffer.Size; i++) c.d->VtxBuffer[i].col = ui::alpha(c.d->VtxBuffer[i].col, w.alpha);
+}
+
+/// ((Triforce) 11-19) Quit Game / Restart Game: as the old Restart and Quit rows did, the settings and the pipeline cache kept first
+void end_game(bool restart) {
+    save();
+    pipeline_cache_save(true);
+    memory_trial_orderly_end();
+    logf(restart ? "menu: Restart Game" : "menu: Quit Game");
+    if (const HWND window = app_window()) PostMessageA(window, restart ? WM_APP + 9 : WM_CLOSE, 0, 0);
 }
 
 void draw_ask(ui::Ctx& c) {
     const float s = c.s;
-    c.d->AddRectFilled(ImVec2(0, 0), ImVec2(c.w, c.h), ui::rgba(8, 5, 2, 110));   // (the dialog over the page: darker still)
+    dim_page(c, ui::rgba(8, 5, 2, 110));   // (the dialog over the page: darker still; the whole window, the Full panel with it)
     ui::banner(c, 0, "Restart Needed");
     const std::string ask = "Restart to apply " + restart_list(" and ") + "?";
     const float wrap = ui::lu(c, 1440), px = ui::lu(c, 54 * ui::kType);
@@ -4359,10 +4752,14 @@ void draw_perf(ui::Ctx& c);
 /// vk_imgui.cpp a few a frame: the first open then draws with no glyphs to make (it took 2.6 ms at 1080p)
 float prebaked[4] = {0, 0, 0, 0};   // (the units and the width prebake last did; (Triforce) and the Full panel's text size, 0 off)
 /// The menu's units now (with Auto, both it can pick) for a window w x h: whether prebake has not done them yet
+/// ((Triforce, 11-19) the height the pages are drawn at: the game's grid's while its Options screen shows, where our tabs open
+/// (draw_menu: pages_column), else the window's)
+float pages_h(float w, float h) { return pages_on_game() ? pages_column(w, h, true).h : h; }
 bool prebake_needed(uint32_t w, uint32_t h) {
     float m = 0;
-    const float u0 = ui::unit((float)h, opts.menu_size, opts.fullscreen != 0, auto_pad, &m);
-    const float u1 = opts.menu_size == 0 ? ui::unit((float)h, 0, opts.fullscreen != 0, !auto_pad, &m) : u0;
+    const float ph = pages_h((float)w, (float)h);
+    const float u0 = ui::unit(ph, opts.menu_size, opts.fullscreen != 0, auto_pad, &m);
+    const float u1 = opts.menu_size == 0 ? ui::unit(ph, 0, opts.fullscreen != 0, !auto_pad, &m) : u0;
     return u0 != prebaked[0] || u1 != prebaked[1] || (float)w != prebaked[2];
 }
 /// (Triforce) The Full panel's glyphs at its one text size px, in the font draw_perf writes with, baked now: ui::prebake only
@@ -4382,7 +4779,9 @@ void bake_perf(const ui::Ctx& c, float px) {
 }
 void prebake(const ui::Ctx& c) {
     float units[2] = {c.s, c.s}, margins[2] = {c.safe, c.safe};
-    if (opts.menu_size == 0) units[1] = ui::unit(c.h, 0, opts.fullscreen != 0, !auto_pad, &margins[1]);
+    const float ph = pages_h(c.w, c.h);   // ((Triforce, 11-19) the game's grid's inside its Options screen)
+    if (ph != c.h) units[0] = units[1] = ui::unit(ph, opts.menu_size, opts.fullscreen != 0, auto_pad, &margins[0]), margins[1] = margins[0];
+    if (opts.menu_size == 0) units[1] = ui::unit(ph, 0, opts.fullscreen != 0, !auto_pad, &margins[1]);
     // ((Triforce) the Full panel's one text size, as draw_perf sizes it, while the row is on Full: baked here at once when it
     // changes (bake_perf), before draw_perf in the same frame, and kept by ui::prebake with the menu's sizes. Its first
     // frame, and one after a resize, then make no glyphs while drawing)
@@ -4430,20 +4829,49 @@ void prebake(const ui::Ctx& c) {
     memcpy(scrolled_to, saved_to, sizeof scrolled_to);
 }
 
-float menu_ox = 0;   // (the menu's column's left edge in the window: more than 0 only on a window wider than 16:9)
 /// The menu: the game dimmed across the whole window, the pages in a column as wide as a 16:9 screen of this height, in the
 /// middle (a window of 16:9 or narrower: the whole of it). The pages draw from 0 as on 16:9; their vertices and clip
-/// rectangles are moved over after, and menu_tick moves the mouse back by menu_ox before it tests the hits. (Triforce)
-/// perf_under: the FPS counter row's Full panel, over the dim and under the pages, as NX2navi keeps its panel under its menu
+/// rectangles are moved over after, and menu_tick moves the mouse back through menu_map before it tests the hits. (Triforce)
+/// perf_under: the FPS counter row's Full panel, over the dim and under the pages, as NX2navi keeps its panel under its menu.
+/// ((Triforce, 11-19) The Mods entry's page (Mods and Quit under the game's list, Quit's dialog) on the game's own grid, where
+/// its list is: game_grid.h)
 void draw_menu(ui::Ctx& c, bool perf_under) {
     const bool row = page == kModsRowPage;   // ((Triforce) the Mods entry has the cursor: over the game's list, nothing dimmed)
-    if (!embed_open && !row) c.d->AddRectFilled(ImVec2(0, 0), ImVec2(c.w, c.h), ui::rgba(8, 5, 2, ui::kDimAlpha));   // (the game behind, dimmed)
-    if (perf_under) draw_perf(c);   // (before the pages' first vertex: the window's top right, not moved with the column)
-    ui::Ctx k = c;
+    // (the game behind: inside its own Options screen its own background, untouched; over play the System screens' own
+    // (ui::system_bg), or dimmed flat without its textures)
+    if (!embed_open && !row && !ui::system_bg(c)) c.d->AddRectFilled(ImVec2(0, 0), ImVec2(c.w, c.h), ui::rgba(8, 5, 2, ui::kDimAlpha));
+    // ((Triforce, 11-19) inside the game's own Options screen the Full panel between our page and our header, as on the game's
+    // own tab it is over the game's panes and under our header (menu_record: draw_perf, then draw_game_tab): the lab's "our
+    // help box draws over part of the stats panel" (fullscreen 3440 x 1440). ((11-20) Over play under the pages, as before.
+    // Either way it waits (panel_wait) in a list split in two, so that a dialog's dim can go under it (dim_page: our dialogs
+    // keep it bright, as the game's own dialogs and Quit's do), the restart question's too)
+    const bool perf_between = perf_under && !row;
+    // ((Triforce, 11-19) the pages over the game's own Options screen on the game's grid, as its panes under them (game_grid.h
+    // column_of): the lab's "16:9 window, 21:9 picture letterboxed: the game's Default Settings (X) / Back (A) and the left
+    // edge of its help box show through mid-screen beside our panel" was our column of the window's whole height over the
+    // picture's grid. Over play (F1), the window's column as before)
+    const bool on_game = !row && pages_on_game();
+    const game_grid::Column col = pages_column(c.w, c.h, on_game);
+    ui::Ctx k = column_ctx(c, col);
     k.over_game = embed_open;   // (inside the game's own Options screen: its background stays, its list is under our plates)
-    k.w = std::min(c.w, std::floor(c.h * 16.0f / 9.0f + 0.5f));
-    menu_ox = std::floor((c.w - k.w) * 0.5f);
+    // ((Triforce, 11-20) its guides band's end, past the column on a wide picture; sooner from the pause menu (a review of 1104352))
+    k.guides_x1 = game_grid::guide_band_x1(col, game_options_from_pause.load(std::memory_order_relaxed) ? game_grid::kPauseGuideBandRight
+                                                                                                          : game_grid::kGuideBandRight);
+    menu_map = col.map;
+    menu_window_w = c.w, menu_window_h = c.h;
+    if (row) {
+        const game_grid::Place g = menu_grid(c.w, c.h);
+        k = grid_ctx(c, g), k.over_game = false;
+        menu_map = game_grid::map_of(g);
+    }
     const int vtx0 = c.d->VtxBuffer.Size, cmd0 = c.d->CmdBuffer.Size;
+    const ImVec4 window_clip = clip_now(c.d);
+    if (perf_between) {   // (inside the game's Options screen the header into channel 1 (header_layer); over play the pages into 1)
+        c.d->ChannelsSplit(2), panel_split = c.d, panel_wait = {&c, window_clip, 0, 0};
+        if (embed_open) header_split = c.d;
+        else c.d->ChannelsSetCurrent(1);
+    }
+    if (on_game) push_window_clip(c.d, menu_map, c.w, c.h);
     hits.clear(0, 0, k.w, k.h);
     hits_game_tab = false;
     if (row) draw_mods_row(k, true);
@@ -4451,9 +4879,14 @@ void draw_menu(ui::Ctx& c, bool perf_under) {
         float cx0, cx1, hx0, hx1;
         bool narrow;
         columns(k, &cx0, &cx1, &hx0, &hx1, &narrow);
-        ui::column_bg(k, cx0, cx1);
+        // (over the game's own Options screen its column is under ours: only our opaque middle, over its list, so its soft
+        // edges stay as the game draws them, once)
+        ui::column_bg(k, cx0, cx1, k.over_game);
     }
-    if (row) {}   // (drawn above)
+    if (row) {   // (the entries: drawn above; Quit's dialog over them, and its Out; its dim the window's)
+        if (quit_ask || quit_closing())
+            draw_quit_ask(k);
+    }
     else if (page == 5) draw_ask(k);
     else if (page == 1) draw_controls(k);
     else if (page == 3) draw_teleport(k);
@@ -4461,15 +4894,16 @@ void draw_menu(ui::Ctx& c, bool perf_under) {
     else if (page == 6) draw_names(k);   // ((Triforce) Game flags, Cutscenes, Scan amiibo)
     else if (page == kModsPage) draw_mods(k);
     else draw_options(k);
-    if (menu_ox <= 0) return;
-    for (int i = vtx0; i < c.d->VtxBuffer.Size; i++) c.d->VtxBuffer[i].pos.x += menu_ox;
+    if (on_game) c.d->PopClipRect();
+    int perf0 = 0, perf1 = 0;   // (the Full panel's vertices: in the window's pixels already)
+    if (perf_between) {   // (the panel under the header, unless a dialog's dim drew it already: dim_page)
+        panel_between(c.d);
+        perf0 = panel_wait.v0, perf1 = panel_wait.v1;
+    }
+    if (menu_map.ox <= 0 && menu_map.oy <= 0 && menu_map.kx == 1) return;
     // (a clip rectangle of the column's: moved with it; the whole window's (the dim's, and the draw list's own) stays, as it
     // holds the column wherever it is)
-    for (int i = std::max(0, cmd0 - 1); i < c.d->CmdBuffer.Size; i++) {
-        ImVec4& r = c.d->CmdBuffer[i].ClipRect;
-        if (r.x <= 0 && r.z >= c.w) continue;
-        r.x += menu_ox, r.z += menu_ox;
-    }
+    put_on_grid(c.d, vtx0, cmd0, menu_map, window_clip, perf0, perf1);
     // (the draw list's current header, for whatever is drawn next: the window's again after the pages' pops)
 }
 
@@ -4493,8 +4927,29 @@ void edged_text(ui::Ctx& c, ImFont* f, float px, ImVec2 p, ImU32 col, const char
     c.d->AddText(f, px, p, col, t);
 }
 
-void draw_fps(ui::Ctx& c, bool under_banner) {
+void draw_fps(ui::Ctx& window, bool under_banner) {
     if (!fps_text[0]) return;
+    // ((Triforce, 11-19) under our header over the game's own Options screen: on the game's grid with the header (draw_menu,
+    // draw_game_tab), in the column's pixels, put there after. (11-20) Over play, the title and the pause menu too: on the
+    // game's grid, as a counter of its HUD, so that it keeps its 16:9 place among the game's own header items (between the
+    // pause menu's R and its rupees) in every shape. The lab's check 3 of 26670c0, a 1680 x 1050 window with a 16:10
+    // picture: it ended 235 px in from the right edge, toward the middle of that gap, as it was laid out on the window's
+    // 16:9 column of its whole height, not squeezed across (x 0.9) with the game's layouts; and with bars above and below
+    // the picture (a 21:9 picture in 1600 x 900) it was at the window's top, in the bar, sized by the window's height.
+    // Under our header over play (F1): the window's column with that header, as before. ((11-20, a review of ca33bee) The
+    // restart question (page 5) too: under our "Restart Needed" banner it is on the column draw_menu lays that page and its
+    // banner on (pages_on_game: the window's over play, the grid inside the game's Options screen). Was: page 5 always on
+    // the grid, over play below the banner it had sat over (1600 x 900, 21:9 picture: from (1392, 25) to (1244, 131)))
+    const bool on_game = under_banner ? pages_on_game() : true;
+    const game_grid::Column col = pages_column(window.w, window.h, on_game);
+    ui::Ctx c = on_game ? column_ctx(window, col) : window;
+    const int vtx0 = c.d->VtxBuffer.Size, cmd0 = c.d->CmdBuffer.Size;
+    const ImVec4 window_clip = clip_now(c.d);
+    // ((Triforce, 11-20) the window's clip in the column's pixels while it draws there, as draw_game_tab's: on a grid narrower
+    // than 16:9 (a 16:10 or 4:3 picture) the column is wider than the window, the counter at its right past the window's
+    // width in the column's pixels, and ImGui drops a glyph past the clip's right edge as it adds it (a review of c3d2d32:
+    // no counter under our header at 16:10))
+    if (on_game) push_window_clip(c.d, col.map, window.w, window.h);
     ImFont* digits = c.f.number ? c.f.number : c.f.strong;
     const float big = ui::lu(c, 72), small = ui::lu(c, 46), label = ui::lu(c, 34), gap = ui::lu(c, 12);
     const char* game = fps_sub[0] ? fps_sub : nullptr;   // ("60": the game's own rate, with frame generation)
@@ -4517,6 +4972,7 @@ void draw_fps(ui::Ctx& c, bool under_banner) {
         x += edged(digits, small, x, my + ui::lu(c, 8), game, ui::kSoft) + gap;
     }
     edged(c.f.strong, label, x, my + ui::lu(c, 12), "FPS", ui::kAccent);
+    if (on_game) c.d->PopClipRect(), put_on_grid(c.d, vtx0, cmd0, col.map, window_clip);
 }
 
 /// (Triforce) The performance overlay on Full: NX2navi's full panel, laid out as its own is, to the pixel of its scale
@@ -4540,7 +4996,8 @@ void draw_fps(ui::Ctx& c, bool under_banner) {
 /// through the plate over a bright scene. Where the game's files have none of it, ui::box and ui::separator draw their plain
 /// plates. Where: NX2navi's, the window's top right corner 12 in from both edges, at every shape of window; Full draws no FPS
 /// counter (menu_record), and while the options are open the panel is under them, over their dim (draw_menu), as NX2navi's
-/// is under its menu's window. The scale is NX2navi's menu_scale with its DPI floor (perf_scale), at which prebake has baked
+/// is under its menu's window; ((Triforce, 11-19) inside the game's own Options screen over our page and under its header,
+/// as on the game's own tab, and over the Mods entry's page). The scale is NX2navi's menu_scale with its DPI floor (perf_scale), at which prebake has baked
 /// the text's size. perf_sample made the texts
 void draw_perf(ui::Ctx& c) {
     const PerfView& v = perf_view;
@@ -4647,16 +5104,33 @@ void draw_perf(ui::Ctx& c) {
 
 /// (Triforce) The game's own tab inside its Options screen: our header over the screen's own (the same picture), the tabs on
 /// it with "Game" chosen; the rest is the game's. It comes in over the screen's opening and goes with its closing
+/// ((Triforce, 11-19) whether the game's own prompts show a controller's buttons: the face it was given at its start
+/// (host/prompts.c), a controller's unless the keys' (-1: the game's own icons, the Switch's)
+bool game_prompts_pad() {
+    const int face = host && host->prompt_face ? host->prompt_face() : -1;
+    return face != HOS_PROMPT_KEYBOARD;
+}
 void draw_game_tab(ui::Ctx& c) {
-    ui::Ctx k = c;
-    k.w = std::min(c.w, std::floor(c.h * 16.0f / 9.0f + 0.5f));
-    const float ox = std::floor((c.w - k.w) * 0.5f);
-    const int vtx0 = c.d->VtxBuffer.Size;
+    // ((Triforce, 11-19) on the game's grid, over its own header wherever the picture is in the window (game_grid.h column_of):
+    // in a 16:9 window with a 21:9 picture between bars it was at the window's top, above the game's header, and our tabs'
+    // pages below it covered the game's panes as far as the picture's bottom only)
+    const game_grid::Column col = pages_column(c.w, c.h, true);
+    ui::Ctx k = column_ctx(c, col);
+    // ((Triforce, 11-19) the lab's "the tab strip's ends show LB/RB pad icons while the footer shows the keyboard's Shift": the
+    // footer under our tabs here is the game's own (its Default Settings and Back), in the face the game was given; the
+    // strip's ends took the overlay's own device used last (pad_last, which a test's scripted press sets as a pad's). They
+    // name the game's face now, as the footer beside them)
+    k.pad = game_prompts_pad();
+    const int vtx0 = c.d->VtxBuffer.Size, cmd0 = c.d->CmdBuffer.Size;
+    const ImVec4 window_clip = clip_now(c.d);
+    push_window_clip(c.d, col.map, c.w, c.h);
     ui::banner(k, 0);
-    // ((Triforce) the tabs as the mouse takes them, as draw_menu's are: their places in k's pixels, and the shift right after)
+    // ((Triforce) the tabs as the mouse takes them, as draw_menu's are: their places in k's pixels, and the map right after)
     hits.clear(0, 0, k.w, k.h);
-    game_tab_ox = ox, hits_game_tab = true;
+    game_tab_map = col.map, hits_game_tab = true;
     draw_tabs(k, -1, true, true);
+    c.d->PopClipRect();
+    put_on_grid(c.d, vtx0, cmd0, col.map, window_clip);
     static const bool still = getenv("RX_VK_UI_STILL") != nullptr;
     const int64_t now = prof_now(), seen = game_options_ns.load(std::memory_order_relaxed);
     float f = 1;
@@ -4664,11 +5138,8 @@ void draw_game_tab(ui::Ctx& c) {
         f = std::clamp((float)((now - embed_since - 120000000LL) / 180e6), 0.0f, 1.0f);              // (in: after the screen's first frames)
         f *= 1 - std::clamp((float)((now - seen - 60000000LL) / 150e6), 0.0f, 1.0f);                  // (out: once it no longer runs)
     }
-    for (int i = vtx0; i < c.d->VtxBuffer.Size; i++) {
-        ImDrawVert& v = c.d->VtxBuffer[i];
-        v.pos.x += ox;
-        if (f < 1) v.col = ui::alpha(v.col, f);
-    }
+    if (f < 1)
+        for (int i = vtx0; i < c.d->VtxBuffer.Size; i++) c.d->VtxBuffer[i].col = ui::alpha(c.d->VtxBuffer[i].col, f);
 }
 
 /// (Triforce) A line at the foot of the screen for a moment, as a guide of the game's: the Debug tab unlocked or locked
@@ -4700,7 +5171,7 @@ void draw_startup(ui::Ctx& c) {
     ImTextureData* logo = ui::logo(&aspect);
     if (logo) c.d->AddImage(logo->GetTexRef(), ImVec2(cx - lh * aspect * 0.5f, top), ImVec2(cx + lh * aspect * 0.5f, top + lh));
     float y = top + lh + 16 * s;
-    ui::spaced(c, c.f.heading, 42 * k, ImVec2(cx, y), ui::rgba(246, 232, 204), "HOOKSHOT", 6 * k);
+    ui::spaced(c, c.f.heading, 42 * k, ImVec2(cx, y), ui::rgba(246, 232, 204), "TRIFORCE", 6 * k);
     ui::flourish(c, cx - 190 * k, cx + 190 * k, y + 66 * k, ui::kAccent);
     ui::text_centre(c, c.f.body, 14.5f * k, ImVec2(cx, y + 78 * k), ui::kDim, v.version.c_str());
     if (!v.title.empty()) {
@@ -4789,6 +5260,7 @@ void menu_init() {
         bool v2 = false;
         int version = 0;
         int old_dynres = -1;   // (the row before Resolution: 0, the full scale, is its 100%; 1 is Auto)
+        merged_rows::Before7 before7;   // ((Triforce) the keys a file before options_version 7 had for rows that are gone)
         while (fgets(line, sizeof line, f)) {
             ini_merge::add_line(ini_base, line);   // ((Triforce, handoff §9) the file as the game read it: save's base)
             char* eq = strchr(line, '=');
@@ -4803,11 +5275,17 @@ void menu_init() {
             v2 |= !strcmp(line, "options_version");
             if (!strcmp(line, "options_version")) version = atoi(eq + 1);
             if (!strcmp(line, "dynamic_resolution")) old_dynres = atoi(eq + 1);
+            if (!strcmp(line, "handheld_profile")) before7.handheld = atoi(eq + 1) != 0;
+            if (!strcmp(line, "stick_dead_zone")) before7.stick_shared = atoi(eq + 1);
             if (!strcmp(line, "microphone_device")) {   // (hookshot: the microphone, by its name)
                 mic_want = mic_key(eq + 1);
             }
+            if (!strcmp(line, "gpu_device_name")) gpu_want = mic_key(eq + 1);   // ((Triforce) 11-20: the GPU device row's card, by its name)
         }
         fclose(f);
+        // ((Triforce) options_version 8 (7 in the 436f9ac-based builds; v0.5.1's 7 still had the rows): the handheld profile is
+        // an Output resolution, the shared stick dead zone each stick's own; the other rows that went keep nothing to move (merged_rows.h kDropped). Before the values at the start are taken)
+        merged_rows::migrate(version, before7, opts.output_res, opts.lstick_dead_zone, opts.rstick_dead_zone);
         hdr_at_start = opts.hdr;   // (local, RenoDX port: vk_menu.h)
         renodx_at_start = opts.renodx, upscale_pre_at_start = opts.upscale_pre;
         tex_detail_at_start = opts.tex_detail;
@@ -4854,22 +5332,27 @@ void menu_init() {
 #endif
     }
     // An opt-in profile for 4 GB cards: keep existing options authoritative, but make a first run usable on
-    // low-VRAM hardware without requiring the menu to render first.
+    // low-VRAM hardware without requiring the menu to render first. ((Triforce, options_version 7) What the Quality preset's
+    // Minimum set, without the preset: the 3D at 50%, the handheld profile's output, the smallest textures, frames shown
+    // evenly; the memory budgets are the card's own)
     if (!has_options && getenv("RX_VK_LOW_SPEC") && atoi(getenv("RX_VK_LOW_SPEC")) != 0) {
-        apply_preset(1);
-        opts.upscale = 0;
-        opts.sharpness = 0;
+        opts.resolution = ur::snap(upscaler(), 4), opts.output_res = merged_rows::kHandheldOutput, opts.tex_detail = 3;
+        opts.pace = 1, opts.realtime = 1, opts.sharpness = 0;
     }
-    if (opts.preset > 0) sync_preset_budgets(opts.preset);
-    if (const char* e = getenv("RX_VK_FRAMEGEN_MULT")) opts.framegen = std::min(std::max(atoi(e), 2), 8);
+    // ((Triforce, FG-9) the row's whole range, 0 Off to 9 AMD's frame generation, for a lab run's pin: 2 to 8 alone before.
+    // (options_version 7) The merged Frame generation row follows it at merged_sync below)
+    if (const char* e = getenv("RX_VK_FRAMEGEN_MULT")) opts.framegen = framegen_rows::env_row(e);
     if (const char* e = getenv("RX_VK_PACE")) opts.pace = atoi(e) != 0;
-    if (const char* e = getenv("RX_VK_UPSCALE"))
-        for (Row& r : rows)
-            if (r.value == &opts.upscale) *r.value = std::min(std::max(atoi(e), r.lo), r.hi);
+    // ((Triforce, options_version 7) Reflex holding the frame rate cap with DLSS frame generation, for a run: off otherwise,
+    // until it has been played (vk_menu.h reflex_limit). The same switch as without frame generation, vk_reflex.cpp reflex_pace)
+    if (const char* e = getenv("RX_VK_REFLEX_LIMIT")) opts.reflex_limit = atoi(e) != 0;
+    // ((Triforce, options_version 7) the window's filter for this run, in place of the one the sizes choose: menu_note_present_sizes)
+    if (const char* e = getenv("RX_VK_UPSCALE")) opts.upscale = std::min(std::max(atoi(e), 0), 3);
     if (const char* e = getenv("HOS_REALTIME_STEP")) opts.realtime = atoi(e) != 0;
     if (const char* e = getenv("HOS_DYNRES")) opts.resolution = atoi(e) != 0 ? 0 : 1;
     if (const char* e = getenv("HOS_OUTPUT_RES")) opts.output_res = output_choice(atoi(e));
     lang_load();   // (Triforce: the Game language row, from language.txt)
+    merged_sync();   // ((Triforce, options_version 7) the merged rows from what was read)
     restart_init();   // (what this run started with: the rows that take a restart differ from it once changed)
 }
 
@@ -4878,6 +5361,8 @@ int resolution_scale() {
     const float s = upscaler_rows::percent(opts.resolution) / 100.0f;
     return s > 0 ? (int)(twelfths(s) * 10000.0f / 12.0f + 0.5f) : 0;   // (the twelfth game_size labels)
 }
+
+const std::string& menu_gpu_name() { return gpu_want; }
 
 void menu_set_gpu_count(int count) {
     for (Row& r : rows) {
@@ -4923,8 +5408,9 @@ int menu_take_mod_cheat() { return mod_cheats.take(); }   // (Triforce: a mod's 
 static_assert(menu_sound::kOpen == HOS_MENU_SOUND_OPEN && menu_sound::kClose == HOS_MENU_SOUND_CLOSE &&
               menu_sound::kCursor == HOS_MENU_SOUND_CURSOR && menu_sound::kDecide == HOS_MENU_SOUND_DECIDE &&
               menu_sound::kCancel == HOS_MENU_SOUND_CANCEL && menu_sound::kTabLeft == HOS_MENU_SOUND_TAB_LEFT &&
-              menu_sound::kTabRight == HOS_MENU_SOUND_TAB_RIGHT && HOS_MENU_SOUND_FANFARE == menu_sound::kTabRight + 1 &&
-              HOS_MENU_SOUND_SYS_CURSOR == HOS_MENU_SOUND_FANFARE + 1 && HOS_MENU_SOUND_N == HOS_MENU_SOUND_SYS_DECIDE + 1,
+              menu_sound::kTabRight == HOS_MENU_SOUND_TAB_RIGHT && menu_sound::kFanfare == HOS_MENU_SOUND_FANFARE &&
+              menu_sound::kSysCursor == HOS_MENU_SOUND_SYS_CURSOR && menu_sound::kSysDecide == HOS_MENU_SOUND_SYS_DECIDE &&
+              menu_sound::kLast + 1 == HOS_MENU_SOUND_N,
               // ((Triforce) the fanfare and the system menu's two: the Mods screen's and entry's own, not the options')
               "menu_sound_events.h's sounds are vk_api.h's HOS_MENU_SOUND_*");
 static_assert(menu_sound::kPageAsk == 5, "the restart question is page 5");
@@ -4989,6 +5475,31 @@ int menu_bug_shot() { return bugshot_state(); }
 void menu_note_present_sizes(uint32_t picture_w, uint32_t picture_h, uint32_t window_w, uint32_t window_h) {
     const auto c = [](uint32_t v) { return (uint64_t)std::min(v, 0xffffu); };
     present_sizes.store(c(picture_w) << 48 | c(picture_h) << 32 | c(window_w) << 16 | c(window_h), std::memory_order_relaxed);
+    // ((Triforce, options_version 7) the Window scaling filter row is gone: the picture is scaled to its place in the window by
+    // AMD FSR 1 when it is enlarged, and by the plain linear copy otherwise (upscaler_rows.h auto_filter). RX_VK_UPSCALE fixes
+    // it for a run (menu_init)
+    // (its place: the window, or the part of it the picture's shape leaves between black bars, as vk_replay.cpp present_image
+    // puts it, present_rect with the game's aspect)
+    // (and the plain copy with HDR Native: the game's picture is HDR10 PQ in 10 bits, which the blit takes as it is
+    // (upscaler_rows.h window_filter). framegen_scale takes it through RGBA16F images now ((Triforce, S5) for Sharpness at
+    // the window and ultrawide's sides), but no filter pass is added at every present for it. The swapchain is made again
+    // before this at a change of HDR (do_present), so dev.hdr is this present's)
+    static const bool fixed = getenv("RX_VK_UPSCALE") != nullptr;
+    if (fixed) return;
+    const PresentAspect aspect{host && host->aspect_ratio ? host->aspect_ratio() : 0.0f};
+    const PresentRect place = present_rect(picture_w, picture_h, nullptr, window_w, window_h, aspect);
+    const bool native_hdr = dev.hdr && opts.hdr == 2;
+    const int filter = ur::window_filter(picture_w, picture_h, place.w, place.h, native_hdr);
+    const bool same = picture_w == place.w && picture_h == place.h;
+    const int tell = filter * 4 + native_hdr * 2 + same;
+    static int told = -1;
+    if (tell != told)
+        logf("menu: the window's filter: %s (the picture %ux%u, shown at %ux%u)",
+             filter == 3 ? "AMD FSR 1" : same ? "none, the sizes are the same"
+             : native_hdr ? "the plain copy (HDR Native: its 10 bits kept)" : "the plain copy",
+             picture_w, picture_h, place.w, place.h);
+    told = tell;
+    opts.upscale = filter;
 }
 void menu_note_frame(bool game_frame, int shown) {
     if (shown) shown_frames.fetch_add(shown, std::memory_order_relaxed);
@@ -5226,6 +5737,7 @@ void menu_option_set(int id, int value) {
     }
     if (id == HOS_OPT_MODS_LIST) {
         mods_list_bits.store(value, std::memory_order_relaxed);
+        mods_list_frame.store(game_frames.load(std::memory_order_relaxed), std::memory_order_relaxed);
         mods_list_ns.store(prof_now(), std::memory_order_release);
         return;
     }
@@ -5234,7 +5746,11 @@ void menu_option_set(int id, int value) {
         return;
     }
     if (id == HOS_OPT_MODS_PRESS) {   // (Triforce: a test's scripted presses while Mods has the cursor, host/nn_hid.c)
-        mods_press.fetch_or(value, std::memory_order_relaxed);
+        mods_press.fetch_or(value & 0xff, std::memory_order_relaxed);
+        if (value & HOS_MODS_REPORT) {   // ((Triforce, 11-19) each read's: the directions held then)
+            mods_held_dirs.store(value >> HOS_MODS_HELD_SHIFT & HOS_MODS_PRESS_DIRS, std::memory_order_relaxed);
+            mods_held_ns.store(prof_now(), std::memory_order_relaxed);
+        }
         return;
     }
     if (id == HOS_OPT_TEXT_CHAR) {   // ((Triforce) a character typed into the Mods screen's search: host/display.c, the window's thread)
@@ -5244,6 +5760,7 @@ void menu_option_set(int id, int value) {
     }
     if (id == HOS_OPT_GAME_OPTIONS) {   // (Triforce: the game's own Options screen runs: each frame it does)
         game_options_ns.store(value ? prof_now() : 0, std::memory_order_relaxed);
+        game_options_from_pause.store(value == 2, std::memory_order_relaxed);
         return;
     }
     // (Triforce: the cheats of the mods' cheat files, named by the host at the first frame: host/mod_cheats.c. A cheat may not
@@ -5538,7 +6055,9 @@ void mods_tick(bool* press, bool tab_left, bool tab_right, bool mouse, bool move
         return;
     }
     if (ended) {
-        if (inst.job == mods::Job::Done) {
+        if (inst.job == mods::Job::Done && inst.kit) {   // ((Triforce) 11-18) a kit started: OK alone
+            if (press[5] || press[7]) mods::clear_done(), mods_btn = 0, changed = true;
+        } else if (inst.job == mods::Job::Done) {
             if (press[1] || press[2] || press[3] || press[4]) mods_btn ^= 1, changed = true;
             if (press[7] && mods_btn == 0) {   // (Restart Now: as the restart question's, everything saved first)
                 logf("mods: restart now, to load %s", inst.mod_name.c_str());
@@ -5657,7 +6176,7 @@ void mods_tick(bool* press, bool tab_left, bool tab_right, bool mouse, bool move
             if ((press[3] || press[4]) && files > 1) m.file_choice = (m.file_choice + files + (press[4] ? 1 : -1)) % files, changed = true;
             if (press[7] && m.details_state == 2 && files) install = mods_choice;
         } else if (press[7]) {   // (Confirm on the bar: tried again after a failure; else the on-screen keyboard (a pad), or the results)
-            if (!n && feed == mods::Feed::Failed) retry = true;
+            if (feed == mods::Feed::Failed) retry = true;   // ((Triforce) 11-18: also a list that stopped with cards in it)
             else if (pad_last || !n) keyboard = true;
             else mods_choice = 0, mods_follow = true, changed = true;
         }
@@ -5666,14 +6185,15 @@ void mods_tick(bool* press, bool tab_left, bool tab_right, bool mouse, bool move
     if (install >= 0) {
         mods::install(install);
         mods_btn = 0, changed = true;
-    } else if (retry) {   // (try again: the search, or the list)
+    } else if (retry) {   // (try again: the search, or the list; (Triforce) 11-18: a list that stopped on a page goes on from it)
         if (searching) mods_retire(mods::search(mods::search_text()));
+        else if (n_all) mods::load_more();
         else mods_retire(mods::open());
         changed = true;
     } else if (keyboard) {
         mods_kbd = true, mods_kbd_row = 1, mods_kbd_col = 0, changed = true;
     }
-    if (at >= n - 4 && mods::more() && feed == mods::Feed::Ready) mods::load_more();   // (the next page, near the end of the cards shown)
+    // ((Triforce) 11-18) the next pages: asked for by the engine one after another (vk_mods.cpp fetch_page), not by the cursor
     if (feed == mods::Feed::Loading) changed = true;   // (drawn again as it comes)
     {   // (a picture or the details came in since the last drawing: drawn again, now and then)
         static int64_t last = 0;
@@ -5684,19 +6204,43 @@ void mods_tick(bool* press, bool tab_left, bool tab_right, bool mouse, bool move
 
 void menu_tick() {
     fullscreen_tick();
+    merged_sync();   // ((Triforce, options_version 7) the merged rows from the saved values: a change made elsewhere shows)
     // (Triforce) the Mods entry under the game's list: the host's word that the cursor goes onto it (the game's Down, which the
     // game was not given) or that it was clicked (open at once)
+    // ((Triforce, 11-19) the owner: "when scrolling with the controller, the mods tab gets skipped over and goes straight to quit".
+    // The host tells of the Down (host/nn_hid.c npad_states) in the same read that gives the pad's bits, so at this tick the
+    // pad's Down is also new below (pad_held is the last tick's, before it), and the menu being open now, it was taken a
+    // second time as the entry's own Down: on to Quit at once. That Down is the move onto Mods, made: not one of the entry's.
+    // The keys had it seldom (their Down is mostly taken on a tick before, with the menu shut). Held, it repeats on to Quit
+    // after 0.35 s as the game's list does)
+    bool entered_by_down = false;
+    static int64_t mods_down_repeat_ns = 0;   // (the held Down's repeat onto Mods, word 5: when; 0 none)
     if (const int enter = mods_enter.exchange(0, std::memory_order_relaxed)) {
         if (!open_now.load() && mods_list_fresh()) {
+            // ((Triforce, 11-19) a click on the title's entry: the game's Decide on it first, then the Mods screen (as A, below))
+            const bool decide = enter == 2 && mods_title_list();
             open_now = true, embed_open = false, listening = 0, mods_btn = 0, mods_follow = true;
-            page = enter == 2 ? kModsPage : kModsRowPage;
-            if (enter == 2) mods_open_page();
+            page = enter == 2 && !decide ? kModsPage : kModsRowPage;
+            // ((Triforce) 11-19: 3, Quit clicked: its dialog opens; 4, the mouse moved onto Quit: it has the cursor)
+            mods_row_sel = enter == 3 || enter == 4 ? 1 : 0, quit_gone(), quit_sel = 0;
+            if (enter == 3) quit_open();
+            entered_by_down = enter == 1 || enter == 5;
+            // ((Triforce, 11-19) 5: a Down held from higher up the game's list, its repeat onto Mods: held on, it repeats
+            // on at the step (the repeat below takes it as held past the first delay), as the game's list went on)
+            mods_down_repeat_ns = enter == 5 ? prof_now() : 0;
+            if (enter == 2 && !decide) mods_open_page();
+            if (decide) mods_decide_ns = prof_now();
             auto_pad = pad_last;
             ui::want_glyphs();
             // (its own: before the options' state is taken. (Triforce, 11-17) the system menu's, as the game's list it is under)
-            mods_sound(enter == 2 ? HOS_MENU_SOUND_SYS_DECIDE : HOS_MENU_SOUND_SYS_CURSOR);
-            logf("menu: the Mods entry %s", enter == 2 ? "clicked" : "has the cursor");
+            const bool clicked = enter == 2 || enter == 3;
+            mods_sound(clicked ? HOS_MENU_SOUND_SYS_DECIDE : HOS_MENU_SOUND_SYS_CURSOR);
+            logf("menu: the %s entry %s%s", enter == 3 || enter == 4 ? "Quit" : "Mods", clicked ? "clicked" : "has the cursor",
+                 enter == 5 ? " (a held Down's repeat)" : "");
             menu_refresh = true;
+        } else {   // ((Triforce, 11-19) a word not taken says so: the lab's lost Down left no line)
+            logf("menu: the host's word %d for the Mods entry not taken: %s", enter,
+                 open_now.load() ? "the menu is open" : "the game's list was last told of too long ago");
         }
     }
     if (!open_now.load() || page != kModsPage) {   // ((Triforce) no text taken off the Mods screen: none kept for it either)
@@ -5717,9 +6261,11 @@ void menu_tick() {
     if (fg) GetWindowThreadProcessId(fg, &pid);
     const bool mine = pid == GetCurrentProcessId();
     bool press[K_N] = {};
+    bool key_queued[K_N] = {};   // ((Triforce, 11-19) the host's queue had a press of it: the game's keys below)
     for (int i = 0; i < K_N; i++) {
         const bool down = mine && (GetAsyncKeyState(keys[i]) & 0x8000) != 0;
         const bool queued = host && host->take_key_press && host->take_key_press(keys[i]);
+        key_queued[i] = mine && queued;
         // Read both keys even if one is disabled, so old presses cannot toggle the menu after a change.
         // (F1 always opens the menu; Menu shortcut's F1 only leaves Insert to an overlay)
         const bool enabled = keys[i] != VK_INSERT || opts.menu_shortcut == 0;
@@ -5731,7 +6277,13 @@ void menu_tick() {
     // buttons the Switch's A and B are bound to as Enter and Esc, as in the game (vk_menu_keys.h; with the Nintendo layout A
     // is the right face button), not while a binding waits for its button
     static uint32_t pad_held = 0;
-    const uint32_t raw = mine && host && host->pad_raw ? host->pad_raw() : 0, pad_press = raw & ~pad_held;
+    // ((Triforce, 11-18) the controllers as the game has them: also with its window behind another one when "Controller in
+    // background" is on (host/nn_hid.c pads_in_background: HOS_INPUT_BACKGROUND over the row). They were the front window's
+    // only here, so with the row on and another window in front the game took the pad and the menu did not: L and R did not
+    // reach our tabs from the game's Options screen, the owner's for a while. The keys stay the front window's)
+    static const char* pad_bg_env = getenv("HOS_INPUT_BACKGROUND");
+    const bool pads_ok = mine || (pad_bg_env ? atoi(pad_bg_env) != 0 : opts.pad_background != 0);
+    const uint32_t raw = pads_ok && host && host->pad_raw ? host->pad_raw() : 0, pad_press = raw & ~pad_held;
     const uint32_t chord = 1u << HOS_PAD_BACK | 1u << HOS_PAD_START;
     const bool chord_now = (raw & chord) == chord && (pad_held & chord) != chord;
     pad_held = raw;
@@ -5746,15 +6298,80 @@ void menu_tick() {
         menu_keys::confirm_back(host->binding(HOS_BIND_PAD, HOS_SW_A, 0), host->binding(HOS_BIND_PAD, HOS_SW_B, 0), &pad_confirm,
                                 &pad_back);
     if (pad(HOS_PAD_GUIDE) || chord_now) press[0] = true;
+    // ((Triforce, 11-19) the keys the player bound to the game's D-pad, its movement and its A, on the entries under the game's
+    // list (Mods, Quit and its dialog): the keys that brought the game's cursor down the list (S, or the D-pad's 4, by default)
+    // go on in the same way from Mods, and its A (E) chooses. They were the menu's own arrows and Enter alone there, and E,
+    // the menu's next tab, gave the cursor back to the game. A bit each, by press[]'s places (1 Up to 4 Right, 7 A): held now
+    // (game_keys) and new since the last tick (game_keys_new; read every tick, so one held from before is no press).
+    // ((Triforce, 11-19) a key's press is one, from one place: as the L, R and B keys' below, it counts when the key was not
+    // down at the last tick and is down now or the host's queue has its press (a tap between two ticks). The queue's press
+    // comes a little after the key's state (the window's thread notes it): one counted on the key's state is not counted
+    // again when its queued press comes at the next tick, and a key that is one of the menu's own (E, its next tab; an arrow)
+    // is the game's only there, not also the menu's: E on Mods was A by its state and the next tab by its queued press, one
+    // press two moves, and a quick tap the next tab alone, the cursor given back to the game. Its queued press that comes
+    // after A opened the Mods screen is that same press, not the screen's next category)
+    uint32_t game_keys = 0, game_keys_new = 0;
+    int gk_vk[20] = {}, gk_n = 0;   // (the game's keys read here and what the queue had of each, for the L, R and B keys below)
+    bool gk_q[20] = {};
+    {
+        static menu_keys::KeyPress gk_key[256];
+        static const int binds[5][2] = {{HOS_SW_UP, HOS_KEY_MOVE_UP}, {HOS_SW_DOWN, HOS_KEY_MOVE_DOWN},
+                                        {HOS_SW_LEFT, HOS_KEY_MOVE_LEFT}, {HOS_SW_RIGHT, HOS_KEY_MOVE_RIGHT}, {HOS_SW_A, -1}};
+        static const int places[5] = {1, 2, 3, 4, 7};
+        uint32_t vk_places[20] = {};
+        for (int b = 0; b < 5 && host && host->binding; b++)
+            for (int j = 0; j < 2; j++)
+                for (int slot = 0; slot < 2 && binds[b][j] >= 0; slot++) {
+                    const int vk = host->binding(HOS_BIND_KEY, binds[b][j], slot);
+                    if (vk < 8 || vk >= 256) continue;
+                    int m = 0;
+                    while (m < gk_n && gk_vk[m] != vk) m++;
+                    if (m == gk_n) gk_vk[gk_n++] = vk;
+                    vk_places[m] |= 1u << places[b];
+                }
+        const bool row = open_now.load() && page == kModsRowPage && listening == 0;
+        const bool queue = host && host->take_key_press;
+        const int64_t t = prof_now();
+        for (int m = 0; m < gk_n; m++) {
+            const int vk = gk_vk[m];
+            int own = -1;   // (the menu's own key it is, if any: its queued press taken above)
+            for (int i = 0; i < K_N && own < 0; i++)
+                if (keys[i] == vk) own = i;
+            const bool down = mine && (GetAsyncKeyState(vk) & 0x8000) != 0;
+            const bool q = own >= 0 ? key_queued[own] : queue && host->take_key_press(vk) && mine;
+            bool echo = false;
+            const bool went = menu_keys::key_press(gk_key[vk], down, q, row, queue, t, &echo);
+            if (echo && own >= 0) press[own] = false;   // (the queued press of one counted already, on the entries)
+            if (row) {
+                if (down) game_keys |= vk_places[m];
+                if (went) game_keys_new |= vk_places[m];
+                if (own >= 0) press[own] = false;   // (the game's key there, its press counted in went)
+            }
+            gk_q[m] = q && !echo && !row;
+        }
+        if (game_keys_new) pad_last = false;
+    }
     {   // holding an arrow or the D-pad repeats it: after 0.35 s, 12 a second, then 30 a second after 1.5 s held
         static int64_t held_since[5], next_repeat[5];
         const int pads[5] = {0, HOS_PAD_UP, HOS_PAD_DOWN, HOS_PAD_LEFT, HOS_PAD_RIGHT};
         // ((Triforce) 11-17, his "you cannot go up from mods ... with the analog stick": the left stick as the D-pad)
         const int sticks[5] = {0, HOS_PAD_LS_UP, HOS_PAD_LS_DOWN, HOS_PAD_LS_LEFT, HOS_PAD_LS_RIGHT};
         const int64_t t = prof_now();
+        // ((Triforce, 11-19) and the directions a test's script holds while the Mods entry or its screen has the cursor, as the
+        // host told at its last read (host/nn_hid.c mods_input): repeated as a pad's are. A report older than a quarter second
+        // is none (the host reads each game frame))
+        const bool mods_here = page == kModsRowPage || page == kModsPage;
+        const int host_held = mods_here && t - mods_held_ns.load(std::memory_order_relaxed) < 250000000LL
+                                  ? mods_held_dirs.load(std::memory_order_relaxed) : 0;
         for (int i = 1; i <= 4; i++) {
-            const bool down = held[i] || (open_now.load() && listening != 1 && ((raw >> pads[i] & 1) || (raw >> sticks[i] & 1)));
+            const bool down = held[i] || (game_keys >> i & 1) || (open_now.load() && listening != 1 &&
+                                          ((raw >> pads[i] & 1) || (raw >> sticks[i] & 1) || (host_held >> (i - 1) & 1)));
             if (!down) { held_since[i] = 0; continue; }
+            if (!held_since[i] && i == 2 && mods_down_repeat_ns && t - mods_down_repeat_ns < 250000000LL) {
+                // ((Triforce, 11-19) the held Down that came onto Mods by repeat: past the first delay already, on at the step)
+                held_since[i] = t - 350000000LL, next_repeat[i] = t + 83000000LL, mods_down_repeat_ns = 0;
+                continue;   // (a script's held Down is told at the host's next read: a quarter second for it)
+            }
             if (!held_since[i]) { held_since[i] = t, next_repeat[i] = t + 350000000LL; continue; }
             if (t >= next_repeat[i] && open_now.load() && listening == 0) {
                 press[i] = true;
@@ -5812,9 +6429,78 @@ void menu_tick() {
             pad_last = true;
         }
     }
+    for (int i : {1, 2, 3, 4, 7}) press[i] |= (game_keys_new >> i & 1) != 0;   // ((Triforce, 11-19) the game's keys on Mods, above)
+    if (entered_by_down) press[2] = false;   // ((Triforce, 11-19) the Down that brought the cursor onto Mods: the game list's move, made)
     bool tab_left = press[10] || pad(HOS_PAD_LSHOULDER) || pad(HOS_PAD_LTRIGGER);
     bool tab_right = press[11] || press[12] || pad(HOS_PAD_RSHOULDER) || pad(HOS_PAD_RTRIGGER);
     if (press[12] && (GetAsyncKeyState(VK_SHIFT) & 0x8000)) tab_left = true, tab_right = false;
+    // ((Triforce) the keys the player bound to the Switch's L, R and B (triforce_options.ini key_l, key_r, key_b: Q, R and Shift
+    // by default), which the tab strip's ends and the guides name (ui_ctx): our tabs and Back answer to them as the game's own
+    // Options tab does, beside Q, E, Tab and Esc; and the gamepad inputs L and R are bound to, beside the shoulders and the
+    // triggers. A key the menu has a use of its own for keeps that use (menu_bound_key). A modifier (B's Shift by default)
+    // counts as it is let go with nothing else pressed meanwhile, so Shift+Tab still steps back a tab (the host
+    // taps the game's Back for it all the same, host/nn_hid.c). Read every tick, so a press from before the menu opened is
+    // not taken. game_lr: the keys bound to L and R as the game has them, every one, for its own tab below)
+    // (A key that is no modifier also counts from the host's queue of presses, as the menu's own keys do, so a quick tap
+    // between two ticks is not lost: counted when the key was not down at the last tick, so no press counts twice. A
+    // modifier is no press of its own once anything else went with it: any other key or mouse button down, a pad press, the
+    // wheel (below, at the mouse's read), or the window losing the front, Win+Shift+S or Alt+Tab)
+    bool bound_go[3] = {}, game_lr[2] = {};   // (L, R, B pressed this tick)
+    static bool bound_armed[3][2];            // (a modifier bound to L, R or B down alone so far: a press as it is let go)
+    {
+        static bool bound_held[3][2], game_held[2][2];
+        static const int buttons[3] = {HOS_SW_L, HOS_SW_R, HOS_SW_B};
+        bool other = !mine || pad_press != 0;   // (a key of the menu's down or pressed, and the rest above)
+        for (int i = 0; i < K_N; i++) other |= held[i] || press[i];
+        int vks[6] = {};
+        bool downs[6] = {}, queued[6] = {};
+        for (int n = 0; n < 6; n++) {
+            const int b = n / 2, slot = n % 2, vk = vks[n] = menu_bound_key(buttons[b], slot);
+            if (vk && !menu_modifier_key(vk) && host && host->take_key_press) {   // (one key bound twice: taken once)
+                int m = 0;
+                while (m < n && vks[m] != vk) m++;
+                int g = 0;   // ((Triforce, 11-19) a key also bound to the game's D-pad, movement or A: its queue read there)
+                while (g < gk_n && gk_vk[g] != vk) g++;
+                queued[n] = m < n ? queued[m] : g < gk_n ? gk_q[g] : host->take_key_press(vk) && mine;
+            }
+            const bool down = downs[n] = mine && vk && (GetAsyncKeyState(vk) & 0x8000) != 0;
+            const bool went = !bound_held[b][slot] && (down || queued[n]);
+            bound_held[b][slot] = down;
+            if (!menu_modifier_key(vk)) {
+                bound_go[b] |= went, other |= went, bound_armed[b][slot] = false;
+                continue;
+            }
+            if (went) bound_armed[b][slot] = true;
+        }
+        for (int n = 0; n < 6; n++) {
+            const int b = n / 2, slot = n % 2, vk = vks[n];
+            if (!bound_armed[b][slot]) continue;
+            bool with = other;   // (any other key or mouse button down: read only while a modifier waits)
+            for (int k = 1; k < 255 && !with; k++) with = !menu_same_modifier(vk, k) && (GetAsyncKeyState(k) & 0x8000) != 0;
+            if (with || listening || !open_now.load()) bound_armed[b][slot] = false;   // (or it went down for a binding, or in play)
+            else if (!downs[n]) bound_go[b] = true, bound_armed[b][slot] = false;
+        }
+        for (int side = 0; side < 2 && host && host->binding; side++)
+            for (int slot = 0; slot < 2; slot++) {
+                const int vk = host->binding(HOS_BIND_KEY, side ? HOS_SW_R : HOS_SW_L, slot);
+                const bool down = mine && vk && (GetAsyncKeyState(vk) & 0x8000) != 0;
+                if (down && !game_held[side][slot]) game_lr[side] = true;
+                game_held[side][slot] = down;
+            }
+    }
+    // (not while the Mods screen's search takes the keyboard's text, menu_mods_typing: there a bound R is a letter of the
+    // search, not the next category, and B's Shift let go alone would clear it. Read all the same above, so no press is kept)
+    if (open_now.load() && listening == 0) {
+        if (bound_go[0] || bound_go[1] || bound_go[2]) pad_last = false;
+        if (!menu_mods_typing()) tab_left |= bound_go[0], tab_right |= bound_go[1], press[5] |= bound_go[2];
+        for (int side = 0; side < 2 && host && host->binding; side++) {   // (a pad input the menu has no other use for)
+            const int p = host->binding(HOS_BIND_PAD, side ? HOS_SW_R : HOS_SW_L, 0);
+            const bool own = p == HOS_PAD_UP || p == HOS_PAD_DOWN || p == HOS_PAD_LEFT || p == HOS_PAD_RIGHT || p == HOS_PAD_GUIDE ||
+                             p == HOS_PAD_BACK || p == HOS_PAD_START || p == pad_confirm || p == pad_back ||
+                             p == HOS_PAD_LSHOULDER || p == HOS_PAD_RSHOULDER || p == HOS_PAD_LTRIGGER || p == HOS_PAD_RTRIGGER;
+            if (p >= 0 && p < HOS_PAD_N && !own && pad(p)) (side ? tab_right : tab_left) = true;
+        }
+    }
     // ((Triforce) the upscalers asked ahead once the game has a frame up (menu_ahead), and the Frame generation row set again once
     // they have answered. The game's button icons asked for as the game's own Options screen comes, ahead of our tabs' open:
     // read on a thread of their own, vk_imgui.cpp)
@@ -5840,17 +6526,13 @@ void menu_tick() {
     if (in_game_options && !open_now.load()) {
         // The game's own tab: the game has the input. L and R as it has them go to our tabs: the gamepad inputs the Switch's L
         // and R are bound to, and their keys (Q, E and Tab are the game's own keys here: E is its A by default)
+        // ((Triforce) the keys' presses are game_lr's, above: read every tick, so a key that closed our tabs at their end and is
+        // still held does not open them again)
         bool go[2] = {script_tab < 0, script_tab > 0};
-        static bool key_held[2][2];
         for (int side = 0; side < 2 && host && host->binding; side++) {
             const int sw = side ? HOS_SW_R : HOS_SW_L, p = host->binding(HOS_BIND_PAD, sw, 0);
             if (p >= 0 && p < HOS_PAD_N && (pad_press >> p & 1)) go[side] = true, pad_last = auto_pad = true;
-            for (int slot = 0; slot < 2; slot++) {
-                const int vk = host->binding(HOS_BIND_KEY, sw, slot);
-                const bool down = mine && vk && (GetAsyncKeyState(vk) & 0x8000) != 0;
-                if (down && !key_held[side][slot]) go[side] = true, pad_last = false;
-                key_held[side][slot] = down;
-            }
+            if (game_lr[side]) go[side] = true, pad_last = false;
         }
         // ((Triforce) the mouse on our tabs over the game's header, as on the open menu's: a tab under it lit, a click on one shows
         // it, on the L and R (Q and E) at their ends as L and R. Its presses are the window's for the game's menus too
@@ -5862,7 +6544,7 @@ void menu_tick() {
             if (!game_tab_read) gp.pressed = 0, game_tab_read = true;   // (pressed before the tabs were shown: not theirs)
             int ix = 0, iy = 0;
             menu_hit::to_image(gp.x, gp.y, gp.width, gp.height, (int)dev.swap_extent.width, (int)dev.swap_extent.height, &ix, &iy);
-            const menu_hit::Hit hit = on ? hits.at((float)(ix - (int)game_tab_ox), (float)iy) : menu_hit::Hit{};
+            const menu_hit::Hit hit = on ? hits.at(game_tab_map.back_x((float)ix), game_tab_map.back_y((float)iy)) : menu_hit::Hit{};
             hover_tab = hit.part == menu_hit::kTab && hit.index != kGameTab ? hit.index : -1;
             if (on && (gp.pressed & HOS_MOUSE_LEFT)) {
                 if (hit.part == menu_hit::kTabPrev) go[0] = true, pad_last = false;
@@ -5900,7 +6582,7 @@ void menu_tick() {
         int ix = 0, iy = 0;
         menu_hit::to_image(ptr.x, ptr.y, ptr.width, ptr.height, (int)dev.swap_extent.width, (int)dev.swap_extent.height,
                            &ix, &iy);
-        if (mouse) mx = ix - (int)menu_ox, my = iy;   // (the menu's column's pixels: draw_menu)
+        if (mouse) mx = (int)std::floor(menu_map.back_x((float)ix)), my = (int)std::floor(menu_map.back_y((float)iy));   // (the menu's column's pixels: draw_menu)
         // ((Triforce) the first read takes no click: one from before the menu opened is not its own. The window keeps the
         // clicks on the game's Options screen for its tabs over the header, host/display.c game_menu_press)
         if (!mouse_read) ptr.pressed = 0;
@@ -5909,6 +6591,8 @@ void menu_tick() {
         last_x = mx, last_y = my, mouse_read = true;                     // menu as it opens leaves the selection alone)
         if (moved) pad_last = false;
         if (!mouse) ptr.pressed = 0, ptr.wheel = 0;
+        if (ptr.pressed || ptr.wheel)   // (a click or the wheel with a modifier bound to L, R or B held: it is no press of its own)
+            for (auto& armed : bound_armed) armed[0] = armed[1] = false;
     }
     // (closing with a setting that takes a restart changed: the restart question first, Later already chosen on it)
     auto later = [&] {
@@ -6096,15 +6780,64 @@ void menu_tick() {
             else teleport_choice = std::clamp(teleport_step_rows(teleport_choice, rows) + (press[4] - press[3]), 0, kTeleports - 1);
             if (teleport_choice != was) teleport_follow = true, changed = true;
         }
-    } else if (open_now.load() && page == kModsRowPage) {   // (Triforce) the cursor on the Mods entry under the game's list
-        if (mouse && (ptr.pressed & HOS_MOUSE_LEFT) && hits.at((float)mx, (float)my).part == menu_hit::kButton) press[7] = true;
-        if (!mods_list_fresh()) {   // (the game's list went: its screen closed under it)
-            open_now = false, page = 0, changed = true;
-        } else if (press[7]) {   // (A: Mods opens)
+    } else if (open_now.load() && page == kModsRowPage && mods_decide_ns) {   // ((Triforce, 11-19) the title's entry's Decide plays
+        // (its sound with the press; no input meanwhile, as the game takes none during its own; the Mods screen at its end)
+        if (!mods_list_fresh()) mods_decide_ns = 0, open_now = false, page = 0, changed = true;
+        else if (prof_now() - mods_decide_ns >= mods_entry::kDecideNs) {
+            mods_decide_ns = 0, mods_decided = true;
             page = kModsPage, mods_btn = 0, mods_follow = true, changed = true;
             mods_open_page();
-        } else if (press[1] || press[5] || press[0] || press[6] || tab_left || tab_right) {   // (Up or Back: the game's cursor again)
-            open_now = false, page = 0, changed = true;
+        }
+    } else if (open_now.load() && page == kModsRowPage) {   // (Triforce) the cursor on the entries under the game's list
+        const bool quit_here = quit_entry_shown();
+        if (!quit_here) mods_row_sel = 0, quit_gone();
+        // ((Triforce, 11-19) the dialog takes input once its In has played, as the game's: what comes before is not kept)
+        const bool quit_ready = quit_ask && focus_anim::window_ready(prof_now() - quit_open_ns);
+        if (mouse) {   // (the cursor on an entry or a dialog button chooses it; a click is A)
+            const menu_hit::Hit hit = hits.at((float)mx, (float)my);
+            if (hit.part == menu_hit::kButton) {
+                if (quit_ready && hit.index >= 10 && hit.index - 10 != quit_sel && (moved || ptr.pressed))
+                    quit_sel = hit.index - 10, mods_sound(HOS_MENU_SOUND_SYS_CURSOR), changed = true;
+                if (!quit_ask && hit.index < 2 && hit.index != mods_row_sel && (moved || ptr.pressed))
+                    mods_row_sel = hit.index, mods_sound(HOS_MENU_SOUND_SYS_CURSOR), changed = true;
+                // (with the dialog open, a click is A only on its own buttons: draw_quit_ask leaves no others, and a tick
+                // before its first drawing still has the entries')
+                if ((ptr.pressed & HOS_MOUSE_LEFT) && (!quit_ask || hit.index >= 10)) press[7] = true;
+            } else if (moved && !quit_ask && !quit_closing()) {
+                // ((Triforce, 11-19) the mouse moved up off the entries onto the game's list (the title's four entries above,
+                // the System page's buttons, as wide): the game's cursor again, as Up from Mods (the host gives the mouse back
+                // to the game's list, which takes the focus under it)
+                const float* e = mods_entry_px;
+                if (mx >= e[0] && mx <= e[2] && my < e[1] && my > e[1] - (quit_here ? 6 : 4) * e[4]) mods_row_sel = 0, press[1] = true;
+            }
+        }
+        if (!mods_list_fresh()) {   // (the game's list went: its screen closed under it)
+            open_now = false, page = 0, quit_gone(), mods_row_sel = 0, changed = true;
+        } else if (quit_ask && !quit_ready) {   // (its In playing: drawn each frame, no input)
+            press[1] = press[2] = press[5] = press[0] = press[6] = press[7] = false, tab_left = tab_right = false;
+        } else if (quit_ask) {   // (Quit's dialog: Up and Down its buttons, A chooses, B is Cancel)
+            if (press[1] && quit_sel > 0) quit_sel--, mods_sound(HOS_MENU_SOUND_SYS_CURSOR), changed = true;
+            else if (press[2] && quit_sel < 2) quit_sel++, mods_sound(HOS_MENU_SOUND_SYS_CURSOR), changed = true;
+            else if (press[7]) {
+                mods_sound(quit_sel == 2 ? HOS_MENU_SOUND_CANCEL : HOS_MENU_SOUND_SYS_DECIDE);
+                if (quit_sel == 2) quit_cancel();
+                else end_game(quit_sel == 1), quit_gone(), quit_ended = true, open_now = false, page = 0;
+                changed = true;
+            } else if (press[5] || press[0] || press[6]) quit_cancel(), mods_sound(HOS_MENU_SOUND_CANCEL), changed = true;
+            press[1] = press[2] = press[5] = press[0] = press[6] = false, tab_left = tab_right = false;
+        } else if (press[7]) {   // (A: Mods opens; on Quit its dialog)
+            if (mods_row_sel == 1) quit_open(), mods_sound(HOS_MENU_SOUND_SYS_DECIDE), changed = true;
+            else if (mods_title_list()) mods_decide_ns = prof_now(), mods_sound(HOS_MENU_SOUND_SYS_DECIDE), changed = true;   // (its Decide first)
+            else {
+                page = kModsPage, mods_btn = 0, mods_follow = true, changed = true;
+                mods_open_page();
+            }
+        } else if (press[2] && quit_here && mods_row_sel == 0) {   // (Down from Mods: Quit)
+            mods_row_sel = 1, mods_sound(HOS_MENU_SOUND_SYS_CURSOR), changed = true;
+        } else if (press[1] && mods_row_sel == 1) {   // (Up from Quit: Mods)
+            mods_row_sel = 0, mods_sound(HOS_MENU_SOUND_SYS_CURSOR), changed = true;
+        } else if (press[1] || press[5] || press[0] || press[6] || tab_left || tab_right) {   // (Up from Mods, or Back: the game's cursor again)
+            open_now = false, page = 0, mods_row_sel = 0, changed = true;
         }
     } else if (open_now.load() && page == kModsPage) {   // (Triforce) the Mods page
         mods_tick(press, tab_left, tab_right, mouse, moved, ptr, mx, my, changed);
@@ -6181,7 +6914,8 @@ void menu_tick() {
         int& selected = tab_selected[cur_tab];
         if (selected >= tab_count) selected = tab_count - 1;   // (a row gone since: the debug tools with them turned off)
         auto heading_at = [&](int k) { return rows[tab_row_to_global(cur_tab, k)].heading; };   // (stepped over)
-        if (heading_at(selected)) selected = (selected + 1) % tab_count;
+        // ((Triforce, options_version 7) every tab but Debug starts with a group's heading: the first row under it)
+        for (int k = 0; k < tab_count && heading_at(selected); k++) selected = (selected + 1) % tab_count;
         if (cur_tab == TAB_DEBUG && (press[1] || press[2])) {   // (the Debug tab: in its layout's order, debug_rows)
             selected = debug_step(selected, press[2] ? 1 : -1);
             changed = true;
@@ -6198,27 +6932,8 @@ void menu_tick() {
             }
         }
         Row& r = rows[tab_row_to_global(cur_tab, selected)];
-        const bool confirm_selected = &r == &rows[kQuitRow] || &r == &rows[kRestartRow];
-        if (pending && (pending != &r || !mine)) pending = nullptr, changed = true;
-        if (press[7] && confirm_selected) {
-            if (mine && !press[5]) {
-                if (pending != &r) {
-                    pending = &r, changed = true;
-                } else {   // (as Restart now: saved first, as the window's own close does not force the pipeline cache)
-                    save();
-                    pipeline_cache_save(true);
-                    memory_trial_orderly_end();
-                    pending = nullptr;
-                    if (&r == &rows[kRestartRow]) {   // (the restart question's Restart now: the window closes, then the game starts again)
-                        logf("menu: restart");
-                        open_now = false, changed = true;
-                        if (const HWND window = app_window()) PostMessageA(window, WM_APP + 9, 0, 0);
-                    } else if (const HWND window = app_window()) {
-                        PostMessageA(window, WM_CLOSE, 0, 0);
-                    }
-                }
-            }
-        } else if (r.cheat >= 0) cheat_press(r.cheat, press, changed);   // (a debug tool: on the Debug tab itself)
+        if (pending) pending = nullptr, changed = true;
+        if (r.cheat >= 0) cheat_press(r.cheat, press, changed);   // (a debug tool: on the Debug tab itself)
         // (Triforce: a mod's cheat: Left On, Right Off, confirm flips; the host takes the change, menu_take_mod_cheat. Before the
         // rows that act by their name or open a page: a cheat's name is the file's)
         else if (mod_cheat_slot(r.name) >= 0) changed |= mod_cheats.press(mod_cheat_slot(r.name), press[3], press[4], press[7]);
@@ -6257,11 +6972,14 @@ void menu_tick() {
         const menu_sound::State after = sound_state();
         const bool row_before = sound_before.open && sound_before.page == kModsRowPage;
         if (row_before) {
-            if (after.open && after.page == kModsPage) mods_sound(HOS_MENU_SOUND_SYS_DECIDE);
-            else if (!after.open) mods_sound(HOS_MENU_SOUND_SYS_CURSOR);
+            if (after.open && after.page == kModsPage) { if (!mods_decided) mods_sound(HOS_MENU_SOUND_SYS_DECIDE); }   // (the title's: at the press)
+            else if (!after.open && !quit_ended) mods_sound(HOS_MENU_SOUND_SYS_CURSOR);   // (not after Quit Game or Restart Game's decide)
         } else if (sound_before.open || !after.open || after.page != kModsRowPage) {
             if (opts.menu_sounds > 0) sound_queue.put(menu_sound::sound_of(sound_before, sound_state(), in), prof_now());
         }
+        mods_decided = false;
+        quit_ended = false;
+        if (!open_now.load() || page != kModsRowPage) mods_decide_ns = 0;   // (a Decide cut short: the menu shut by its keys)
     }
     names_tick();   // ((Triforce) the name pages: their lists, the flags asked for, what the game's side said)
     // (Triforce) the Salesman's thread draws only while the Mods page shows him
@@ -6306,8 +7024,93 @@ void menu_tick() {
     }
 }
 
+/// (Triforce, 11-19) Benchmark mode's panel (host/hos_bench.c, HOS_BENCHMARK; MkwVkHost.bench): what the run does, drawn over
+/// the game in the launcher's look, top left, clear of the middle: near-black at 85% with a thin gold edge, the title in gold,
+/// the scene and its place in the run, the live frame rate big with the scene's 1% low beside it, the newest frame times as
+/// a line (the 60 fps time marked), the whole run's progress as a gold bar along the panel's foot and how to stop it.
+/// While the start loads the save, while a teleport loads the next place and at the end it says so in the scene's line
+bool bench_now(MkwVkBench* b) { return host && host->bench && host->bench(b) && b->phase != MKWVK_BENCH_OFF; }
+void draw_bench(ui::Ctx& c, const MkwVkBench& b) {
+    ImFont* title_f = c.f.heading ? c.f.heading : c.f.strong;
+    ImFont* body = c.f.body ? c.f.body : c.f.strong;
+    ImFont* strong = c.f.strong ? c.f.strong : body;
+    ImFont* digits = c.f.number ? c.f.number : strong;
+    if (!body || !title_f) return;
+    const float k = std::max(0.6f, c.h / 1080.0f);
+    const ImU32 gold = ui::rgba(224, 178, 62), ink = ui::rgba(243, 234, 213), soft = ui::rgba(243, 234, 213, 165),
+                faint = ui::rgba(243, 234, 213, 110), bg = ui::rgba(10, 9, 8, 217);
+    const float m = std::floor(28 * k), pad = std::floor(22 * k), pw = std::floor(440 * k);
+    const float t_px = 28 * k, l_px = 21 * k, big = 64 * k, unit_px = 22 * k, small = 15.5f * k, low_px = 30 * k;
+    const float graph_h = 64 * k, bar_h = std::max(3.0f, std::floor(5 * k));
+    const float x0 = m + pad, x1 = m + pw - pad;
+    // (the heights first: the panel keeps one size through the run)
+    const float h_title = t_px * 1.15f, h_line = l_px * 1.3f, h_big = big * 1.05f;
+    const float ph = std::ceil(pad + h_title + 6 * k + h_line + 14 * k + h_big + 12 * k + graph_h + 16 * k + bar_h + 12 * k + small * 1.2f + pad);
+    const ImVec2 a(m, m), z(m + pw, m + ph);
+    c.d->AddRectFilled(a, z, bg, 6 * k);
+    c.d->AddRect(a, z, ui::alpha(gold, 0.85f), 6 * k, 0, std::max(1.0f, 1.25f * k));
+    float y = m + pad;
+    c.d->AddText(title_f, t_px, ImVec2(x0, y), gold, "Triforce benchmark");
+    y += h_title + 6 * k;
+    char line[160];
+    switch (b.phase) {
+    case MKWVK_BENCH_BOOT: snprintf(line, sizeof line, "Loading your newest save"); break;
+    case MKWVK_BENCH_TRAVEL: snprintf(line, sizeof line, "Going to %s", b.name); break;
+    case MKWVK_BENCH_DONE: snprintf(line, sizeof line, "Finished \xC2\xB7 the launcher has your results"); break;
+    case MKWVK_BENCH_STOPPED: snprintf(line, sizeof line, "Stopped \xC2\xB7 the launcher has what was measured"); break;
+    case MKWVK_BENCH_FAILED: snprintf(line, sizeof line, "%s", b.line[0] ? b.line : "The benchmark could not finish"); break;
+    default: snprintf(line, sizeof line, "Scene %d of %d \xC2\xB7 %s", b.scene, b.scenes, b.name); break;
+    }
+    c.d->PushClipRect(ImVec2(x0, y), ImVec2(x1, y + h_line), true);   // (a long name or reason stays inside the panel)
+    c.d->AddText(body, l_px, ImVec2(x0, y), b.phase == MKWVK_BENCH_FAILED ? ui::rgba(236, 120, 96) : ink, line);
+    c.d->PopClipRect();
+    y += h_line + 14 * k;
+    {   // (the live rate, big; the scene's 1% low at the right. Finished: the whole run's average and its lowest 1% low)
+        const bool live = b.phase == MKWVK_BENCH_SETTLE || b.phase == MKWVK_BENCH_MEASURE || b.phase == MKWVK_BENCH_DONE;
+        char fps[16], low[16];
+        snprintf(fps, sizeof fps, live && b.fps > 0 ? "%.0f" : "--", b.fps);
+        snprintf(low, sizeof low, live && b.low1 > 0 ? "%.0f" : "--", b.low1);
+        const ImVec2 fs = ui::size_of(digits, big, fps);
+        c.d->AddText(digits, big, ImVec2(x0, y), live ? ink : faint, fps);
+        c.d->AddText(strong, unit_px, ImVec2(x0 + fs.x + 10 * k, y + big * 0.98f - unit_px * 1.25f), gold, "fps");
+        const ImVec2 ls = ui::size_of(strong, low_px, low), ll = ui::size_of(body, small, "1% low");
+        c.d->AddText(body, small, ImVec2(x1 - ll.x, y + 4 * k), soft, "1% low");
+        c.d->AddText(strong, low_px, ImVec2(x1 - ls.x, y + 4 * k + small * 1.25f), live ? ink : faint, low);
+    }
+    y += h_big + 12 * k;
+    {   // (the frame times: the newest at the right, 0 at the bottom, the top 33 ms or the longest shown; the 60 fps time marked)
+        const ImVec2 g0(x0, y), g1(x1, y + graph_h);
+        c.d->AddRectFilled(g0, g1, ui::rgba(0, 0, 0, 110), 3 * k);
+        const int n = std::min<int>(b.graph_n, MKWVK_BENCH_GRAPH);
+        float most = 33.4f;
+        for (int i = 0; i < n; i++) most = std::max(most, std::min(b.graph_ms[i], 250.0f));
+        const float top = g0.y + 4 * k, bot = g1.y - 3 * k;
+        const float y60 = bot - 16.667f / most * (bot - top);
+        c.d->AddLine(ImVec2(g0.x, y60), ImVec2(g1.x, y60), ui::rgba(243, 234, 213, 40), 1.0f);
+        if (n >= 2) {
+            static ImVec2 pts[MKWVK_BENCH_GRAPH];
+            for (int i = 0; i < n; i++) {
+                const float t = std::min(b.graph_ms[i], most);
+                pts[i] = ImVec2(g1.x - (g1.x - g0.x) * (float)(n - 1 - i) / (MKWVK_BENCH_GRAPH - 1), bot - t / most * (bot - top));
+            }
+            const bool live = b.phase == MKWVK_BENCH_SETTLE || b.phase == MKWVK_BENCH_MEASURE;
+            c.d->AddPolyline(pts, n, live ? gold : ui::alpha(gold, 0.4f), ImDrawFlags_None, std::max(1.0f, 1.5f * k));
+        }
+    }
+    y += graph_h + 16 * k;
+    {   // (the whole run's progress)
+        const float p = std::clamp(b.progress, 0.0f, 1.0f);
+        c.d->AddRectFilled(ImVec2(x0, y), ImVec2(x1, y + bar_h), ui::rgba(243, 234, 213, 36), bar_h * 0.5f);
+        if (p > 0) c.d->AddRectFilled(ImVec2(x0, y), ImVec2(x0 + (x1 - x0) * p, y + bar_h), gold, bar_h * 0.5f);
+    }
+    y += bar_h + 12 * k;
+    if (b.phase < MKWVK_BENCH_DONE) c.d->AddText(body, small, ImVec2(x0, y), faint, "Esc stops the benchmark");
+}
+
 void menu_record(VkCommandBuffer cmd, uint32_t index, uint32_t w, uint32_t h) {
     const bool start = startup_on.load(std::memory_order_acquire);
+    static MkwVkBench bench;   // ((Triforce) benchmark mode: its panel over everything else)
+    const bool bench_on = bench_now(&bench);
     if (!start) bugshot_record(cmd, index, w, h);   // (Triforce: a bug capture's picture of this frame, before anything is drawn over it)
     const bool fps = opts.show_fps && !start;   // (no game frames yet: not "0 FPS" over the start-up screen)
     const bool open = open_now.load(std::memory_order_relaxed);
@@ -6315,8 +7118,8 @@ void menu_record(VkCommandBuffer cmd, uint32_t index, uint32_t w, uint32_t h) {
     // (Triforce: the game's own Options screen is up and none of our tabs: its header's tabs alone)
     const int64_t game_seen = game_options_ns.load(std::memory_order_relaxed);
     const bool game_tab = !open && !start && embed_allowed() && game_seen && prof_now() - game_seen < 250000000LL && embed_since;
-    const bool mods_row = !open && !start && mods_list_fresh();   // ((Triforce) the Mods entry under the game's list)
-    if (!start && !fps && !open && !note && !game_tab && !mods_row) {   // (nothing shows: no ImGui frame, no render pass)
+    const bool mods_row = !open && !start && (mods_list_fresh() || mods_title_fading());   // ((Triforce) the Mods entry under the game's list)
+    if (!start && !fps && !open && !note && !game_tab && !mods_row && !bench_on) {   // (nothing shows: no ImGui frame, no render pass)
         // (but a new window size or Menu size since the last bake: one frame with nothing drawn that bakes the menu's glyphs
         // and measures its page for the new size, so the next open has no hitch whatever was resized while nothing showed)
         if (prebake_needed(w, h) && ui::begin(w, h)) {
@@ -6346,14 +7149,22 @@ void menu_record(VkCommandBuffer cmd, uint32_t index, uint32_t w, uint32_t h) {
     // ((Triforce) Full: NX2navi's panel alone, no counter beside it (its perf_draw), and under the options or the game tab's
     // header while they show (its BringWindowToDisplayBack): the open menu covers it)
     const bool full = fps && opts.show_fps == 2;
-    if (open) draw_menu(c, full);
+    // ((Triforce, 11-19) the Mods entry's page: the panel over Quit's dialog and its dim, as over the game's own dialogs, which
+    // the game draws under every overlay. The lab's "its dim covers the left part of the stats overlay")
+    const bool over_row = open && page == kModsRowPage;
+    if (open) draw_menu(c, full && !over_row);
     else {
         if (full) draw_perf(c);
         if (game_tab) draw_game_tab(c);
         else if (mods_row) draw_mods_row_shut(c);
     }
+    if (full && over_row) draw_perf(c);
     if (fps && !full) draw_fps(c, (open && page != kModsRowPage) || game_tab);   // ((Triforce) the Mods entry: the counter stays where the game list has it)
     if (note) draw_notice(c);
+    if (bench_on) {   // ((Triforce) benchmark mode's panel, in the overlay's own fonts, over the rest
+        ui::Ctx bc = ui_ctx(w, h);
+        draw_bench(bc, bench);
+    }
     ::mkwvk::rec::boundary(::mkwvk::rec::B_DIRECT);   // (Dear ImGui records into cmd directly, its backend through its own pointers: what this thread recorded through vk_work.h reaches cmd first)
     ui::record(cmd, index, w, h);
 }
@@ -6363,22 +7174,30 @@ void menu_record_image(VkCommandBuffer cmd, VkImage image, VkImageView view, uin
     const bool fps = opts.show_fps && !startup_on.load(std::memory_order_acquire);
     const bool note = !open && notice_text[0] && prof_now() < notice_until;
     const bool game_tab = !open && game_options_shown() && embed_since;
-    const bool mods_row = !open && mods_list_fresh();
-    if (!open && !fps && !note && !game_tab && !mods_row) return;
+    const bool mods_row = !open && (mods_list_fresh() || mods_title_fading());
+    static MkwVkBench bench;   // ((Triforce) benchmark mode's panel, in the shots too)
+    const bool bench_on = bench_now(&bench);
+    if (!open && !fps && !note && !game_tab && !mods_row && !bench_on) return;
     if (!ui::begin(w, h)) return;
     // ((Triforce) a still: with no window's frames stepping the easing (menu_record), the lists stand where the selection asks.
     // Before, a headless shot, and tests/ui_preview.cpp's pictures, showed every list at its top whatever was selected)
     if (!ease_live) ease_step = 1.0f;
     ui::Ctx c = menu_ctx(w, h);
     const bool full = fps && opts.show_fps == 2;   // ((Triforce) as menu_record: the panel alone, under the menu)
-    if (open) draw_menu(c, full);
+    const bool over_row = open && page == kModsRowPage;   // ((Triforce, 11-19) over Quit's dialog: as menu_record)
+    if (open) draw_menu(c, full && !over_row);
     else {
         if (full) draw_perf(c);
         if (game_tab) draw_game_tab(c);
         else if (mods_row) draw_mods_row_shut(c);
     }
+    if (full && over_row) draw_perf(c);
     if (fps && !full) draw_fps(c, (open && page != kModsRowPage) || game_tab);   // ((Triforce) the Mods entry: the counter stays where the game list has it)
     if (note) draw_notice(c);
+    if (bench_on) {
+        ui::Ctx bc = ui_ctx(w, h);
+        draw_bench(bc, bench);
+    }
     ::mkwvk::rec::boundary(::mkwvk::rec::B_DIRECT);   // (Dear ImGui records into cmd directly, its backend through its own pointers: what this thread recorded through vk_work.h reaches cmd first)
     ui::record_to(cmd, image, view, w, h);
 }

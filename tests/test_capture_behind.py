@@ -410,17 +410,40 @@ def check_source(mem, replay, texture, dev):
     seg = replay[replay.index("seg_cv.wait(l, [j] { return j->done.load(); });"):]
     check(seg.index("seg_cv.wait(l, [j] { return j->done.load(); });") < seg.index("vkQueueSubmit2(dev.queue, 1, &si, j->r->fence)"),
           "a parallel replay's segment is submitted before it is done")
-    check(replay.count("vkQueueSubmit2(") == 4, "vk_replay.cpp submits in a place this test does not know: check that the copies "
+    # ((Triforce) the early segments' path (replay_handle_early, RX_VK_SEG_EARLY) submits its segments as replay_handle does: two
+    # segment submits, each after its job's wait, and each job flushes its uploads (run_job: texture_uploads_recorded) before it is done)
+    seg_submit = "vkQueueSubmit2(dev.queue, 1, &si, j->r->fence)"
+    seg_wait = "seg_cv.wait(l, [j] { return j->done.load(); });"
+    check(replay.count(seg_submit) == 2 and replay.count(seg_wait) == 2 and
+          replay.count("j->uploads = texture_uploads_recorded();") == 2,
+          "the parallel replay's two segment paths no longer submit as this test knows")
+    at = 0
+    for _ in range(2):
+        w = replay.index(seg_wait, at)
+        s = replay.index(seg_submit, at)
+        check(w < s, "a parallel replay's segment (one of the two paths) is submitted before it is done")
+        at = s + 1
+    check(replay.count("vkQueueSubmit2(") == 5, "vk_replay.cpp submits in a place this test does not know: check that the copies "
           "behind are done before it")
-    # (the submitting thread: only the synchronous replay leaves copies behind, and it finishes them before it returns)
+    # (the submitting thread: the synchronous replay leaves copies behind, and it finishes them before it returns)
     q = block(replay, "void submit_q(")
     sync = q[:q.index("std::lock_guard lk(submit_order_mu);")]
-    before(sync, "memory_capture_submit(true);", "~CopiesDone() { memory_capture_copies_done(); }",
+    # ((Triforce) a held submit's capture (HOS_NVN_HOLD=2: its game thread already runs again either way) leaves its copies
+    # behind too unless RX_VK_HELD_BEHIND=0: the synchronous path's call is memory_capture_submit(!tl_submit_held || held_behind))
+    sync_call = "memory_capture_submit(!tl_submit_held || held_behind);"
+    before(sync, sync_call, "~CopiesDone() { memory_capture_copies_done(); }",
            "submit_q: the copies behind are not done before the game's thread returns")
     before(sync, "} copies_done;", "return do_submit(handles, n);", "submit_q: the replay runs after the copies are done")
-    check("memory_capture_submit(true)" not in q[q.index("std::lock_guard lk(submit_order_mu);"):],
-          "submit_q: the replay thread's capture leaves copies behind while the game goes on")
-    check(replay.count("memory_capture_submit(true)") == 1, "a capture other than the synchronous replay's leaves copies behind")
+    # ((Triforce, async_rules.h 2) the replay thread's capture shares its copies with the helpers too, and has every one of them
+    # made before the hand-over: the game goes on once the submit returns, and nothing is left behind it)
+    own = q[q.index("std::lock_guard lk(submit_order_mu);"):]
+    check(own.count("memory_capture_submit(true);") == 1, "submit_q: the replay thread's capture is not the one this test knows")
+    before(own, "memory_capture_submit(true);", "memory_capture_copies_done();",
+           "submit_q: the replay thread's capture leaves copies behind while the game goes on")
+    before(own, "memory_capture_copies_done();", "enqueue(std::move(j));",
+           "submit_q: the replay thread's capture is handed over before its copies are made")
+    check(replay.count("memory_capture_submit(true)") == 1 and replay.count(sync_call) == 1,
+          "a capture other than the two submits' leaves copies behind")
     # (the figures and the switch)
     check("vk: a frame's captures at the game's submits:" in replay, "no 120-present line of the captures on the game's threads")
     check("RX_VK_CAPTURE_BEHIND" in dev, "docs/development.md: RX_VK_CAPTURE_BEHIND is not in the switches table")

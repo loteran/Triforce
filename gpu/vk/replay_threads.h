@@ -82,22 +82,21 @@ namespace replay_threads {
 inline constexpr int kRowAutomatic = 8;
 inline constexpr int kDefaultRow = kRowAutomatic;
 
-/// The threads Automatic records a frame's large command buffers on: 0, none (the replay thread alone), on every PC.
-/// (Triforce, 11-17) It was 2 or 3 with five cores or more. The owner's playtests on a 12-core PC (24 logical, RTX, 2560x1440):
-/// with helper threads on (Automatic's 3, or the row's 3 or 8) moving and jumping brought stretches of 10-25 s at 39-48 fps,
-/// the game's own frame time going from about 4 to 10-13 ms and the game slowing then catching up, on the merged build and
-/// on the build before it; with the row's None, twice (both builds), none of it, at the same frame rate otherwise (52-74).
-/// The helper threads take the processors the game's own threads need while it streams and makes textures. The row's
-/// counts are still there for a tester. logical, amd_older: as before, for the log's line (why)
+/// The threads Automatic records a frame's large command buffers on: 0 none (the replay thread alone), else 2 or 3.
+/// logical: the logical processors; amd_older: AMD's Windows driver for RDNA 1 and 2
 constexpr int automatic(unsigned logical, bool amd_older) {
-    (void)logical, (void)amd_older;
-    return 0;
+    if (amd_older) return 0;
+    const unsigned cores = logical / 2;
+    if (cores <= 4) return 0;
+    return cores < 8 ? 2 : 3;
 }
 
 /// Why, for the log's line at the start
 constexpr const char* why(unsigned logical, bool amd_older) {
-    (void)logical, (void)amd_older;
-    return "none: the helper threads slowed the game's own threads when moving (11-17); the Debug tab's row still sets a count";
+    if (amd_older) return "none on AMD's driver for RX 5000 and RX 6000 cards, where NX2navi's players lost the device with them";
+    const unsigned cores = logical / 2;
+    if (cores <= 4) return "none with four cores or fewer: the game's own threads need them";
+    return cores < 8 ? "2 with five to seven cores" : "3 with eight cores or more";
 }
 
 /// The threads a value of the row stands for: 0 for Off and for anything the row does not have, one more than the value

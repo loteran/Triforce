@@ -151,6 +151,7 @@ void logf(const char* fmt, ...) { (void)fmt; logged++; }
 struct { int language = 0, other = 5; } opts;
 struct Row { int* value; int hi; };
 Row rows[] = {{&opts.other, 9}, {&opts.language, 0}, {nullptr, 0}};
+bool is_merged(const int*) { return false; }   /* ((Triforce, options_version 7) no merged row here */
 @STATE@
 @TEXT@
 @HINT@

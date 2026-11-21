@@ -46,6 +46,15 @@ int main() {
     expect(count(4, 64 * GB, false, 1) == 1, "the switch: one");
     expect(count(8, 64 * GB, false, 1000) == 64, "the switch: 64 at most");
     expect(count(24, 26 * GB, false, -3) == 24 && count(24, 26 * GB, false, 0) == 24, "the switch not set, or not a count: the rule");
+    // (the translation pass on AMD's Windows driver for RDNA 1 and 2: kAmdOlderMost at most, fewer where count gives fewer;
+    // other drivers and the switch: count's number)
+    using prepare_threads::translate;
+    const unsigned most = prepare_threads::kAmdOlderMost;
+    expect(translate(count(24, 26 * GB, false, 0), true, false) == most, "AMD's older driver, 24 processors: the cap");
+    expect(translate(count(24, 64 * GB, true, 0), true, false) == most, "AMD's older driver, above normal: the cap over half");
+    expect(translate(count(4, 64 * GB, false, 0), true, false) == 4 && translate(2, true, false) == 2, "AMD's older driver, few processors: count's");
+    expect(translate(count(24, 26 * GB, false, 20), true, true) == 20, "AMD's older driver: the switch still decides");
+    expect(translate(count(24, 26 * GB, false, 0), false, false) == 24, "other drivers: count's");
     if (failures) return EXIT_FAILURE;
     std::printf("prepare threads: all checks passed\n");
     return EXIT_SUCCESS;

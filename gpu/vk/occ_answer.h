@@ -167,6 +167,83 @@ struct Counter {
     }
 };
 
+/// A map from 64-bit keys, open addressing with linear probes and backward-shift deletion (no tombstones): no allocation per
+/// entry. The replay placed one entry for every samples-passed report (~2,600 a frame at the Market) in a std::unordered_map,
+/// a node allocated and freed each time: 0.76 ms a frame of the Presentation Thread (all-thread sample, 2026-11-20)
+template <class V>
+class FlatU64 {
+public:
+    struct Slot {
+        uint64_t key = 0;
+        V val{};
+        bool used = false;
+    };
+    V* find(uint64_t k) {
+        if (!n_) return nullptr;
+        for (size_t i = idx(k);; i = (i + 1) & mask_) {
+            Slot& s = s_[i];
+            if (!s.used) return nullptr;
+            if (s.key == k) return &s.val;
+        }
+    }
+    const V* find(uint64_t k) const { return const_cast<FlatU64*>(this)->find(k); }
+    V& operator[](uint64_t k) {
+        if (V* v = find(k)) return *v;
+        if ((n_ + 1) * 10 > s_.size() * 7) grow();
+        size_t i = idx(k);
+        while (s_[i].used) i = (i + 1) & mask_;
+        s_[i].key = k, s_[i].val = V{}, s_[i].used = true;
+        n_++;
+        return s_[i].val;
+    }
+    size_t count(uint64_t k) const { return find(k) ? 1 : 0; }
+    size_t erase(uint64_t k) {
+        if (!n_) return 0;
+        size_t i = idx(k);
+        for (;; i = (i + 1) & mask_) {
+            if (!s_[i].used) return 0;
+            if (s_[i].key == k) break;
+        }
+        // backward shift: the entries after the hole that would be found from a slot at or before it move into it
+        for (size_t j = (i + 1) & mask_;; j = (j + 1) & mask_) {
+            if (!s_[j].used) break;
+            const size_t home = idx(s_[j].key);
+            const bool moves = i <= j ? (home <= i || home > j) : (home <= i && home > j);
+            if (moves) s_[i] = s_[j], i = j;
+        }
+        s_[i] = Slot{};
+        n_--;
+        return 1;
+    }
+    template <class F>
+    void erase_if(F pred) {   // (the keys to go first, then each erased: a shift during the walk would skip or revisit entries)
+        std::vector<uint64_t> gone;
+        for (const Slot& s : s_)
+            if (s.used && pred(s.key, s.val)) gone.push_back(s.key);
+        for (uint64_t k : gone) erase(k);
+    }
+    bool empty() const { return n_ == 0; }
+    size_t size() const { return n_; }
+
+private:
+    size_t idx(uint64_t k) const { return (size_t)((k * 0x9E3779B97F4A7C15ull) >> shift_) & mask_; }
+    void grow() {
+        std::vector<Slot> old;
+        old.swap(s_);
+        const size_t cap = old.empty() ? 1024 : old.size() * 2;
+        s_.assign(cap, Slot{});
+        mask_ = cap - 1;
+        shift_ = 64;
+        for (size_t c = cap; c > 1; c >>= 1) shift_--;
+        n_ = 0;
+        for (const Slot& s : old)
+            if (s.used) (*this)[s.key] = s.val;
+    }
+    std::vector<Slot> s_;
+    size_t n_ = 0, mask_ = 0;
+    int shift_ = 64;
+};
+
 /// Per report address, the newest samples-passed report the replay wrote there (in stream order: placed) and where its
 /// count stands: NX2navi's Pending table (runtime/vk_exec_xfer.c: seq, written, unknown, "the last report to addr
 /// decides"). A count read back goes into its record only while its report is the newest there (the game's records rotate,
@@ -199,27 +276,27 @@ public:
     /// What a count read back for the report at (addr, pos) may do. (Two reports at one address with no draw between share
     /// a place; in stream order the last one's count is written last, over the first one's)
     Verdict verdict(uint64_t addr, uint64_t pos) const {
-        auto it = m_.find(addr);
-        if (it == m_.end()) return kUnknown;            // (not reported for kKeepAge presents, or rewritten in the stream)
-        if (it->second.pos > pos) return kSuperseded;   // (reported again since: another object's record now)
-        if (it->second.pos != pos) return kUnknown;
-        return it->second.state == kFinal ? kFixed : kWrite;
+        const auto* it = m_.find(addr);
+        if (!it) return kUnknown;            // (not reported for kKeepAge presents, or rewritten in the stream)
+        if (it->pos > pos) return kSuperseded;   // (reported again since: another object's record now)
+        if (it->pos != pos) return kUnknown;
+        return it->state == kFinal ? kFixed : kWrite;
     }
     /// The value the report at addr left in its word (the placeholder, or the count written since)
     uint64_t value(uint64_t addr) const {
-        auto it = m_.find(addr);
-        return it == m_.end() ? 0 : it->second.value;
+        const auto* it = m_.find(addr);
+        return !it ? 0 : it->value;
     }
     /// The count of the report at (addr, pos) is in its record now
     void wrote(uint64_t addr, uint64_t pos, uint64_t count) {
-        auto it = m_.find(addr);
-        if (it != m_.end() && it->second.pos == pos) it->second.state = kWritten, it->second.value = count;
+        auto* it = m_.find(addr);
+        if (it && it->pos == pos) it->state = kWritten, it->value = count;
     }
     /// No count comes for the report at (addr, pos) (not counted whole, lost, late, never sent, the CPU wrote the record):
     /// a condition reads its word from memory from now on, as before
     void settle(uint64_t addr, uint64_t pos) {
-        auto it = m_.find(addr);
-        if (it != m_.end() && it->second.pos == pos && it->second.state == kPending) it->second.state = kFinal;
+        auto* it = m_.find(addr);
+        if (it && it->pos == pos && it->state == kPending) it->state = kFinal;
     }
     /// A report of another counter type at addr (a timestamp: base behaviour) is the newest there now
     bool erase(uint64_t addr) { return m_.erase(addr) != 0; }
@@ -236,10 +313,10 @@ public:
     /// (unknown: renders), written (memory holds it), or none to come (memory). A count pending longer than kLateAge
     /// presents is not written any more (complete: late): memory
     Src word(uint64_t addr, int64_t now) const {
-        auto it = m_.find(addr);
-        if (it == m_.end()) return kNone;
-        switch (it->second.state) {
-        case kPending: return now - it->second.present > kLateAge ? kFinalSrc : kPendingSrc;
+        const auto* it = m_.find(addr);
+        if (!it) return kNone;
+        switch (it->state) {
+        case kPending: return now - it->present > kLateAge ? kFinalSrc : kPendingSrc;
         case kWritten: return kWrittenSrc;
         case kFinal: break;
         }
@@ -247,15 +324,14 @@ public:
     }
     /// The addresses not reported for more than `age` presents go (a count still to come for them is not written)
     void prune(int64_t now, int64_t age) {
-        for (auto it = m_.begin(); it != m_.end();)
-            it = now - it->second.present > age ? m_.erase(it) : std::next(it);
+        m_.erase_if([now, age](uint64_t, const Placed& p) { return now - p.present > age; });
     }
     size_t size() const { return m_.size(); }
 
 private:
     // (the pages a report went into, by a hash of the page, as NX2navi's rep_pages: a clear elsewhere looks nothing up)
     static uint32_t page(uint64_t a) { return (uint32_t)(((a >> 12) * 0x9E3779B97F4A7C15ull) >> 48); }
-    std::unordered_map<uint64_t, Placed> m_;
+    FlatU64<Placed> m_;   // (by report address: FlatU64, no allocation per report)
     std::vector<uint8_t> page_ = std::vector<uint8_t>(1u << 16);
 };
 
@@ -439,15 +515,26 @@ struct Sites {
 };
 
 /// The distinct addresses reported since the last line (bounded)
+/// (a fixed open-addressing table of 131072 keys, 0 meaning empty (a report address is never 0), cleared at each line: it
+/// was a std::unordered_set, a node allocated for each report's address only to count them for the log, 2,600 a frame)
 struct Distinct {
-    std::unordered_set<uint64_t> seen;
+    static constexpr size_t kSlots = 1u << 17, kMost = 65536;
+    std::vector<uint64_t> slot = std::vector<uint64_t>(kSlots, 0);
+    int64_t n = 0;
     void note(uint64_t addr) {
-        if (seen.size() < 65536) seen.insert(addr);
+        if (!addr || n >= (int64_t)kMost) return;
+        for (size_t i = (size_t)((addr * 0x9E3779B97F4A7C15ull) >> 47) & (kSlots - 1);; i = (i + 1) & (kSlots - 1)) {
+            if (slot[i] == addr) return;
+            if (!slot[i]) {
+                slot[i] = addr, n++;
+                return;
+            }
+        }
     }
     int64_t take() {
-        const int64_t n = (int64_t)seen.size();
-        seen.clear();
-        return n;
+        const int64_t r = n;
+        if (n) std::fill(slot.begin(), slot.end(), 0), n = 0;
+        return r;
     }
 };
 

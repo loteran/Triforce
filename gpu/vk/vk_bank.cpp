@@ -210,6 +210,14 @@ uint32_t sampler_slot_version(int id) {
 uint64_t sampler_registrations_generation() {
     return samp_gen.load(std::memory_order_acquire);
 }
+// ---- (Triforce) Outside the translation stamp, to the next mark (nx2/build.py translation_text; the rule: program_carry.h): the
+// samplers' generation moved for the texture LOD bias, which only vk_draw.cpp's sampler_for reads; no translation calls it or
+// reads samp_gen (tests/test_program_carry.py) ----
+// ((Triforce, S8) the texture LOD bias of DLSS and FSR changed (vk_draw.cpp upscale_lod_tick): every sampler made anew, as
+// for a registration whose contents changed; sampler_for's tables (the scene's biased entries and the other passes' unbiased
+// ones alike) and the descriptors kept follow the generation)
+void sampler_bias_changed() { samp_gen.fetch_add(1, std::memory_order_acq_rel); }
+// ---- (Triforce) Inside the translation stamp again ----
 void texture_released(uint64_t serial) {
     std::lock_guard lk(reg_mu);
     auto it = regs_by_serial.find(serial);

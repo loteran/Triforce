@@ -77,6 +77,8 @@ void logf(const char* fmt, ...) {
 }
 static int upscaling = 0;   // (upscaler_rows.h: what the temporal chain draws with)
 int temporal_mode() { return upscaling; }
+static bool before_bloom = false;   // (the Upscale before bloom row: the upscaler takes the scene, before the SMAA)
+bool temporal_before_bloom() { return before_bloom; }
 bool fsr3_wanted() { return false; }
 bool fsr3_native() { return false; }
 static uint64_t frame_no = 10;
@@ -154,7 +156,7 @@ static int logic(const char* env) {
             CHECK(aa_asked() && aa_mode() == ar::FXAA);
         }
         upscaling = ur::DLAA, frame_no++;
-        CHECK(aa_mode() == ar::GAME);   // (an upscaler's own anti-aliasing goes over the switch too)
+        CHECK(aa_mode() == ar::FXAA);   // (the switch over an upscaler too: a lab's A/B of the game's SMAA under it)
         std::puts("aa passes: RX_VK_AA is the run's choice");
         return 0;
     }
@@ -206,10 +208,16 @@ static int logic(const char* env) {
     CHECK(said.size() == 3);   // (replaced again: said again)
     frame_no++;
     CHECK(aa_leave_out(ar::kEdgesKey));
-    // DLSS comes on: the game's own SMAA whole again, at once; and off again: Off's first frame runs the two passes
+    // DLSS comes on after the bloom: the game's SMAA stays out (Off under it: AMD and NVIDIA want jittered frames no other
+    // anti-aliasing has been over); with Upscale before bloom the game's own whole again, at once; and off again: Off's first
+    // frame runs the two passes
     aa_composed(true, nullptr);
     upscaling = ur::DLSS, frame_no++;
+    CHECK(aa_asked() && aa_mode() == ar::OFF && aa_leave_out(ar::kEdgesKey) && aa_leave_out(ar::kWeightsKey));
+    aa_composed(true, nullptr);
+    before_bloom = true, frame_no++;
     CHECK(aa_asked() && aa_mode() == ar::GAME && !aa_leave_out(ar::kEdgesKey) && !aa_leave_out(ar::kWeightsKey) && aa_state() == ar::QUIET);
+    before_bloom = false;
     upscaling = ur::GAME, frame_no++;
     CHECK(aa_mode() == ar::OFF && !aa_leave_out(ar::kEdgesKey));
     aa_composed(true, nullptr);

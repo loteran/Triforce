@@ -25,6 +25,10 @@ rework one by hand (nx2/prompt_faces/README.md).
 The faces' fonts are larger than the game's, and the game drops a file larger than its entry in the resource size table: <out>/
 rsizetable.zs is the game's table with the font's entry raised to fit the largest, served in its place.
 
+(Triforce) The title screen's Options entry ("Options / ZELDA NOTES Setting") the same way: <out>/mals/<language>.product.110
+.sarc.zs is each language's messages with that entry made the game's word for Options, its separator and TITLE_TEXT, and the
+host serves the one of the language the game runs in (title_messages).
+
 A .bfotf is an OpenType font behind an 8-byte header and XORed per little-endian word: the header is the magic 0x18029a7f and the
 font's size (big-endian), each XORed with the same key as the font. The .zs files are zstd frames made with the dictionary zs.zsdic
 of Pack/ZsDic.pack.zs.
@@ -101,14 +105,7 @@ def size_table(romfs, dictionary, game_size, font_size):
     entry raised from the game's font (game_size bytes) to fit one of font_size: the game drops a file larger than its entry. None
     when it fits already"""
     import zlib
-    folder = os.path.join(romfs, "System", "Resource")
-    name = next((n for n in sorted(os.listdir(folder)) if n.startswith("ResourceSizeTable.") and n.endswith(".rsizetable.zs")),
-                None)
-    if not name:
-        raise SystemExit("prompts: no System/Resource/ResourceSizeTable.*.rsizetable.zs")
-    b = bytearray(read_zs(romfs, f"System/Resource/{name}", dictionary))
-    if b[:6] != b"RESTBL":
-        raise SystemExit(f"prompts: {name} is not a RESTBL table")
+    name, b = read_size_table(romfs, dictionary)
     hashed, = struct.unpack_from("<I", b, 14)
     want = zlib.crc32(FONT[:-3].encode())
     for i in range(hashed):
@@ -1073,6 +1070,262 @@ def write_camera(path, speeds):
             f.write(struct.pack("<If", off, v))
 
 
+# ---- (Triforce) the title screen's third entry, "Options / ZELDA NOTES Setting" in US English: it opens the game's Options,
+# where Triforce's own tabs are, so it reads "Options / Triforce". The text is label 0002 of LayoutMsg/Title_00.msbt in each
+# language's messages, Mals/<language>.Product.110.sarc.zs (a SARC, zstd with zs.zsdic): the game's word for Options, a size
+# tag (the rest is drawn smaller), then the rest. Everything up to the end of that tag is kept, the rest becomes the game's
+# own separator and TITLE_TEXT. prompts/mals/<language>.product.110.sarc.zs (the file's name in lower case, as host/prompts.c
+# asks for it) is each language's archive with that one file rewritten, as a zstd frame without the dictionary; the host
+# serves the one of the language the game runs in, where no mod has that file
+TITLE_TEXT = "Triforce"   # (what the entry says after the game's word for Options and its separator)
+TITLE_MSBT, TITLE_LABEL = "LayoutMsg/Title_00.msbt", "0002"
+TITLE_SEPARATORS = "/／|"   # (the game's own between the two parts, kept with its spaces: "/", the full-width one, "|")
+TITLE_SEPARATOR = " / "   # (where the game has none: the rest in brackets, "Optionen (inkl. ZELDA NOTES-Einstellungen)")
+MALS = "Mals"
+SARC_ALIGN = 0x2000   # (the largest alignment a file in an archive is given: textures and models)
+
+
+def msbt_sections(m):
+    """an MSBT's sections, [(magic, the 8 bytes after its size, body, the padding after it)], or None when m is not one (only
+    the little-endian kind: "MsgStdBn", the mark ff fe, the text's encoding at +0xc (0 UTF-8, 1 UTF-16), the count of
+    sections at +0xe, the file's size at +0x12, sections from +0x20, each a magic, u32 its body's size, 8 bytes, the body,
+    padded to 16)"""
+    if len(m) < 0x20 or m[:8] != b"MsgStdBn" or m[8:10] != b"\xff\xfe" or m[0xc] not in (0, 1):
+        return None
+    count, = struct.unpack_from("<H", m, 0xe)
+    if struct.unpack_from("<I", m, 0x12)[0] != len(m):
+        return None
+    out, at = [], 0x20
+    for _ in range(count):
+        if at + 16 > len(m):
+            return None
+        n, = struct.unpack_from("<I", m, at + 4)
+        end = at + 16 + n
+        pad = end + (-end % 16)
+        if pad > len(m):
+            return None
+        out.append((bytes(m[at:at + 4]), bytes(m[at + 8:at + 16]), bytes(m[at + 16:end]), bytes(m[end:pad])))
+        at = pad
+    return out if at == len(m) else None
+
+
+def msbt_build(m, sections):
+    """the MSBT m (its header) with these sections (msbt_sections' form): a body of another size gets its padding (the byte
+    the section had, else 0xab) and the file its size"""
+    out = bytearray(m[:0x20])
+    for magic, rest, body, pad in sections:
+        need = -(16 + len(body)) % 16
+        out += magic + struct.pack("<I", len(body)) + rest + body
+        out += pad if len(pad) == need else (pad[:1] or b"\xab") * need
+    struct.pack_into("<I", out, 0x12, len(out))
+    return bytes(out)
+
+
+def msbt_labels(body):
+    """{label: its text's number} of a LBL1 body: u32 slots, each u32 count and u32 offset; at an offset that many labels, each
+    u8 length, the name, u32 number"""
+    slots, = struct.unpack_from("<I", body, 0)
+    out = {}
+    for i in range(slots):
+        count, at = struct.unpack_from("<II", body, 4 + 8 * i)
+        for _ in range(count):
+            n = body[at]
+            out[body[at + 1:at + 1 + n].decode("ascii")] = struct.unpack_from("<I", body, at + 1 + n)[0]
+            at += 5 + n
+    return out
+
+
+def txt2_strings(body):
+    """a TXT2 body's texts (u32 count, u32 offset each from the body's start, the texts with their ends), or None"""
+    count, = struct.unpack_from("<I", body, 0)
+    offs = list(struct.unpack_from(f"<{count}I", body, 4)) + [len(body)]
+    if offs[0] != 4 + 4 * count or offs != sorted(offs):
+        return None
+    return [body[a:z] for a, z in zip(offs, offs[1:])]
+
+
+def txt2_build(strings):
+    at = 4 + 4 * len(strings)
+    offs = []
+    for s in strings:
+        offs.append(at)
+        at += len(s)
+    return struct.pack(f"<I{len(strings)}I", len(strings), *offs) + b"".join(strings)
+
+
+def title_text(s, encoding, text=TITLE_TEXT):
+    """label 0002's text with its rest after the size tag (a tag: 0x0e, u16 group, u16 type, u16 its parameters' size, the
+    parameters; group 0 type 2 the size) the separator and text, or None when it has no size tag before its end"""
+    w, codec = (1, "utf-8") if encoding == 0 else (2, "utf-16-le")
+    at = 0
+    while at + w <= len(s):
+        c = int.from_bytes(s[at:at + w], "little")
+        if c == 0:
+            return None
+        if c == 0x0f:   # (a tag's end: u16 group, u16 type)
+            at += w + 4
+            continue
+        if c != 0x0e:
+            at += w
+            continue
+        if at + w + 6 > len(s):
+            return None
+        group, kind, n = struct.unpack_from("<HHH", s, at + w)
+        at += w + 6 + n
+        if group == 0 and kind == 2:
+            break
+    else:
+        return None
+    rest = bytearray()   # (the rest's text, up to its first tag or its end)
+    for k in range(at, len(s) - w + 1, w):
+        if int.from_bytes(s[k:k + w], "little") in (0, 0x0e, 0x0f):
+            break
+        rest += s[k:k + w]
+    words = rest.decode(codec, "replace")
+    sep = words[:len(words) - len(words.lstrip())]
+    if words.lstrip()[:1] and words.lstrip()[0] in TITLE_SEPARATORS:
+        after = words.lstrip()[1:]
+        sep += words.lstrip()[0] + after[:len(after) - len(after.lstrip())]
+    else:
+        sep = TITLE_SEPARATOR
+    return s[:at] + (sep + text).encode(codec) + b"\0" * w
+
+
+def title_msbt(m, text=TITLE_TEXT):
+    """the MSBT m with label 0002's rest made text (title_text), every other byte as it was, or None when m is not the
+    title's (no LBL1 or TXT2, no label 0002, or a text with no size tag)"""
+    sections = msbt_sections(m)
+    if not sections:
+        return None
+    try:
+        by = {magic: i for i, (magic, _, _, _) in enumerate(sections)}
+        if b"LBL1" not in by or b"TXT2" not in by:
+            return None
+        k = msbt_labels(sections[by[b"LBL1"]][2]).get(TITLE_LABEL)
+        magic, rest, body, pad = sections[by[b"TXT2"]]
+        strings = txt2_strings(body)
+        if strings is None or k is None or k >= len(strings):
+            return None
+        new = title_text(strings[k], m[0xc], text)
+    except (struct.error, IndexError, UnicodeDecodeError):
+        return None
+    if new is None:
+        return None
+    strings[k] = new
+    sections[by[b"TXT2"]] = (magic, rest, txt2_build(strings), pad)
+    return msbt_build(m, sections)
+
+
+def sarc_replace(b, name, data):
+    """the SARC b with the file `name` made data: the files before it as they were, those after it moved on together by a
+    multiple of every alignment they may need (an archive does not say which: each one's place's, up to SARC_ALIGN), so
+    each keeps its own, the bytes between them as they were and a gap of zeros after the new file; the nodes' offsets and
+    the archive's size made to agree. A file shorter by less than that moves nothing. None when b is no little-endian
+    SARC, has no such file, or files that overlap it"""
+    if len(b) < 0x20 or b[:4] != b"SARC":
+        return None
+    hl, bom = struct.unpack_from("<HH", b, 4)
+    total, data_at = struct.unpack_from("<II", b, 8)
+    if bom != 0xfeff or total != len(b) or b[hl:hl + 4] != b"SFAT":
+        return None
+    n, = struct.unpack_from("<H", b, hl + 6)
+    nodes = hl + 12
+    at = sarc_member(b, name)
+    if not at:
+        return None
+    start, end = at[0] - data_at, at[1] - data_at
+    entries = [struct.unpack_from("<IIII", b, nodes + 16 * i) for i in range(n)]
+    k = next(i for i, e in enumerate(entries) if (e[2], e[3]) == (start, end))
+    later = [i for i, e in enumerate(entries) if i != k and e[2] >= end]
+    after = set(later)
+    if any(i != k and i not in after and e[3] > start for i, e in enumerate(entries)):
+        return None
+    grow = len(data) - (end - start)
+    if later:
+        first = min(entries[i][2] for i in later)
+        align = max([1] + [min((data_at + entries[i][2]) & -(data_at + entries[i][2]), SARC_ALIGN) for i in later])
+        move = -(-grow // align) * align   # (at least grow, the least multiple of the alignment)
+        out = bytearray(b[:data_at + start]) + data + bytes(first + move - start - len(data)) + b[data_at + first:]
+    else:
+        move = grow
+        out = bytearray(b[:data_at + start]) + data + b[data_at + end:]
+    struct.pack_into("<I", out, nodes + 16 * k + 12, start + len(data))
+    for i in later:
+        struct.pack_into("<II", out, nodes + 16 * i + 8, entries[i][2] + move, entries[i][3] + move)
+    struct.pack_into("<I", out, 8, len(out))
+    return bytes(out)
+
+
+def title_sarc(sarc, text=TITLE_TEXT):
+    """a language's messages (Mals/*.sarc, decompressed) with the title's Options entry saying text, or None when they are
+    not the ones known"""
+    at = sarc_member(sarc, TITLE_MSBT)
+    m = title_msbt(sarc[at[0]:at[1]], text) if at else None
+    return sarc_replace(sarc, TITLE_MSBT, m) if m else None
+
+
+def read_size_table(romfs, dictionary):
+    """(its name, the game's resource size table decompressed: size_table says its form)"""
+    folder = os.path.join(romfs, "System", "Resource")
+    name = next((n for n in sorted(os.listdir(folder)) if n.startswith("ResourceSizeTable.") and n.endswith(".rsizetable.zs")),
+                None)
+    if not name:
+        raise SystemExit("prompts: no System/Resource/ResourceSizeTable.*.rsizetable.zs")
+    b = bytearray(read_zs(romfs, f"System/Resource/{name}", dictionary))
+    if b[:6] != b"RESTBL":
+        raise SystemExit(f"prompts: {name} is not a RESTBL table")
+    return name, b
+
+
+def size_entry(table, path):
+    """a file's entry in a resource size table (path without .zs), None when it has none: a named entry (u32 name length
+    after the version, then after the hashed entries each the name in that many bytes and u32 size) over a hashed one"""
+    import zlib
+    room, hashed, named = struct.unpack_from("<III", table, 10)
+    at = 22 + 8 * hashed
+    for i in range(named):
+        e = at + (room + 4) * i
+        if table[e:e + room].split(b"\0")[0] == path.encode():
+            return struct.unpack_from("<I", table, e + room)[0]
+    want = zlib.crc32(path.encode())
+    for i in range(hashed):
+        h, size = struct.unpack_from("<II", table, 22 + 8 * i)
+        if h == want:
+            return size
+    return None
+
+
+def title_messages(romfs, dictionary, out, text=TITLE_TEXT):
+    """writes <out>/mals/<language>.product.110.sarc.zs for each language whose messages are the ones known and whose
+    rewritten archive is no larger than the game's file (and within its entry in the size table, where it has one); the
+    languages written. The entry is the file's size plus an allowance the game keeps over it (336 bytes for every Mals
+    archive), as size_table keeps the font's: an archive growing into that allowance is past what the entry holds for it
+    and the game drops a file larger than its entry, so a TITLE_TEXT longer than a language's rest leaves that language as
+    the game has it (the build says so) rather than raising the entry"""
+    import zstandard
+    _, table = read_size_table(romfs, dictionary)
+    done = []
+    for name in sorted(os.listdir(os.path.join(romfs, MALS))):
+        if not name.endswith(".sarc.zs"):
+            continue
+        game = read_zs(romfs, f"{MALS}/{name}", dictionary)
+        new = title_sarc(game, text)
+        if not new:
+            print(f"prompts: {MALS}/{name}: the title keeps its text (its messages are not the ones known)", file=sys.stderr)
+            continue
+        entry = size_entry(table, f"{MALS}/{name[:-3]}")
+        fits = len(game) if entry is None else min(len(game), entry)   # (the entry's allowance over the file kept)
+        if len(new) > fits:
+            print(f"prompts: {MALS}/{name}: the title keeps its text ({len(new)} bytes; the game's file is {len(game)}, "
+                  f"its size table entry {entry}: a shorter TITLE_TEXT fits)", file=sys.stderr)
+            continue
+        os.makedirs(os.path.join(out, "mals"), exist_ok=True)
+        with open(os.path.join(out, "mals", name.lower()), "wb") as f:
+            f.write(zstandard.ZstdCompressor(level=3).compress(new))
+        done.append(name.split(".")[0])
+    return done
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--romfs", required=True)
@@ -1156,6 +1409,13 @@ def main():
         print("prompts: the camera's speeds " + " ".join("%.2f" % v for _, v in speeds), file=sys.stderr)
     else:
         print("prompts: the camera keeps the game's speed (its pack is not the one known)", file=sys.stderr)
+    try:
+        titles = title_messages(a.romfs, dictionary, a.out)
+    except (Exception, SystemExit) as e:   # (a romfs without the messages, or one that does not decompress)
+        titles = []
+        print(f"prompts: the title's messages were not read ({e})", file=sys.stderr)
+    if titles:
+        print(f"prompts: the title's Options entry says {TITLE_TEXT} in " + " ".join(titles), file=sys.stderr)
     if ring:
         write_ring(os.path.join(a.out, "ring.bin"), ring)
         print("prompts: the Talk ring", file=sys.stderr)

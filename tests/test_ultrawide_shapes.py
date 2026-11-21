@@ -82,6 +82,9 @@ int main() {
     CHECK(!std::strcmp(tx_ultrawide(0), "16:9") && !std::strcmp(tx_ultrawide(1), "16:10"));
     CHECK(!std::strcmp(tx_ultrawide(2), "21:9") && !std::strcmp(tx_ultrawide(3), "32:9"));
     CHECK(ultrawide_row_ratio(0) == 0.0f && ultrawide_row_ratio(1) == 1.6f && ultrawide_row_ratio(-2) == 0.0f);   /* (the shapes' ratios) */
+    /* (wider than 16:9, where the HUD position and the menu sides have sides to act on: 21:9 and 32:9, not 16:10) */
+    CHECK(!ultrawide_row_wider(0) && !ultrawide_row_wider(1) && ultrawide_row_wider(2) && ultrawide_row_wider(3));
+    CHECK(!ultrawide_row_wider(-1) && ultrawide_row_wider(4));
     CHECK(!std::strcmp(tx_ultrawide(-1), "16:9") && !std::strcmp(tx_ultrawide(4), "32:9"));   /* (past the row: its nearest end) */
     for (int v = 0; v <= 3; v++) CHECK(hn_ultrawide(v, -1) && hn_ultrawide(v, 0) == hn_ultrawide(v, -1) && !hn_ultrawide(v, 1));
     CHECK(std::strstr(hn_ultrawide(1, -1), "16:10") && std::strstr(hn_ultrawide(2, -1), "21:9") && std::strstr(hn_ultrawide(3, -1), "32:9"));
@@ -118,14 +121,21 @@ def main():
     env = host.index('const char *e = getenv("HOS_ASPECT");')
     check("if (!e) {" in host[env:host.index("want = ultrawide_ratio(", env)], "HOS_ASPECT no longer goes over the Ultrawide row")
     menu = (ROOT / "gpu/vk/vk_menu.cpp").read_text(encoding="utf-8")
-    row = re.search(r'\{TAB_DISPLAY, "Ultrawide", &opts\.ultrawide, 0, 3, 1, tx_ultrawide,.*?hn_ultrawide, true\},', menu, re.S)
-    check(row, "the Ultrawide row is not 16:9, 16:10, 21:9, 32:9 with a restart")
+    # ((Triforce, options_version 7) the Ultrawide group's Aspect ratio row; its key is still ultrawide, which hos_main.c reads)
+    row = re.search(r'\{TAB_DISPLAY, "Aspect ratio", &opts\.ultrawide, 0, 3, 1, tx_ultrawide,.*?hn_ultrawide, true\},', menu, re.S)
+    check(row, "the Aspect ratio row is not 16:9, 16:10, 21:9, 32:9 with a restart")
+    check('{"Aspect ratio", "ultrawide"}' in function(menu, "const char* ini_key(const Row& r) {"),
+          "the Aspect ratio row is not kept as ultrawide=")
     check("Monitor's shape" not in function(menu, "const char* tx_ultrawide(int v) {"), "the Ultrawide row still offers Monitor's shape")
+    # (the HUD position and the menu sides shown with a shape wider than 16:9 alone: 16:10, the row's 1, is narrower)
+    shown = function(menu, "bool row_shown(int i) {")
+    check("((rows[i].value != &opts.wide_hud && rows[i].value != &opts.wide_menus) || ultrawide_row_wider(opts.ultrawide))" in shown,
+          "row_shown does not show the HUD position and the menu sides with 21:9 and 32:9 alone")
     init = function(menu, "void menu_init() {")
     check("opts.ultrawide = ultrawide_row_read(opts.ultrawide, version, GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN));"
           in init, "menu_init does not read an old file's Monitor's shape as the nearest shape, as the host does")
     readme = (ROOT / "readme.md").read_text(encoding="utf-8")
-    check("| Ultrawide | 16:9 (the game's own), 16:10, 21:9, 32:9" in readme, "readme.md's settings table does not list the Ultrawide row's four shapes")
+    check("| Aspect ratio | 16:9 (the game's own), 16:10, 21:9, 32:9" in readme, "readme.md's settings table does not list the Aspect ratio row's four shapes")
     guide = (ROOT / "docs/development.md").read_text(encoding="utf-8")
     check("| `ultrawide` | 0 16:9, 1 16:10, 2 21:9, 3 32:9 (before `options_version` 6, 1 was the monitor's shape" in guide,
           "docs/development.md's options table has no ultrawide")
@@ -165,7 +175,9 @@ def main():
         source.write_text(HOST.replace("@ROWS@", rows_h)
                               .replace("@RATIO@", function(host, "static float ultrawide_ratio(int row, int version, int screen_w, int screen_h) {"))
                               .replace("@SIZES@", sizes(host)), encoding="utf-8")
-        subprocess.run([args.cc, "-std=c11", "-Wall", "-Wextra", "-Werror", "-Wno-unused-variable", str(source), "-o", str(exe), "-lm"], check=True)
+        # (the header is pasted in, not included: the menu's own helpers in it, ultrawide_row_wider, go unused by the host's side)
+        subprocess.run([args.cc, "-std=c11", "-Wall", "-Wextra", "-Werror", "-Wno-unused-variable", "-Wno-unused-function", str(source),
+                        "-o", str(exe), "-lm"], check=True)
         bad = []
         for case, expect in cases:
             got = subprocess.run([str(exe)] + [str(v) for v in case], capture_output=True, text=True, check=True).stdout.strip()

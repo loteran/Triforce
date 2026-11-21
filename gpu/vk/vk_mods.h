@@ -37,6 +37,10 @@ struct Mod {
     void* texture = nullptr;   // (ImTextureData*, the menu's)
     // (installed: a folder in mods with this mod's id in its triforce_mod.json; update: a file newer than the one installed)
     bool installed = false, update = false;
+    // ((Triforce) 11-18) wip: posted on GameBanana as a WiP (a work in progress with files: many are mods all the same; its
+    // ids are its own, Wip/<id>). kit: a program of its own on the kits list (vk_mods.cpp kKits), not a romfs mod: installed
+    // into kits\<its folder> beside the game and started from there (Squadala!, the online co-op)
+    bool wip = false, kit = false;
 };
 
 enum class Feed { Idle, Loading, Ready, Failed };
@@ -48,6 +52,7 @@ struct InstallState {
     std::string mod_name, file_name, message;   // (message: why it failed, or what was installed where)
     uint64_t done = 0, total = 0;
     double rate = 0;   // (bytes a second, smoothed)
+    bool kit = false;  // ((Triforce) 11-18) a kit's: Done = started in its own window (no restart)
 };
 
 /// Whether this build can browse and install (Windows: yes; Linux: not yet)
@@ -62,8 +67,10 @@ void lock();
 void unlock();
 Feed feed_state(std::string* error = nullptr);
 bool more();          // (GameBanana has more pages than the list holds)
-void load_more();     // (the next page, when none is loading)
-int total();          // (GameBanana's count: the section's submissions, mods and others; a search's results, about)
+/// ((Triforce) 11-18) The next page, when none is loading or queued. Pages come one after another by themselves from open()
+/// and search() until the list is whole; this only starts again a list that stopped on a failed page
+void load_more();
+int total();          // (GameBanana's count: the section's mods and WiPs; a search's results, about)
 /// ((Triforce) 11-17) A search of the section's mods: GameBanana's own (whole words, best matches first), then a part of a
 /// name when that finds none. Fewer than 2 characters (trimmed) ends the search. The list is its results until search_clear,
 /// which goes back to the section's list as it was. Both return the textures of the pictures of the results let go (the

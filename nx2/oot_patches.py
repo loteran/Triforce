@@ -19,6 +19,9 @@ Each is a runtime switch where it can be, so the game's own path stays reachable
 - The OptimizeChangeBank thread's allocations tried again when their heap is full (host/oot_heap_retry.c): f_804566e0's two
   calls of f_80522050, its GPU memory (GPU_ALLOC_SITES), and its two tryAllocs of CPU buffers (HEAP_ALLOC_SITES). They went on
   with a null pointer and crashed writing through it (issue 1697). The supported build only.
+- ((Triforce) 11-19) The texture data compaction thread's step called through the host (host/oot_tex_compact.c): f_807da3f0's
+  call of f_807da480. The host counts the cycles it starts and, with HOS_OOT_TEX_COMPACT_MS set, holds them to a pace; unset,
+  the step runs as shipped. The supported build only.
 """
 import glob
 import os
@@ -431,6 +434,25 @@ RECORD_OLD = "    c->x[8]=recomp_fp_to_int(c->vreg[0][0]&UINT64_C(0xffffffff),32
 RECORD_NEW = ("    c->x[8]=hos_oot_record_frames((uint32_t)c->vreg[0][0]);"
               "   /* (nx2/oot_patches.py: the ocarina recorder's clock above 60 fps) */\n")
 RECORD_DECL = "extern uint32_t hos_oot_record_frames(uint32_t step_bits);\n"
+# ((Triforce, 11-18) #bug-tracker "Enemy Music not clearing in dungeon": above 60 fps the battle music kept playing after the last
+# enemy was gone; at a cap of 60 it ended. Two places in Link's update f_804caa80 (x19 Link) take the time since one he keeps
+# (the float [[x19+144]] less s0) times a constant of the game's (page +2952), cut to whole frames into x8, then step a small
+# state of his by that count (against 8 and 4). Above 60 fps the time is under a frame every update, cut to 0, and the state
+# never moved on, so the music that waits on it never ended. Found in the lab (a probe over every cut in the 40 functions that
+# load the frame step: with all of them carried, then with these two alone, the music ended at 240 fps). A positive amount goes
+# through hos_frame_whole (host/frame_whole.h: its fraction carried while the frames' own time is the step, the game's cut at a
+# cap of 60), one remainder per place (the keys are ids, not fields: Link + 145 and + 147); a negative one keeps the game's cut.
+# Each place is found by its own page constant, then the constant's load and the cut (a hot lift's multiply is
+# a64_fpx_hot_*: any lines between).
+BATTLE_HEAD = "void f_804caa80(Ctx *__restrict A64_NOESC c) {\n"
+BATTLE_CUT = "    c->x[8]=recomp_fp_to_int(c->vreg[0][0]&UINT64_C(0xffffffff),32,32,1,3,c->fpcr,&c->fpsr);\n"
+BATTLE_SITES = (("    c->x[8]=g_module_base + 0x804cb000ULL + (int64_t)60379136;\n", "c->x[19] + 145"),
+                ("    c->x[8]=g_module_base + 0x804cd000ULL + (int64_t)60370944;\n", "c->x[19] + 147"))
+BATTLE_LOAD = "    { { uint64_t _v=recomp_load32(c,(c->x[8]+2952ULL)); a64_vset64(c->vreg[1],_v); } }\n"
+BATTLE_MARK = "/* (nx2/oot_patches.py: Link's state steps above 60 fps, the battle music's end) */"
+BATTLE_NEW = ("    { const uint64_t _g=recomp_fp_to_int(c->vreg[0][0]&UINT64_C(0xffffffff),32,32,1,3,c->fpcr,&c->fpsr);"
+              " c->x[8]=((int32_t)(uint32_t)c->vreg[0][0] > 0) ? hos_frame_whole(%s, (uint32_t)c->vreg[0][0]) : _g; }   "
+              + BATTLE_MARK + "\n")
 
 
 def _function(s, head_text):
@@ -537,6 +559,34 @@ def patch_record_clock(s):
             done += count
     if done and RECORD_DECL not in s:
         s = s.replace('#include "a64.h"\n', '#include "a64.h"\n' + RECORD_DECL, 1)
+    return s, done
+
+
+def patch_battle_steps(s):
+    """Link's two state steps of BATTLE_SITES with hos_frame_whole's whole frames: (s, how many are in s with it, made now or
+    before). A place not found exactly once (another game version, or a lift with other code there) is left as it is."""
+    at = _function(s, BATTLE_HEAD)
+    if at is None:
+        return s, 0
+    head, end = at
+    body = s[head:end]
+    done = 0
+    for anchor, key in BATTLE_SITES:
+        new = BATTLE_NEW % key
+        if new in body:
+            done += 1
+            continue
+        found = [m for m in re.finditer(re.escape(anchor) + r"(?:[^\n]*\n){0,6}?" + re.escape(BATTLE_LOAD)
+                                        + r"(?:[^\n]*\n){0,4}?" + re.escape(BATTLE_CUT), body)]
+        if len(found) != 1:
+            continue
+        m = found[0]
+        cut_at = m.end() - len(BATTLE_CUT)
+        body = body[:cut_at] + new + body[m.end():]
+        done += 1
+    s = s[:head] + body + s[end:]
+    if done and WHOLE_DECL not in s:
+        s = s.replace('#include "a64.h"\n', '#include "a64.h"\n' + WHOLE_DECL, 1)
     return s, done
 
 
@@ -733,6 +783,28 @@ def patch_heap_retry(s):
     return s, found
 
 
+# ((Triforce) 11-19) f_807da3f0, the handler of the game's "aglTextureDataMgr::Compaction" thread, calls the compaction's step
+# (f_807da480: with the compaction idle it plans, and starts a cycle that moves a texture's data in the game's heap) at one
+# place, for each message that asks. That call is made through host/oot_tex_compact.c hos_oot_tex_compact, which calls the
+# game's own, counts the cycles started and holds them to a pace when HOS_OOT_TEX_COMPACT_MS says so (unset: as shipped).
+# f_807da480's other callers, the game's own waits for a compaction, stay as they are.
+TEX_COMPACT_OLD = "c->x[30] = 0x807da430ULL; f_807da480(c);"   # (the call's return address: this one place)
+TEX_COMPACT_NEW = "c->x[30] = 0x807da430ULL; hos_oot_tex_compact(c, f_807da480);   /* (nx2/oot_patches.py: host/oot_tex_compact.c) */"
+TEX_COMPACT_DECL = "void hos_oot_tex_compact(Ctx *A64_NOESC c, A64Fn game);\n"
+
+
+def patch_tex_compact(s):
+    """The call above in one file's text: (text, 1 when made now or found made). apply() wants 1 over the whole lift"""
+    if TEX_COMPACT_NEW in s:
+        return s, 1
+    if s.count(TEX_COMPACT_OLD) != 1 or s.count('#include "a64.h"\n') != 1:
+        return s, 0
+    s = s.replace(TEX_COMPACT_OLD, TEX_COMPACT_NEW, 1)
+    if TEX_COMPACT_DECL not in s:
+        s = s.replace('#include "a64.h"\n', '#include "a64.h"\n' + TEX_COMPACT_DECL, 1)
+    return s, 1
+
+
 def apply(gen, *, protect_hearts=False, required=False):
     """required: the lift of the supported build (LIFE_BUILD_ID), whole: a missing output-size edit stops it (apply_output_size).
     The other patches only warn when their place is not found once."""
@@ -752,10 +824,12 @@ def apply(gen, *, protect_hearts=False, required=False):
     whole_sites = 0   # (the counters of WHOLE_SITES with the whole frames: patch_whole_frames)
     sound_jobs = solver_sites = 0   # (patch_sound_job, patch_solver_steps: the places found with their hooks)
     floor_sites = sim_sites = record_sites = 0   # (patch_floor_carry, patch_sim_steps, patch_record_clock: the same)
+    battle_sites = 0   # (patch_battle_steps: Link's two state steps)
     sprint_sites = 0   # (patch_sprint: its two calls)
     zstd_sites = 0   # (patch_host_zstd: its two calls, the supported build's alone)
     mod_size_sites = 0   # ((Triforce) patch_mod_sizes: its one call, the supported build's alone)
     heap_sites = [0, 0]   # (the GPU memory's sites, the CPU buffers': patch_heap_retry, the supported build only)
+    tex_compact_sites = 0   # ((Triforce) patch_tex_compact: its one call, the supported build's alone)
     for path in sorted(glob.glob(os.path.join(glob.escape(gen), "code_*.c"))):
         with open(path, encoding="utf-8", newline="") as f:
             s = f.read()
@@ -862,6 +936,11 @@ def apply(gen, *, protect_hearts=False, required=False):
         if record != out:
             print("oot_patches: the ocarina recorder's clock above 60 fps in", os.path.basename(path))
         out = record
+        battle, found = patch_battle_steps(out)
+        battle_sites += found
+        if battle != out:
+            print("oot_patches: Link's state steps above 60 fps (the battle music's end) in", os.path.basename(path))
+        out = battle
         sprinted, found = patch_sprint(out)
         sprint_sites += found
         if sprinted != out:
@@ -878,6 +957,11 @@ def apply(gen, *, protect_hearts=False, required=False):
             if sized != out:
                 print("oot_patches: room for the mods' files in", os.path.basename(path))
             out = sized
+            compacted, found = patch_tex_compact(out)
+            tex_compact_sites += found
+            if compacted != out:
+                print("oot_patches: the texture compaction's step through the host in", os.path.basename(path))
+            out = compacted
         if out != s:
             whole_write.write_whole(path, out, newline="")
     if sound_jobs != 1:   # (without it, above 60 fps sounds and then the music can stop after a few loading zones)
@@ -891,10 +975,14 @@ def apply(gen, *, protect_hearts=False, required=False):
     if record_sites != sum(n for _, n in RECORD_SITES):   # (without them, above 60 fps a recorded song loses its rests)
         print("oot_patches: WARNING: the ocarina recorder's clock was found at %d of %d places"
               % (record_sites, sum(n for _, n in RECORD_SITES)))
+    if battle_sites != len(BATTLE_SITES):   # (without them, above 60 fps the battle music keeps playing after the last enemy)
+        print("oot_patches: WARNING: Link's state steps were found at %d of %d places" % (battle_sites, len(BATTLE_SITES)))
     if sprint_sites != 2:   # (without them the Sprint button row does nothing)
         print("oot_patches: WARNING: the sprint button's calls were found at %d of 2 places" % sprint_sites)
     if protect_hearts and mod_size_sites != 1:   # (without it a mod's bigger model can crash the game: host/mods.c)
         print("oot_patches: WARNING: the resource size table's lookup was found at %d of 1 place" % mod_size_sites)
+    if protect_hearts and tex_compact_sites != 1:   # (without it the compaction is neither counted nor paced: host/oot_tex_compact.c)
+        print("oot_patches: WARNING: the texture compaction's step was found at %d of 1 place" % tex_compact_sites)
     if protect_hearts and zstd_sites != len(ZSTD_SITES):   # (without them HOS_HOST_ZSTD does nothing, or half: host/hos_zstd.c)
         print("oot_patches: WARNING: the host's zstd decoder's calls were found at %d of %d places" % (zstd_sites, len(ZSTD_SITES)))
     if protect_hearts and heap_sites != [len(GPU_ALLOC_SITES), len(HEAP_ALLOC_SITES)]:   # (the supported build's functions)

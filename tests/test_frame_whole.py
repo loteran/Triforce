@@ -103,6 +103,33 @@ class FrameWholeTests(unittest.TestCase):
         hot = LIFTED[0].replace(old0, "    _v=a64_fpx_hot_mul32_fma32(c,_a,_b,_z);\n    a64_vset64(c->vreg[0],_v);}\n" + old0)
         self.assertEqual(oot_patches.patch_whole_frames(hot)[1], 1)
 
+    def test_battle_steps_patch_their_two_cuts(self):
+        # ((Triforce, 11-18) Link's two state steps in f_804caa80: each found by its page constant, the constant's load and the
+        #  cut; other cuts of the same text in the function stay the game's, a negative amount keeps the game's cut)
+        P = oot_patches
+        mul = ("    {uint64_t _a=0,_b=0,_z,_v;memcpy(&_a,c->vreg[0],4);memcpy(&_b,c->vreg[1],4);_z=(_a^_b)&0x80000000ULL;\n"
+               "    _v=a64_fpx_mul32_fma32(c,_a,_b,_z);\n    a64_vset64(c->vreg[0],_v);}\n")
+        site = lambda anchor, extra="": (anchor + "    c->x[10] = 0x8ULL;\n    c->x[10] &= 0xFFFFFFFFULL;\n" + extra
+                                         + P.BATTLE_LOAD + mul + P.BATTLE_CUT + "    c->x[9]=c->x[8];\n")
+        lifted = ('#include "a64.h"\n' + P.BATTLE_HEAD + P.BATTLE_CUT + site(P.BATTLE_SITES[0][0])
+                  + site(P.BATTLE_SITES[1][0], "    c->x[11] = 0x20ULL;\n    c->x[11] &= 0xFFFFFFFFULL;\n")
+                  + "return;\n}\nvoid f_804cfb00(Ctx *__restrict A64_NOESC c) {\n" + P.BATTLE_CUT + "return;\n}\n")
+        out, n = P.patch_battle_steps(lifted)
+        self.assertEqual(n, 2)
+        self.assertEqual(out.count(P.BATTLE_MARK), 2)
+        self.assertIn("hos_frame_whole(c->x[19] + 145, (uint32_t)c->vreg[0][0])", out)
+        self.assertIn("hos_frame_whole(c->x[19] + 147, (uint32_t)c->vreg[0][0])", out)
+        self.assertIn("((int32_t)(uint32_t)c->vreg[0][0] > 0)", out)   # (a negative amount: the game's cut)
+        self.assertEqual(out.count(P.BATTLE_CUT), 2)   # (the function's other cut and the next function's stay)
+        self.assertIn(P.WHOLE_DECL, out)
+        self.assertEqual(P.patch_battle_steps(out), (out, 2))   # (patched before: as it is)
+        hot = lifted.replace("a64_fpx_mul32_fma32", "a64_fpx_hot_mul32_fma32")
+        self.assertEqual(P.patch_battle_steps(hot)[1], 2)
+        other = lifted.replace("+2952ULL", "+2956ULL")   # (another game version's code)
+        self.assertEqual(P.patch_battle_steps(other), (other, 0))
+        twice = lifted.replace(site(P.BATTLE_SITES[0][0]), site(P.BATTLE_SITES[0][0]) * 2)
+        self.assertEqual(P.patch_battle_steps(twice)[1], 1)   # (a place found twice is left as it is)
+
     def test_clock_patches_its_seconds_alone(self):
         # (f_803edf70 cuts into x8 the same way once more, in the branch that sets the time from another source: that cut
         #  stays the game's)

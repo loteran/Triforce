@@ -70,6 +70,26 @@ def main():
                 return real_open(path, *a, **k)
             with mock.patch("builtins.open", host_edited):
                 check("other host/ code does not change the key", make_game.lift_key(str(exefs), str(work), env) == key)
+            # ((Triforce) the chunk boundaries a lift writes into a work folder that had none (nx2/chunks.py save): the key kept
+            # for that lift is the one the next build takes, so the next build skips the lift)
+            unchunked = make_game.lift_key(str(exefs), str(work), env, chunks=False)
+            check("chunks=False leaves the boundaries out", unchunked != key and unchunked ==
+                  make_game.lift_key(str(exefs), str(work), env, chunks=False))
+            (work / "image" / "chunks.txt").unlink()
+            fresh = make_game.lift_key(str(exefs), str(work), env)
+            before = make_game.lift_key(str(exefs), str(work), env, chunks=False)
+            check("without chunks.txt the key is the one without boundaries", fresh == before == unchunked)
+            (work / "image" / "chunks.txt").write_text("# first guest address of each lifted C chunk after the first\n80001000\n")
+            after = make_game.key_after_lift(str(exefs), str(work), env, fresh, before, False)
+            check("the key kept for a lift that wrote chunks.txt is the next build's", after != fresh and
+                  after == make_game.lift_key(str(exefs), str(work), env))
+            check("boundaries copied in from the source keep the key from before the lift",
+                  make_game.key_after_lift(str(exefs), str(work), env, fresh, before, True) == fresh)
+            (work / "hot_funcs.txt").write_text("f_80000008\n")
+            check("tools or inputs changed during the lift keep the key from before it",
+                  make_game.key_after_lift(str(exefs), str(work), env, fresh, before, False) == fresh)
+            (work / "hot_funcs.txt").write_text("f_80000000\n")
+            (work / "image" / "chunks.txt").write_text("80001000\n")
 
         gen, image = work / "sa" / "gen", work / "sa" / "image"
         check("no lift yet: not lifted before", not make_game.lifted_before(str(work), key))

@@ -16,8 +16,13 @@ struct Texture;
 
 /// What the Upscaler row runs now on this chain (upscaler_rows.h: GAME, DLSS, DLAA, FSR4, FSR4_AA): the row's choice
 /// (opts.dlss), or RX_VK_DLSS=1 / 2 or RX_VK_FSR4=1 / 2 over it; GAME when the chosen engine cannot run here, and while
-/// AMD FSR 3.1 (vk_fsr3.cpp, its own inputs) upscales: RX_VK_FSR=1, or the row's FSR 3.1 with neither switch above set
+/// AMD FSR 3.1 (vk_fsr3.cpp, its own inputs) upscales: RX_VK_FSR=1, or the row's FSR 3.1 with neither switch above set.
+/// (Triforce, FSR4-1) GAME too while the chosen engine is off after failing again and again: a creation or an evaluation
+/// that fails is tried again 2 s later, and the fourth failure in a row turns it off until the Upscaler row is set again
 int temporal_mode();
+/// (Triforce, FSR4-1) The engine chosen (DLSS, DLAA, FSR4, FSR4_AA) when it is off after failures and the game's upscale
+/// stands in for it (the Upscaler row's help says so); GAME when nothing stands in
+int temporal_stood_in();
 /// RX_VK_DLSS=1 / 2 or RX_VK_FSR4=1 / 2 set for this run, and that engine runs here: over the row, its FSR 3.1 too
 /// (vk_fsr3.cpp fsr3_wanted). Where it cannot run, a saved FSR 3.1 stays
 bool temporal_env_chosen();
@@ -25,13 +30,27 @@ bool temporal_wanted();       // (temporal_mode() != GAME)
 /// DLAA or FSR's native anti-aliasing (FSR 4's on this chain, FSR 3.1's with its own passes: vk_fsr3.h fsr3_native): the 3D
 /// drawn at full scale, whatever the Render resolution row says
 bool temporal_full_scale();
+/// ((Triforce, FSR3-06, FSR4-5) The engine (or AMD FSR 3.1) draws before the game's bloom and tone mapping this run (the
+/// Upscale before bloom row at the start, RX_VK_DLSS_PRE over it): it takes the scene, which the game's SMAA has not been over
+bool temporal_before_bloom();
+
+/// ((Triforce, S1) The Sharpness row as the upscalers' own sharpening, 0 to 1 (sharpen_rules.h amount); 0 at 0, and with
+/// RX_VK_SHARPEN_3D=0 (the row then sharpens the finished picture at the window for every upscaler, as before)
+float temporal_sharpness();
+/// ((Triforce, S1) Whether what upscales now sharpens the 3D before the HUD at the row's value: AMD FSR 3.1 (its own RCAS),
+/// AMD FSR 4 (its own sharpening), NVIDIA DLSS and DLAA (AMD's RCAS over their picture, vk_fsr3.h fsr3::rcas, only where it is
+/// tone mapped: not before the bloom nor RenoDX's RGBA16F scene, sharpen_rules.h lone_rcas). The window pass then sharpens
+/// nothing (vk_framegen.cpp framegen_scale): never twice, and not the HUD. The game's own upscaler: false
+bool temporal_sharpens_3d();
 
 /// A draw into a scene-sized target (colour target 0 and the depth target), with the vertex stage's uniform buffer 3 at
 /// `camera` (its size): the camera of the frame, when that buffer holds one
 void temporal_note_scene_draw(const Texture* color0, uint32_t width, uint32_t height, Texture* depth, uint64_t camera,
                               uint64_t camera_size);
 /// Whether a target of width x height can be the scene the gameplay upscale takes (1 to 3 times smaller than its output, as
-/// last seen; dlss_checks.h scene_size_fits): the camera, the actor motion and RX_VK_DLSS_TRACE take only those
+/// last seen; dlss_checks.h scene_size_fits): the camera, the actor motion and RX_VK_DLSS_TRACE take only those.
+/// ((Triforce, FSR3-03) while AMD FSR 3.1 upscales, also the sizes its own inputs take as the scene, vk_fsr3_inputs.h
+/// scene_size: its upscale's output is noted there, and the draws of its scene are to store their positions)
 bool temporal_scene_size(uint32_t width, uint32_t height);
 /// A skinned draw into a scene-sized target (vk_draw.cpp finds them by their vertex layout): what the motion needs to draw
 /// it again with this frame's bones and the frame before's (actor motion: Link, the others, what moves by itself)
@@ -77,9 +96,23 @@ struct CaptureSlot {
 /// The slot for a draw about to be recorded, when the chain wants its positions (*out left zero when not); the draw must be
 /// recorded after it, as it is described
 void temporal_capture_draw(const CaptureDraw& k, CaptureSlot* out);
-/// Whether draws are to store their positions at all now (an engine wanted, RX_VK_DLSS_ACTORS not 0 or bones): a draw
-/// that is not asks nothing more
+/// Whether draws are to store their positions at all now (an engine wanted, or AMD FSR 3.1 upscaling: temporal_motion_wanted;
+/// RX_VK_DLSS_ACTORS not 0 or bones): a draw that is not asks nothing more
 bool temporal_capture_wanted();
+/// ((Triforce, FSR3-03) Whether what moves by itself is to get its own motion now: an engine of this chain draws, or AMD
+/// FSR 3.1 upscales (vk_fsr3.cpp fsr3_wanted), whose inputs the chain's redraws draw into (temporal_fsr3_motion). The draws
+/// store their positions, and the skinned ones are noted, only then
+bool temporal_motion_wanted();
+
+namespace fsr3_inputs {
+struct Frame;
+}
+/// ((Triforce, FSR3-03) AMD FSR 3.1's upscale in place of the upscale's dispatch (vk_fsr3.cpp fsr3_upscale), its inputs just
+/// made (f): this frame's draws that stored their positions (or the skinned ones, RX_VK_DLSS_ACTORS=bones) drawn again into
+/// f's motion over the camera's, as the chain does for its engines, from f's camera (fsr3_inputs::Frame::own). Takes this
+/// frame's draws, as an engine's upscale does: f null when FSR 3.1 was to draw and its inputs were not made, the draws only
+/// let go. Returns the draws drawn again. Before the bloom the chain does the same itself (temporal_pre_tonemap)
+int temporal_fsr3_motion(VkCommandBuffer cmd, const fsr3_inputs::Frame* f);
 
 /// (local, RenoDX port) Whether f is the scene's colour format: the game's B10G11R11, or the RGBA16F the host chose for the
 /// run once an upscale's input was RGBA16F
@@ -181,11 +214,12 @@ struct TemporalEngine {
     bool (*start)();
     /// Ready to scale rw x rh into ow x oh, made again when its sizes or settings changed (cmd: what that records). in_w and
     /// in_h: how large the inputs are to be (the most the render size can be for what it made). 1 ready, 2 ready and made
-    /// just now (a new history), 0 not this frame (*why: the reason), -1 failed for good (*why too). hdr: the colour holds
+    /// just now (a new history), 0 not this frame (*why: the reason), -1 failed (*why too: (Triforce, FSR4-1) tried again 2 s
+    /// later, off after four in a row until the Upscaler row is set again, vk_temporal.cpp fail_again). hdr: the colour holds
     /// linear HDR values (an RGBA16F scene), not the LDR of TemporalFrame's color
     int (*prepare)(VkCommandBuffer cmd, uint32_t rw, uint32_t rh, uint32_t ow, uint32_t oh, bool hdr, uint32_t* in_w,
                    uint32_t* in_h, const char** why);
-    /// Records the frame: false when it failed (for good: the game's upscale from then on)
+    /// Records the frame: false when it failed (the game's upscale for that frame, and as after a failed prepare)
     bool (*evaluate)(VkCommandBuffer cmd, const TemporalFrame& f);
     /// What it made, let go (its feature or context): the chain unused for a while, or another engine chosen. Work in flight
     /// may still use it, so what it frees goes through later

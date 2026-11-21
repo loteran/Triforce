@@ -132,8 +132,9 @@ def main():
           "hdr_was = opts.hdr, vsync_was = opts.vsync;" in present,
           "present_image does not make the swapchain again when the VSync row changes")
     menu = (vk / "vk_menu.cpp").read_text(encoding="utf-8")
-    row = re.search(r'\{TAB_DISPLAY, "VSync", &opts\.vsync, 0, 1, 1, tx_onoff,.*?hn_vsync, false, true\},', menu, re.S)
-    check(row and "Changes at once" in row.group(0), "the VSync row is not an On / Off row of the Display tab that changes at once")
+    # ((Triforce, options_version 7) the Graphics tab's Frame rate & latency group)
+    row = re.search(r'\{TAB_GRAPHICS, "VSync", &opts\.vsync, 0, 1, 1, tx_onoff,.*?hn_vsync, false, true\},', menu, re.S)
+    check(row and "Changes at once" in row.group(0), "the VSync row is not an On / Off row of the Graphics tab that changes at once")
     header = (vk / "vk_menu.h").read_text(encoding="utf-8")
     check(re.search(r"\bint vsync = 1;", header), "VSync is not on by default: the present mode would not be the one from before the row")
     readme = (ROOT / "readme.md").read_text(encoding="utf-8")

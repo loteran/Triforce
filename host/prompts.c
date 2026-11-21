@@ -8,6 +8,12 @@
    (SDL), else 1 Switch, 2 Xbox, 3 PlayStation 4, 4 PlayStation 5, 5 Steam Deck, 6 Keyboard & mouse. The game reads the font
    once, at its start: a new face or new controls show at the next start.
 
+   (Triforce, 11-19) Auto follows the device used last over runs: with no controller there at the start it takes the face of
+   the device the player used last in the run before (<user>/prompts_auto.txt, follow_main). And while the game has the keys'
+   face, the overlay's own prompts (the Insert menu, Mods, the Quit dialog, the options' tabs) show the icons of the
+   controller used last, from a font of that controller's face built during play (prompts/External.pad.<n>.bfotf.zs, n
+   its HOS_PROMPT_*): the game's own texts keep the face they were given at the start.
+
    (Triforce) The keyboard and mouse face (NX2navi's prompts = pc; nx2/prompt_keys.py draws it): its font has an icon per
    key that can be bound, at U+F700 + the key's code, and each button's icon is that of the first key bound to it
    (bound_input). The left stick's and the d-pad's icons there are those keys side by side (bind_keys); the right stick's
@@ -31,6 +37,12 @@ int hos_binding(int set, int button, int slot);   /* nn_hid.c */
 int hos_sdl_pads(uint64_t *buttons, int32_t stick[4]);   /* pad_sdl.c */
 void hos_sdl_pad_first_name(char *out, size_t cap);
 int hos_xinput_connected(void);   /* nn_hid.c */
+int hos_input_last(void);   /* nn_hid.c: 0 none yet, 1 the keys or the mouse, 2 a controller */
+unsigned hos_input_uses(int device);   /* nn_hid.c: that device's uses so far */
+extern const char *hos_user_dir;   /* nn_fs.c: the saves' folder */
+void hos_sdl_pad_last_name(char *out, size_t cap);   /* pad_sdl.c */
+int hos_sdl_pad_scans(void);
+void hos_host_thread_register_self(const char *name);   /* hos_prof.c */
 int hos_mods_has(const char *prefix, const char *suffix);   /* mods.c */
 
 #define FONT_PATH "font2/scalable/external.nin_ounce_nvn2.bfotf.zs"   /* (as hos_mods_romfs's keys: lower case) */
@@ -64,20 +76,54 @@ static int contains(const char *text, const char *word) {   /* (any case) */
     return 0;
 }
 
-/* (Triforce) Auto's face: the first controller's, from its name (SDL's; "": it has none). With none the keyboard and mouse
-   are what the player has: their keys' icons, where the Switch's were shown before. xinput: XInput has a controller that
-   SDL does not name (HOS_NO_SDL=1, or no SDL beside the game): the game's own icons, as before.
-   The game reads its icons once, at its start, so Auto is chosen once, then: it cannot follow the device used last during
-   play, as NX2navi's prompts setting could not (a fixed choice, after a restart). A controller that is there at the start
-   is the face even while the keys are used with it, so the two never take turns */
-static int auto_face(const char *name, int xinput) {
-    if (!name[0]) return xinput ? HOS_PROMPT_SWITCH : HOS_PROMPT_KEYBOARD;
+/* (Triforce) Auto's face: the first controller's, from its name (SDL's; "": it has none). xinput: XInput has a controller
+   that SDL does not name (HOS_NO_SDL=1, no SDL beside the game, or one SDL had not opened yet): the Xbox's, as XInput
+   reads only pads of the Xbox's layout ((11-19) it was the Switch's: an Xbox pad SDL had not opened in time showed the
+   Switch's letters). With none, remembered: the face of the device used last in the run before (remembered_face,
+   follow_main; -1 none), so a controller switched on after the game started is the face at the next start; without one
+   the keyboard and mouse are what the player has: their keys' icons.
+   The game reads its icons once, at its start, so Auto is chosen once, then: its texts cannot follow the device used last
+   during play, as NX2navi's prompts setting could not. A controller that is there at the start is the face even while the
+   keys are used with it, so the two never take turns */
+static int auto_face(const char *name, int xinput, int remembered) {
+    if (!name[0]) return xinput ? HOS_PROMPT_XBOX : remembered >= 0 && remembered < HOS_PROMPT_N ? remembered : HOS_PROMPT_KEYBOARD;
     if (contains(name, "dualsense") || contains(name, "ps5")) return HOS_PROMPT_PS5;
     if (contains(name, "dualshock") || contains(name, "ps4") || contains(name, "playstation")) return HOS_PROMPT_PS4;
     if (contains(name, "steam deck")) return HOS_PROMPT_STEAMDECK;
     if (contains(name, "nintendo") || contains(name, "switch") || contains(name, "joy-con")) return HOS_PROMPT_SWITCH;
     return HOS_PROMPT_XBOX;   /* (Xbox pads, and the many that copy their layout) */
 }
+
+/* ((Triforce, 11-19) where Auto keeps the device used last: <user>/prompts_auto.txt, beside the saves and mouse_sens.txt.
+   Not in prompts/, which Setup makes again from nothing when its tools or the game's files change (nx2/make_game.py
+   Prompts.finish), as a release's update does: the face remembered went with it, and the first start after each update
+   without a controller ready had the keys' face again */
+static void auto_path(char *out, size_t cap) {
+    snprintf(out, cap, "%s/prompts_auto.txt", hos_user_dir ? hos_user_dir : "user");
+}
+/* ((Triforce) the face auto_path has (faces[]), the device used last in the run before (follow_main), or prompts/auto.txt's,
+   where an older build kept it; -1 none */
+static int remembered_face(const char *dir) {
+    char path[MAX_PATH], line[32] = "";
+    auto_path(path, sizeof path);
+    FILE *f = fopen(path, "r");
+    if (!f) {
+        snprintf(path, sizeof path, "%sprompts/auto.txt", dir);
+        f = fopen(path, "r");
+    }
+    if (!f) return -1;
+    if (!fgets(line, sizeof line, f)) line[0] = 0;
+    fclose(f);
+    line[strcspn(line, "\r\n")] = 0;
+    for (int i = 0; i < HOS_PROMPT_N; i++)
+        if (!strcmp(line, faces[i])) return i;
+    return -1;
+}
+
+/* (Triforce) Auto's wait at the start: SDL's first scan for controllers and four more, a second of them (pad_sdl.c scans
+   each quarter second at first), 3 s at most; none without SDL */
+#define AUTO_SCANS 5
+static int chosen_auto;   /* (choose_face's: the row is on Auto) */
 
 /* HOS_PROMPT_* (faces[]) */
 static int choose_face(const char *dir) {
@@ -91,18 +137,23 @@ static int choose_face(const char *dir) {
         fclose(f);
     }
     if (choice >= 1 && choice <= HOS_PROMPT_N) return choice - 1;
-    /* Auto: the first controller SDL opens (it scans every second: up to 1.5 s for one, at the game's start) */
+    chosen_auto = 1;
+    /* Auto: the first controller SDL opens, as long as AUTO_SCANS's wait */
     char name[128] = "";
     uint64_t b = 0;
     int32_t s[4] = {0};
-    for (int i = 0; i < 30 && !name[0]; i++) {
+    for (int i = 0; i < 60; i++) {
         hos_sdl_pads(&b, s);
         hos_sdl_pad_first_name(name, sizeof name);
-        if (!name[0]) Sleep(50);
+        const int scans = hos_sdl_pad_scans();
+        if (name[0] || scans < 0 || scans >= AUTO_SCANS) break;
+        Sleep(50);
     }
     const int xinput = !name[0] && hos_xinput_connected();
-    const int face = auto_face(name, xinput);
-    hos_log("prompts: auto: controller \"%s\": %s", name[0] ? name : xinput ? "(XInput's, no name)" : "(none)", faces[face]);
+    const int remembered = name[0] || xinput ? -1 : remembered_face(dir);
+    const int face = auto_face(name, xinput, remembered);
+    hos_log("prompts: auto: controller \"%s\": %s", name[0] ? name : xinput ? "(XInput's, no name)" :
+            remembered >= 0 ? "(none: the device used last in the run before, prompts_auto.txt)" : "(none)", faces[face]);
     return face;
 }
 
@@ -272,6 +323,7 @@ static uint8_t *read_all(const char *path, const char *magic, long *n) {   /* (t
 }
 
 static volatile LONG setup_state;   /* setup's: 0 not looked, 1 looking, 2 prompts, 3 none */
+static DWORD WINAPI follow_main(void *arg);
 
 /* the game folder and the face, found once; 0 when the folder has no prompts/ (built before them: the game's own icons) */
 static int setup(char *dir, size_t cap, int *face) {
@@ -289,6 +341,11 @@ static int setup(char *dir, size_t cap, int *face) {
            setting did nothing, and the log said nothing of it) */
         else hos_log("prompts: no prompts folder beside the game: the game's own icons, whatever Button prompts is set to "
                      "(Setup's Update makes them)");
+        /* ((Triforce) the device used last followed, on Auto or with the keys' face: follow_main, which waits for this) */
+        if (ok && (chosen_auto || f == HOS_PROMPT_KEYBOARD)) {
+            HANDLE t = CreateThread(NULL, 0, follow_main, NULL, 0, NULL);
+            if (t) CloseHandle(t);
+        }
         InterlockedExchange(&setup_state, ok ? 2 : 3);
     }
     while (setup_state == 1) Sleep(1);
@@ -558,29 +615,19 @@ static int build_layouts(char *out, size_t cap) {
     return ok;
 }
 
-/* builds prompts/External.bfotf.zs for this run; 1 when there is one */
-static int build(char *out, size_t cap) {
-    char dir[MAX_PATH], path[MAX_PATH];
-    int face;
-    if (!setup(dir, sizeof dir, &face)) return 0;
-    /* (a mod's size table is served, not ours: the faces' fonts, larger than the game's, do not fit it. ((Triforce, 11-18)
-       unless the lifted code asks host/mods.c's hos_mods_table_size for each file's room, which gives the font its own: so
-       only when that hook has not run in this game, an older build of it) */
-    extern volatile LONG hos_mods_size_hook_seen;
-    if (hos_mods_has(SIZES_PATH, ".rsizetable.zs")) {
-        if (!hos_mods_size_hook_seen) {
-            hos_log("prompts: a mod has the resource size table: the game's own icons in texts");
-            return 0;
-        }
-        hos_log("prompts: a mod has the resource size table: the font's room comes from the size hook (host/mods.c)");
-    }
+/* face's font (prompts/<face>/External.bfotf) with these controls, written to prompts/<name> (out its path); 1 when written,
+   -1 when the folder has no font of that face. pad: (Triforce) the overlay's font of the controller used last
+   (follow_main), written whole and then put in place: (11-19) once a run for each face, before the overlay is told of it,
+   so never while it reads it */
+static int build_font(const char *dir, int face, const char *name, int pad, char *out, size_t cap) {
+    char path[MAX_PATH];
     snprintf(path, sizeof path, "%sprompts/%s/External.bfotf", dir, faces[face]);
     long n;
     uint8_t *b = read_all(path, NULL, &n);
     if (!b || n < 16 || n % 4) {
         hos_log("prompts: no %s: the game's own icons", path);
         free(b);
-        return 0;
+        return -1;
     }
     const uint32_t key = rd32le(b) ^ MAGIC;
     for (long i = 8; i < n; i += 4) wr32le(b + i, rd32le(b + i) ^ key);
@@ -594,15 +641,134 @@ static int build(char *out, size_t cap) {
         free(k);
     }
     for (long i = 8; i < n; i += 4) wr32le(b + i, rd32le(b + i) ^ key);
-    snprintf(out, cap, "%sprompts/External.bfotf.zs", dir);
-    const int ok = write_zstd_raw(out, b, (size_t)n);
+    snprintf(out, cap, "%sprompts/%s", dir, name);
+    snprintf(path, sizeof path, "%s.new", out);
+    const int ok = pad ? write_zstd_raw(path, b, (size_t)n) && MoveFileExA(path, out, MOVEFILE_REPLACE_EXISTING)
+                       : write_zstd_raw(out, b, (size_t)n);
     free(b);
-    if (face == HOS_PROMPT_KEYBOARD)
+    if (pad)
+        hos_log("prompts: the overlay's icons of the controller used last: %s, %d buttons on this pad's controls%s", faces[face],
+                bound, ok ? "" : ": could not be written");
+    else if (face == HOS_PROMPT_KEYBOARD)
         hos_log("prompts: %s icons, %d buttons and directions on these keys, %d keys in the icons of several%s", faces[face],
                 bound, several, ok ? "" : ": could not be written");
     else
         hos_log("prompts: %s icons, %d buttons on this pad's controls%s", faces[face], bound, ok ? "" : ": could not be written");
     return ok;
+}
+
+/* builds prompts/External.bfotf.zs for this run; 1 when there is one */
+static int build(char *out, size_t cap) {
+    char dir[MAX_PATH];
+    int face;
+    if (!setup(dir, sizeof dir, &face)) return 0;
+    /* (a mod's size table is served, not ours: the faces' fonts, larger than the game's, do not fit it. ((Triforce, 11-18)
+       unless the lifted code asks host/mods.c's hos_mods_table_size for each file's room, which gives the font its own: so
+       only when that hook has not run in this game, an older build of it) */
+    extern volatile LONG hos_mods_size_hook_seen;
+    if (hos_mods_has(SIZES_PATH, ".rsizetable.zs")) {
+        if (!hos_mods_size_hook_seen) {
+            hos_log("prompts: a mod has the resource size table: the game's own icons in texts");
+            return 0;
+        }
+        hos_log("prompts: a mod has the resource size table: the font's room comes from the size hook (host/mods.c)");
+    }
+    return build_font(dir, face, "External.bfotf.zs", 0, out, cap) > 0;
+}
+
+/* the face of the device used last (device: hos_input_last's; name: the controller used last's, SDL's, "" none: XInput's,
+   an Xbox pad), -1 none yet */
+static int device_face(int device, const char *name) {
+    return device == 2 ? auto_face(name, 1, -1) : device == 1 ? HOS_PROMPT_KEYBOARD : -1;
+}
+
+/* follow_main's: the device's face (device_face) held since held_ns, the looks it was used in since (active), and the face
+   auto_path has (-1 none) */
+typedef struct { int held, recorded; int64_t held_ns; int active; } Follow;
+/* ((Triforce, 11-19) the keys' face is recorded once they have been used in this many of the looks (a quarter second
+   each) while they were the device used last: a key pressed once, or the mouse bumped, and the game then left alone is
+   not a player of the keys */
+#define KEYS_ACTIVE 20
+/* face seen at now, its device used since the last look or not (active): whether auto_path is to have it now (then
+   recorded is it) */
+static int follow_record(Follow *f, int face, int64_t now, int active) {
+    if (face < 0) return 0;
+    if (face != f->held) f->held = face, f->held_ns = now, f->active = 0;
+    if (active) f->active++;
+    const int keys = face == HOS_PROMPT_KEYBOARD;
+    if (face == f->recorded || now - f->held_ns < (keys ? 30 : 3) * 1000000000LL || (keys && f->active < KEYS_ACTIVE)) return 0;
+    f->recorded = face;
+    return 1;
+}
+
+/* ((Triforce, 11-19) the overlay's icons follow a controller once it has been the one used last this long: two controllers
+   of two faces given the same presses (a DualSense and the virtual Xbox pad DS4Windows makes of it, a Steam Input pad)
+   take turns as the one used last, and the icons would change at each press */
+#define PAD_HOLD_NS 1000000000LL
+/* whether the overlay is to show face's icons now: the game has the keys' face, face is a controller's, not the one shown
+   (shown: -1 none), the one used last for PAD_HOLD_NS (held_ns) unless none is shown yet, and not one whose font cannot be
+   made (failed: a bit a face) */
+static int pad_font_due(int served, int face, int shown, int64_t held_ns, unsigned failed) {
+    return served == HOS_PROMPT_KEYBOARD && face >= 0 && face != HOS_PROMPT_KEYBOARD && face != shown && !(failed >> face & 1) &&
+           (shown < 0 || held_ns >= PAD_HOLD_NS);
+}
+
+/* ((Triforce, 11-19) The device the player uses (host/nn_hid.c hos_input_last), looked at four times a second on a thread
+   of its own, from the start (setup) on Auto or with the keys' face:
+   - while the game has the keys' face, a controller used builds the overlay's font of its face (build_font's pad), once a
+     run for each face (prompts/External.pad.<n>.bfotf.zs), and hos_prompts_pad_face says which to show once written;
+     another face's after it has been the last for a second (pad_font_due). One not written is tried again 2 s on;
+   - on Auto, the face of the device used last (a controller: its name's, auto_face; the keys or the mouse: theirs) goes
+     into auto_path for the next start (remembered_face) once it has been the last for 3 s, the keys' for 30 s and used in
+     5 s of them (a key pressed between a controller's presses, or to close the game, keeps the controller's); written
+     only when it changes. Never on the input's thread: read_input only stores the device */
+static volatile LONG pad_face_shown = -1;   /* the face of the overlay's font to show this run (built), -1 none */
+static DWORD WINAPI follow_main(void *arg) {
+    (void)arg;
+    hos_host_thread_register_self("button prompts");
+    char dir[MAX_PATH];
+    int served;
+    setup(dir, sizeof dir, &served);
+    Follow follow = {-1, remembered_face(dir), 0, 0};
+    unsigned built = 0, failed = 0, uses[3] = {0};
+    int seen = -1;   /* (the face used last, since seen_ns) */
+    int64_t seen_ns = 0, retry_ns[HOS_PROMPT_N] = {0};
+    for (;;) {
+        Sleep(250);
+        char name[128] = "";
+        const int device = hos_input_last();
+        if (device == 2) hos_sdl_pad_last_name(name, sizeof name);
+        const int face = device_face(device, name);
+        const int64_t now = hos_now_ns();
+        const unsigned used = hos_input_uses(device);
+        const int active = device >= 1 && device <= 2 && used != uses[device];
+        if (device >= 1 && device <= 2) uses[device] = used;
+        if (face != seen) seen = face, seen_ns = now;
+        if (pad_font_due(served, face, (int)pad_face_shown, now - seen_ns, failed) && now >= retry_ns[face]) {
+            char out[MAX_PATH], file[48];
+            snprintf(file, sizeof file, "External.pad.%d.bfotf.zs", face);
+            const int got = built >> face & 1 ? 1 : build_font(dir, face, file, 1, out, sizeof out);
+            if (got > 0) built |= 1u << face, InterlockedExchange(&pad_face_shown, face);
+            else if (got < 0) failed |= 1u << face;   /* (no font of that face: not tried again) */
+            else retry_ns[face] = now + 2000000000LL;   /* (not written: again in 2 s) */
+        }
+        if (chosen_auto && follow_record(&follow, face, now, active)) {   /* (written or not: again only when it changes) */
+            char path[MAX_PATH];
+            auto_path(path, sizeof path);
+            FILE *f = fopen(path, "w");
+            int ok = f && fputs(faces[face], f) >= 0;
+            if (f) ok &= fclose(f) == 0;
+            hos_log("prompts: auto: the device used last has the %s face: the next start's without a controller%s",
+                    faces[face], ok ? "" : " (prompts_auto.txt could not be written)");
+        }
+    }
+}
+
+/* ((Triforce) the face of the controller used last whose icons the overlay is to show, from prompts/External.pad.<n>.bfotf.zs
+   (n the face's HOS_PROMPT_*), built while the game has the keys' face (follow_main); -1 none (no controller used yet, or the
+   game has a controller's face) */
+int hos_prompts_pad_face(void) {
+    return (int)pad_face_shown;
 }
 
 /* (Triforce) The Insert menu's Camera speed row (camera_speed= in the options file, percent; HOS_CAMERA_SPEED=<percent>
@@ -670,12 +836,42 @@ int hos_prompts_font_file(const char *key, char *out, size_t cap) {
     return hos_prompts_romfs(FONT_PATH, out, cap);
 }
 
+/* (Triforce) The title screen's third entry, "Options / ZELDA NOTES Setting" in US English, reads "Options / Triforce":
+   prompts/mals/<language>.product.110.sarc.zs is that language's messages (Mals/, its name in lower case) with the entry's
+   rest after the game's word for Options made Triforce's (nx2/prompt_assets.py title_messages; the wording is its
+   TITLE_TEXT), built at Setup's Update from the player's own files. The one of the language the game shows is served
+   (desired_language: language.txt, HOS_LANGUAGE over it), each language's messages are a file of their own. No larger
+   than the game's file (title_messages writes no other), so the size table's entry holds it with its allowance. A mod's file of the same name wins (mods.c asks here only without one) */
+const char *hos_desired_language(void);   /* nn_applet.c */
+static const struct { const char *code, *mals; } title_languages[] = {   /* (nn_applet.c languages[] -> romfs/Mals) */
+    {"en-US", "usen"}, {"en-GB", "euen"}, {"fr", "eufr"}, {"fr-CA", "usfr"}, {"de", "eude"}, {"it", "euit"},
+    {"es", "eues"}, {"es-419", "uses"}, {"pt-BR", "uspt"}, {"nl", "eunl"}, {"pl", "eupl"}, {"ru", "euru"},
+    {"ja", "jpja"}, {"ko", "krko"}, {"zh-Hans", "cnzh"}, {"zh-Hant", "twzh"},
+};
+static int title_messages(const char *key, char *out, size_t cap) {
+    char dir[MAX_PATH], want[16];
+    int face;
+    const char *lang = hos_desired_language(), *mals = "usen";
+    for (size_t i = 0; i < sizeof title_languages / sizeof *title_languages; i++)
+        if (!strcmp(lang, title_languages[i].code)) mals = title_languages[i].mals;
+    snprintf(want, sizeof want, "mals/%s.", mals);
+    if (strncmp(key, want, strlen(want)) || !setup(dir, sizeof dir, &face)) return 0;   /* (another language's: the game's) */
+    snprintf(out, cap, "%sprompts/%s", dir, key);
+    const int ok = GetFileAttributesA(out) != INVALID_FILE_ATTRIBUTES;
+    static volatile LONG logged;
+    if (InterlockedExchange(&logged, 1) == 0)
+        hos_log(ok ? "prompts: the title's Options entry from prompts/%s (%s)"
+                   : "prompts: no prompts/%s (%s): the title's Options entry is the game's (Setup's Update makes it)", key, lang);
+    return ok;
+}
+
 /* mods.c: the file for a RomFS path the prompts replace (key: lower case, '/'), 1 with one. Asked only when no mod has
    the file: a mod's own wins */
 int hos_prompts_romfs(const char *key, char *out, size_t cap) {
     static volatile LONG state[4];   /* the font, the textures, the layouts, the camera: 0 not built, 1 being built, 2 built, 3 none */
     static char path[4][MAX_PATH];
     const size_t kn = strlen(key);
+    if (!strncmp(key, "mals/", 5) && kn > 8 && !strcmp(key + kn - 8, ".sarc.zs")) return title_messages(key, out, cap);
     if (!strncmp(key, SIZES_PATH, sizeof SIZES_PATH - 1) && kn > 14 && !strcmp(key + kn - 14, ".rsizetable.zs")) {
         char dir[MAX_PATH];   /* (the game's size table with room for the faces' fonts, larger than its: nx2/prompt_assets.py) */
         int face;

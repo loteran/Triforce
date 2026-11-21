@@ -34,7 +34,9 @@
 // The Insert menu's Upscaler row (opts.dlss, upscaler_rows.h) chooses the engine; RX_VK_DLSS=1 / 2 (DLSS, DLAA) or
 // RX_VK_FSR4=1 / 2 (FSR 4, its native anti-aliasing) over it, and =0 takes that engine out for the run. AMD FSR 3.1
 // (vk_fsr3.cpp, the row's value 3, 6 for its Native AA, or RX_VK_FSR=1 / 2) has inputs of its own (vk_fsr3_inputs.cpp):
-// while it upscales, this chain stands aside.
+// while it upscales, this chain stands aside, but for ((Triforce, FSR3-03) temporal_motion_wanted) what moves by itself:
+// the draws store their positions as for an engine, and the chain draws them again into FSR's motion (fsr3_motion:
+// temporal_fsr3_motion in place of the upscale's dispatch, pre_fsr3 before the bloom).
 // RX_VK_DLSS_DEBUG=motion: the motion vectors shown instead of the picture (|x|, |y| over 16 px as red and green, the actors'
 // in it); =characters: a grey picture, blue where a draw moves by itself (not as the camera moves what is there: a still
 // character is grey), brighter the further apart, up to 8 px; =alternate: every other frame the game's own upscale (a test's reference beside the engine's). (The names are
@@ -56,7 +58,11 @@
 #include "dlss_actor.h"
 #include "dlss_checks.h"
 #include "dlss_math.h"
+#include "framegen_rows.h"   // ((Triforce) pose_of, camera_cut: a camera cut starts a new history)
+#include "fsr3_math.h"       // ((Triforce, FSR4-10) jitter_phases: AMD's jitter length, for FSR 4 too)
 #include "stream_order.h"
+#include "temporal_rules.h"   // ((Triforce, FSR4-1, FSR4-2) Retry, native_at)
+#include "sharpen_rules.h"    // ((Triforce, S1, S8) the Sharpness row as the engines', the texture LOD bias)
 #include "upscaler_rows.h"
 #include "vk_dlss.h"
 #include "vk_hudless.h"
@@ -65,6 +71,7 @@
 #include "vk_fsr3.h"   // (fsr3_wanted: AMD FSR 3.1 upscales with inputs of its own)
 #include "vk_fsr3fi.h"   // (frames_wanted: not before the bloom with frame interpolation on)
 #include "vk_ffx3.h"   // (AMD's own library as the engine of the row's FSR 3.1)
+#include "vk_fsr3_inputs.h"   // ((Triforce, FSR3-03) its inputs' Frame and scene sizes: temporal_fsr3_motion)
 #include "vk_fsr4.h"
 #include "vk_menu.h"
 #include "vk_renodx.h"   // (renodx_built: temporal_scene_format)
@@ -95,6 +102,8 @@ int env_switch(const char* name) {   // (-1: unset)
 namespace {
 int env_dlss() { static const int v = env_switch("RX_VK_DLSS"); return v; }   // (read at the first ask, as the others)
 int env_fsr4() { static const int v = env_switch("RX_VK_FSR4"); return v; }
+bool stood_in(int mode);          // ((Triforce, FSR4-1) below: the engine off after failures, the game's upscale in its place)
+void rearm_on_choice(int choice);  // (and a fresh choice on the Upscaler row trying it anew)
 }  // namespace
 
 bool temporal_env_chosen() {
@@ -106,6 +115,7 @@ bool temporal_env_chosen() {
 int temporal_mode() {
     const int dlss = env_dlss(), fsr4 = env_fsr4();
     int v = opts.dlss;
+    rearm_on_choice(v);
     if (dlss > 0) v = dlss >= 2 ? ur::DLAA : ur::DLSS;   // (2 and up: DLAA, as RX_VK_DLSS was clamped before)
     else if (fsr4 > 0) v = fsr4 >= 2 ? ur::FSR4_AA : ur::FSR4;
     // (FSR 3.1 asked for (the row's 3, RX_VK_FSR=1) and AMD's own library there and working (vk_ffx3.cpp): an engine of this
@@ -117,7 +127,20 @@ int temporal_mode() {
     if (fsr3_wanted()) return ur::GAME;
     if (ur::is_dlss(v) && dlss_why() != DLSS_OK) return ur::GAME;
     if (ur::is_fsr4(v) && fsr4_why() != FSR_OK) return ur::GAME;
+    // ((Triforce, FSR4-1) off after failing again and again: the game's own, which the Upscaler row and the rows after it
+    // then say. Not while it waits to try again: the hooks that feed the chain stay on for the retry)
+    if (stood_in(v)) return ur::GAME;
     return v;
+}
+
+int temporal_stood_in() {
+    const int dlss = env_dlss(), fsr4 = env_fsr4();
+    int v = opts.dlss;
+    if (dlss > 0) v = dlss >= 2 ? ur::DLAA : ur::DLSS;
+    else if (fsr4 > 0) v = fsr4 >= 2 ? ur::FSR4_AA : ur::FSR4;
+    if ((!ur::is_dlss(v) && !ur::is_fsr4(v)) || fsr3_wanted()) return ur::GAME;
+    if ((ur::is_dlss(v) && dlss_why() != DLSS_OK) || (ur::is_fsr4(v) && fsr4_why() != FSR_OK)) return ur::GAME;
+    return stood_in(v) ? v : ur::GAME;
 }
 bool temporal_wanted() { return temporal_mode() != ur::GAME; }
 namespace {
@@ -125,6 +148,34 @@ bool pre_wanted(int mode);   // (below: the engine, or AMD FSR 3.1, before the g
 }
 // (AMD FSR 3.1's Native AA too, which is not an engine of this chain: vk_fsr3.cpp fsr3_native)
 bool temporal_full_scale() { return ur::full_scale(temporal_mode()) || fsr3_native(); }
+bool temporal_before_bloom() { return pre_wanted(temporal_mode()); }
+
+float temporal_sharpness() {
+    static const bool off = [] {
+        const char* e = getenv("RX_VK_SHARPEN_3D");
+        return e && *e && atoi(e) == 0;
+    }();
+    return off ? 0.0f : sharpen_rules::amount(opts.sharpness);
+}
+namespace {
+// ((Triforce) whether the chain's last colour was RenoDX's RGBA16F scene (linear HDR): -1 before its first frame, when the
+// run's scene format answers. The chain sets it each frame; temporal_sharpens_3d reads it on the present's thread)
+std::atomic<int> chain_rgba16f{-1};
+bool chain_hdr_scene() {
+    const int v = chain_rgba16f.load(std::memory_order_relaxed);
+    return v < 0 ? temporal_scene_format(VK_FORMAT_R16G16B16A16_SFLOAT) : v != 0;
+}
+}  // namespace
+bool temporal_sharpens_3d() {
+    if (temporal_sharpness() <= 0.0f) return false;
+    if (fsr3_wanted()) return fsr3::sharpens();
+    const int mode = temporal_mode();
+    if (ur::is_fsr4(mode)) return true;      // (FSR 4's own, in its dispatch: vk_fsr4.cpp)
+    // (AMD's RCAS over DLSS's picture, in the chain below: ((Triforce) the tone mapped picture alone, sharpen_rules.h
+    // lone_rcas; over linear HDR light the window pass sharpens)
+    if (ur::is_dlss(mode)) return fsr3::rcas_ok() && sharpen_rules::lone_rcas(pre_wanted(mode), chain_hdr_scene());
+    return false;
+}
 
 namespace {
 
@@ -154,18 +205,25 @@ struct Camera {
     bool valid = false;
 };
 
-/// An engine as the chain keeps it: started once, failed for good once
+/// An engine as the chain keeps it: started once, failed for good once (not there, or its shaders not made)
 struct Engine {
     const TemporalEngine* e = nullptr;
     bool started = false, ok = false;
     std::atomic<bool> failed{false};   // (atomic: temporal_jitter_size reads it on the game's thread, without the lock)
+    // ((Triforce, FSR4-1) what it made not made, or its evaluation failed: tried again 2 s later, off after four in a row
+    // until the Upscaler row is set again (temporal_rules.h Retry; fail_again, rearm_on_choice)
+    temporal_rules::Retry retry;
 };
+int64_t now_ns() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
 
 struct State {
     std::mutex mu;
     Engine engines[3];               // (DLSS, FSR 4, FSR 3.1 through AMD's library: engine_of)
     const TemporalEngine* drawing = nullptr;   // (the engine that drew last: another one starts a new history)
     Image color, depth, motion, output;
+    Image sharp;   // ((Triforce, S1) DLSS's picture through AMD's RCAS: the Sharpness row before the HUD
     // (the engine before the bloom, scaling up: the scene's colour target as its pass left it, in the scene's format; and
     // the engine's picture with what the game drew into the scene since: shaders/dlss_merge.comp)
     Image base, merged;
@@ -221,6 +279,11 @@ struct State {
     std::atomic<uint64_t> last_frame{0};   // (the frame an engine last drew: read on the game's thread too)
     float last_jitter[2]{};   // (its camera's jitter: the frame before's, for the next one)
     float last_vp[16]{};      // (its camera's view-projection: the frame before's)
+    // ((Triforce) camera cuts: the pose of the camera the engine was last given (framegen_rows.h pose_of), when, and how many)
+    framegen_rows::Pose last_pose;
+    std::chrono::steady_clock::time_point last_pose_time{};
+    bool have_pose = false;
+    uint64_t cuts = 0;
     std::atomic<uint32_t> jitter_w{0}, jitter_h{0};   // (the scene's size while an engine draws: the host's jitter's scale)
     std::atomic<uint32_t> jitter_phases{8};           // (its sequence's length, for the engine's scale: dlss_jitter_phases)
     std::unordered_map<VkImage, VkImageView> depth_views;
@@ -229,6 +292,8 @@ struct State {
     int reason_repeats = 0;
     const TemporalEngine* told_first = nullptr;
     bool told_camera = false;
+    bool told_sharp = false;   // ((Triforce, S1) the first picture sharpened before the HUD was said)
+    bool told_sharp_hdr = false;   // ((Triforce) and that a linear HDR picture is left to the window pass (lone_rcas))
     // (actor motion: the skinned draws into the scene since the last upscale; the poses the engine last drew, by draw: the
     // frame before's, where they were copied to in one of the two pose buffers (each frame's poses go to the other one))
     struct Skin {
@@ -331,6 +396,24 @@ State& st() {
     return s;
 }
 
+/// (Triforce, FSR4-1) The chain's slot of an Upscaler value's engine, without making it (DLSS and DLAA: 0; FSR 4: 1)
+Engine& slot_of(int mode) { return st().engines[ur::is_fsr4(mode) ? 1 : 0]; }
+/// Off after kFailMax failures in a row, or failed for good: the game's upscale stands in (temporal_mode says GAME)
+bool stood_in(int mode) {
+    const Engine& k = slot_of(mode);
+    return k.retry.is_off() || k.failed.load(std::memory_order_relaxed);
+}
+/// A fresh choice on the Upscaler row (opts.dlss changed): an engine off after failures is tried anew, with a count from 0
+void rearm_on_choice(int choice) {
+    static std::atomic<int> seen{-1};
+    if (seen.load(std::memory_order_relaxed) == choice) return;
+    const int was = seen.exchange(choice, std::memory_order_relaxed);
+    if (was < 0 || was == choice) return;
+    for (int i = 0; i < 2; i++)
+        if (st().engines[i].retry.rearm())
+            logf("vk: upscaler: the Upscaler row set again: %s tried anew", i ? "AMD FSR 4" : "NVIDIA DLSS");
+}
+
 /// The gameplay upscale's output size, as it is seen: the scene sizes the upscaler can take (temporal_scene_size). Until the
 /// first one, none: that frame keeps the game's upscale
 void note_output(const Texture* out, uint32_t level) {
@@ -367,6 +450,30 @@ bool fail(const char* why) {   // (the network runs: why, when it changes and ev
 }
 
 void later(std::function<void()> f) { st().dead.push_back({texture_frame_no(), std::move(f)}); }
+void drop_image(Image& im);
+
+/// (Triforce, FSR4-1) The engine's creation or evaluation failed (why): what it made is let go, and the chain's images,
+/// which the game's upscale does not use meanwhile, so the video memory it lacked (an area's textures loading) has come
+/// back when it is tried again, kRetryNs later (the deferred frees run a few frames on). The kFailMax-th failure in a row
+/// turns it off until the Upscaler row is set again (temporal_mode, rearm_on_choice). The game's upscale runs this frame
+bool fail_again(Engine& k, const char* why) {
+    State& s = st();
+    k.e->release();
+    if (s.drawing == k.e) s.drawing = nullptr;
+    for (Image* im : {&s.color, &s.depth, &s.motion, &s.output, &s.sharp, &s.base, &s.merged}) drop_image(*im);
+    s.pre_pending = false, s.pre_picture = {};
+    s.last_frame = 0;   // (a new history when it draws again; no jitter meanwhile, temporal_jitter_size)
+    if (k.retry.failed(now_ns()))
+        logf("vk: %s: %s, %d times in a row: off, the game's upscale stands in until the Upscaler row is set again (frame %llu)",
+             k.e->name, why, k.retry.count(), (unsigned long long)texture_frame_no());
+    else
+        logf("vk: %s: %s (%d of %d in a row): the game's upscale for 2 s while what it held is let go, then it is tried "
+             "again (frame %llu)", k.e->name, why, k.retry.count(), temporal_rules::Retry::kFailMax,
+             (unsigned long long)texture_frame_no());
+    return fail(why);
+}
+/// Waiting to be tried again after a failure (fail_again)
+bool waiting(const Engine& k) { return k.retry.waiting(now_ns()); }
 void free_dead(bool all) {
     State& s = st();
     const uint64_t now = texture_frame_no();
@@ -668,12 +775,21 @@ uint32_t redraw_tolerance() {
            (own ? dlss_actor::kOwnBit : 0u);
 }
 
+/// ((Triforce, FSR3-03) Where the redraws draw and what they go by: the motion image (RG16F, a colour attachment, GENERAL),
+/// the frame the history is of (the frame before's positions and poses are used only when they are that frame's) and that
+/// frame's jitter in clip space. The chain's own images and state (chain), or AMD FSR 3.1's inputs' (fsr3_motion)
+struct RedrawTarget {
+    VkImageView motion = VK_NULL_HANDLE;
+    uint64_t last = 0;
+    const float* jitter_before = nullptr;
+};
+
 /// A redraw into the motion begun: the cameras' buffer written (this frame's as drawn, the frame before's without its jitter
 /// (before), this frame's jitter, the render size, the view and projection, the planes, the tolerance, the frame before's
 /// jitter (jitter_before: the stored positions'; null none), the prep pass's reproject), pipe bound with it and the scene's depth, the motion the
-/// target. False: nothing begun
+/// target (motion: the chain's, or FSR 3.1's inputs'). False: nothing begun
 bool begin_redraw(VkCommandBuffer cmd, VkPipeline pipe, const Camera& cam, const float* before, const float* jitter_before,
-                  const float* reproject, uint32_t rw, uint32_t rh, VkImageView dview) {
+                  const float* reproject, uint32_t rw, uint32_t rh, VkImageView dview, VkImageView motion) {
     State& s = st();
     State::Upload& u = s.uploads[s.upload_at];
     s.upload_at = (s.upload_at + 1) % (int)(sizeof s.uploads / sizeof s.uploads[0]);
@@ -693,7 +809,7 @@ bool begin_redraw(VkCommandBuffer cmd, VkPipeline pipe, const Camera& cam, const
     std::memcpy(head + dlss_actor::kReprojectWord, reproject, 64);
     flush_mapped(u.memory, dlss_actor::kHeadWords * 4);
     VkRenderingAttachmentInfo ca{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
-    ca.imageView = s.motion.view, ca.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+    ca.imageView = motion, ca.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
     ca.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD, ca.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
     VkRenderingInfo ri{VK_STRUCTURE_TYPE_RENDERING_INFO};
     ri.renderArea = {{0, 0}, {rw, rh}}, ri.layerCount = 1, ri.colorAttachmentCount = 1, ri.pColorAttachments = &ca;
@@ -720,9 +836,9 @@ constexpr uint64_t kPoseBytes = 4 << 20;   // (a pose buffer: 280 bones of 48 by
 /// temporal_note_skinned_draw), go into this frame's pose buffer, for this frame and the next. They were copied on the GPU
 /// at the upscale before, from where the game has them; by then the game could have written the next frame's pose there,
 /// and the limbs that moved most were drawn where the scene was not: no motion of their own. before: the frame before's camera without its jitter. history:
-/// the engine has the frame before. Returns the draws drawn
+/// the engine has the frame before. to: the motion drawn into, and the frame the history is of. Returns the draws drawn
 int actor_motion(VkCommandBuffer cmd, const Camera& cam, const float* before, const float* reproject, uint32_t rw,
-                 uint32_t rh, VkImageView dview, bool history) {
+                 uint32_t rh, VkImageView dview, bool history, const RedrawTarget& to) {
     State& s = st();
     struct Timed {
         State& s;
@@ -802,10 +918,10 @@ int actor_motion(VkCommandBuffer cmd, const Camera& cam, const float* before, co
         const uint32_t mine = at;
         at += (bytes + 15) & ~15u;
         const auto it = old.find(k.key);
-        if (!history || it == old.end() || it->second.frame != s.last_frame || it->second.nbones != k.nbones) {
+        if (!history || it == old.end() || it->second.frame != to.last || it->second.nbones != k.nbones) {
             s.actor_skipped++;
             left(k, !history ? "no history" : it == old.end() ? "not drawn the frame before (its key)"
-                    : it->second.frame != s.last_frame ? "its pose is older than the frame before" : "another bone count the frame before");
+                    : it->second.frame != to.last ? "its pose is older than the frame before" : "another bone count the frame before");
             continue;
         }
         // (the vertices and indices where the game has them: its buffers as this recording binds them)
@@ -836,7 +952,7 @@ int actor_motion(VkCommandBuffer cmd, const Camera& cam, const float* before, co
     s.pose_at = (s.pose_at + 1) % (int)(sizeof s.pose_buffers / sizeof s.pose_buffers[0]);
     if (draws.empty()) return 0;
     full_barrier(cmd);   // (the poses copied)
-    if (!begin_redraw(cmd, s.actor, cam, before, nullptr, reproject, rw, rh, dview)) return 0;
+    if (!begin_redraw(cmd, s.actor, cam, before, nullptr, reproject, rw, rh, dview, to.motion)) return 0;
     for (size_t i = 0; i < draws.size(); i++) {   // (vertex i of a draw is its i-th index)
         vkCmdPushConstants(cmd, s.actor_layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof draws[i], &draws[i]);
         vkCmdDraw(cmd, counts[i], 1, 0, 0);
@@ -881,10 +997,11 @@ std::vector<State::Captured> take_captures() {
 
 /// The draws that stored their positions this frame (caps) drawn again into the motion over the camera's, where they were
 /// drawn the frame before too (the same draw: dlss_actor::key), from those positions: their own motion, whatever moved
-/// them. before: the frame before's camera without its jitter; history: the engine has the frame before. Returns the
-/// draws drawn
+/// them. before: the frame before's camera without its jitter; history: the engine has the frame before; to: the motion
+/// drawn into, the frame the history is of and its jitter. Returns the draws drawn
 int capture_motion(VkCommandBuffer cmd, const Camera& cam, const float* before, const float* reproject, uint32_t rw,
-                   uint32_t rh, VkImageView dview, bool history, const std::vector<State::Captured>& caps) {
+                   uint32_t rh, VkImageView dview, bool history, const std::vector<State::Captured>& caps,
+                   const RedrawTarget& to) {
     State& s = st();
     struct Timed {
         State& s;
@@ -894,7 +1011,7 @@ int capture_motion(VkCommandBuffer cmd, const Camera& cam, const float* before, 
     std::unordered_map<uint64_t, State::Captured> old = std::move(s.captured_before);
     s.captured_before.clear();
     // (the frame before's are of the frame the engine last drew: else a gap, and their positions are older)
-    const bool old_ok = history && s.captured_frame && s.captured_frame == s.last_frame;
+    const bool old_ok = history && s.captured_frame && s.captured_frame == to.last;
     s.captured_frame = texture_frame_no();
     for (const auto& c : caps)
         if (c.k.depth == cam.depth) s.captured_before[c.key] = c;
@@ -939,7 +1056,7 @@ int capture_motion(VkCommandBuffer cmd, const Camera& cam, const float* before, 
         dlss_actor::CapturePush push{c.address, o.address, c.first, o.first, c.count, o.count, {}, {}};
         for (int i = 0; i < 2; i++) {
             push.jitter_now[i] = c.own ? c.jitter[i] : cam.jitter[i];
-            push.jitter_before[i] = o.own ? o.jitter[i] : s.last_jitter[i];
+            push.jitter_before[i] = o.own ? o.jitter[i] : to.jitter_before[i];
         }
         if (c.own && (c.jitter[0] != cam.jitter[0] || c.jitter[1] != cam.jitter[1])) s.capture_unjittered++;
         draws.push_back({push, &c, ib});
@@ -1021,7 +1138,7 @@ int capture_motion(VkCommandBuffer cmd, const Camera& cam, const float* before, 
         }
     }
     // (the positions the scene's draws stored: the prep pass's barrier is after them)
-    if (!begin_redraw(cmd, s.capture, cam, before, s.last_jitter, reproject, rw, rh, dview)) return 0;
+    if (!begin_redraw(cmd, s.capture, cam, before, to.jitter_before, reproject, rw, rh, dview, to.motion)) return 0;
     for (const Redraw& d : draws) {   // (the same indices, base vertex and topology: VertexIndex names the same vertex)
         const CaptureDraw& k = d.c->k;
         vkCmdPushConstants(cmd, s.actor_layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof d.push, &d.push);
@@ -1075,10 +1192,21 @@ uint32_t bones_used(const SkinnedDraw& k) {
     return most;
 }
 
+/// A camera's planes and field of view from its projection (k.proj), for an engine that wants them (FSR's depth heuristics)
+/// and the redraws' tolerance: an OpenGL-style projection, depth -1 to 1, P[2][2] = -(f + n) / (f - n) and P[2][3] =
+/// -2fn / (f - n); 0 when they do not read as one
+void camera_planes(Camera& k) {
+    const float p11 = k.proj[5], p22 = k.proj[10], p23 = k.proj[11];
+    const float n = p23 / (p22 - 1.0f), f = p23 / (p22 + 1.0f);
+    const bool plain = std::isfinite(n) && n > 0.0f && p11 > 0.0f && (!std::isfinite(f) || f > n);
+    k.near_z = plain ? n : 0.0f, k.far_z = plain ? (std::isfinite(f) ? f : 1e9f) : 0.0f;
+    k.fov_y = plain ? 2.0f * std::atan(1.0f / p11) : 0.0f;
+}
+
 /// The chain's images and buffers let go (the engine's own: its release)
 void drop_all() {
     State& s = st();
-    for (Image* im : {&s.color, &s.depth, &s.motion, &s.output, &s.base, &s.merged}) drop_image(*im);
+    for (Image* im : {&s.color, &s.depth, &s.motion, &s.output, &s.sharp, &s.base, &s.merged}) drop_image(*im);
     for (auto& pb : s.pose_buffers)   // (the actor motion's poses and cameras)
         if (pb.buffer) {
             const State::PoseBuffer gone = pb;
@@ -1156,22 +1284,22 @@ void temporal_note_scene_draw(const Texture* color0, uint32_t width, uint32_t he
     std::memcpy(k.view, c, sizeof k.view), std::memcpy(k.proj, c + 0x70 / 4, sizeof k.proj);
     // (the offset sead's projection gave the frustum, in its third column: 2 * offset, which moves the picture by -that)
     k.jitter[0] = -c[0x78 / 4], k.jitter[1] = -c[0x88 / 4];
-    // (its planes and field of view, for an engine that wants them (FSR's depth heuristics): an OpenGL-style projection, depth
-    // -1 to 1, P[2][2] = -(f + n) / (f - n) and P[2][3] = -2fn / (f - n); 0 when they do not read as one)
-    const float p11 = c[0x84 / 4], p22 = c[0x98 / 4], p23 = c[0x9c / 4];
-    const float n = p23 / (p22 - 1.0f), f = p23 / (p22 + 1.0f);
-    const bool plain = std::isfinite(n) && n > 0.0f && p11 > 0.0f && (!std::isfinite(f) || f > n);
-    k.near_z = plain ? n : 0.0f, k.far_z = plain ? (std::isfinite(f) ? f : 1e9f) : 0.0f;
-    k.fov_y = plain ? 2.0f * std::atan(1.0f / p11) : 0.0f;
+    // (its planes and field of view, from the projection at 0x70: P[1][1] at 0x84, P[2][2] and P[2][3] at 0x98 and 0x9c)
+    camera_planes(k);
     k.width = width, k.height = height, k.format = color0->format, k.color = color0, k.depth = depth, k.frame = now;
     k.color_id = color0->id, k.depth_id = depth->id, k.noted = texture_destroyed_count();
     k.valid = true;
+    upscale_lod_scene(width, height);   // ((Triforce, S8) this frame's scene size for the texture LOD bias: vk_draw.cpp)
 }
 
 bool temporal_scene_size(uint32_t width, uint32_t height) {
     const State& s = st();
+    // ((Triforce, FSR3-03) or, while AMD FSR 3.1 upscales, the scene its own inputs take (vk_fsr3_inputs.cpp scene_size): in
+    // place of the upscale's dispatch only FSR 3.1's inputs see the output, so the chain's stays unknown, and no draw of
+    // the scene would store its positions for FSR's motion)
     return dlss_checks::scene_size_fits(width, height, s.out_w.load(std::memory_order_relaxed),
-                                        s.out_h.load(std::memory_order_relaxed));
+                                        s.out_h.load(std::memory_order_relaxed)) ||
+           (fsr3_wanted() && fsr3_inputs::scene_size(width, height));
 }
 
 uint32_t temporal_jitter_size(int axis) {
@@ -1197,7 +1325,7 @@ int temporal_status(char* b, size_t n) {
     if (k.failed || !k.e) return 0;
     // (the chain's own video memory: the images and buffers it made here, and what the engine says it holds, when it says)
     uint64_t own = 0;
-    for (const Image* im : {&s.color, &s.depth, &s.motion, &s.output, &s.base, &s.merged})
+    for (const Image* im : {&s.color, &s.depth, &s.motion, &s.output, &s.sharp, &s.base, &s.merged})
         if (im->image) own += allocation_size(im->memory);
     for (const auto& pb : s.pose_buffers)
         if (pb.buffer) own += allocation_size(pb.memory);
@@ -1230,6 +1358,12 @@ int temporal_status(char* b, size_t n) {
 
 void temporal_idle() {
     State& s = st();
+    // ((Triforce) AMD FSR 3.1's own images and its inputs', which it lets go the same way (vk_fsr3.cpp). The picture of its
+    // the chain kept from before the bloom goes with them)
+    if (fsr3_idle()) {
+        std::lock_guard lk(s.mu);
+        s.pre_pending = false, s.pre_picture = {};
+    }
     if (!s.holding.load(std::memory_order_relaxed)) return;
     std::lock_guard lk(s.mu);
     const uint64_t now = texture_frame_no();
@@ -1254,7 +1388,7 @@ void temporal_idle() {
 
 const char* temporal_note_skinned_draw(const SkinnedDraw& k) {
     if (motion_mode() == kMotionCapture) return "its stored positions are drawn instead";
-    if (motion_mode() != kMotionBones || !temporal_wanted()) return "actor motion off";
+    if (motion_mode() != kMotionBones || !temporal_motion_wanted()) return "actor motion off";
     if (!k.depth || !k.bones || k.bones_size < 48 || !k.object || k.object_size < 0x4c) return "no object buffer";
     State& s = st();
     std::lock_guard lk(s.mu);
@@ -1291,7 +1425,11 @@ const char* temporal_note_skinned_draw(const SkinnedDraw& k) {
     return nullptr;
 }
 
-bool temporal_capture_wanted() { return motion_mode() == kMotionCapture && temporal_wanted(); }
+// ((Triforce, FSR3-03) AMD FSR 3.1 too, which is no engine of the chain (temporal_mode() is GAME while it upscales): its
+// inputs get the same redraws, temporal_fsr3_motion and pre_fsr3. Before, no draw stored its positions while FSR 3.1 drew,
+// and what moves by itself had the camera's motion there: Link, the others and what the game moves trailed)
+bool temporal_motion_wanted() { return temporal_wanted() || fsr3_wanted(); }
+bool temporal_capture_wanted() { return motion_mode() == kMotionCapture && temporal_motion_wanted(); }
 
 void temporal_capture_draw(const CaptureDraw& k, CaptureSlot* out) {
     *out = {};
@@ -1482,20 +1620,89 @@ bool pre_dispatch(VkCommandBuffer cmd, int mode, Texture* in, VkImageView in_vie
     return false;
 }
 
+/// ((Triforce, FSR3-03) AMD FSR 3.1's inputs just made (f, vk_fsr3_inputs.cpp): what moves by itself drawn into their motion
+/// over the camera's, as chain() draws it into its own for its engines: this frame's draws that stored their positions
+/// (captures, taken by the caller once), or the skinned ones from their bones (RX_VK_DLSS_ACTORS=bones), from f's camera,
+/// the history being the frame FSR's inputs were made before (f.own.last). RX_VK_DLSS_DEBUG=motion (or actors) and
+/// =characters show the motion, or the draws' own, in FSR's colour as for the chain's engines. With the chain's lock held.
+/// Returns the draws drawn again
+int fsr3_motion(VkCommandBuffer cmd, const fsr3_inputs::Frame& f, const std::vector<State::Captured>& captures) {
+    State& s = st();
+    const fsr3_inputs::Frame::Own& o = f.own;
+    if (!o.depth || !f.motion || !f.color || !f.depth || !f.width || !f.height) return 0;
+    if (!make_pipelines(false)) return 0;   // (the samplers the redraws sample the scene's depth with; the debug view's pass)
+    const VkImageView dview = depth_view(o.depth);
+    if (!dview) return 0;
+    Camera cam;
+    std::memcpy(cam.current, o.current, sizeof cam.current);
+    std::memcpy(cam.view, f.view, sizeof cam.view), std::memcpy(cam.proj, o.projection, sizeof cam.proj);
+    cam.jitter[0] = o.jitter[0], cam.jitter[1] = o.jitter[1];
+    camera_planes(cam);
+    cam.width = f.width, cam.height = f.height, cam.depth = o.depth;
+    struct Disturbed {   // (the redraws bind pipelines and push descriptors of their own)
+        ~Disturbed() { descriptors_disturbed(); }
+    } disturbed;
+    const RedrawTarget into{f.motion, o.last, o.jitter_before};
+    const int actors = motion_mode() == kMotionCapture
+                           ? capture_motion(cmd, cam, o.before, o.reproject, f.width, f.height, dview, o.history, captures, into)
+                           : actor_motion(cmd, cam, o.before, o.reproject, f.width, f.height, dview, o.history, into);
+    if (actors) full_barrier(cmd);
+    // (RX_VK_DLSS_DEBUG: chain()'s view of it, from dlss_prep.comp's pass reading FSR's motion into FSR's colour: bit 2 the
+    // motion as it is now, with bit 3 grey and blue where a draw has its own. Its depth image is not written then)
+    static const char* const debug = getenv("RX_VK_DLSS_DEBUG");
+    static const bool show_motion = debug && (!strcmp(debug, "motion") || !strcmp(debug, "actors"));
+    static const bool show_own = debug && !strcmp(debug, "characters");
+    if (show_motion || show_own) {
+        struct {
+            float reproject[16];
+            float jitter[2];
+            int32_t size[2];
+            int32_t flags;
+        } pc{};
+        static_assert(sizeof pc == 84, "dlss_prep.comp's push constants");
+        std::memcpy(pc.reproject, o.reproject, sizeof pc.reproject);
+        pc.jitter[0] = o.jitter[0], pc.jitter[1] = o.jitter[1];
+        pc.size[0] = (int32_t)f.width, pc.size[1] = (int32_t)f.height, pc.flags = show_own ? 4 | 8 : 4;
+        const VkDescriptorImageInfo info[5] = {{s.point, dview, VK_IMAGE_LAYOUT_GENERAL},
+                                               {s.point, dview, VK_IMAGE_LAYOUT_GENERAL},
+                                               {VK_NULL_HANDLE, f.color, VK_IMAGE_LAYOUT_GENERAL},
+                                               {VK_NULL_HANDLE, f.depth, VK_IMAGE_LAYOUT_GENERAL},
+                                               {VK_NULL_HANDLE, f.motion, VK_IMAGE_LAYOUT_GENERAL}};
+        VkWriteDescriptorSet w[5]{};
+        for (uint32_t i = 0; i < 5; i++) {
+            w[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+            w[i].dstBinding = i, w[i].descriptorCount = 1, w[i].pImageInfo = &info[i];
+            w[i].descriptorType = i < 2 ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        }
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s.prep);
+        vkCmdPushDescriptorSetKHR(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s.prep_layout, 0, 5, w);
+        vkCmdPushConstants(cmd, s.prep_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, &pc);
+        vkCmdDispatch(cmd, (f.width + 7) / 8, (f.height + 7) / 8, 1);
+        full_barrier(cmd);
+    }
+    return actors;
+}
+
 /// AMD FSR 3.1 before the bloom: its picture (vk_fsr3.cpp fsr3_pre) back into the scene's colour target at the scene's
-/// size, and the same into the copy when it scaled up, as the chain's own pass does for its engines
-bool pre_fsr3(VkCommandBuffer cmd, Texture* scene, VkImageView view, uint32_t rw, uint32_t rh, uint32_t ow, uint32_t oh) {
+/// size, and the same into the copy when it scaled up, as the chain's own pass does for its engines. captures: this frame's
+/// draws that stored their positions, which temporal_pre_tonemap took ((Triforce, FSR3-03) drawn into FSR's motion by
+/// fsr3_motion: they were taken here a second time before and thrown away, the motion the camera's alone)
+bool pre_fsr3(VkCommandBuffer cmd, Texture* scene, VkImageView view, uint32_t rw, uint32_t rh, uint32_t ow, uint32_t oh,
+              const std::vector<State::Captured>& captures) {
     State& s = st();
     const bool scaled = ow != rw || oh != rh;
-    if (!make_pipelines(false) || (scaled && !make_image(cmd, s.base, VK_FORMAT_B10G11R11_UFLOAT_PACK32, rw, rh))) return false;
+    // ((Triforce) an RGBA16F scene too (RenoDX's HDR Native): FSR's picture back into it through the output pass's -DHDR
+    // layout, and its copy in the scene's own format, as the chain does for its engines. It was left to the game's upscale)
+    const bool wide = scene->format == VK_FORMAT_R16G16B16A16_SFLOAT;
+    if (!make_pipelines(wide) || (scaled && !make_image(cmd, s.base, scene->format, rw, rh))) return false;
     struct Disturbed {
         ~Disturbed() { descriptors_disturbed(); }
     } disturbed;
-    s.cam.valid = false, s.skins.clear();   // (each frame's own: FSR 3.1 keeps a camera of its own)
-    (void)take_captures();
+    s.cam.valid = false;   // (each frame's own: FSR 3.1 keeps a camera of its own. The skinned draws: actor_motion's)
     s.asked = texture_frame_no(), s.holding = true;
     VkImageView picture = VK_NULL_HANDLE;
-    if (!fsr3_pre(cmd, scene, view, ow, oh, &picture) || !picture) return false;
+    const auto own_motion = [&](const fsr3_inputs::Frame& f) { return fsr3_motion(cmd, f, captures); };
+    if (!fsr3_pre(cmd, scene, view, ow, oh, &picture, own_motion) || !picture) return false;
     full_barrier(cmd);
     const int32_t opc[3] = {(int32_t)rw, (int32_t)rh, 1};
     VkDescriptorImageInfo info[2] = {{scaled ? s.linear : s.point, picture, VK_IMAGE_LAYOUT_GENERAL},
@@ -1505,7 +1712,7 @@ bool pre_fsr3(VkCommandBuffer cmd, Texture* scene, VkImageView view, uint32_t rw
     w[0].pImageInfo = &info[0];
     w[1].dstBinding = 1, w[1].descriptorCount = 1, w[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
     w[1].pImageInfo = &info[1];
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s.out);
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, wide ? s.out_hdr : s.out);
     vkCmdPushDescriptorSetKHR(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s.out_layout, 0, 2, w);
     vkCmdPushConstants(cmd, s.out_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof opc, opc);
     vkCmdDispatch(cmd, (rw + 7) / 8, (rh + 7) / 8, 1);
@@ -1520,7 +1727,45 @@ bool pre_fsr3(VkCommandBuffer cmd, Texture* scene, VkImageView view, uint32_t rw
     s.pre_picture = {picture, ow, oh};
     return true;
 }
+
+/// ((Triforce, FG-4, and why AMD's frame generation never made a frame: the lab's fgprobe1 log, RX 7900 XT) The engine drew
+/// this frame (chain): frame generation's inputs (vk_fsr3_inputs.h, which AMD's frame generation, FSR 3.1's frame
+/// interpolation and NVIDIA DLSS frame generation take) made from the same scene, where nothing else made them, and the
+/// chain's own motion, what moves by itself drawn in it, copied over their camera's. Before, they were made at the gameplay
+/// network's dispatch alone (vk_draw.cpp fsr3_stand_in): a network that does not translate on the card (the Render
+/// resolution's shares on RDNA 3: "program 72ba090c70fe2614 not translated") is drawn by the engine through upscale_stub,
+/// which never made them, so the present had no depth and motion and AMD's library was never given a frame; the
+/// renderer's own interpolation made every one. scene: the texture the engine read (the network's input, or before the
+/// bloom the scene's colour target itself, linear). With the chain's lock held (fsr3_inputs' lock is taken inside it, never
+/// the other way round)
+void fg_inputs_from_chain(VkCommandBuffer cmd, Texture* scene, VkImageView view, bool linear, uint32_t rw, uint32_t rh) {
+    if (!fsr3_inputs::wanted() || fsr3_wanted() || !scene || !view) return;   // (FSR 3.1 upscaling makes its own)
+    State& s = st();
+    if (!fsr3_inputs::made_this_frame()) {
+        fsr3_inputs::Frame f;
+        if (!fsr3_inputs::prepare(cmd, scene, view, f, linear)) return;   // (it says why)
+        descriptors_disturbed();
+    }
+    if (s.motion.image) (void)fsr3_inputs::chain_motion(cmd, s.motion.image, rw, rh);
+}
 }  // namespace
+
+int temporal_fsr3_motion(VkCommandBuffer cmd, const fsr3_inputs::Frame* f) {
+    State& s = st();
+    std::lock_guard lk(s.mu);
+    struct SkinsDone {   // (the skinned draws, each frame's own: actor_motion takes them, or they go here)
+        State& s;
+        ~SkinsDone() { s.skins.clear(); }
+    } skins_done{s};
+    if (!f && s.captured.empty()) return 0;   // (nothing stored this frame: the ring of their buffers stays where it is)
+    free_dead(false);
+    // (this frame's draws that stored their positions, once: the next frame's go into the next buffer of the ring)
+    const std::vector<State::Captured> captures = take_captures();
+    if (!f) return 0;
+    // (the redraws' buffers are the chain's: kept while FSR 3.1 draws, let go 120 frames after, temporal_idle)
+    s.asked = texture_frame_no(), s.holding = true;
+    return fsr3_motion(cmd, *f, captures);
+}
 
 bool temporal_upscale(VkCommandBuffer cmd, uint64_t key, bool known, Texture* in, VkImageView in_view, Texture* out,
                       VkImageView out_view, uint32_t out_level) {
@@ -1558,6 +1803,7 @@ bool temporal_upscale(VkCommandBuffer cmd, uint64_t key, bool known, Texture* in
 
     Engine& engine = engine_of(mode);
     if (!engine.e || engine.failed) return fail("it failed earlier");
+    if (waiting(engine)) return fail("it failed: tried again in a moment");   // ((Triforce, FSR4-1) fail_again)
     s.asked = texture_frame_no(), s.holding = true;   // (not after a failure: what it holds is let go, temporal_idle)
     if (!in || !in_view || !out || !out_view) return fail("no input or output view");
     if (!cam.valid || texture_frame_no() - cam.frame > 1) return fail("no scene camera this frame");
@@ -1570,11 +1816,13 @@ bool temporal_upscale(VkCommandBuffer cmd, uint64_t key, bool known, Texture* in
         return fail("unexpected scene depth");
     if (!temporal_scene_format(out->format) || out->format != in->format || !dlss_checks::scene_size_fits(rw, rh, ow, oh))
         return fail("unexpected output");
-    const bool drew = chain(cmd, mode, engine, cam, captures, in_view, rw, rh, ow, oh, out_view, nullptr, in->format, out->format);
+    if (!chain(cmd, mode, engine, cam, captures, in_view, rw, rh, ow, oh, out_view, nullptr, in->format, out->format)) return false;
     // (the engine's picture is in `out` now and the HUD is drawn into it next: NVIDIA DLSS Frame Generation keeps a copy of it, the
     // picture without the HUD. Not before the bloom (pre), where the picture is not in `out` yet: that path returns above)
-    if (drew) hudless::note(cmd, out, out_level);
-    return drew;
+    hudless::note(cmd, out, out_level);
+    // ((Triforce, FG-4) frame generation's inputs from this frame's scene, with the chain's motion)
+    fg_inputs_from_chain(cmd, in, in_view, in->format == VK_FORMAT_R16G16B16A16_SFLOAT, rw, rh);
+    return true;
 }
 
 namespace {
@@ -1586,12 +1834,11 @@ bool chain(VkCommandBuffer cmd, int mode, Engine& engine, const Camera& cam, con
            VkImageView in_view, uint32_t rw, uint32_t rh, uint32_t ow, uint32_t oh, VkImageView out_view, const Texture* pre,
            VkFormat in_format, VkFormat out_format) {
     State& s = st();
-    // (the engine is given linear HDR colour: before the bloom, or an RGBA16F scene's picture (local, RenoDX port), which
-    // only DLSS took; else the network's input, tonemapped, LDR. wide: the image the picture is written into is RGBA16F,
-    // the passes' -DHDR layout)
+    // (the engine is given linear HDR colour: before the bloom, or an RGBA16F scene's picture (local, RenoDX port: HDR
+    // Native), which (Triforce, FSR4-3) AMD FSR 4 takes as DLSS does, in an HDR context (vk_fsr4.cpp make_context); else the
+    // network's input, tonemapped, LDR. wide: the image the picture is written into is RGBA16F, the passes' -DHDR layout)
     const bool hdr = pre != nullptr || in_format == VK_FORMAT_R16G16B16A16_SFLOAT;
     const bool wide = out_format == VK_FORMAT_R16G16B16A16_SFLOAT;
-    if (hdr && !pre && !ur::is_dlss(mode)) return fail("an HDR scene: only DLSS takes it");
     if (!engine.started) engine.started = true, engine.ok = engine.e->start();
     if (!engine.ok) {
         engine.failed = true;
@@ -1613,8 +1860,10 @@ bool chain(VkCommandBuffer cmd, int mode, Engine& engine, const Camera& cam, con
         s.last_frame = 0;
     }
     // (DLAA, FSR's native AA: the engine at the render size, anti-aliasing alone; its picture then scaled to the output's by
-    // dlss_out.comp. With them the 3D is drawn at full scale, temporal_full_scale)
-    const bool native = ur::full_scale(mode);
+    // dlss_out.comp. With them the 3D is drawn at full scale, temporal_full_scale. (Triforce, FSR4-2) The host reads that
+    // scale once, at the start: one chosen in play while the 3D is drawn smaller scales it up to the output as the engine's
+    // upscale does, until the next start draws it at full size, not anti-aliased at the smaller size and stretched)
+    const bool native = temporal_rules::native_at(ur::full_scale(mode), rw, rh, ow, oh);
     const uint32_t dw = native ? rw : ow, dh = native ? rh : oh;
     // (from here commands are recorded, the engine's own too: whichever way this returns, the program's descriptor pushes are
     // gone from the bind point and are pushed again)
@@ -1632,15 +1881,13 @@ bool chain(VkCommandBuffer cmd, int mode, Engine& engine, const Camera& cam, con
                  (unsigned long long)texture_frame_no());
     }
     const int ready = engine.e->prepare(cmd, rw, rh, dw, dh, hdr, &iw, &ih, &why);
-    if (ready < 0) {
-        engine.failed = true;
-        return fail(why ? why : "it could not be made");
-    }
+    if (ready < 0) return fail_again(engine, why ? why : "it could not be made");   // ((Triforce, FSR4-1) not for good)
     if (ready == 0) return fail(why ? why : "not this frame");
     if (ready == 2) s.engines_made++, s.last_frame = 0;   // (made just now: a new history)
     if (!make_image(cmd, s.color, VK_FORMAT_R16G16B16A16_SFLOAT, iw, ih) ||
         !make_image(cmd, s.depth, VK_FORMAT_R32_SFLOAT, iw, ih) ||
-        !make_image(cmd, s.motion, VK_FORMAT_R16G16_SFLOAT, iw, ih, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) ||
+        // ((Triforce, FG-4) the motion a copy's source too: frame generation's inputs take it, fg_inputs_from_chain)
+        !make_image(cmd, s.motion, VK_FORMAT_R16G16_SFLOAT, iw, ih, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT) ||
         !make_image(cmd, s.output, VK_FORMAT_R16G16B16A16_SFLOAT, dw, dh) ||
         (pre && !native && !make_image(cmd, s.base, pre->format, rw, rh)))
         return fail("its images were not made");
@@ -1649,7 +1896,24 @@ bool chain(VkCommandBuffer cmd, int mode, Engine& engine, const Camera& cam, con
     const uint64_t last = s.last_frame;
     // (Triforce, the hold of the last picture: vk_replay.cpp do_present) and after a present that held its frame: what was drawn
     // while new textures were still owed (the dummy in their place) is not carried into the picture shown after the hold
-    const bool reset = !last || now - last > 2 || present_held_last();
+    // ((Triforce) and at a camera cut, as AMD's and NVIDIA's guides ask: framegen_rows.h kUpscalerCut, NX2navi's 2495391
+    // thresholds, the time measured since the camera the engine was last given: the CPU's between two recordings, which
+    // kUpscalerCut never takes under one 60th, so frames recorded back to back after a stall are no cut for it)
+    const auto pose_time = std::chrono::steady_clock::now();
+    const framegen_rows::Pose pose = framegen_rows::pose_of(cam.view);
+    bool cut = false;
+    if (last && now - last <= 2 && s.have_pose && !present_held_last()) {
+        const float dt = (float)std::chrono::duration<double, std::milli>(pose_time - s.last_pose_time).count();
+        cut = framegen_rows::camera_cut(s.last_pose, pose, dt, framegen_rows::kUpscalerCut);
+        if (cut && s.cuts++ < 24) {
+            float d2 = 0.0f;
+            for (int i = 0; i < 3; i++) d2 += (pose.pos[i] - s.last_pose.pos[i]) * (pose.pos[i] - s.last_pose.pos[i]);
+            logf("vk: %s: frame %llu: a camera cut (moved %.2f m in %.1f ms): a new history (%llu so far)", engine.e->name,
+                 (unsigned long long)now, std::sqrt(d2), dt, (unsigned long long)s.cuts);
+        }
+    }
+    s.last_pose = pose, s.last_pose_time = pose_time, s.have_pose = true;
+    const bool reset = !last || now - last > 2 || present_held_last() || cut;
     struct {
         float reproject[16];
         float jitter[2];
@@ -1693,9 +1957,10 @@ bool chain(VkCommandBuffer cmd, int mode, Engine& engine, const Camera& cam, con
     full_barrier(cmd);
     // (what moves by itself: the draws drawn again over the camera's motion from the positions they stored, with their own;
     // or the skinned draws from their bones (RX_VK_DLSS_ACTORS=bones))
+    const RedrawTarget into{s.motion.view, last, s.last_jitter};   // (the chain's own motion, its history the engine's)
     const int actors = motion_mode() == kMotionCapture
-                           ? capture_motion(cmd, cam, previous, pc.reproject, rw, rh, dview, motion, captures)
-                           : actor_motion(cmd, cam, previous, pc.reproject, rw, rh, dview, motion);
+                           ? capture_motion(cmd, cam, previous, pc.reproject, rw, rh, dview, motion, captures, into)
+                           : actor_motion(cmd, cam, previous, pc.reproject, rw, rh, dview, motion, into);
     if (actors) full_barrier(cmd);
     if ((show_motion && actors) || show_own) {   // (RX_VK_DLSS_DEBUG=motion: the motion as it is now, the actors' in it)
         pc.flags = show_own ? 4 | 8 : 4;
@@ -1714,19 +1979,40 @@ bool chain(VkCommandBuffer cmd, int mode, Engine& engine, const Camera& cam, con
         logf("vk: upscaler: the scene's camera: near %.3f, far %.1f, vertical field of view %.1f degrees", cam.near_z,
              cam.far_z, cam.fov_y * 57.29578f);
     }
-    if (!engine.e->evaluate(cmd, f)) {
-        logf("vk: %s: its evaluation failed: the game's upscale from now on", engine.e->name);
-        engine.failed = true;
-        return false;   // (the network writes its output over whatever the evaluation did)
-    }
+    if (!engine.e->evaluate(cmd, f))   // (the network writes its output over whatever the evaluation did)
+        return fail_again(engine, "its evaluation failed");   // ((Triforce, FSR4-1) not for good)
+    engine.retry.succeeded();   // ((Triforce, FSR4-1) a good one: the failures in a row counted from 0 again)
     full_barrier(cmd);
+    upscale_lod_note(rw, rh, ow);   // ((Triforce, S8) the texture LOD bias for the next frames' scene: vk_draw.cpp)
+    // ((Triforce, S1) the Sharpness row before the HUD: NVIDIA DLSS and DLAA have no sharpening of their own here, so their
+    // picture goes through AMD FSR 3.1's RCAS pass at the row's value, as FSR 3.1's own does (FSR 4 sharpens in its own
+    // dispatch). Where it cannot run (vk_fsr3.h fsr3::rcas_ok) the picture stays as it is, and the window pass sharpens it.
+    // ((Triforce) Nor over linear HDR light, before the bloom or RenoDX's RGBA16F scene: RCAS's limiter takes 1.0 for the
+    // peak (sharpen_rules.h lone_rcas); there too the window pass sharpens, temporal_sharpens_3d saying so)
+    VkImageView picture = s.output.view;
+    const bool scene_rgba16f = in_format == VK_FORMAT_R16G16B16A16_SFLOAT;
+    chain_rgba16f.store(scene_rgba16f ? 1 : 0, std::memory_order_relaxed);
+    if (ur::is_dlss(mode) && temporal_sharpness() > 0.0f && !sharpen_rules::lone_rcas(pre != nullptr, scene_rgba16f) &&
+        !s.told_sharp_hdr)
+        s.told_sharp_hdr = true, logf("vk: %s: its picture is linear HDR here (%s), which AMD's RCAS alone does not take: the "
+                                      "Sharpness row sharpens at the window", engine.e->name,
+                                      pre ? "before the bloom" : "RenoDX's RGBA16F scene");
+    if (ur::is_dlss(mode) && temporal_sharpness() > 0.0f && sharpen_rules::lone_rcas(pre != nullptr, scene_rgba16f) &&
+        make_image(cmd, s.sharp, VK_FORMAT_R16G16B16A16_SFLOAT, s.output.width, s.output.height) &&
+        fsr3::rcas(cmd, s.output.view, s.sharp.view, s.output.width, s.output.height, temporal_sharpness())) {
+        picture = s.sharp.view;
+        full_barrier(cmd);
+        if (!s.told_sharp)
+            s.told_sharp = true, logf("vk: %s: its picture sharpened by AMD's RCAS before the HUD (Sharpness %d%%)",
+                                      engine.e->name, opts.sharpness);
+    }
     {
         // (pre: the engine's picture back into the scene's colour target, at the scene's size: scaled down when the engine
         // scaled up, for the bloom and what else reads the scene. The picture itself is drawn from by the tone mapping,
         // temporal_pre_composite)
         if (pre) ow = rw, oh = rh;
         const int32_t opc[3] = {(int32_t)ow, (int32_t)oh, pre ? 1 : 0};
-        const VkDescriptorImageInfo info[2] = {{native != (pre != nullptr) ? s.linear : s.point, s.output.view, VK_IMAGE_LAYOUT_GENERAL},
+        const VkDescriptorImageInfo info[2] = {{native != (pre != nullptr) ? s.linear : s.point, picture, VK_IMAGE_LAYOUT_GENERAL},
                                                {VK_NULL_HANDLE, out_view, VK_IMAGE_LAYOUT_GENERAL}};
         VkWriteDescriptorSet w[2]{{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}, {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}};
         w[0].dstBinding = 0, w[0].descriptorCount = 1, w[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
@@ -1770,12 +2056,15 @@ bool chain(VkCommandBuffer cmd, int mode, Engine& engine, const Camera& cam, con
     if (pre) {
         s.pre_pending = true, s.pre_frame = now, s.pre_scene = pre, s.pre_drawn++;
         s.pre_final = nullptr, s.pre_direct = false, s.pre_miss_run = 0, s.pre_touched = false;
-        s.pre_picture = {s.output.view, s.output.width, s.output.height};
+        s.pre_picture = {picture, s.output.width, s.output.height};
         full_barrier(cmd);
     }
 
     std::memcpy(s.last_vp, cam.current, sizeof s.last_vp);
-    s.jitter_w = rw, s.jitter_h = rh, s.jitter_phases = (uint32_t)dlss_jitter_phases(rw, rh, dw, dh);
+    // ((Triforce, FSR4-10) AMD FSR 4 by AMD's own rule, as FSR 3.1 (fsr3_math.h): 71 or 72 at Ultra Performance, where
+    // NVIDIA's stops at 64)
+    s.jitter_w = rw, s.jitter_h = rh;
+    s.jitter_phases = ur::is_fsr4(mode) ? fsr3_math::jitter_phases(rw, dw) : (uint32_t)dlss_jitter_phases(rw, rh, dw, dh);
     if (s.reason) logf("vk: %s draws the upscale again (frame %llu)", engine.e->name, (unsigned long long)now);
     s.reason = nullptr;
     // (RX_VK_DLSS_DEBUG=alternate, a test's reference: every other frame the game's own upscale over the engine's, which still
@@ -1852,13 +2141,12 @@ Texture* temporal_pre_tonemap(VkCommandBuffer cmd) {
     const bool f3 = !ur::is_dlss(mode) && !ur::is_fsr4(mode) && mode != ur::FSR3;
     Engine* const engine = f3 ? nullptr : &engine_of(mode);
     // (anything unexpected: nothing here, and the upscale's dispatch draws as before, on the tone mapped picture)
-    if (!cam.valid || !scene || (engine && (!engine->e || engine->failed)) || !there_still(cam))
+    if (!cam.valid || !scene || (engine && (!engine->e || engine->failed || waiting(*engine))) || !there_still(cam))
         return nullptr;
     const uint32_t rw = cam.width, rh = cam.height;
     const VkImageUsageFlags need = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT;
-    // (an RGBA16F scene too (local, RenoDX port): the engines' picture goes back into it through the pass's -DHDR layout.
-    // AMD FSR 3.1's own output pass has only the plain one)
-    if (f3 && scene->format != VK_FORMAT_B10G11R11_UFLOAT_PACK32) return nullptr;
+    // (an RGBA16F scene too (local, RenoDX port): the engines' picture goes back into it through the pass's -DHDR layout,
+    // AMD FSR 3.1's too (pre_fsr3))
     if (scene->width != rw || scene->height != rh || !temporal_scene_format(scene->format) ||
         (scene->usage & need) != need || scene->samples != VK_SAMPLE_COUNT_1_BIT || scene->layers != 1) {
         static bool told;
@@ -1871,10 +2159,13 @@ Texture* temporal_pre_tonemap(VkCommandBuffer cmd) {
     if (cam.depth->width != rw || cam.depth->height != rh || !(cam.depth->usage & VK_IMAGE_USAGE_SAMPLED_BIT) ||
         cam.depth->samples != VK_SAMPLE_COUNT_1_BIT || !(cam.depth->aspect & VK_IMAGE_ASPECT_DEPTH_BIT))
         return nullptr;
-    // (an engine that scales up draws at the upscale's output size, as last seen)
+    // (an engine that scales up draws at the upscale's output size, as last seen. (Triforce, FSR4-2) So does a native AA
+    // chosen in play while the 3D is still drawn smaller (it takes its full size at the next start): scaled up to the
+    // output, not anti-aliased at the smaller size and stretched by the game's upscale after it (chain's native)
     uint32_t ow = rw, oh = rh;
-    if (!ur::full_scale(mode)) {
-        ow = s.out_w.load(std::memory_order_relaxed), oh = s.out_h.load(std::memory_order_relaxed);
+    const uint32_t seen_w = s.out_w.load(std::memory_order_relaxed), seen_h = s.out_h.load(std::memory_order_relaxed);
+    if (!ur::full_scale(mode) || (seen_w && seen_h && (seen_w > rw || seen_h > rh))) {
+        ow = seen_w, oh = seen_h;
         if (!ow || !oh || !dlss_checks::scene_size_fits(rw, rh, ow, oh)) return nullptr;
     }
     const VkImageView view = depth_view(scene);   // (its colour, sampled by the inputs pass and written by the output pass)
@@ -1887,8 +2178,11 @@ Texture* temporal_pre_tonemap(VkCommandBuffer cmd) {
     } skins_done{s};
     const std::vector<State::Captured> captures = take_captures();
     s.asked = texture_frame_no(), s.holding = true;
-    if (f3) return pre_fsr3(cmd, scene, view, rw, rh, ow, oh) ? scene : nullptr;
+    if (f3) return pre_fsr3(cmd, scene, view, rw, rh, ow, oh, captures) ? scene : nullptr;
     if (!chain(cmd, mode, *engine, cam, captures, view, rw, rh, ow, oh, view, scene, scene->format, scene->format)) return nullptr;
+    // ((Triforce, FG-4) frame generation's inputs from the scene before the bloom (linear), with the chain's motion: the
+    // upscale's dispatch after it makes none (vk_fsr3.cpp fsr3_upscale, made_this_frame)
+    fg_inputs_from_chain(cmd, scene, view, true, rw, rh);
     return scene;
 }
 

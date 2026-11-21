@@ -209,7 +209,7 @@ def check_menu_and_docs():
     row = re.search(r'\{TAB_DEBUG, "Opaque textures as BC1", &opts\.tex_bc1, 0, 1, 1, tx_onoff,.*?hn_tex_bc1, true, true\},', rows, re.S)
     check(row and "Applies after a restart" in row.group(0), "the Opaque textures as BC1 row is not an Off/On row of the Debug tab that takes a restart")
     check(rows.index('{TAB_DEBUG, "Developer", nullptr') < rows.index('"Start next frame early", &opts.tail_early') <
-          rows.index('"Opaque textures as BC1"') < rows.index('{TAB_SYSTEM, "Restart"'),
+          rows.index('"Opaque textures as BC1"') < len(rows),   # ((Triforce, 11-19) v0.5.2 has no Restart row: the table's end)
           "the Opaque textures as BC1 row is not among the Debug tab's Developer rows (after Start next frame early)")
     hint = function(menu, "const char* hn_tex_bc1(int, int variant) {")
     check('getenv("RX_VK_TEX_BC1")' in hint, "the row's line no longer says when the switch decides")

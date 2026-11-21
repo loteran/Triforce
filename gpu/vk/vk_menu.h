@@ -45,11 +45,18 @@ struct Options {
     int steady_fps = 0;   // (Triforce) Steady frame rate: 0 Off, 1 any rate, 2 steps of the display's refresh (host/pace_steady.h; host/nn_vi.c
                           // reads steady_frame_rate= at the start)
     int reflex_limit = 0; // (Triforce) Reflex frame limit: 1 with DLSS frame generation NVIDIA Reflex's sleep holds the frame rate cap where the
-                          // game's frame starts and the game's own wait steps aside (vk_dlssg.cpp pace, dlssg_pace.h); 0 the game's own wait, as before
+                          // game's frame starts and the game's own wait steps aside (vk_dlssg.cpp pace, dlssg_pace.h); 0 the game's own wait.
+                          // (options_version 7) No row, no key: 0, the old row's default and what nearly every options file held,
+                          // until the path has been played with DLSS frame generation on an RTX 40/50 card (the old row's note:
+                          // nobody had run it in the game). RX_VK_REFLEX_LIMIT=1 turns it on for a run (menu_init), as it does
+                          // Reflex's hold without frame generation (vk_reflex.cpp reflex_pace)
     int resolution = 0;   // the 3D's (Render resolution): 0 Auto (the game's dynamic resolution), else a share of the output,
                           // 1..6 = 100%, 75%, 67%, 50%, 58%, 33% (upscaler_rows.h; nx2/oot_patches.py)
-    int output_res = 0;   // the game's whole frame, docked: 0 its 2048x1152, 1 2560x1440, 2 3840x2160, 3 1920x1080, 4 5120x1440, 5 5120x2880, 6 5120x2160; read once, at the start (host/nn_applet.c)
-    int upscale = 0;      // to the window (Window scaling filter, saved as upscaling): 0 off (the plain copy), 1 Catmull-Rom, 2 Lanczos, 3 AMD FSR 1 (EASU + RCAS)
+    int output_res = 0;   // the game's whole frame, docked: 0 its 2048x1152, 1 2560x1440, 2 3840x2160, 3 1920x1080, 4 5120x1440, 5 5120x2880, 6 5120x2160;
+                          // (options_version 7) 7 1536x864, the game's handheld profile (merged_rows.h kHandheldOutput); read once, at the start (host/nn_applet.c)
+    int upscale = 0;      // to the window: 0 off (the plain copy), 1 Catmull-Rom, 2 Lanczos, 3 AMD FSR 1 (EASU + RCAS). (options_version 7) No
+                          // row: chosen at each present by the picture's size and its place in the window (vk_menu.cpp
+                          // menu_note_present_sizes, upscaler_rows.h auto_filter); RX_VK_UPSCALE=<0..3> fixes it for a run
     int reflex = 2;       // NVIDIA Reflex: 0 off, 1 on, 2 on + boost (the default since options_version 5) (vk_reflex.cpp; NVIDIA GPUs with VK_NV_low_latency2)
     int antilag = 0;      // AMD Anti-Lag 2: 0 off, 1 on (vk_antilag.cpp; AMD GPUs with VK_AMD_anti_lag)
     int dlss = 0;         // the Upscaler (its name from before FSR: options files and the tests' stand-ins keep it): 0 the game's
@@ -58,7 +65,11 @@ struct Options {
                           // vk_temporal.cpp. Saved as dlss
     int dlss_model = 0;   // DLSS's network, by its preset: 0 K (transformer), 1 M, 2 L (second-generation transformer), 3 NVIDIA's
                           // default (upscaler_rows.h model_preset; vk_dlss.cpp). RX_VK_DLSS_PRESET over it
-    int sharpness = 0;    // 0 to 100
+    // 0 to 100. ((Triforce, S1) With DLSS, DLAA, FSR 3.1 and FSR 4 the 3D before the HUD, the upscaler's own sharpening
+    // (vk_temporal.h temporal_sharpens_3d); with the game's own upscaler the finished picture at the window. 0 by default,
+    // as before: the default Upscaler is the game's own, where any other value sharpens the HUD and text at the window and
+    // runs that pass every present. A file that has the key keeps its value
+    int sharpness = 0;
     int fsr_sharpness = 0; // FSR sharpening, 0 (off) to 100: AMD's own RCAS in the library's FSR 3.1 and FSR 4 (fsr_sharpen.h), apart from sharpness
     int aa = 0;           // (Triforce) Anti-aliasing: 0 the game's own SMAA, as before the row; in its place 1 nothing, 2 FXAA, 3 SMAA at
                           // its Ultra preset (aa_rows.h, vk_aa.cpp; RX_VK_AA over it). Not applied while DLSS, DLAA or FSR
@@ -70,7 +81,6 @@ struct Options {
                           // half the video memory, when every block of them is opaque; read at the start (tex_bc1.h, vk_texture.cpp
                           // bc1_on; RX_VK_TEX_BC1 over it)
     int realtime = 1;     // game time follows the clock (host/nn_vi.c); 0: per frame (slower frames, slower game)
-    int handheld = 0;     // the game's handheld profile: ~4 fps, softer; read once, at the start (host/nn_applet.c)
     int ultrawide = 0;    // the camera's shape: 0 the game's 16:9, 1 the monitor's when it is wider or narrower, 2 a fixed 21:9, 3 a fixed
                           // 32:9; read once, at the start (host/hos_main.c ultrawide_ratio)
     int wide_menus = 1;   // ultrawide: the pause, item and map menus 0 at full width (stretched), 1 in the middle 16:9 with the sides
@@ -95,8 +105,9 @@ struct Options {
     int rumble = 100;     // the controllers' rumble in percent of the game's: 0 Off, 25 to 300 (host/pad_sdl.c)
     int rumble_curve = 100;   // (Triforce) the power on the motors' rumble, in hundredths: 20 to 150, 100 none (host/pad_sdl.c rumble_curve)
     int rumble_triggers = 0;  // (Triforce) the rumble in an Xbox pad's trigger motors too: 0 off (host/pad_sdl.c trigger_poll)
-    int stick_dead_zone = 0;  // a stick axis below it is 0: 0 XInput's 7849 (~24%), 1..5 5% to 30% (host/nn_hid.c)
-    int lstick_dead_zone = -1;   // (Triforce) the left stick's own dead zone, percent: -1 As Stick dead zone, 0 to 50 (host/nn_hid.c hos_stick_axis_own)
+    int stick_dead_zone = 0;  // a stick axis below it is 0: 0 XInput's 7849 (~24%), 1..5 5% to 30% (host/nn_hid.c). (options_version 7) No
+                              // row: always 0, the Default; an older file's moved into each stick's own (merged_rows.h migrate)
+    int lstick_dead_zone = -1;   // (Triforce) the left stick's own dead zone, percent: -1 Default (XInput's ~24%), 0 to 50 (host/nn_hid.c hos_stick_axis_own)
     int rstick_dead_zone = -1;   // (Triforce) the right stick's own
     int walk_key = 0;     // (Triforce) the key that makes the movement keys walk while it is held: 0 Off, 1 Caps Lock, 2 Shift, 3 Ctrl, 4 Tab (host/nn_hid.c walk_key_code)
     int walk_scale = 51;  // (Triforce) how far they push the left stick then, in hundredths of all the way: 20 to 90 (host/nn_hid.c walk_keys)
@@ -123,7 +134,8 @@ struct Options {
                                // threads, what RX_VK_PARALLEL_AUTO=<n> does, 8 Automatic (the default, replay_threads.h
                                // kDefaultRow: that header says why), the count replay_threads.h gives this PC
                                // (replay_threads_of; gpu/vk/vk_replay.cpp par_threads_max); read at the start
-    int preset = 0;       // quality preset: 0 Custom, 1 Minimum (6GB), 2 Low (8GB), 3 Balanced (12GB), 4 High (16GB), 5 Ultra (20GB+)
+    // ((Triforce, options_version 7) The Quality preset row is gone: these limits, which only it set, stay 0, the card's own
+    // sizes from its video memory (vk_texture.cpp texture_frame, vk_memory.cpp mirror_budget))
     int vram_mb = 0;      // dynamic texture cache budget limit in MB
     int mirror_mb = 0;    // staging mirror limit in MB
     int audio_output = 0; // (hookshot) the speakers the game mixes for: 0 Auto (the default output's), 1 Stereo, 2 5.1; read once, at the start (host/nn_audio.c; HOS_AUDIO_CHANNELS)
@@ -161,13 +173,15 @@ extern int tex_detail_at_start;
 /// (Triforce) opts.tex_bc1 as the file had it at the start: whether this run keeps opaque ASTC textures as BC1
 /// (vk_texture.cpp bc1_on; RX_VK_TEX_BC1 over it)
 extern int tex_bc1_at_start;
-/// (vk_memory.cpp) true when the quality preset's memory budgets (vram_mb, mirror_mb) are to be used: the card has no more
-/// video memory than the preset is for. A 4 GB preset (Minimum before 11-15) on an 8 GB card kept 256 MB of mirrors and 2.2 GB of textures: the
-/// game's memory was read over PCIe and the textures made again every frame, 5 fps with the CPU idle (Discord, 11-08)
+/// (vk_memory.cpp) true when the quality preset's memory budgets (vram_mb, mirror_mb) are to be used. (options_version 7)
+/// There is no preset any more: false, the card's own sizes
 bool preset_caps_memory();
 
 void menu_init();             // (the options from the file, once)
 void menu_set_gpu_count(int count);
+/// ((Triforce) 11-20) the GPU device row's card by its name, as triforce_options.ini's gpu_device_name had it (empty: none
+/// saved): vk_main.cpp pick_device finds the card by it first (gpu_choice.h pick)
+const std::string& menu_gpu_name();
 void menu_tick();             // (each frame shown: the keys, while the game's window has the focus)
 bool menu_is_open();
 bool resolution_auto();       // (the game's dynamic resolution: Resolution Auto)
@@ -199,8 +213,8 @@ int menu_text_wanted();
 /// 2 written, 3 no picture
 int menu_bug_shot();
 void menu_note_frame(bool game_frame, int shown = 1);   // (the frame rates the FPS counter shows)
-/// The game's picture's size (the Output resolution, its crop) and the window's, at each present: the Window scaling filter
-/// row says when it is not needed
+/// The game's picture's size (the Output resolution, its crop) and the window's, at each present: ((Triforce, options_version
+/// 7) the filter the picture is scaled to its place in the window with follows them (opts.upscale, upscaler_rows.h auto_filter)
 void menu_note_present_sizes(uint32_t picture_w, uint32_t picture_h, uint32_t window_w, uint32_t window_h);
 /// Over the window's image `index` (TRANSFER_DST_OPTIMAL before and after), w x h: the start-up screen, the menu and the FPS
 /// counter, drawn with Dear ImGui (vk_imgui.h, vk_ui.h). Nothing recorded while none of them shows

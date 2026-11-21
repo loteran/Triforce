@@ -149,8 +149,9 @@ def main():
     check("if (id == HOS_OPT_DISPLAY_CAP) return fps_cap::of_display(display_refresh_mhz());" in replay,
           "the renderer does not answer HOS_OPT_DISPLAY_CAP with fps_cap.h's rule for the window's display")
     menu = (ROOT / "gpu/vk/vk_menu.cpp").read_text(encoding="utf-8")
-    check(re.search(r'\{TAB_DISPLAY, "Game frame rate cap", &opts\.fps_cap, -3, 6, 1, tx_fps_cap,', menu),
-          "the Game frame rate cap row does not go from 30 (-3) to Monitor's rate (6)")
+    # ((Triforce, options_version 7) the Graphics tab's Frame rate & latency group: Frame rate cap)
+    check(re.search(r'\{TAB_GRAPHICS, "Frame rate cap", &opts\.fps_cap, -3, 6, 1, tx_fps_cap,', menu),
+          "the Frame rate cap row does not go from 30 (-3) to Monitor's rate (6)")
     label = block(menu, "const char* tx_fps_cap(int v) {")
     check("fps_cap::of_display(display_refresh_mhz())" in label and '"Monitor\'s rate (%d)"' in label,
           "the row does not say what Monitor's rate gives on this display")
@@ -164,8 +165,8 @@ def main():
     check("const int interval = fps_max() < 60 ? 1 : present_interval;" in presented and "fps_max() * interval" in presented,
           "a cap under 60 that settles late is paced with the game's own interval on top")
     readme = (ROOT / "readme.md").read_text(encoding="utf-8")
-    check("| Game frame rate cap | 30, 40, 45, 60, 90, 120, 144, 165, 240, Monitor's rate" in readme,
-          "readme.md's settings table has no Game frame rate cap row with Monitor's rate")
+    check("| Frame rate cap | 30, 40, 45, 60, 90, 120, 144, 165, 240, Monitor's rate" in readme,
+          "readme.md's settings table has no Frame rate cap row with Monitor's rate")
     guide = (ROOT / "docs/development.md").read_text(encoding="utf-8")
     check("| `frame_rate_cap` | 0 60, 1 90, 2 120, 3 144, 4 165, 5 240, 6 the monitor's refresh rate; -1 45, -2 40, -3 30 |" in guide,
           "docs/development.md's options table has no frame_rate_cap")

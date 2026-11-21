@@ -166,6 +166,22 @@ bool dump(const char* path, bool to_log) {
     return f != nullptr;
 }
 
+/// ((Triforce) The ask's file taken away (hang_watch.h): DeleteFileW on the path as game_path_there reads it, so a game folder
+/// past MAX_PATH is no different. False when it is still there: the ask is not served, or one file would ask every second
+bool ask_take(const std::string& path) {
+    const int n = MultiByteToWideChar(CP_UTF8, 0, path.data(), (int)path.size(), nullptr, 0);
+    if (n <= 0) return false;
+    std::wstring w((size_t)n, L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, path.data(), (int)path.size(), w.data(), n);
+    for (wchar_t& c : w)
+        if (c == L'/') c = L'\\';
+    const bool already = w.size() > 2 && w[0] == L'\\' && w[1] == L'\\' && (w[2] == L'?' || w[2] == L'.');
+    const bool unc = !already && w.size() > 2 && w[0] == L'\\' && w[1] == L'\\';
+    const bool drive = w.size() > 2 && w[1] == L':' && w[2] == L'\\';
+    if (!already && (unc || drive)) w = unc ? L"\\\\?\\UNC" + w.substr(1) : L"\\\\?\\" + w;
+    return DeleteFileW(w.c_str()) != 0;
+}
+
 /// The game's own window is the one in front, and not minimized
 bool window_in_front() {
     const HWND w = GetForegroundWindow();
@@ -196,9 +212,26 @@ void hang_watch_start() {
     std::thread([path, sec, by_name] {
         SetThreadDescription(GetCurrentThread(), L"mkw_vk hang watch");
         hangwatch::Watch watch;
+        int asked = 0;
+        bool ask_stuck = false;   // (the ask's file could not be taken away: said once, not looked for again)
         for (;;) {
             Sleep(1000);
             if (file_writers::stopping()) return;   // ((Triforce) the game is ending: no report begins)
+            // ((Triforce) the stacks asked for from outside, hang_watch.h: the file taken away first, so that one ask is one report)
+            const std::string ask_path = path + hangwatch::kAskSuffix;
+            if (!ask_stuck && game_path_there(ask_path)) {
+                if (!ask_take(ask_path)) {
+                    ask_stuck = true;
+                    logf("vk: hang: %s is there but could not be taken away (read-only, or in use): no stacks are written for it",
+                         ask_path.c_str());
+                } else if (hangwatch::ask(asked)) {
+                    logf("vk: STACKS asked for (%s was there; present %lld): where every thread is follows, and their whole stacks "
+                         "go to %s. Report %d of at most %d", ask_path.c_str(), (long long)presents_now, path.c_str(), asked,
+                         hangwatch::kAsked);
+                    if (!dump(path.c_str(), true)) logf("vk: hang: %s could not be written", path.c_str());
+                    if (host && host->log_flush) host->log_flush();
+                }
+            }
             const int64_t presents = presents_now;
             if (!hangwatch::step(watch, presents, by_name || window_in_front(), sec)) continue;
             logf("vk: HANG: no frame was shown for %d s%s (after present %lld). The game goes on if it can; where every "

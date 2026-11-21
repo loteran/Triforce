@@ -230,13 +230,17 @@ VmaPool textures_pool() {
     ai.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
     ai.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
     uint32_t type = 0;
-    if (vmaFindMemoryTypeIndexForImageInfo(vma, &rep, &ai, &type) != VK_SUCCESS) return VK_NULL_HANDLE;
+    if (vmaFindMemoryTypeIndexForImageInfo(vma, &rep, &ai, &type) != VK_SUCCESS) {
+        memory_trial_refused(MEMTRIAL_COMPACT);
+        return VK_NULL_HANDLE;
+    }
     VmaPoolCreateInfo pi{};
     pi.memoryTypeIndex = type;
     pi.blockSize = kImageBlock;
     if (vmaCreatePool(vma, &pi, &texture_pool) != VK_SUCCESS) texture_pool = VK_NULL_HANDLE;
     logf("vk: textures from a pool of their own, %llu MB blocks (RX_VK_COMPACT)%s", (unsigned long long)(kImageBlock >> 20),
          texture_pool ? "" : ": not made");
+    if (!texture_pool) memory_trial_refused(MEMTRIAL_COMPACT);   // (Triforce: the memory trial does not wait for the compaction)
     return texture_pool;
 }
 bool textures_pool_usage(uint64_t* block_bytes, uint64_t* free_bytes) {
@@ -502,16 +506,21 @@ bool create_image_inner_(const VkImageCreateInfo& ci, VkImage& image, VmaAllocat
         VmaAllocationCreateInfo pai = ai;
         pai.pool = pool;
         pai.usage = VMA_MEMORY_USAGE_UNKNOWN;
+        // (Triforce: a texture made in the compacted pool: the compaction ran, for the memory trial, vk_memory.cpp memory_trial_used)
+        const auto made = [&] {
+            if (pool == texture_pool) memory_trial_used(MEMTRIAL_COMPACT);
+            return true;
+        };
         if (Ahead* a = ahead_of(pool)) {   // (Triforce: in the blocks the pool has; else in the one made ahead: above)
             VmaAllocationCreateInfo nai = pai;
             nai.flags |= VMA_ALLOCATION_CREATE_NEVER_ALLOCATE_BIT;
             if (vmaCreateImage(vma, &ci, &nai, &image, &allocation, nullptr) == VK_SUCCESS) {
                 ahead_ask(pool, *a);
-                return true;
+                return made();
             }
-            if (ahead_take(pool, *a) && vmaCreateImage(vma, &ci, &nai, &image, &allocation, nullptr) == VK_SUCCESS) return true;
+            if (ahead_take(pool, *a) && vmaCreateImage(vma, &ci, &nai, &image, &allocation, nullptr) == VK_SUCCESS) return made();
         }
-        if (vmaCreateImage(vma, &ci, &pai, &image, &allocation, nullptr) == VK_SUCCESS) return true;
+        if (vmaCreateImage(vma, &ci, &pai, &image, &allocation, nullptr) == VK_SUCCESS) return made();
         create_image_path = 1;   // (the pool refused it: the allocator's own blocks, or a memory object of its own)
     }
     if (vmaCreateImage(vma, &ci, &ai, &image, &allocation, nullptr) == VK_SUCCESS) return true;

@@ -21,6 +21,9 @@
      precompile's loads (where the records are and when they are read, never what one holds: program_cache_read, in the stamp,
      reads each and checks its key). What a record holds, how it is written and read, the keys and the answers a record is
      picked by all stay in the stamp.
+   - The parts of vk_bank.cpp so marked: code no translation can reach (sampler_bias_changed, which only vk_draw.cpp's
+     sampler_for reads by). What a translation calls there, what those read and what writes that (texture_of's registrations:
+     register_texture, texture_released) stay in the stamp; tests/test_program_carry.py bank_check holds it.
    - Comments, blank lines and the spaces at the ends of lines, in the C and C++ files.
    The run-time part of the stamp is as before (disk_stamp: the depth mode, the GPU's mesh shaders and warps, the per-GPU
    translation settings, the C++ library's layouts, the RX_VK_ and EDEN_ switches that change a translation). So a record is

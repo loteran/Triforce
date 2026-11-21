@@ -11,6 +11,18 @@ namespace mkwvk {
 /// Something other than the draw path pushed or bound descriptors in the recording (its next push is whole)
 void descriptors_disturbed();
 
+/// ((Triforce, S8, FSR3-07) The texture LOD bias while DLSS or FSR scales the 3D with jitter (sharpen_rules.h lod_bias, on
+/// the scene's material samplers, lod_biased): an upscaler that drew a frame says its render size and output width (note), and
+/// once a present (tick, vk_replay.cpp) the bias follows them, the samplers made anew when it changes. Only the draws into
+/// targets of that render size, or of this frame's scene camera's (scene, below), take it (vk_draw.cpp draw_in_scene): no dispatch, shadow map or capture. RX_VK_UPSCALE_LOD_BIAS=0:
+/// none, the game's own bias alone (for a lab A/B); a negative number (-1, -1.5): that bias in its place
+void upscale_lod_note(uint32_t render_w, uint32_t render_h, uint32_t output_w);
+void upscale_lod_tick();
+/// ((Triforce, S8) The scene camera's target size this frame, as the upscaler's notes take it in stream order
+/// (temporal_note_scene_draw, fsr3_inputs::note_scene_draw): the draws at that size are the scene in the frame the game's
+/// dynamic resolution moved to it, before the upscale notes it (sharpen_rules.h lod_scene_now)
+void upscale_lod_scene(uint32_t width, uint32_t height);
+
 /// A graphics pipeline as triforce_pipelines.bin keeps it (the precompile's notes): what built it
 struct PipeNote {
     uint64_t key, prog, variant;

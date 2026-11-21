@@ -84,21 +84,28 @@ def main():
           "the menu does not show FSR 3.1's Native AA when it runs")
     check("ur::fsr3_bits(fsr3::supported() || ffx3_usable())" in function(menu, "unsigned upscalers_available() {"),   # (linux fork: or AMD's library)
           "the Upscaler row does not offer both of FSR 3.1's where it runs")
+    # ((Triforce, options_version 7) the Upscaler row names the engine of each of the seven values; a native AA is the Render
+    # resolution row's Native (100%) step, upscaler_rows.h step_resolution)
     names = function(menu, "const char* tx_upscaler(int) {")
     table = re.search(r"static const char\* t\[ur::kUpscalers\] = \{(.*?)\};", names, re.S)
     check(table and [n.strip().strip('"') for n in table.group(1).replace("\n", " ").split(",")] ==
-          ["Game", "NVIDIA DLSS", "NVIDIA DLAA", "AMD FSR 3.1", "AMD FSR 4", "AMD FSR 4 Native AA", "AMD FSR 3.1 Native AA"],
-          "tx_upscaler's names are not the seven values' in their saved order")
+          ["Game", "NVIDIA DLSS", "NVIDIA DLSS", "AMD FSR 3.1", "AMD FSR 4", "AMD FSR 4", "AMD FSR 3.1"],
+          "tx_upscaler's names are not the seven values' engines in their saved order")
+    # ((Triforce, FSR4-7) FSR 4 by the version AMD's library runs, fsr4_name, the engine's name too)
+    check("const int up = ur::engine(std::clamp(upscaler(), 0, ur::kUpscalers - 1));" in names and "return t[up];" in names,
+          "tx_upscaler does not name what runs by its engine")
     hints = function(menu, "const char* hn_upscaler(int v, int variant) {")
-    lines = re.search(r"static const char\* const t\[ur::kUpscalers\] = \{(.*?)\n    \};", hints, re.S)
-    check(lines and len(re.findall(r'",\n', lines.group(1) + "\n")) == 7, "hn_upscaler has no line for each of the seven values")
-    check('if (up == ur::FSR3_AA) return "Native (FSR 3.1)";' in function(menu, "const char* tx_resolution(int v) {"),
-          "the Render resolution row does not say Native with FSR 3.1's Native AA")
-    check("if (up == ur::FSR3_AA)" in function(menu, "const char* hn_resolution(int v, int variant) {"),
-          "the Render resolution row's help has no line for FSR 3.1's Native AA")
+    check("v = ur::engine(v);" in hints, "hn_upscaler does not say each value's engine")
+    check('if (ur::full_scale(up)) return "Native (100%)";' in function(menu, "const char* tx_resolution(int v) {"),
+          "the Render resolution row does not say Native (100%) with a native AA")
+    check("if (ur::full_scale(up))" in function(menu, "const char* hn_resolution(int v, int variant) {"),
+          "the Render resolution row's help has no line for a native AA")
+    check("ur::step_resolution(upscaler(), *r.value, dir)" in function(menu, "void set_row("),
+          "the Render resolution row does not step through Native (100%)")
     readme = (ROOT / "readme.md").read_text(encoding="utf-8")
-    check("| Upscaler | Game, NVIDIA DLSS, NVIDIA DLAA, AMD FSR 3.1, AMD FSR 3.1 Native AA, AMD FSR 4, AMD FSR 4 Native AA" in readme,
-          "readme.md's settings table has no Upscaler row with FSR 3.1's Native AA")
+    check("| Upscaler | Game, NVIDIA DLSS, AMD FSR 3.1, AMD FSR 4" in readme and
+          "Native (100%: DLAA, or FSR's native anti-aliasing)" in readme,
+          "readme.md's settings table has no Upscaler row, or no Native (100%) on the Render resolution row")
     guide = (ROOT / "docs/development.md").read_text(encoding="utf-8")
     check("6 AMD FSR 3.1 Native AA" in guide and "`=2`: FSR 3.1 as its Native AA" in guide,
           "docs/development.md does not say the Upscaler's value 6, or RX_VK_FSR=2")

@@ -1,0 +1,149 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Triforce</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<link rel="stylesheet" href="ui.css"><link rel="stylesheet" href="theme.css"><link rel="stylesheet" href="v3.css"><link rel="stylesheet" href="proto.css"><link rel="stylesheet" href="app.css"></head>
+<body>
+<div id="fit"><div class="win" id="win">
+
+<!-- ============ FIRST RUN: welcome (no game read yet, so no game art and no music) ============ -->
+<section class="screen" id="s-welcome" data-first="pickFile">
+<div class="stage"></div>
+<div class="welcome"><div class="k">Welcome</div><h1>Play Ocarina of Time on your PC.</h1><p>Triforce turns your own copy of the game into a native PC game: high frame rates, wide screens, mods, and your controller.</p><p>Start with your game file. Nothing is uploaded, and nothing of the game comes with Triforce.</p></div>
+<div class="portal" id="portal"><i class="c c1"></i><i class="c c2"></i><i class="c c3"></i><i class="c c4"></i><div><div class="ic"></div><h2 id="portalH">Drop your game here</h2><p id="portalP">Your .nup file, or the folder with romfs and exefs in it</p><div class="or"><div class="qbtn" data-f id="pickFile" data-act="pick:file">Choose a file</div><div class="qbtn" data-f data-act="pick:folder">Choose a folder</div></div></div></div>
+<div class="foot4"><span id="needLine">Windows 10 or 11, or Linux · about 60 GB free while building</span><span><b class="lnk" data-f data-act="open:help">Need help?</b> · <span class="lnk" data-f data-act="open:discord">Discord</span></span></div>
+</section>
+
+<!-- ============ FIRST RUN: the reveal (the game is read: its logo and Saria's Song) ============ -->
+<section class="screen" id="s-reveal" data-first="buildBtn" data-back="welcome">
+<div class="reveal"></div><div class="grain" style="opacity:.1"></div>
+<div class="rlogo"><div class="aura"></div><div class="glowl"></div><img class="gamelogo" src="img/game/Logo_USEU_00.png" alt=""></div>
+<div class="found4" id="found"></div>
+<div class="choices" id="choices"></div>
+<div class="buildrow"><div class="orn"></div><div class="play" style="width:330px" data-f id="buildBtn" data-act="build" data-big>Build the game</div><div class="orn r"></div></div>
+<div class="under" id="under"></div>
+<div class="nowmusic" style="bottom:auto;top:76px;right:150px"><div class="eq"><i></i><i></i><i></i><i></i></div><em>Saria's Song</em> · from your game</div>
+</section>
+
+<!-- ============ WORKING: the build, an update, or the tools download (one screen, filled by the launcher) ============ -->
+<section class="screen" id="s-work" data-first="workStop">
+<div class="hall"></div>
+<div class="mini"><div class="aura"></div><img class="gamelogo" src="img/game/Logo_USEU_00.png" alt=""></div>
+<div class="path" id="workPath" style="top:300px"></div>
+<div class="center" style="top:334px"><div class="eb" id="workEb"></div><h1 id="workTitle"></h1><p class="lead" id="workLead"></p></div>
+<div style="position:absolute;left:0;right:0;top:432px" id="workBody"><div class="gline" id="workLine"><i id="workBar"></i><u id="workKnob"></u></div>
+<div class="stepl" id="workSteps"></div></div>
+<div class="workerr" id="workErr"><div class="playrow" style="position:static;justify-content:center"><div class="orn"></div><div class="play sm" style="width:260px" data-f id="workRetry" data-act="retry" data-big>Try again</div><div class="orn r"></div></div>
+<p><span class="lnk" data-f data-act="report">Copy report</span> · <span class="lnk" data-f data-act="open:log">Open the log</span> · <span class="lnk" data-f data-act="workback" data-back-sound>Back</span></p></div>
+<div class="workfoot" id="workFoot"><span id="workNote"></span> &#183; <span class="lnk" data-f data-act="details">Show details</span><span id="workStopWrap"> &#183; <span class="lnk" data-f id="workStop" data-act="stop">Stop</span></span></div>
+<div class="nowmusic"><div class="eq"><i></i><i></i><i></i><i></i></div><em>Temple of Time</em> &#183; from your game</div>
+<div class="drawer" id="drawer"><div class="dhead"><b>Details</b><span class="lnk" data-act="report">Copy report</span><span class="lnk" data-act="details">Close</span></div><pre id="drawerLog"></pre></div>
+</section>
+
+<!-- ============ FIRST RUN: done ============ -->
+<section class="screen" id="s-done" data-first="doneplay">
+<div class="hall"></div>
+<div class="mini"><div class="aura"></div><img class="gamelogo" src="img/game/Logo_USEU_00.png" alt=""></div>
+<div class="path" style="top:300px"><span class="done"><i></i>Your game</span><span class="done"><i></i>Build</span><span class="now"><i></i>Play</span></div>
+<div class="center" style="top:350px"><div class="eb" id="doneEb">Built</div><h1>Your game is ready</h1>
+<p class="lead" id="doneLead"></p></div>
+<div class="playrow" style="left:0;right:0;top:560px;justify-content:center"><div class="orn"></div><div class="play" data-f id="doneplay" data-act="play" data-big>Play</div><div class="orn r"></div></div>
+<div style="position:absolute;left:0;right:0;top:680px;text-align:center;font-size:14px;color:var(--text2)">Played before on an emulator? <span class="lnk" style="color:var(--gold)" data-f data-act="bringin">Bring your saves in</span> &#183; <span class="lnk" style="color:var(--gold)" data-f data-act="go:home">Go to the launcher</span></div>
+</section>
+
+<!-- ============ HOME ============ -->
+<section class="screen" id="s-home" data-first="playBtn" data-tab="0">
+<div class="scene"><div class="img" id="homeImg"></div><div class="grade"></div><div class="grain"></div></div>
+<div class="logo"><div class="aura"></div><img class="gamelogo" src="img/game/Logo_USEU_00.png" alt=""></div>
+<div class="cont"><div class="eb" id="hEb"></div><h1 id="hH1"></h1><div class="meta" id="hMeta"></div></div>
+<div class="frame" id="hFrame"><div class="pic" id="homePic"></div><div class="edge"></div><div class="top"><i></i><i></i></div><div class="cap"><span></span><span id="hCap"></span></div></div>
+<div class="glow"></div>
+<div class="playrow"><div class="orn"></div><div class="play" data-f id="playBtn" data-act="play" data-big>Play</div><div class="orn r"></div></div>
+<div class="links" id="hLinks"></div>
+<div class="dock"><div class="rule"><i class="a"></i><i class="b"></i></div>
+<div class="files"><h4>Your files</h4><div class="strip" id="strip"></div></div>
+<div class="whatsnew" id="whatsnew"></div>
+</div>
+</section>
+
+<!-- ============ PLAYING (the game is running) ============ -->
+<section class="screen" id="s-playing" data-first="showGame">
+<div class="scene"><div class="img" id="playImg" style="filter:blur(30px) saturate(1.1) brightness(.35)"></div><div class="grade"></div><div class="grain"></div></div>
+<div class="mini"><div class="aura"></div><img class="gamelogo" src="img/game/Logo_USEU_00.png" alt=""></div>
+<div class="center" style="top:330px"><div class="eb" id="pEb">Playing now</div><h1>Ocarina of Time is running</h1>
+<p class="lead">The music stops while you play and comes back when you close the game.</p></div>
+<div class="act" style="left:0;right:0;top:520px;justify-content:center"><div class="qbtn" data-f id="showGame" data-act="showgame" style="width:260px">Show the game</div></div>
+</section>
+
+<!-- ============ SAVES ============ -->
+<section class="screen" id="s-saves" data-first="sc0" data-back="home" data-tab="2">
+<div class="scene"><div class="img" id="savesImg" style="filter:blur(26px) saturate(1.1) brightness(.5)"></div><div class="grade"></div><div class="grain"></div></div>
+<div style="position:absolute;left:64px;top:96px"><div class="cont" style="position:static;width:auto"><div class="eb" id="savesEb"></div><h1 style="font-size:54px">Your files</h1></div></div>
+<div class="sgrid" id="sgrid"></div>
+<div class="sside"><div class="fbox"><h3>Bring saves in</h3><p id="foundSaves">From an emulator on this PC, or a folder.</p>
+<div class="play sm" data-f data-act="bringin">Bring saves in</div></div>
+<div class="fbox"><h3>Copy saves out</h3><p>To an emulator or a folder, to carry on somewhere else.</p><div class="qbtn" style="width:100%" data-f data-act="copyout">Copy saves out</div></div>
+<p style="margin-top:14px;font-size:13px;color:var(--text3)">Whatever gets replaced is backed up first. <span class="lnk" style="color:var(--gold)" data-f data-act="open:backups">Open backups</span></p></div>
+</section>
+
+<!-- ============ MODS ============ -->
+<section class="screen" id="s-mods" data-first="modTab0" data-back="home" data-tab="1">
+<div class="scene"><div class="img" id="modsImg" style="filter:blur(26px) saturate(1.1) brightness(.5)"></div><div class="grade"></div><div class="grain"></div></div>
+<div style="position:absolute;left:64px;top:96px"><div class="cont" style="position:static;width:auto"><div class="eb" id="modsEb">From GameBanana, and your mods folder</div><h1 style="font-size:54px">Mods</h1></div></div>
+<div class="modtabs" id="modTabs"><span data-f id="modTab0" data-act="modtab:browse">Browse</span><span data-f id="modTab1" data-act="modtab:mine">Yours</span></div>
+<div class="search" id="modSearch"><input id="modQ" data-f placeholder="Search mods" spellcheck="false" autocomplete="off"></div>
+<div class="mods" id="mods"></div>
+<div class="modnote" id="modNote"></div>
+</section>
+
+<!-- ============ SETTINGS ============ -->
+<section class="screen" id="s-settings" data-first="row0" data-back="home" data-tab="3">
+<div class="scene"><div class="img" id="setImg" style="filter:blur(26px) saturate(1.1) brightness(.45)"></div><div class="grade"></div><div class="grain"></div></div>
+<div style="position:absolute;left:64px;top:96px"><div class="cont" style="position:static;width:auto"><div class="eb" id="setEb">The launcher and your game</div><h1 style="font-size:54px">Settings</h1></div></div>
+<div class="settabs" id="setTabs"></div>
+<div class="set" id="set"></div>
+<div class="benchcard fbox" id="benchCard"><h3>Find my best settings</h3><p>Your game flies through four places in about 2 minutes with its own panel on screen, then this tells you what your PC runs best.</p>
+<div class="play sm" style="width:100%;font-size:21px;height:52px" data-f id="benchGo" data-act="bench">Find my best settings</div>
+<p style="margin:14px 0 0;font-size:12.5px;color:var(--text3)" id="benchLast"></p></div>
+</section>
+
+<!-- ============ BENCHMARK RUN ============ -->
+<section class="screen" id="s-brun" data-first="bStop" data-back="benchstop">
+<div class="brun"><div class="placebig" id="bPlace"></div><div class="grade"></div><div class="grain"></div>
+<span class="stop lnk" data-f id="bStop" data-act="benchstop">Stop · Esc</span>
+<div class="hud"><div class="eb" id="bPass"></div><h1 id="bName"></h1><p class="bline" id="bLine"></p><p class="bhint">About 2 minutes. The game shows where it is and the frame rate. Esc in the game, or Stop here, ends it.</p></div>
+<div class="prog"><i id="bProg"></i></div></div>
+</section>
+
+<!-- ============ BENCHMARK RESULTS ============ -->
+<section class="screen" id="s-bench" data-first="applyBtn" data-back="settings" data-tab="3">
+<div class="scene"><div class="img" id="benchImg" style="filter:blur(26px) saturate(1.1) brightness(.5)"></div><div class="grade"></div><div class="grain"></div></div>
+<div style="position:absolute;left:64px;top:96px"><div class="cont" style="position:static;width:auto"><div class="eb" id="benchEb"></div><h1 style="font-size:54px">Your best settings</h1></div></div>
+<div class="bench"><div><div class="places" id="places"></div>
+<p class="verdict" id="verdict"></p></div>
+<div class="recs"><h3>Recommended</h3><div class="fbox" id="recs"></div>
+<div class="qbtn compare" data-f data-act="bench.compare" id="compareBtn"></div>
+<div class="act" style="position:static;margin-top:22px;justify-content:flex-end"><span class="qlink" data-f data-act="go:settings">Keep mine</span><span class="qlink" data-f data-act="bench">Run again</span>
+<div class="play sm" style="width:220px" data-f id="applyBtn" data-act="benchapply">Apply</div></div></div></div>
+</section>
+
+<!-- ============ shared: the bar, the sound panel, the sheet ============ -->
+<div class="bar" id="bar"><div class="brand flair"><div class="mark"></div><span>Triforce</span></div>
+<div class="nav" id="nav"><a data-f data-go="home">Play</a><a data-f data-go="mods">Mods</a><a data-f data-go="saves">Saves</a><a data-f data-go="settings">Settings</a></div>
+<div class="grow"></div><div class="state" id="pill"></div>
+<div class="spk on" id="spk" data-f data-act="vol"><svg viewBox="0 0 24 24"><path d="M4 9.5h3.5L12 5.5v13l-4.5-4H4z"/><path d="M15.5 9a4.5 4.5 0 0 1 0 6M18 6.5a8 8 0 0 1 0 11"/></svg></div>
+<div class="wc"><span data-act="win:min"><svg viewBox="0 0 12 12"><path d="M1 6.5h10"/></svg></span><span data-act="win:max"><svg viewBox="0 0 12 12"><rect x="1.5" y="1.5" width="9" height="9"/></svg></span><span data-act="win:close"><svg viewBox="0 0 12 12"><path d="M1.5 1.5l9 9M10.5 1.5l-9 9"/></svg></span></div></div>
+
+<div class="vol" id="vol"><h5>Sound</h5>
+<div class="vrow"><b>Music</b><div class="slider" data-f data-vol="music"><i></i><u></u></div><span data-volv="music">40%</span></div>
+<div class="vrow"><b>Sounds</b><div class="slider" data-f data-vol="sfx"><i></i><u></u></div><span data-volv="sfx">70%</span></div>
+<div class="nowp" id="nowp"><div class="eq"><i></i><i></i><i></i><i></i></div><em id="nowT">Nothing playing</em><span>· from your game</span></div>
+<div class="mute"><span>Music stops while you play</span><b data-f data-act="mute" id="muteB">Mute (M)</b></div></div>
+
+<div class="sheet-bg" id="sheetBg"><div class="sheet fbox" id="sheet"></div></div>
+<div id="toastHost"></div>
+</div></div>
+
+<div id="protonote"><b>Preview</b> · a stand-in answers instead of the launcher: nothing here touches your game · <u style="cursor:pointer" id="jumpBtn">jump to a screen (F2)</u></div>
+<div id="jump"></div>
+<script src="demo.js"></script>
+<script src="app.js"></script>
+</body></html>

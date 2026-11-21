@@ -33,11 +33,19 @@ inline int chosen(int row, int env) {
     const int v = env >= 0 ? env : row;
     return v >= GAME && v < kValues ? v : GAME;
 }
-/// DLSS, DLAA, FSR 3.1, FSR 4 and their native modes anti-alias the 3D themselves, from frames the game's own pass has not
-/// smoothed any better: while one of them draws (upscaler: what runs, upscaler_rows.h) the row does not apply
+/// DLSS, DLAA, FSR 3.1, FSR 4 and their native modes anti-alias the 3D themselves: while one of them draws (upscaler: what
+/// runs, upscaler_rows.h) the row does not apply
 inline bool upscaler_own(int upscaler) { return upscaler != upscaler_rows::GAME; }
-/// What is in effect: the choice, or the game's own while such an upscaler draws (its frame is then drawn as before the row)
-inline int effective(int choice, int upscaler) { return upscaler_own(upscaler) ? (int)GAME : choice; }
+/// What is in effect: the choice with the game's own upscaler. ((Triforce, FSR3-06, FSR4-5) While such an upscaler draws from
+/// the tone mapped picture (Upscale before bloom off), none: the game's SMAA is left out, as AMD and NVIDIA ask for jittered
+/// frames no other anti-aliasing has been over (SMAA before them softened what they gather, and its edges, found anew in
+/// each jittered frame, flickered). It was the game's own SMAA before. Before the bloom (before_bloom) the upscaler takes
+/// the scene, which the SMAA has not been over: the game's own then, as before. env_set (RX_VK_AA for the run): its choice
+/// there too, for an A/B (RX_VK_AA=0: the game's SMAA under the upscaler)
+inline int effective(int choice, int upscaler, bool before_bloom = false, bool env_set = false) {
+    if (!upscaler_own(upscaler) || env_set) return choice;
+    return before_bloom ? (int)GAME : (int)OFF;
+}
 /// The row has nothing to choose then (shown without arrows; Left and Right leave the saved value alone), nor with
 /// RX_VK_AA set for the run
 inline bool fixed(int upscaler, bool env_set) { return upscaler_own(upscaler) || env_set; }

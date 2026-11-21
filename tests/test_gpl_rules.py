@@ -11,7 +11,11 @@ The header is compiled and run as it is:
   start that died), and tells another driver's journal and an older build's empty marker apart;
 - the skip list keeps each variant once, for one driver;
 - starts in a row against a stand-in driver that dies on some programs: the step ends at the next start with those
-  programs left out, and is left out for good only after three starts in a row that did not end it.
+  programs left out, and is left out for good only after three starts in a row that did not end it;
+- a start counts as one of those three only when it died with the journal's "began" word written: for good from the stage
+  libraries' first driver call, and in the program pass only while a compute warm is in the driver (Journal::Compiling).
+  One that died or was stopped before, or in the translation between or after the compute warms, uses no try, however
+  many there are; one killed in a compute compile does; an older build's journal (no word) counts as it did.
 Then the source: the link is off unless the row or RX_VK_GPL=1 says so, the entry goes through the header's rules, the
 link is made under the guard, the journal is marked around each library build, and the row is where the switch reads it.
 python -I -B tests/test_gpl_rules.py --cxx clang++
@@ -28,6 +32,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 FIXTURE = r"""
 #include <cstdio>
+#include <memory>
 #include <set>
 #include <thread>
 #include "gpl_rules.h"
@@ -47,13 +52,37 @@ static size_t size_of(const std::string& path) {
 }
 // A start of the driver's part as vk_draw.cpp makes it (warm_begin, warm_libraries, warm_end), against a driver that dies
 // with a program of `bad` in its hands: 0 the part was made, 1 the start died, 2 the part was left out.
+// die: where else the start dies (killed, or a power cut). First comes the program pass, the translation with its compute
+// warms spread over it (prepare_run's warm_compute, each held by a Journal::Compiling): kEarly, after the journal is opened
+// and before any of them; kAfterCompute, in the translation after compute warms on several workers came back (an update's
+// minutes of graphics translation); kInCompute, with one of them in the driver (a hung compile killed)
+enum Die { kNone, kEarly, kAfterCompute, kInCompute };
 static int start(const std::string& warming, uint64_t stamp, int programs, const std::set<uint64_t>& bad, int workers,
-                 std::vector<Id>* skipped, int* built) {
+                 std::vector<Id>* skipped, int* built, Die die = kNone) {
     const Left left = journal_left(warming, stamp);
     *skipped = skip_add(warming + ".skip", stamp, left.in_hand);
     if (left.found && !goes_on(left)) return remove(warming.c_str()), 2;
     Journal j;
     if (!j.open(warming, stamp, left.tries + 1)) return 2;
+    if (die == kEarly) return 1;
+    {   // (the compute warms of the program pass: two workers' at once, then one, then none)
+        std::vector<std::unique_ptr<Journal::Compiling>> held;
+        held.push_back(std::make_unique<Journal::Compiling>(j));
+        held.push_back(std::make_unique<Journal::Compiling>(j));
+        if (!j.counts()) return 3;
+        held.erase(held.begin());
+        if (!j.counts()) return 3;
+        if (die == kInCompute) {   // (the process is gone: nothing comes back from the driver, no destructor runs)
+            for (auto& h : held) (void)h.release();
+            return 1;
+        }
+        held.clear();
+        if (j.counts()) return 3;
+        Journal::Compiling again(j);
+        if (!j.counts()) return 3;
+    }
+    if (j.counts() || j.has_begun()) return 3;
+    if (die == kAfterCompute) return 1;
     for (int p = 1; p <= programs; p += workers) {   // (the workers take a program each, all in the driver at once)
         int in_driver = 0;
         bool dies = false;
@@ -62,6 +91,7 @@ static int start(const std::string& warming, uint64_t stamp, int programs, const
             bool skip = false;
             for (const Id& s : *skipped) skip = skip || s == id;
             if (skip) continue;
+            j.began();   // (before each driver call, as vk_draw.cpp warm_libraries: the first one writes the word)
             j.mark(w, id), in_driver++;
             dies = dies || bad.count(id.key);
         }
@@ -174,12 +204,32 @@ int main(int, char** argv) {
         CHECK(!journal_left(path, stamp).found && goes_on(journal_left(path, stamp)));   // (no journal: an ordinary start)
         Journal j;
         CHECK(j.open(path, stamp, 1));
-        CHECK(size_of(path) == 16 + 16 * (size_t)kSlots);
+        CHECK(size_of(path) == 16 + 16 * (size_t)kSlots + 4 && kBeganAt == 16 + 16 * kSlots);
         Left l = journal_left(path, stamp);
-        CHECK(l.found && l.tries == 1 && l.in_hand.empty() && goes_on(l));   // (died with nothing in the driver's hands)
+        // (died before its first driver call: found, but no try used)
+        CHECK(l.found && !l.began && l.tries == 0 && l.in_hand.empty() && goes_on(l) && !j.has_begun());
+        {   // ((Triforce, 11-18) a compute warm under way: counted while the driver has it, not once it came back)
+            Journal::Compiling c(j);
+            l = journal_left(path, stamp);
+            CHECK(j.counts() && l.began && l.tries == 1 && !j.has_begun());
+            {
+                Journal::Compiling d(j);   // (and another worker's at once: the word stays until both came back)
+            }
+            CHECK(journal_left(path, stamp).began && j.counts());
+        }
+        l = journal_left(path, stamp);
+        CHECK(!j.counts() && !l.began && l.tries == 0 && !j.has_begun());
+        j.began(), j.began();
+        {   // (once the libraries' pass wrote it, a compute warm that comes back does not take it away)
+            Journal::Compiling c(j);
+        }
+        CHECK(j.counts() && journal_left(path, stamp).began);
+        CHECK(j.has_begun() && size_of(path) == 16 + 16 * (size_t)kSlots + 4);
+        l = journal_left(path, stamp);
+        CHECK(l.found && l.began && l.tries == 1 && l.in_hand.empty() && goes_on(l));   // (died with nothing in the driver's hands)
         j.mark(3, {0xAAAA, 1}), j.mark(5, {0xBBBB, 2}), j.mark(63, {0xCCCC, 0});
         j.mark(64, {0xDDDD, 4}), j.mark(-1, {0xEEEE, 4});   // (past the slots: no line, and no byte)
-        CHECK(size_of(path) == 16 + 16 * (size_t)kSlots);
+        CHECK(size_of(path) == 16 + 16 * (size_t)kSlots + 4);
         l = journal_left(path, stamp);
         CHECK(l.in_hand.size() == 3 && l.in_hand[0] == (Id{0xAAAA, 1}) && l.in_hand[1] == (Id{0xBBBB, 2}) && l.in_hand[2] == (Id{0xCCCC, 0}));
         j.mark(3, {});   // (it came back from the driver)
@@ -191,9 +241,29 @@ int main(int, char** argv) {
         j.close();
         CHECK(journal_left(path, stamp).in_hand.size() == 2);   // (closing is not ending: only removing the file is)
         // (the count of starts: the third that did not end it is the last)
-        CHECK(j.open(path, stamp, 2) && journal_left(path, stamp).tries == 2 && goes_on(journal_left(path, stamp)));
-        CHECK(j.open(path, stamp, kTries) && journal_left(path, stamp).tries == kTries && !goes_on(journal_left(path, stamp)));
+        CHECK(j.open(path, stamp, 2) && journal_left(path, stamp).tries == 1);   // (not counted until it calls the driver)
+        j.began();
+        CHECK(journal_left(path, stamp).tries == 2 && goes_on(journal_left(path, stamp)));
+        // (the third start, ended before its first driver call: the last try is still there)
+        CHECK(j.open(path, stamp, kTries) && journal_left(path, stamp).tries == kTries - 1 && goes_on(journal_left(path, stamp)));
+        j.began();
+        CHECK(journal_left(path, stamp).tries == kTries && !goes_on(journal_left(path, stamp)));
+        // (a slot named with the word not written, which no build writes: counted, and the variant blamed)
+        CHECK(j.open(path, stamp, 1));
+        j.mark(0, {0xF00D, 1});
+        l = journal_left(path, stamp);
+        CHECK(l.began && l.tries == 1 && l.in_hand.size() == 1);
         j.close();
+        // (an older build's journal, the slots and no word after them: counted as it was)
+        {
+            FILE* o = fopen(path.c_str(), "wb");
+            const uint32_t head[2] = {kJournalMagic, 2};
+            const uint64_t zero[2 * kSlots]{};
+            CHECK(o && fwrite(head, 4, 2, o) == 2 && fwrite(&stamp, 8, 1, o) == 1 &&
+                  fwrite(zero, 8, (size_t)(2 * kSlots), o) == (size_t)(2 * kSlots) && fclose(o) == 0);
+            l = journal_left(path, stamp);
+            CHECK(l.found && l.began && l.tries == 2 && l.in_hand.empty());
+        }
         // (an older build's marker, an empty file: one start, no variant named)
         FILE* f = fopen(path.c_str(), "wb");
         CHECK(f && fclose(f) == 0);
@@ -252,6 +322,62 @@ int main(int, char** argv) {
         CHECK(skipped.size() == 4 * kTries && built == 0);
     }
     {
+        const std::string w = dir + "/f.warming";
+        std::vector<Id> skipped;
+        int built = 0;
+        // ((Triforce, 11-18) starts that died before their first driver call use no try, however many: between them, a
+        // driver that dies on everything still gets its three starts, and the fourth leaves the part out)
+        std::set<uint64_t> all;
+        for (int i = 1; i <= 40; i++) all.insert((uint64_t)i);
+        for (int i = 0; i < 5; i++) CHECK(start(w, stamp, 40, all, 4, &skipped, &built, kEarly) == 1);
+        CHECK(journal_left(w, stamp).tries == 0 && skipped.empty());
+        for (uint32_t i = 0; i < kTries; i++) {
+            CHECK(start(w, stamp, 40, all, 4, &skipped, &built) == 1);
+            if (i + 1 < kTries)
+                CHECK(start(w, stamp, 40, all, 4, &skipped, &built, kEarly) == 1 && journal_left(w, stamp).tries == i + 1);
+        }
+        CHECK(start(w, stamp, 40, all, 4, &skipped, &built) == 2 && skipped.size() == 4 * kTries && built == 0);
+    }
+    {
+        const std::string w = dir + "/g.warming";
+        std::vector<Id> skipped;
+        int built = 0;
+        // (an early death after one in the driver: that one's variants stay on the list, and the next start ends the part)
+        CHECK(start(w, stamp, 40, {10}, 4, &skipped, &built) == 1);
+        CHECK(start(w, stamp, 40, {10}, 4, &skipped, &built, kEarly) == 1 && skipped.size() == 4);
+        built = 0;
+        CHECK(start(w, stamp, 40, {10}, 4, &skipped, &built) == 0 && skipped.size() == 4 && built == 36);
+    }
+    {
+        const std::string w = dir + "/h.warming";
+        std::vector<Id> skipped;
+        int built = 0;
+        // ((Triforce, 11-18) killed in the translation after compute warms came back, the minutes after an update: no try,
+        // however many; between them a driver that dies on everything still gets its three starts)
+        std::set<uint64_t> all;
+        for (int i = 1; i <= 40; i++) all.insert((uint64_t)i);
+        for (int i = 0; i < 5; i++) CHECK(start(w, stamp, 40, all, 4, &skipped, &built, kAfterCompute) == 1);
+        CHECK(journal_left(w, stamp).tries == 0 && !journal_left(w, stamp).began && skipped.empty());
+        for (uint32_t i = 0; i < kTries; i++) {
+            CHECK(start(w, stamp, 40, all, 4, &skipped, &built) == 1);
+            if (i + 1 < kTries)
+                CHECK(start(w, stamp, 40, all, 4, &skipped, &built, kAfterCompute) == 1 && journal_left(w, stamp).tries == i + 1);
+        }
+        CHECK(start(w, stamp, 40, all, 4, &skipped, &built) == 2 && skipped.size() == 4 * kTries && built == 0);
+    }
+    {
+        const std::string w = dir + "/i.warming";
+        std::vector<Id> skipped;
+        int built = 0;
+        // (killed with a compute warm in the driver, a hung compile: each such start is a try, and the fourth leaves the
+        // part out; no variant is named, compute warms have no slot)
+        for (uint32_t i = 0; i < kTries; i++) {
+            CHECK(start(w, stamp, 40, {}, 4, &skipped, &built, kInCompute) == 1);
+            CHECK(journal_left(w, stamp).began && journal_left(w, stamp).tries == i + 1);
+        }
+        CHECK(start(w, stamp, 40, {}, 4, &skipped, &built) == 2 && skipped.empty() && built == 0);
+    }
+    {
         const std::string w = dir + "/e.warming";
         std::vector<Id> skipped;
         int built = 0;
@@ -284,7 +410,7 @@ def check_source():
     row = re.search(r'\{TAB_DEBUG, "Fast pipeline link", &opts\.fast_pipeline_link, 0, 1, 1, tx_onoff,(.*?)\},\n', menu, re.S)
     if not row or not row.group(1).rstrip().endswith("nullptr, true, true"):
         raise SystemExit("no Fast pipeline link row on the Debug tab (one that applies after a restart and leaves the preset alone)")
-    if menu.index('"Developer", nullptr') > row.start() or row.start() > menu.index('{TAB_SYSTEM, "Restart"'):
+    if menu.index('"Developer", nullptr') > row.start() or row.start() > menu.index('constexpr int kRowsEnd'):
         raise SystemExit("the Fast pipeline link row is not under the Debug tab's Developer heading")
     if "int fast_pipeline_link = 1;" not in opts:
         raise SystemExit("the Fast pipeline link row is not on by default")
@@ -324,11 +450,34 @@ def check_source():
         warm.index("build_graphics(p, *blank, at, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, part)")
     if not a < b < c < warm.index("warm_journal.mark(slot, {});"):
         raise SystemExit("warm_libraries does not skip, then name the variant, then build, then clear its line")
+    # ((Triforce, 11-18) a start is a try from its first driver call: the word is written before the variant is named)
+    if not warm.index("warm_journal.began();") < b:
+        raise SystemExit("warm_libraries names a variant in the driver's hands before the journal says the start called the driver")
     if "threads.emplace_back(worker, (int)i);" not in warm:
         raise SystemExit("the workers of the driver's part have no journal slot of their own")
     prep = between(draw, "bool prepare_run(", "\n}\n")
     if prep.count("warm_begin(warming, warmed)") != 2 or "remove(warming" in prep or prep.count("warm_end(warming);") < 5:
         raise SystemExit("prepare_run begins or ends the driver's part past warm_begin and warm_end")
+    # (the program pass's compute warms stay under the journal, opened before the translation, and make the start a try
+    # only while one is in the driver: held by a Journal::Compiling around guarded_compute alone, not the sticky began(),
+    # which would count a death anywhere in the translation after the first of them. The creation is
+    # prepare_compute_pipeline's, which the pipeline cache carry's rebuild shares: pcache_carry.h)
+    cs = between(prep, "const auto warm_compute = [&](Program& p) {", "\n    };\n")
+    build = between(draw, "bool prepare_compute_pipeline(Program& p) {", "\n}\n")
+    held = re.search(r"\{\s*const gpl_rules::Journal::Compiling compiling\(warm_journal\);\s*"
+                     r"built = guarded_compute\(pcache, &ci, &pl\) == VK_SUCCESS && pl;\s*\}", build)
+    if not held or "prepare_compute_pipeline(p)" not in cs or "guarded_compute(" in cs or \
+            build.count("guarded_compute(") != 1 or "warm_journal.began();" in cs + build:
+        raise SystemExit("prepare_run's compute warms do not hold the journal's word for the driver call alone")
+    # (stopped, the state list is not gone through after the program pass: it held a stop for minutes past the kill)
+    if "if (!background && !prepare_stopped()) state_list_prepare(nullptr);" not in prep:
+        raise SystemExit("prepare_run goes through the state list after a stop")
+    sl = between(draw, "void state_list_prepare(", "\n}\n")
+    if sl.count("if (stopped()) return;") != 2 or "applied.id = 0;" not in between(sl, "const auto stopped = [&] {", "};") or \
+            sl.count("if (prepare_stopped()) return;") != 2:
+        raise SystemExit("state_list_prepare does not stop on a stop, or writes the lists down as gone through when it does")
+    if not prep.index("if (!warm_begin(warming, warmed)) warm = warm_cs = false;") < prep.index("threads.emplace_back(worker);"):
+        raise SystemExit("prepare_run's program pass (its compute warms) is no longer under warm_begin's journal")
     begin = between(draw, "bool warm_begin(", "\n}\n")
     for need in ("gpl_rules::journal_left(warming, warmed)", 'gpl_rules::skip_add(warming + ".skip", warmed, left.in_hand)',
                  "if (left.found && !gpl_rules::goes_on(left)) {", "warm_journal.open(warming, warmed, left.tries + 1)"):
@@ -336,7 +485,8 @@ def check_source():
             raise SystemExit("warm_begin: " + need + " is missing")
     # (and in play: no library of a variant on the skip list is built behind a draw, at any start with the libraries)
     if "if (gpl_skipped(p)) cold[0] = cold[1] = 0;" not in gp or "gpl_skip_set(warm_skip);" not in begin or \
-            'if (libraries && !background) gpl_skip_set(gpl_rules::skip_read(warming + ".skip", warmed));' not in prep:
+            ('if (libraries && !background) {\n        warm_skip_carry(warming + ".skip", libraries, warmed);\n'
+             '        gpl_skip_set(gpl_rules::skip_read(warming + ".skip", warmed));') not in prep:
         raise SystemExit("a variant the driver's part leaves out still has its libraries built behind a draw")
     # (without the libraries the marker is as it was: one start that did not end the compute warm leaves it out)
     if 'logf("vk: the last start did not finish the driver\'s part of the shaders: left out");' not in prep:

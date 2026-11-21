@@ -46,6 +46,12 @@ VkImageView framegen_scaled_view();   // (hookshot) the view of framegen_scale's
 VkImage framegen_hdr(VkCommandBuffer cmd, VkImageView src, uint32_t sw, uint32_t sh, const int crop[4], uint32_t dw, uint32_t dh);
 /// (Triforce) Each present, outside any recording of framegen_record's: frame generation's unused resources are let go
 void framegen_present_tick();
+struct Texture;
+/// ((Triforce, FG-2) The gameplay upscale's output (out, its level), just written by the upscale's dispatch or the upscaler in
+/// its place, before the HUD is drawn into it: taken as frame generation's picture without the HUD for this frame (AMD's
+/// library makes no frame without it). Nothing unless the Frame generation row is at AMD FSR and AMD's library can make the
+/// frames; recorded into cmd, on whichever thread records the dispatch (vk_draw.cpp)
+void framegen_hudless_note(VkCommandBuffer cmd, Texture* out, uint32_t level);
 /// (Triforce) The process is about to exit: nothing of frame generation calls into a vendor's library after this
 void framegen_exiting();
 /// Each present: ultrawide's menus (the Insert menu's setting to the game's side, the sides blurred or black while a menu shows)

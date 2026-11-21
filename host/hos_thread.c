@@ -31,6 +31,7 @@ struct HosThread {
     char name[48];
     HANDLE handle;
     int started;
+    int bg_kind; int64_t bg_since;   /* (HOS_BG_THROTTLE: bg_throttle) */
     /* the kernel side (hos_svc.c): this thread's Horizon handle and the event it blocks on */
     uint32_t kernel_handle;
     HANDLE wake;
@@ -349,6 +350,9 @@ void hos_fatal(Ctx *c, const char *fmt, ...) {
         TerminateProcess(GetCurrentProcess(), 3);
         ExitProcess(3);
     }
+    /* (Triforce) what the other threads are doing now, taken while this one reports (host/crash_threads.h) */
+    void hos_crash_threads_begin(void), hos_crash_threads_end(void);
+    hos_crash_threads_begin();
     if (!c) c = hos_ctx();
     log_flush();
     fprintf(stderr, "[hos %s] FATAL: %s", cur ? cur->name : "host", buf);
@@ -358,6 +362,8 @@ void hos_fatal(Ctx *c, const char *fmt, ...) {
     void hos_backtrace(void), hos_hostcall_stats(void);
     hos_backtrace();
     hos_hostcall_stats();
+    hos_crash_threads_end();
+    log_flush();
     /* (Triforce, after NX2navi) TerminateProcess, not ExitProcess: ExitProcess stops the other threads wherever they are
        and then runs every library's detach on this thread, and a detach that faults there (an upscaler's, a driver's) put
        a crash report of its own after the lines above, or held the process open. Everything said here is written out
@@ -1048,11 +1054,22 @@ void hos_sleep_logged(int64_t ns, uint64_t lr) {
    frame noticed the GPU's signal late, ~7 ms of the 25 ms frame asleep on its critical path. The GPU writes the event
    into guest memory itself, so the sleep looks at it between yields (its virtual core given up) and ends once it is
    1, at the latest when the asked time is up. Only where the poll is nvnEventGetValue. HOS_PRESENT_POLL=1 (an
-   experiment: no fps change measured, and it keeps a core busy while it looks) */
+   experiment: no fps change measured, and it keeps a core busy while it looks).
+   (Triforce, gpu/vk/async_rules.h 4) With the replay on a thread of its own (RX_VK_ASYNC=1) it is on unless
+   HOS_PRESENT_POLL=0: there the poll does sleep, every frame, until the replay thread has recorded the frame and the GPU has
+   run it, and each sleep ended about 0.6 ms late on average by the system's timer. And it does not look the whole time: while
+   the replay thread still has work handed over the event cannot be set by that work, so the poll waits for the thread, asleep
+   (rx_nvn_replay_idle_wait, the asked time at most), and looks between yields only once the GPU has the frame */
 static int present_poll(Ctx *c, int64_t ns) {
-    static int on = -1;
+    static int on = -1, async = 0;
     static uint64_t fn_ok, fn_bad;
-    if (on < 0) on = getenv("HOS_PRESENT_POLL") && atoi(getenv("HOS_PRESENT_POLL")) != 0;
+    int rx_async_replay(void);
+    int rx_nvn_replay_idle_wait(uint64_t timeout_ns);
+    if (on < 0) {
+        const char *e = getenv("HOS_PRESENT_POLL");
+        async = rx_async_replay();
+        on = e ? atoi(e) != 0 : async;
+    }
     if (!on || c->x[30] != 0x80590520 || ns <= 0 || ns > 20000000) return 0;
     const uint64_t fp = G64(c->x[24]);
     if (fp != fn_ok) {
@@ -1069,6 +1086,10 @@ static int present_poll(Ctx *c, int64_t ns) {
     if (!hos_nvn_event_value(ev, &v)) return 0;
     const int away = hos_vcore_away();
     const int64_t end = hos_now_ns() + ns;
+    if (async && v != 1) {   /* (asleep while the replay thread records: the asked time at most, as the sleep it stands for) */
+        rx_nvn_replay_idle_wait((uint64_t)ns);
+        hos_nvn_event_value(ev, &v);
+    }
     while (v != 1 && hos_now_ns() < end) {
         SwitchToThread();
         for (int i = 0; i < 64; i++) _mm_pause();
@@ -1606,8 +1627,35 @@ void hos_vcore_back(void) {
    mkw_glue.c: the poll hands over no context, so the compiler need not spill them). It, and everything it calls, must never
    read or write the thread's guest context (Ctx) or run guest code: what it would see there may be older than the loop. A
    stall dump of a thread spinning in a polled loop shows such older registers for the same reason. */
+/* HOS_BG_THROTTLE=<run us>:<sleep us> (default 300:3000, =0: off): OoT's OptimizeChangeBank (guest priority 27, the lowest:
+   on the console it gets only the time nothing else wants) runs without end here, 35-44% of a logical processor in busy
+   places, at the host's lowest priority, which keeps it off no SMT sibling: the game's executor, module worker or replay
+   thread on the other half of its core ran up to 1.7x slower while it did. After <run> of running it gives its virtual core
+   up and sleeps <sleep>, at a checkpoint (an nn::os call or SVC, where Horizon could switch it out too): ~5-9% of a
+   processor instead. bg_kind: 0 not looked at yet, 1 that thread, 2 any other */
+static void bg_throttle(HosThread *t) {
+    static int64_t run_ns = -1, sleep_ms;
+    if (run_ns < 0) {
+        const char *e = getenv("HOS_BG_THROTTLE");
+        long long r = 300, s = 3000;
+        if (e && sscanf(e, "%lld:%lld", &r, &s) < 1) r = 300;
+        sleep_ms = s >= 1000 ? s / 1000 : 1;
+        if (r > 0) hos_log("threads: OptimizeChangeBank runs %lld us, then sleeps %lld ms (HOS_BG_THROTTLE)", r, (long long)sleep_ms);
+        run_ns = r > 0 ? r * 1000 : 0;
+    }
+    if (!t->bg_kind) t->bg_kind = strstr(t->name, "OptimizeChange") ? 1 : 2;
+    if (t->bg_kind != 1 || !run_ns) return;
+    const int64_t now = hos_now_ns();
+    if (!t->bg_since) t->bg_since = now;
+    if (now - t->bg_since < run_ns) return;
+    const int away = hos_vcore_away();
+    Sleep((DWORD)sleep_ms);
+    if (away) hos_vcore_back();
+    t->bg_since = hos_now_ns();
+}
 void hos_vcore_checkpoint(void) {
     HosThread *t = cur;
+    if (t && t->bg_kind != 2) bg_throttle(t);
     if (t && t->vc_kick) vc_yield(t, t->vc_kick == 1);
 }
 void hos_vcore_yield(void) {

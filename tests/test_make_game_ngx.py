@@ -83,6 +83,17 @@ class NgxRuntimeTests(unittest.TestCase):
         self.assertTrue(make_game.fsr_wanted(update, out))
         self.assertFalse(make_game.fsr_wanted(SimpleNamespace(fsr=False, no_fsr=True, update=out), out))
         self.assertFalse(make_game.fsr_wanted(plain, out))   # (a new build without --fsr: the mark is for --update only)
+        # ((Triforce) 11-20) HOOKSHOT_FSR=1 in the environment asks for it as --fsr does; --no-fsr still wins
+        saved = os.environ.get("HOOKSHOT_FSR")
+        try:
+            os.environ["HOOKSHOT_FSR"] = "1"
+            self.assertTrue(make_game.fsr_wanted(plain, out))
+            self.assertFalse(make_game.fsr_wanted(SimpleNamespace(fsr=False, no_fsr=True, update=None), out))
+        finally:
+            if saved is None:
+                os.environ.pop("HOOKSHOT_FSR", None)
+            else:
+                os.environ["HOOKSHOT_FSR"] = saved
 
     def test_linux_runtime(self):
         self.sdk_files("linux")
@@ -194,6 +205,19 @@ class FakeVar:
 
     def set(self, value):
         self.value = value
+
+
+class SetupUpdateKeepsDlssTests(unittest.TestCase):
+    """(Triforce, 11-18, #bug-tracker "Update & merge removes NVIDIA DLSS") Setup's Run: an update of a folder built with DLSS
+    (its ngx/nvngx_dlss.dll) runs with the NGX flags whatever the stored choice, and stores the choice again; the flags follow"""
+    def test_update_of_a_dlss_folder_keeps_it(self):
+        shell = (ROOT / "setup" / "Shell.cs").read_text(encoding="utf-8")
+        run = shell[shell.index("    void Run(Tools tools, List<string> args, bool keepRows = false)"):]
+        run = run[:run.index("\n    }\n")]
+        self.assertIn('args.IndexOf("--update")', run)
+        self.assertIn('File.Exists(System.IO.Path.Combine(updated, "ngx", "nvngx_dlss.dll"))', run)
+        self.assertIn('Install.Set("Dlss", "1");', run)
+        self.assertLess(run.index('"nvngx_dlss.dll"'), run.index('args.AddRange(new[] { "--fetch-ngx-sdk", "--accept-nvidia-license" })'))
 
 
 class LinuxBuilderDlssTests(unittest.TestCase):

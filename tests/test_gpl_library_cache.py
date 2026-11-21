@@ -43,6 +43,22 @@ def main():
             "return true;" in warm[:over]:
         raise SystemExit("the warm pass is taken for done without its libraries on disk, other than for a cache over the bound "
                          "and with a log line that says so")
+    # ((Triforce) over the bound with an older file's data in it (a file carried over an update): that file is not read again,
+    # and the part is not taken for done, so that the next start makes a new file with only these shaders' pipelines; a new file
+    # over the bound too is the way out above. Not with RX_VK_PCACHE_KEEP_OLD (it would be read again at every start), and only
+    # once the .for is gone (else the same file would come back)
+    # ((Triforce) nor for a file of this part's own kind, <file>.own: a checkpoint's before a crash, warm_checkpoint.h)
+    carried = warm.find("if (pcache_from_file && !pcache_from_own && !getenv(\"RX_VK_PCACHE_KEEP_OLD\") && remove((pcache_path + \".for\").c_str()) == 0) {")
+    if carried < over or carried > warm.index("warm_unsaved = true;", over) or \
+            "warm_reset = true;\n                return false;\n            }" not in warm[carried:warm.index("warm_unsaved = true;", over)]:
+        raise SystemExit("a cache over the bound only by a carried file's old pipelines is kept so for good")
+    init = between(draw, "void pcache_init() {", "\n}\n")
+    if "pcache_from_file = pcache && ci.initialDataSize > 0;" not in init or \
+            init.index("pcache_from_file = pcache && ci.initialDataSize > 0;") < init.rindex("vkCreatePipelineCache("):
+        raise SystemExit("pcache_init does not say whether the cache began from the file")
+    if "if (cold && !prepare_stopped() && !warm_reset && !pcache_carry_over.load()) lib_check_made(path, warmed, false);" not in \
+            between(draw, "bool prepare_run(", "\n}\n"):
+        raise SystemExit("a part to be made again into a new file is recorded as a making that did not stay")
     if "if (!saved) return false;" not in warm[saved:] or warm.index("return true;", saved) < warm.index("if (!saved) return false;"):
         raise SystemExit("a warm pass whose libraries are not on disk is taken for done")
     prep = between(draw, "bool prepare_run(", "\n}\n")
@@ -52,7 +68,7 @@ def main():
             if prep.index("return false;", at) > prep.index("prepared_for.warmed = warmed;", at):
                 raise SystemExit("the warmed stamp is written although the warm pass did not finish")
             at += 1
-    if "kWarmRecipe = 1;" in draw or "gpl_libs_cached() ? 1u : 3u" not in between(draw, "uint64_t warmed_stamp(", "\n}\n"):
+    if "kWarmRecipe = 1;" in draw or "gpl_libs_cached() ? 1u : 3u" not in between(draw, "uint64_t warmed_stamp_of(", "\n}\n"):
         raise SystemExit("a folder warmed before the libraries were kept would read as warmed")
     print("PASS: the stage libraries go into the pipeline cache, and the warm pass counts once they are saved")
 

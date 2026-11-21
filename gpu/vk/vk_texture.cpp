@@ -51,6 +51,7 @@
 #include "astc_opaque.h"
 #include "tex_bc1.h"
 #include "touch_quick.h"
+#include "tex_warm.h"      // (Triforce: textures made and uploaded ahead in light frames, texture_warm_step)
 #include "tex_detail.h"
 #include "vram_compact.h"
 #include "texture_gone.h"
@@ -64,6 +65,7 @@
 #include "reupload_early.h"   // ((Triforce) the re-uploads made before a parallel replay's segments)
 #include "upload_earliest.h"   // ((Triforce) a parallel replay's upload into the earliest segment still recorded)
 #include "pass_barrier.h"   // ((Triforce) the rule of the barrier a draw pass starts with)
+#include "redrawn.h"   // ((Triforce) whether a target is drawn again frame after frame: the new-texture budget's rule)
 #include "host_shaders/block_linear_unswizzle_2d_comp_spv.h"
 #include "shaders/swizzle_back_comp_spv.h"
 #include "vk_work.h"   // (after the others: counts the commands that do GPU work, for full_barrier)
@@ -2777,7 +2779,15 @@ Texture* create(const Key& key, const nvn_tex* t, VkFormat vf, bool astc, int bw
                      (int)x.format, (int)r, x.type == VK_IMAGE_TYPE_3D ? " (3D: taken)" : "");
         }
     }
-    if (x.type == VK_IMAGE_TYPE_2D && x.layers >= 6 && x.width == x.height && x.samples == VK_SAMPLE_COUNT_1_BIT)
+    // ((Triforce, 11-18, EstebanGGM's port from NX2navi) on AMD's drivers only a cubemap's image is made cube compatible: a square
+    // 2D array of 6 layers or more made so broke terrain textures on an RX 580 and an RX 7800 XT. Elsewhere as before (a cube view
+    // of an image without the flag is refused: view_of), until a cube read of a non-cube target is ruled out there too.
+    // RX_VK_CUBE_ONLY=1: on every GPU, =0: on none)
+    static const int cube_env = getenv("RX_VK_CUBE_ONLY") ? atoi(getenv("RX_VK_CUBE_ONLY")) : -1;
+    const bool cube_only = cube_env >= 0 ? cube_env != 0 : dev.props.vendorID == 0x1002;
+    const bool cube_target = d.target == NVN_TEXTURE_TARGET_CUBEMAP || d.target == NVN_TEXTURE_TARGET_CUBEMAP_ARRAY;
+    if (x.type == VK_IMAGE_TYPE_2D && (!cube_only || cube_target) && x.layers >= 6 && x.width == x.height &&
+        x.samples == VK_SAMPLE_COUNT_1_BIT)
         flags |= VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT, x.cube = true;
     if (x.type == VK_IMAGE_TYPE_3D) {
         flags |= VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT;
@@ -3233,6 +3243,88 @@ Texture* texture_get(const nvn_tex* t, bool for_sampling) {
     return texture_touch(tex, for_sampling);
 }
 
+// ---- (Triforce, 11-19) Textures made and uploaded ahead, while the frames are light (tex_warm.h, RX_VK_TEX_WARM=1) ----
+namespace {
+std::mutex warm_mu;
+std::deque<std::pair<int, uint64_t>> warm_pending;   // (a registered slot, the frame it was noted in; warm_mu)
+// ((Triforce) the slots in warm_pending (warm_mu): one entry a slot. The game registers its slots again and again in play (every
+// dynamic-resolution step), and the list filled to kMaxPending with the same render targets, dropping the next area's slots)
+std::unordered_set<int> warm_noted;
+int64_t st_warm_looked, st_warm_made, st_warm_ns, st_warm_steps;   // (the recording thread's)
+uint64_t warm_frame = 0;        // (the frame warm_frame_ns is of)
+int64_t warm_frame_ns = 0;      // (this frame's looks ahead so far, over its submissions)
+// (what texture_frame last knew of the card's memory and the textures' budget: tex_warm::has_room)
+bool warm_known = false;
+uint64_t warm_used = 0, warm_allowed = 0, warm_budget = 0;
+}
+bool texture_warm_on() {
+    static const bool on = [] {
+        const bool v = tex_warm::on_of(getenv("RX_VK_TEX_WARM"));
+        if (v)
+            logf("vk: textures made and uploaded ahead in light frames (RX_VK_TEX_WARM): registered slots, %lld ms a frame while the "
+                 "frame before had under %lld draws and dispatches", (long long)(tex_warm::kBudgetNs / 1000000),
+                 (long long)tex_warm::kLightWork);
+        return v;
+    }();
+    return on;
+}
+/// A slot was registered (any thread): noted for texture_warm_step
+void texture_warm_note(int slot) {
+    if (!texture_warm_on()) return;
+    std::lock_guard lk(warm_mu);
+    if (warm_pending.size() < tex_warm::kMaxPending && warm_noted.insert(slot).second) warm_pending.push_back({slot, frame_no});
+}
+/// At a submission's start, on the thread that records it, in its recording: when the frame before was light, the noted
+/// slots old enough are looked up as a draw's first look does (texture_get: made, and its bytes uploaded by this recording's
+/// upload command buffer), until the budget is taken. last_frame_work: the draws and dispatches of the frame before
+void texture_warm_step(int64_t last_frame_work) {
+    if (warm_frame != frame_no) warm_frame = frame_no, warm_frame_ns = 0;
+    if (!tex_warm::may_warm(texture_warm_on(), last_frame_work, frame_upload_ns.load(std::memory_order_relaxed), warm_frame_ns)) return;
+    if (!tex_warm::has_room(warm_known, warm_used, warm_allowed, total_bytes, warm_budget)) return;
+    const auto t0 = std::chrono::steady_clock::now();
+    int64_t spent = 0;
+    bool any = false;
+    for (;;) {
+        std::pair<int, uint64_t> e;
+        {
+            std::lock_guard lk(warm_mu);
+            if (warm_pending.empty() || !tex_warm::ripe(warm_pending.front().second, frame_no)) break;
+            e = warm_pending.front();
+            warm_pending.pop_front();
+            warm_noted.erase(e.first);
+        }
+        nvn_tex t;
+        nvn_view v;
+        bool has_view = false;
+        if (!texture_of(e.first, &t, &v, &has_view) || !t.gpu) continue;   // (registered anew as nothing since, or let go)
+        any = true;
+        st_warm_looked++;
+        {
+            ParLock lk;
+            const size_t had = textures.size();
+            texture_get(&t, true);
+            st_warm_made += textures.size() != had;
+        }
+        spent = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
+        if (!tex_warm::goes_on(warm_frame_ns + spent, frame_upload_ns.load(std::memory_order_relaxed))) break;
+    }
+    warm_frame_ns += spent;
+    if (!any) return;
+    st_warm_ns += spent, st_warm_steps++;
+    static int64_t told;
+    if (st_warm_made - told >= 256) {
+        size_t left;
+        {
+            std::lock_guard lk(warm_mu);
+            left = warm_pending.size();
+        }
+        told = st_warm_made;
+        logf("vk: textures made ahead in light frames (RX_VK_TEX_WARM): %lld made of %lld looked up, in %lld submissions' starts, "
+             "%.0f ms in all; %zu slots noted and not looked up yet", (long long)st_warm_made, (long long)st_warm_looked,
+             (long long)st_warm_steps, st_warm_ns / 1e6, left);
+    }
+}
+
 uint64_t texture_destroy_generation() {
     return destroy_gen;
 }
@@ -3321,6 +3413,15 @@ void audit_scan(const Texture& t) {
 }
 
 thread_local bool upload_defer_ok = false;
+bool texture_redrawn(const Texture* t) {
+    if (!t) return true;
+    static const uint64_t window = [] {   // ((Triforce, 11-19) redrawn.h kWindow; RX_VK_REDRAWN_FRAMES=1: v0.5.2's frame-before rule)
+        const char* e = getenv("RX_VK_REDRAWN_FRAMES");
+        const long v = e && *e ? strtol(e, nullptr, 10) : 0;
+        return v >= 1 && v <= 600 ? (uint64_t)v : redrawn::kWindow;
+    }();
+    return redrawn::drawn_before(t->prev_written, t->last_written, t->gpu_written && !t->released, frame_no, window);
+}
 /// (Triforce) The hold of the last picture (present_hold.h): the mode do_present sets for the draws of the next frame, this
 /// frame's looks that left a texture owed its first bytes, and the new textures left for later
 std::atomic<int> hold_mode{present_hold::AS_BEFORE};
@@ -3510,6 +3611,10 @@ bool upload_again_later(const Texture& tex) {
     return true;
 }
 int64_t texture_uploads_later() { return st_again_later.load(std::memory_order_relaxed); }
+bool texture_frame_left_any() {   // (each counter is set back at the frame's end: texture_frame)
+    return frame_owed.load(std::memory_order_relaxed) || st_again_later_frame.load(std::memory_order_relaxed) ||
+           st_torn_later_frame.load(std::memory_order_relaxed) || st_deferred_frame.load(std::memory_order_relaxed);
+}
 // ---- (Triforce, 11-16) the re-uploads made before a parallel replay's segments (reupload_early.h) ----
 namespace {
 std::mutex reup_mu;   // (the notes come from the segments' threads too, under the recording lock; the early looks before them)
@@ -4665,6 +4770,9 @@ void texture_written(Texture* tex, const char* why) {
         tex->wb_burst = frame_no;
     }
     if (!tex->gpu_written || tex->released) tex->first_written = frame_no;
+    // ((Triforce) redrawn.h: the frame it was written in before this one, for the new-texture budget's rule; read before
+    // gpu_written and released are set for this write)
+    tex->prev_written = redrawn::prev_on_write(tex->prev_written, tex->last_written, tex->gpu_written && !tex->released, frame_no);
     tex->last_written = frame_no;
     tex->gpu_written = true;
     upload_same::changed(tex->same);   // ((Triforce) its image's bytes are the GPU's: no kept hash of a re-upload's is theirs)
@@ -6008,6 +6116,7 @@ void texture_frame(uint64_t completed) {
         logf("vk: verify %ux%u: %d textures, %d changed since uploaded, %d of them unnoticed", verify_dim().first,
              verify_dim().second, checked, changed, missed);
     }
+    warm_known = known, warm_used = used, warm_allowed = allowed, warm_budget = budget;   // ((Triforce) tex_warm.h: the room there is)
     texture_sweep(completed, total_bytes <= budget, budget, evict_to, known, used, allowed, false, hold_to, rule_to);
 }
 

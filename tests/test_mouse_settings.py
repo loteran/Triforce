@@ -10,10 +10,11 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def preset_exempt(menu, value):
-    """the menu's row for opts.<value> leaves the quality preset alone (Row::preset_exempt, which set_row checks)"""
+    """the menu has no quality preset that a change of the row's could reset ((Triforce, options_version 7) the Quality preset
+    row is gone, and with it the memory budget it set: the card's own), and the row is on its tab"""
     start = menu.index("&opts.%s," % value, menu.index("Row rows[] = {"))
     row = menu[start:menu.index("},", start)]
-    return row.rstrip().endswith(", true") and "if (!r.preset_exempt)" in menu
+    return bool(row) and "opts.preset" not in menu and "void apply_preset" not in menu
 
 
 def read(*parts):

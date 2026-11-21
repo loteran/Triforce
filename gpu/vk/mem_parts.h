@@ -199,5 +199,16 @@ constexpr uint64_t kKeepAllBytes = 22ull << 30;
 inline bool keep_all_pipelines(uint64_t total, uint64_t avail, uint64_t own) {
     return total >= (20ull << 30) && avail + own >= kKeepAllBytes;
 }
+/// (11-18) What the process holds that counts as the game's for keep_all_pipelines: its working set (ws) less what reading the
+/// pipeline cache added (cache_read; the driver holds that all session, so it is no room for the pipelines). Two 32 GB PCs on
+/// v0.5.1 with 2.7 and 3.0 GB cache files (4.7 and 4.9 GB of working set once read): 18.2 GB available + 7.0 held and 19.1 +
+/// 7.7, both over 22 GB, everything kept, and RAM short all session (39 times on one; the other lost the GPU after the save
+/// loaded). Without the cache: 20.5 and 21.9 GB, kept by none. Not on AMD's driver (amd: the vendor 0x1002), which the rule
+/// keeps as it was: there a pipeline left to its first draw cost ~100 ms (an RX 6650 XT: 152 of them in one 15.7 s frame),
+/// worse than the RAM
+inline uint64_t own_for_keep(uint64_t ws, uint64_t cache_read, bool amd) {
+    if (amd) return ws;
+    return ws > cache_read ? ws - cache_read : 0;
+}
 
 }   // namespace mem_parts

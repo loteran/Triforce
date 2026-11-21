@@ -80,13 +80,17 @@ def main():
     option = option[:option.index("};") + 2]
     check("if (id == 11) return opts.stick_dead_zone;" in option, "the host cannot see the menu's row (option 11)")
     check("int stick_dead_zone = 0;" in header, "the option's default is not 0 (Default)")
-    row = re.search(r'\{TAB_CONTROLS, "Stick dead zone", &opts\.stick_dead_zone, 0, 5, 1, tx_stick_dead_zone,\s*"[^}]*\},',
-                    menu)
-    check(row is not None, "the Insert menu has no Stick dead zone row (0 to 5)")
-    check(row.group(0).rstrip().endswith("nullptr, false, true},"),
-          "the row is not preset_exempt: changing the dead zone would set the quality preset to Custom")
-    check("\n| Stick dead zone | Default (24%), 5%, 10%, 15%, 20%, 30%" in readme,   # (the table is Setting | Options now)
-          "readme.md's settings table has no Stick dead zone row")
+    # ((Triforce, options_version 7) the shared Stick dead zone row is gone: each stick's own row has its Default, XInput's
+    # 7849, and an older file's shared zone is moved into each stick's own where it had none (merged_rows.h migrate). The
+    # option stays the host's, always 0 now)
+    check('"Stick dead zone", &opts.stick_dead_zone' not in menu, "the Insert menu still has a shared Stick dead zone row")
+    merged = (ROOT / "gpu" / "vk" / "merged_rows.h").read_text(encoding="utf-8")
+    check('"stick_dead_zone"' in merged[merged.index("constexpr const char* kDropped[]"):], "an old stick_dead_zone= line is kept")
+    check('if (!strcmp(line, "stick_dead_zone")) before7.stick_shared = atoi(eq + 1);' in menu and
+          "merged_rows::migrate(version, before7, opts.output_res, opts.lstick_dead_zone, opts.rstick_dead_zone);" in menu,
+          "menu_init does not move an older file's shared dead zone into each stick's own")
+    check("\n| Left stick dead zone, Right stick dead zone | Default (24%), or 0% to 50%" in readme,
+          "readme.md's settings table has no Left and Right stick dead zone row")
 
     c = r'''#include <stdint.h>
 #include <stdio.h>
@@ -124,40 +128,29 @@ int main(void) {
 }
 '''
 
-    init = block(menu, "void menu_init(")
-    loop = block(init, "for (Row& r : rows) {")
-    check("ini_key(r)" in loop, "menu_init's options loop no longer reads rows by ini_key")
-    cxx = r'''#include <algorithm>
-#include <cctype>
+    # (the migration: a shared zone moved into a stick's own cuts every input where the shared one did, so a file from before
+    # plays the same)
+    cxx = r'''#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
-#include <cstring>
+#include "''' + (ROOT / "gpu" / "vk" / "merged_rows.h").as_posix() + r'''"
 #define CHECK(x) do { if (!(x)) { fprintf(stderr, "FAIL:%d %s\n", __LINE__, #x); exit(1); } } while (0)
-enum MenuTab { TAB_CONTROLS };
-struct Options { int output_res = 0, resolution = 0, fps_cap = 0, upscale = 0, dlss = 0, stick_dead_zone = 0, language = 0; } opts;
-static int output_choice(int v) { return v; }
-''' + block(menu, "struct Row {") + ";\n" + block(menu, "const char* tx_stick_dead_zone(") + "\n" + \
-        "Row rows[] = {" + row.group(0) + "};\n" + block(menu, "bool ini_row(") + "\n" + block(menu, "const char* ini_key(") + r'''
-static int parse(const char* text) {
-    opts.stick_dead_zone = 0;
-    char line[80];
-    snprintf(line, sizeof line, "%s", text);
-    char* eq = strchr(line, '=');
-    *eq = 0;
-    ''' + loop + r'''
-    return opts.stick_dead_zone;
-}
+''' + block(hid, "int32_t hos_stick_axis(") + "\n" + own + r'''
 int main() {
-    CHECK(!strcmp(ini_key(rows[0]), "stick_dead_zone"));
-    CHECK(rows[0].preset_exempt && !rows[0].restart);
-    CHECK(parse("stick_dead_zone=0\n") == 0 && parse("stick_dead_zone=3\n") == 3 && parse("stick_dead_zone=5\n") == 5);
-    CHECK(parse("stick_dead_zone=9\n") == 5 && parse("stick_dead_zone=-4\n") == 0 && parse("stick_dead_zone=x\n") == 0);
-    CHECK(parse("stick_deadzone=3\n") == 0);
-    static const char* want[] = {"Default (24%)", "5%", "10%", "15%", "20%", "30%"};
-    for (int v = 0; v < 6; v++) CHECK(!strcmp(rows[0].text(v), want[v]));
-    CHECK(!strcmp(rows[0].text(-1), want[0]) && !strcmp(rows[0].text(6), want[0]));
-    (void)output_choice(0);
-    printf("menu: stick_dead_zone parses and clamps to 0..5; labels Default (24%%) ... 30%%\n");
+    namespace mr = mkwvk::merged_rows;
+    for (int z = 0; z < 6; z++) {
+        int out = 0, l = -1, r = 12;   /* (the right stick has a zone of its own: it keeps it) */
+        mr::Before7 old;
+        old.stick_shared = z;
+        mr::migrate(6, old, out, l, r);
+        CHECK(l == mr::kSharedZone[z] && r == 12 && out == 0);
+        for (int32_t i = -32768; i <= 32767; i++)
+            CHECK(hos_stick_axis_own((int16_t)i, 0, l) == hos_stick_axis((int16_t)i, z));
+        int l7 = -1, r7 = -1;
+        mr::migrate(8, old, out, l7, r7);   /* (a file of version 8 has no shared zone to move; v0.5.1's 7 still had one) */
+        CHECK(l7 == -1 && r7 == -1);
+    }
+    printf("menu: an older file's shared dead zone, moved into each stick's own, cuts all 65536 inputs where it did\n");
     return 0;
 }
 '''

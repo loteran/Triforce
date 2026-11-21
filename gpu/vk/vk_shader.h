@@ -134,6 +134,8 @@ std::string program_code_keys(const NvnState& s);   // (hookshot) " stage:key" f
 const Program* program_pick(const NvnState& s, ProgramKind kind, const uint8_t color_types[8]);   // (program_for without its cache)
 void program_wait(const Program* p);
 uint64_t program_cache_stamp();   // (what the kept programs and pipelines are good for)
+int shader_water_mode();          // ((Triforce) make_module's water simplification: 0 off, 1 medium, 2 low (vk_shader.cpp))
+uint64_t program_cache_build_part();   // ((Triforce) the part of it only a new build changes: cache_set.h)
 size_t program_cache_load_some(const std::unordered_set<uint64_t>& wanted, const std::function<void(Program&)>& fn,
                                bool computes = true, bool fallbacks = false);   // (computes: and every kept compute program)
 /// (Triforce) The pipeline notes' programs, one key a note in their order: the order the program read-ahead reads in

@@ -75,28 +75,34 @@ def check_source():
     check('const char* tx_perf(int v) { return v == 1 ? "On" : v >= 2 ? "Full" : "Off"; }' in menu, "the row's values are not Off, On, Full")
     check("show_fps" not in block(menu, "const char* ini_key(const Row& r) {"), "the row's key is no longer its name's")
     check(re.search(r"\n    int show_fps = 0;", menu_h) is not None, "the overlay is not off by default")
-    # ((Triforce) 11-17, the tabs in sections: the last row of the Display tab's Frame rate, before High dynamic range)
-    check(menu.index('{TAB_DISPLAY, "VSync"') < menu.index('{TAB_DISPLAY, "FPS counter"') < menu.index('{TAB_DISPLAY, "High dynamic range"'),
-          "the row is not where it was")
+    # ((Triforce, options_version 7) the Display tab's Overlay group, after RenoDX's rows)
+    check(menu.index('MENU_HEADING(TAB_DISPLAY, "Overlay")') < menu.index('{TAB_DISPLAY, "FPS counter"') <
+          menu.index('MENU_HEADING(TAB_GRAPHICS, "Upscaling")'), "the row is not in the Display tab's Overlay group")
     # (the counter itself for 1 and for 2: menu_record's `fps` is the row not 0; the FPS-only mode as it was)
     # (Full is NX2navi's panel alone, in the counter's place (its perf_draw: mode 2 draws perf_full_draw and returns), and under
     # an open menu (its BringWindowToDisplayBack): draw_menu draws it over its dim, before its pages; the game tab's header over
-    # it. tests/test_fps_overlay_order.py runs menu_record for the order)
+    # it; (Triforce, 11-19) over the Mods entry's Quit dialog and its dim instead. tests/test_fps_overlay_order.py runs
+    # menu_record for the order)
     for name in ("void menu_record(VkCommandBuffer cmd, uint32_t index, uint32_t w, uint32_t h) {",
                  "void menu_record_image(VkCommandBuffer cmd, VkImage image, VkImageView view, uint32_t w, uint32_t h) {"):
         record = block(menu, name)
         check("const bool fps = opts.show_fps && !start;" in record or "const bool fps = opts.show_fps && !startup_on.load(std::memory_order_acquire);" in record,
               "the counter's and the panel's switch is not the row")
-        check("const bool full = fps && opts.show_fps == 2;" in record and "if (open) draw_menu(c, full);" in record and
-              "if (full) draw_perf(c);" in record and "if (fps && !full) draw_fps(c, open || game_tab);" in record,
+        check("const bool full = fps && opts.show_fps == 2;" in record and "if (open) draw_menu(c, full && !over_row);" in record and
+              "if (full) draw_perf(c);" in record and "if (full && over_row) draw_perf(c);" in record and
+              "if (fps && !full) draw_fps(c, (open && page != kModsRowPage) || game_tab);" in record,
               "Full does not draw the panel alone, under the menu (%s)" % name[:24])
         check(record.index("if (full) draw_perf(c);") < record.index("if (game_tab) draw_game_tab(c);"), "the game tab's header is not over the panel")
-        check(record.count("draw_perf(") == 1, "the panel is drawn twice")
+        check(record.count("draw_perf(") == 2, "the panel is drawn more than under the menu and over the Mods entry's dialog")
     record = block(menu, "void menu_record(VkCommandBuffer cmd, uint32_t index, uint32_t w, uint32_t h) {")
     check(record.index("bugshot_record(") < record.index("ui::begin("), "a bug capture's picture is taken after the overlays could be drawn")
     dm = block(menu, "void draw_menu(ui::Ctx& c, bool perf_under) {")
-    check(dm.index("ui::kDimAlpha));") < dm.index("if (perf_under) draw_perf(c);") < dm.index("const int vtx0 = c.d->VtxBuffer.Size"),
-          "the panel is not over the menu's dim and under its pages (nor kept out of the column's move)")
+    # ((Triforce, 11-19) the panel waits (panel_wait) in the list split in two and is drawn between the pages and the header
+    # (panel_between), so that a dialog's dim can go under it; its vertices are kept out of the column's move (put_on_grid))
+    check(dm.index("ui::kDimAlpha));") < dm.index("const int vtx0 = c.d->VtxBuffer.Size") <
+          dm.index("panel_wait = {&c, window_clip, 0, 0};") < dm.index("panel_between(c.d);") and
+          "put_on_grid(c.d, vtx0, cmd0, menu_map, window_clip, perf0, perf1);" in dm,
+          "the panel is not over the menu's dim and under its pages' header (nor kept out of the column's move)")
     check("void draw_menu(ui::Ctx& c, bool perf_under = false);" in menu, "draw_menu's other callers ask for the panel")
     check("fps_drawn" not in menu, "the panel still moves for the counter, which Full does not draw")
 
@@ -196,7 +202,7 @@ def check_source():
     # ((Triforce, 11-16) "The FPS counter doesn't show the frame generation FPS, and the base frame rate": DLSS frame generation's
     # frames are counted by the present's multiplier, and the counter writes the game's own rate beside them while it generates)
     replay = (ROOT / "gpu/vk/vk_replay.cpp").read_text(encoding="utf-8")
-    check("else if (!held) menu_note_frame(true, dlssg::multiplier());" in replay,
+    check("else if (!held) menu_note_frame(true, ffx_swapchain && ffxfg::generating() ? 2 : dlssg::multiplier());" in replay,   # (linux fork: AMD's swapchain)
           "the present does not count DLSS frame generation's frames it shows")
     check("if (opts.framegen >= 1 || mkwvk::dlssg::multiplier() > 1) snprintf(fps_sub, sizeof fps_sub, \"%.0f\", game);" in menu,
           "the counter does not write the game's own rate with DLSS frame generation")
@@ -264,7 +270,7 @@ def check_source():
                     "label(kPerfSetting[i])", "if (names) {", "divider();", "v.gpu_name), y += px + item;", "v.cpu_name);"],
              "the panel's parts are not in NX2navi's order")
     # (every text through the edge: none drawn bare; the edge the FPS counter's own)
-    check(draw.count("AddText(") == 0 and "edged_text(c, f, px, ImVec2(x, ui::mid_top(f, px, y)), col, t);" in block(menu, "void draw_fps(ui::Ctx& c, bool under_banner) {"),
+    check(draw.count("AddText(") == 0 and "edged_text(c, f, px, ImVec2(x, ui::mid_top(f, px, y)), col, t);" in block(menu, "void draw_fps(ui::Ctx& window, bool under_banner) {"),
           "the panel's texts, or the counter's, are not drawn with the one edge")
     edge = block(menu, "void edged_text(ui::Ctx& c, ImFont* f, float px, ImVec2 p, ImU32 col, const char* t) {")
     check("const float e = std::max(1.0f, px * 0.05f);" in edge and "ui::rgba(20, 14, 6, 150)" in edge, "the edge is not the HUD's thin soft one")
@@ -284,7 +290,7 @@ def check_source():
           "the panel's text size is not baked at once when it changes")
     check("ImFont* font = c.f.body ? c.f.body : c.f.strong;   // (draw_perf's)" in block(menu, "void bake_perf(const ui::Ctx& c, float px) {") and
           "ImFont* font = c.f.body ? c.f.body : c.f.strong;" in draw, "the panel's glyphs are baked in another font than draw_perf's")
-    check(record.index("prebake(c);") < record.index("if (open) draw_menu(c, full);"), "the bake is not before the drawing")
+    check(record.index("prebake(c);") < record.index("if (open) draw_menu(c, full && !over_row);"), "the bake is not before the drawing")
     check("if (r == kPerfFG && !v.fg) continue;" in draw, "the FG row shows without frame generation")
     check("if (v.setting[i][0]) label(kPerfSetting[i])" in draw, "a setting without a value is not left out")
     # (no panel of its own making: the options' plate, separator and font; the game's art read at run time from the player's
@@ -305,7 +311,7 @@ def check_source():
     box = block(ui_h, "inline void box(Ctx& c, ImVec2 a, ImVec2 b, float opacity = 1) {")
     check("nine(c, t, a - ImVec2(m, m), b + ImVec2(m, m), 133, 133, alpha(IM_COL32_WHITE, opacity));" in box and
           "c.d->AddRectFilled(a, b, alpha(kBox, opacity));" in box, "the caption plate is not drawn at the opacity asked for")
-    sep = block(ui_h, "inline void separator(Ctx& c, float x0, float x1, float y, ImU32 col = rgba(104, 80, 46), ImU32 line_col = 0) {")
+    sep = block(ui_h, "inline void separator(Ctx& c, float x0, float x1, float y, ImU32 col = kSeparator, ImU32 line_col = 0) {")
     check("if (!line_col) line_col = col;" in sep and sep.count("line_col") >= 6, "the separator's lines do not take their tint")
     for t in ("alpha(label_col", "alpha(value_col", "alpha(ui::kInk", "alpha(ui::kAccent"):
         check(t not in draw, "the panel's text is see-through too")

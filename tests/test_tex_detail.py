@@ -53,33 +53,17 @@ MENU_FIXTURE = r"""
 #define CHECK(x) do { if (!(x)) { std::fprintf(stderr, "FAIL:%d %s\n", __LINE__, #x); return 1; } } while (0)
 @OPTIONS@
 Options opts;
-/* (stand-ins for what the preset asks of the Upscaler's rows, and the card's own level as vk_texture.cpp says it) */
-int upscaler() { return 0; }
-namespace ur { int snap(int, int v) { return v; } }
+/* (a stand-in for the card's own level as vk_texture.cpp says it) */
 int card = -1;
 int texture_detail_auto() { return card; }
-@BUDGETS@
-@PRESET@
 @ENV@
 @TEXT@
 @HINT@
 int main(int argc, char**) {
     const bool env = argc > 1;   /* (run again with RX_VK_TEX_DETAIL=low) */
-    /* a Quality preset sets its card size's detail, whatever was chosen: Minimum (6GB) Low, Low (8GB) Reduced, Balanced,
-       High and Ultra Full; Custom leaves the row alone */
-    static const int want[] = {0, 3, 2, 1, 1, 1};
-    for (int p = 1; p <= 5; p++)
-        for (int v = 0; v <= 3; v++) {
-            opts = Options{};
-            opts.tex_detail = v;
-            apply_preset(p);
-            CHECK(opts.tex_detail == want[p]);
-        }
+    /* ((Triforce, options_version 7) no Quality preset sets it any more: the row is the player's, Automatic by the card) */
     opts = Options{};
     CHECK(opts.tex_detail == 0);   /* (Automatic unless chosen: as before the row) */
-    opts.tex_detail = 2;
-    apply_preset(0);
-    CHECK(opts.tex_detail == 2);
     /* the value: the three levels by name, Automatic with what it gives this card once that is known */
     CHECK(!std::strcmp(tx_tex_detail(1), "Full") && !std::strcmp(tx_tex_detail(2), "Reduced") && !std::strcmp(tx_tex_detail(3), "Low"));
     CHECK(!std::strcmp(tx_tex_detail(0), "Automatic"));
@@ -109,8 +93,10 @@ int main(int argc, char**) {
 def menu_fixture():
     menu = (ROOT / "gpu/vk/vk_menu.cpp").read_text(encoding="utf-8")
     header = (ROOT / "gpu/vk/vk_menu.h").read_text(encoding="utf-8")
-    # the row: on the Graphics tab, Automatic to Low, a restart, and not the preset's to keep (no preset_exempt: a change turns
-    # the Quality preset to Custom, whose memory limits are the card's own)
+    # the row: on the Graphics tab, Automatic to Low, a restart. ((Triforce, options_version 7) No Quality preset sets it: the
+    # memory limits are the card's own)
+    if "void apply_preset" in menu or "opts.preset" in menu:
+        raise SystemExit("vk_menu.cpp: a Quality preset is back, and could set the Texture detail")
     row = re.search(r'\{TAB_GRAPHICS, "Texture detail", &opts\.tex_detail, 0, 3, 1, tx_tex_detail,', menu)
     if not row:
         raise SystemExit("vk_menu.cpp: the Texture detail row is missing, or not Automatic, Full, Reduced, Low on the Graphics tab")
@@ -123,8 +109,7 @@ def menu_fixture():
         raise SystemExit("menu_init does not keep the Texture detail the game started with")
     fixture = MENU_FIXTURE.replace("@ROOT@", ROOT.as_posix())
     for mark, text in (("@OPTIONS@", re.search(r"struct Options \{.*?\n\};", header, re.S).group(0)),
-                       ("@BUDGETS@", definition(menu, "void sync_preset_budgets")),
-                       ("@PRESET@", definition(menu, "void apply_preset")),
+
                        ("@ENV@", definition(menu, "int tex_detail_env")),
                        ("@TEXT@", definition(menu, "const char* tx_tex_detail")),
                        ("@HINT@", definition(menu, "const char* hn_tex_detail"))):

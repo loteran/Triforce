@@ -25,6 +25,10 @@ for its left half (On, up to where the halves meet, past the value's middle) and
 choice's value Left or Right of its middle, on a name or a row of no kind A. A row scrolled away past the list is not
 pointed at, the header (our tabs', the renderer's) is neither pointed at nor clicked, the right button is B, and the wheel
 gives the focus to the row past the list's foot (the list's view, not the screen's).
+(Triforce, 11-19) The Mods entry under the title's list is told to the renderer a pitch under the last row, and the mouse
+takes it across the line as the game's own rows: moved onto its word it takes the cursor (as the pad's Down), a click there
+opens it. On the pause menu's System page the mouse moved onto Mods or Quit under its buttons takes the cursor as well,
+as the game's own buttons do on hover.
 python -I -B tests/test_oot_menu_mouse.py   (Windows: the feature's; elsewhere it is skipped)
 """
 import shutil
@@ -73,6 +77,7 @@ static uint64_t heap_top = FAKE_BASE + 0x1000;
 static int64_t clock_ns = 1000000000LL;
 void hos_log(const char *fmt, ...) { va_list a; va_start(a, fmt); vfprintf(stderr, fmt, a); va_end(a); fputc(10, stderr); }
 int64_t hos_now_ns(void) { return clock_ns; }
+volatile LONG64 hos_present_count;   /* (display.c's: the game's presents, which hos_oot_mods_down counts) */
 void hos_oot_menu_focus(Ctx *c, uint64_t screen, uint64_t pane, uint64_t lr);
 void hos_oot_menu_tick(Ctx *c, uint64_t screen);
 
@@ -83,8 +88,14 @@ static int pointer_hidden;   /* (the cursor hidden while the pad is in use: the 
 static int menu_frees, menu_gone;   /* (the game's menus' mouse: freed for a menu's frame; their close told) */
 void hos_mouse_game_menu(void) { menu_frees++; }
 void hos_mouse_game_menu_gone(void) { menu_gone++; }
-void rx_option_set(int id, int value) { (void)id, (void)value; }   /* (the Options screen named: the renderer's) */
-int rx_option(int id, int otherwise) { (void)id; return otherwise; }   /* ((Triforce) the Mods entry's: never selected here) */
+/* (the renderer's options: the Options screen named; (Triforce) the Mods entry's list told, and the host's words on it) */
+static int mods_box_said[5], mods_enter_said, mods_selected, game_options_said;
+void rx_option_set(int id, int value) {
+    if (id >= HOS_OPT_MODS_X0 && id <= HOS_OPT_MODS_PITCH) mods_box_said[id - HOS_OPT_MODS_X0] = value;
+    if (id == HOS_OPT_MODS_ENTER) mods_enter_said = value;
+    if (id == HOS_OPT_GAME_OPTIONS) game_options_said = value;
+}
+int rx_option(int id, int otherwise) { return id == HOS_OPT_MODS_SELECTED ? mods_selected : otherwise; }
 int hos_mouse_wheel_take(void) { const int w = wheel_next; wheel_next = 0; return w; }   /* (the wheel only, mouse kept) */
 int hos_mouse_game_pointer(int *x, int *y, int *w, int *h, uint32_t *pressed, int *wheel) {
     *x = ptr_x, *y = ptr_y, *w = 3840, *h = 2160, *pressed = pressed_next, *wheel = wheel_next;
@@ -392,6 +403,86 @@ int main(void) {
     focused(o_toggle, 0);
     (void)o_away;
 
+    /* ((Triforce, 11-19) The title's list with the Mods entry under it (mods_list_tick; the renderer draws it): four marks
+       110 apart, the game's cursor on the last (its focus controller's entry). The entry is told a pitch under the last mark,
+       and taken across the line as the game's own rows are (1100 wide, a pitch high): the mouse moved onto its word, well
+       off the 60 x 60 mark's square, takes the cursor as the pad's Down does (the renderer's word 1); a click there opens it
+       (2). With Mods chosen the mouse moving over it says nothing again */
+    clock_ns += 300000000LL;
+    const uint64_t tl = screen_new(0x84c106e8ULL);
+    button_new(tl, 0, -500, 60, 60), button_new(tl, 0, -610, 60, 60), button_new(tl, 0, -720, 60, 60);
+    const uint64_t t3 = button_new(tl, 0, -830, 60, 60);
+    {
+        const uint64_t mgr = alloc(128), ctrl = alloc(256), e = alloc(64);
+        put64(get64(tl + 32) + 96, mgr), put64(mgr + 40, ctrl), put64(ctrl + 120, e), put64(e + 24, t3), put64(e + 32, tl);
+    }
+    focused(t3, 3);
+    frame(tl, 0, -830);
+    frame(tl, 0, -830);
+    CHECK(mods_box_said[4] == 110 && mods_box_said[2] == -860 && mods_box_said[3] == -800);   /* (the last mark's box, the pitch) */
+    mods_enter_said = 0;
+    reset();
+    frame(tl, 230, -950);   /* (the word, 230 right of the entry's middle: under no game row) */
+    CHECK(mods_enter_said == 1 && focus_calls == 0);
+    mods_enter_said = 0;
+    pressed_next = HOS_MOUSE_LEFT;
+    frame(tl, 230, -950);
+    CHECK(mods_enter_said == 2 && taps[0] == 0);   /* a click on it: open, not the game's A */
+    mods_enter_said = 0;
+    frame(tl, -400, -980);
+    CHECK(mods_enter_said == 1);   /* (the entry's lower half, left of its middle) */
+    mods_enter_said = 0;
+    frame(tl, 0, -1010);
+    CHECK(mods_enter_said == 0);   /* below it: nothing */
+    mods_selected = 1;
+    frame(tl, 230, -950);
+    CHECK(mods_enter_said == 0);   /* chosen already */
+    mods_selected = 0;
+
+    /* ((Triforce, 11-19) The pause menu's System page: its buttons (Pa_Button_*) in the left column, 200 apart, the game's
+       cursor on the last; Mods a pitch under it and Quit under Mods. The mouse moved onto Mods takes the cursor (1), onto
+       Quit too (4), as the game's buttons above take it on hover; a click on Quit opens its dialog (3) */
+    clock_ns += 300000000LL;
+    const uint64_t ps = screen_new(0x84c0baa8ULL);
+    uint64_t sys[4];
+    for (int i = 0; i < 4; i++) {
+        sys[i] = button_new(ps, -1000, 300 - 200.0f * i, 672, 144);
+        const uint64_t name = alloc(32);
+        memcpy(GP(name), "Pa_Button_00", 13);
+        put64(sys[i] + 0x18, name);
+    }
+    {   /* (the System page's name, as the pause menu's focus handler reads it: pane+32 -> +128 -> +248 -> +24) */
+        const uint64_t obj = alloc(256), p1 = alloc(512), p2 = alloc(64), page = alloc(32);
+        memcpy(GP(page), "PaSystemMenu_00", 16);
+        put64(p2 + 24, page), put64(p1 + 248, p2), put64(obj + 128, p1), put64(sys[3] + 32, obj);
+        const uint64_t mgr = alloc(128), ctrl = alloc(256), e = alloc(64);
+        put64(get64(ps + 32) + 96, mgr), put64(mgr + 40, ctrl), put64(ctrl + 120, e), put64(e + 24, sys[3]), put64(e + 32, ps);
+    }
+    focused(sys[3], 3);
+    hos_oot_menu_focus(&ctx, ps, sys[3], 0);
+    frame(ps, -1000, 0);
+    frame(ps, -1000, 0);
+    CHECK(mods_box_said[4] == 200 && mods_box_said[2] == -372 && mods_box_said[3] == -228);   /* (the last button's box, the pitch) */
+    mods_enter_said = 0;
+    reset();
+    frame(ps, -1100, -500);   /* (Mods: under no game button) */
+    CHECK(mods_enter_said == 1 && focus_calls == 0);
+    mods_enter_said = 0;
+    frame(ps, -1100, -700);   /* (Quit) */
+    CHECK(mods_enter_said == 4 && focus_calls == 0);
+    mods_enter_said = 0;
+    pressed_next = HOS_MOUSE_LEFT;
+    frame(ps, -1100, -700);
+    CHECK(mods_enter_said == 3 && taps[0] == 0);   /* a click on Quit: its dialog, not the game's A */
+    mods_enter_said = 0;
+    frame(ps, -1100, -900);
+    CHECK(mods_enter_said == 0);   /* below Quit: nothing */
+    mods_selected = 1;
+    frame(ps, -1100, -500);
+    frame(ps, -1100, -700);
+    CHECK(mods_enter_said == 0);   /* chosen already */
+    mods_selected = 0;
+
     /* Back in play (R let go): only the HUD's screen runs, no menu's. The window is told the menus have closed once
        50 ms of frames have had none: the camera gets its mouse back then, not 300 ms on */
     clock_ns += 300000000LL;
@@ -402,6 +493,29 @@ int main(void) {
     CHECK(menu_gone == 0);   /* (the first frames: not yet 50 ms) */
     for (int i = 0; i < 4; i++) frame(hud, 0, 0);
     CHECK(menu_gone > 0);
+
+    /* ((Triforce, 11-20, a review of 1104352) The Options screen told as 1 from the title (no pause menu ran before it), as 2
+       chosen from the pause menu (its screen ran just before), for the whole of that run even with the pause menu's updates
+       stopped under it; a new run later with no pause menu before it: 1 again */
+    clock_ns += 2000000000LL;
+    const uint64_t opts = screen_new(0x84c0f108ULL);
+    game_options_said = 0;
+    frame(opts, 0, 0);
+    CHECK(game_options_said == 1);   /* (the title's Options) */
+    clock_ns += 300000000LL;
+    frame(hud, 0, 0);
+    frame(ps, -1000, 0);             /* (the pause menu, Options chosen on it) */
+    frame(opts, 0, 0);
+    CHECK(game_options_said == 2);
+    for (int i = 0; i < 60; i++) frame(opts, 0, 0);   /* (a second of it alone) */
+    CHECK(game_options_said == 2);
+    clock_ns += 300000000LL;         /* (closed; the pause menu back, then play, then the title's Options) */
+    frame(ps, -1000, 0);
+    clock_ns += 1000000000LL;
+    frame(hud, 0, 0);
+    clock_ns += 300000000LL;
+    frame(opts, 0, 0);
+    CHECK(game_options_said == 1);
     if (!fails) printf("PASS\n");
     return fails != 0;
 }
@@ -456,6 +570,22 @@ int main(void) {
     memcpy(GP(options), &other_vt, 8);
     hos_oot_menu_tick(&ctx, options);
     CHECK(told == 2 && !hos_oot_options_front());
+    /* ((Triforce, 11-20, a review of 1104352) chosen from the pause menu (its screen, 0x84c0baa8, ran just before): told as
+       2 for that run, the pause menu's updates stopped under it or not; a later run with none before it: 1 */
+    memcpy(GP(options), &options_vt, 8);
+    const uint64_t pause = FAKE_BASE + 0x3000, pause_vt = 0x84c0baa8ULL;
+    memcpy(GP(pause), &pause_vt, 8);
+    now_ns += 300000000;
+    hos_oot_menu_tick(&ctx, pause);
+    CHECK(told == 2);   /* (the pause menu is not the Options screen) */
+    now_ns += 16000000;
+    hos_oot_menu_tick(&ctx, options);
+    CHECK(told == 3 && told_value == 2);
+    for (int i = 0; i < 60; i++) now_ns += 16000000, hos_oot_menu_tick(&ctx, options);
+    CHECK(told == 63 && told_value == 2);
+    now_ns += 1000000000;   /* (closed, back in play, then the title's Options) */
+    hos_oot_menu_tick(&ctx, options);
+    CHECK(told == 64 && told_value == 1);
     if (!fails) printf("PASS\n");
     return fails != 0;
 }
@@ -475,6 +605,7 @@ class OotOptionsScreenTests(unittest.TestCase):
             (tmp / "gpu" / "vk" / "vk_api.h").write_text(VK_API_H, encoding="utf-8")
             shutil.copy(ROOT / "host" / "oot_menu.c", tmp / "host" / "oot_menu.c")
             shutil.copy(ROOT / "host" / "guest_bounds.h", tmp / "host" / "guest_bounds.h")   # (set_item_key's buffer check)
+            (tmp / "host" / "hos_bench.h").write_text(HOS_BENCH_H, encoding="utf-8")   # ((Triforce, 11-19) benchmark mode: off here)
             (tmp / "host" / "t.c").write_text(OPTIONS_FIXTURE, encoding="utf-8")
             binary = tmp / "t.exe"
             other_half = ["-DHOS_OOT_MENU_NO_MOUSE"] if sys.platform == "win32" else []
@@ -488,6 +619,18 @@ class OotOptionsScreenTests(unittest.TestCase):
             self.assertEqual(build.returncode, 0, build.stderr)
             run = subprocess.run([str(binary)], text=True, capture_output=True, timeout=30)
             self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+
+
+# ((Triforce, 11-19) host/hos_bench.h's two calls oot_menu.c makes, benchmark mode off: the menus as a player has them)
+HOS_BENCH_H = """#pragma once
+#include <stdint.h>
+enum { HOS_BENCH_MENU_NONE, HOS_BENCH_MENU_PRESS_A };
+static inline int hos_bench_on(void) { return 0; }
+static inline int hos_bench_menu(uint64_t screen, uint64_t vt, int focus, int focused_entry, int entries, int *entry) {
+    (void)screen, (void)vt, (void)focus, (void)focused_entry, (void)entries, (void)entry;
+    return HOS_BENCH_MENU_NONE;
+}
+"""
 
 
 class OotMenuMouseTests(unittest.TestCase):
@@ -506,6 +649,7 @@ class OotMenuMouseTests(unittest.TestCase):
             (tmp / "gpu" / "vk" / "vk_api.h").write_text(VK_API_H, encoding="utf-8")
             shutil.copy(ROOT / "host" / "oot_menu.c", tmp / "host" / "oot_menu.c")
             shutil.copy(ROOT / "host" / "guest_bounds.h", tmp / "host" / "guest_bounds.h")   # (set_item_key's buffer check)
+            (tmp / "host" / "hos_bench.h").write_text(HOS_BENCH_H, encoding="utf-8")   # ((Triforce, 11-19) benchmark mode: off here)
             (tmp / "host" / "t.c").write_text(FIXTURE, encoding="utf-8")
             binary = tmp / "t.exe"
             build = subprocess.run([compiler, "-std=gnu11", "-Wall", "-O1", "-g", "-D_WIN32_WINNT=0x0601",

@@ -151,12 +151,18 @@ int main() {
     CHECK(sound_of(on_page(rows(2, 0), 5), closed(), In().confirm_()) == kDecide);
     std::puts("sound_of: NX2navi's mapping, the game's own Options screen, the pages and modes");
 
-    /* the queue: one of the seven, in order; 16 wait, a 17th is dropped; a stale one is not played */
+    /* the queue: one of the sounds (1 to kLast), in order; 16 wait, a 17th is dropped; a stale one is not played */
     Queue q;
-    CHECK(!q.put(kNone, 0) && !q.put(-1, 0) && !q.put(kTabRight + 1, 0) && q.take(0) == kNone);
-    for (int i = 0; i < kQueue; i++) CHECK(q.put(1 + i % 7, 1000));
+    CHECK(!q.put(kNone, 0) && !q.put(-1, 0) && !q.put(kLast + 1, 0) && q.take(0) == kNone);
+    for (int i = 0; i < kQueue; i++) CHECK(q.put(1 + i % kLast, 1000));
     CHECK(!q.put(kOpen, 1000));
-    for (int i = 0; i < kQueue; i++) CHECK(q.take(2000) == 1 + i % 7);
+    for (int i = 0; i < kQueue; i++) CHECK(q.take(2000) == 1 + i % kLast);
+    CHECK(q.take(2000) == kNone);
+    /* ((Triforce) 11-19) the Mods entry's and screen's own: the system menu's cursor and decide, and the fanfare, are queued
+       and taken as the others are (they were dropped: the entry under the title's list made no sound) */
+    CHECK(kFanfare == kTabRight + 1 && kSysCursor == kFanfare + 1 && kSysDecide == kSysCursor + 1 && kLast == kSysDecide);
+    CHECK(q.put(kSysCursor, 1000) && q.put(kSysDecide, 1000) && q.put(kFanfare, 1000));
+    CHECK(q.take(1000) == kSysCursor && q.take(1000) == kSysDecide && q.take(1000) == kFanfare);
     CHECK(q.take(2000) == kNone);
     CHECK(q.put(kCursor, 0) && q.put(kDecide, kStaleNs) && q.put(kCancel, kStaleNs + 10));
     CHECK(q.take(kStaleNs + 1) == kDecide);   /* (the cursor a quarter second and more ago: dropped) */
@@ -259,6 +265,13 @@ def main():
           "if (id == HOS_OPT_MENU_SOUND_VOLUME) return std::clamp(opts.menu_sounds, 0, 100);" in replay,
           "the renderer does not answer the host's two options: the sounds asked for, the Menu sounds row")
     check("static_assert(menu_sound::kOpen == HOS_MENU_SOUND_OPEN" in menu, "vk_menu.cpp does not hold the sounds against vk_api.h's")
+    # ((Triforce) 11-19: the Mods entry's sounds, the system menu's, are the queue's too, and held against vk_api.h's)
+    check("menu_sound::kSysCursor == HOS_MENU_SOUND_SYS_CURSOR" in menu and "menu_sound::kSysDecide == HOS_MENU_SOUND_SYS_DECIDE" in menu
+          and "menu_sound::kFanfare == HOS_MENU_SOUND_FANFARE" in menu and "menu_sound::kLast + 1 == HOS_MENU_SOUND_N" in menu,
+          "vk_menu.cpp does not hold the Mods entry's sounds (the fanfare, the system menu's cursor and decide) against vk_api.h's")
+    events = (vk / "menu_sound_events.h").read_text(encoding="utf-8")
+    check("if (sound <= kNone || sound > kLast) return false;" in events,
+          "the sounds' queue does not take every sound up to kLast (the Mods entry's are dropped)")
 
     # (the row: under Master volume on the Audio tab, its default, its line in the readme and the options file's table)
     row = re.search(r'\{TAB_AUDIO, "Menu sounds", &opts\.menu_sounds, 0, 100, 5, tx_menu_sounds,\s*"[^{}]*?", nullptr, false, true\},',
@@ -279,7 +292,7 @@ def main():
         .replace("@TEXT@", block(menu, "const char* tx_percent(int v) {") + "\n" +
                  re.search(r"const char\* tx_menu_sounds\(int v\) \{[^\n]*\}", menu).group(0)) \
         .replace("@ROW@", row.group(0)) \
-        .replace("@INI@", block(menu, "bool ini_row(") + "\n" + block(menu, "const char* ini_key(")) \
+        .replace("@INI@", "bool is_merged(const int*) { return false; }   /* ((Triforce, options_version 7) no merged row here */\n" + block(menu, "bool ini_row(") + "\n" + block(menu, "const char* ini_key(")) \
         .replace("@LOOP@", loop)
     with tempfile.TemporaryDirectory(prefix="menu-sound-events-") as tmp:
         run(a.cxx, EVENTS.replace("@ROOT@", ROOT.as_posix()), "events.cpp", tmp, [] if os.name == "nt" else ["-pthread"])

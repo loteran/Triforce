@@ -64,14 +64,72 @@ class PrepareShadersTests(unittest.TestCase):
         self.assertIn("exit status 5", not_prepared(lines)[0])
 
     def test_a_silent_hang_is_stopped_and_not_a_failed_build(self):
-        # (prints its stage, then nothing: as a driver deadlock or a crash dialog left open. silence is 15 minutes in a build)
+        # (prints its stage, then nothing: as a driver deadlock or a crash dialog left open. silence is 15 minutes in a build;
+        # a hang does not answer the stop request either, and is killed stop_wait seconds after it)
         started = time.monotonic()
-        code, lines = prepared(stub("import time; print('@@stage shaders Preparing shaders', flush=True); time.sleep(120)"),
-                               silence=1)
+        with tempfile.TemporaryDirectory(prefix="hookshot-prepare-") as folder:
+            stop = os.path.join(folder, make_game.PREPARE_STOP)
+            code, lines = prepared(stub("import time; print('@@stage shaders Preparing shaders', flush=True); time.sleep(120)"),
+                                   silence=1, stop=stop, stop_wait=1)
+            self.assertFalse(os.path.exists(stop))   # (the request written for it is not left behind)
         self.assertLess(time.monotonic() - started, 30)
         self.assertIsNone(code)
         self.assertEqual(lines[0], "@@stage shaders Preparing shaders")
         self.assertIn("printed nothing for 1 seconds and was stopped", not_prepared(lines)[0])
+
+    def test_a_silent_run_is_asked_to_stop_before_it_is_killed(self):
+        # ((Triforce, 11-18) the game answers triforce_prepare.stop as a closed window: it ends its driver's part cleanly. Here a
+        # stand-in that waits for the request, then says it ended by itself, in a file a kill would never write)
+        with tempfile.TemporaryDirectory(prefix="hookshot-prepare-") as folder:
+            stop, ended = os.path.join(folder, make_game.PREPARE_STOP), os.path.join(folder, "ended")
+            code = ("import os, time\nprint('@@stage shaders Preparing shaders', flush=True)\n"
+                    "while not os.path.exists(%r): time.sleep(0.05)\nopen(%r, 'w').close()" % (stop, ended))
+            started = time.monotonic()
+            code, lines = prepared(stub(code), silence=1, stop=stop, stop_wait=60)
+            self.assertLess(time.monotonic() - started, 30)
+            self.assertTrue(os.path.exists(ended), "the run was killed, not asked to stop")
+            self.assertFalse(os.path.exists(stop))
+        self.assertIsNone(code)
+        self.assertEqual(len(not_prepared(lines)), 1)
+
+    def test_a_stale_stop_request_is_removed_before_the_run(self):
+        with tempfile.TemporaryDirectory(prefix="hookshot-prepare-") as folder:
+            stop = os.path.join(folder, make_game.PREPARE_STOP)
+            open(stop, "w").close()
+            code, lines = prepared(stub("import os; print(os.path.exists(%r))" % stop), stop=stop)
+            self.assertEqual((code, lines), (0, ["False"]))
+            self.assertFalse(os.path.exists(stop))
+
+    def test_the_stop_request_is_the_games_and_the_builders(self):
+        # (the file's name and the stopped run's line are the game's own; the builder's Cancel sets the event the game opens)
+        main = (ROOT / "gpu" / "vk" / "vk_main.cpp").read_text(encoding="utf-8")
+        runner = (ROOT / "builder" / "HookshotBuilder" / "Runner.cs").read_text(encoding="utf-8")
+        self.assertIn('"%s"' % make_game.PREPARE_STOP, main)
+        self.assertIn('printf("%s (' % make_game.NOT_PREPARED, main)
+        self.assertEqual(make_game.PREPARE_STOP_WAIT, 60)
+        default = make_game.prepare_shaders.__defaults__
+        self.assertIn(make_game.PREPARE_STOP_WAIT, default)
+        # (the event's name is the builder's run's own, passed to the game through make_game.py's environment, which keeps it;
+        # not an RX_VK_ name, which the shaders' stamp would take)
+        self.assertIn('const char* name = getenv("TRIFORCE_PREPARE_STOP");', main)
+        self.assertIn('if (name && !strncmp(name, "Local\\\\TriforcePrepareStop.", 26)) event_ = CreateEventA(nullptr, TRUE, FALSE, name);',
+                      main)
+        self.assertEqual(len("Local\\TriforcePrepareStop."), 26)
+        self.assertIn('readonly string stopEvent = @"Local\\TriforcePrepareStop." + Guid.NewGuid().ToString("N");', runner)
+        self.assertIn('si.Environment["TRIFORCE_PREPARE_STOP"] = stopEvent;', runner)
+        self.assertIn("Process.Start(Info(tools, args, workers, ngxSdk, stopEvent))", runner)
+        self.assertEqual(make_game.game_env({"TRIFORCE_PREPARE_STOP": "x"}), {"TRIFORCE_PREPARE_STOP": "x"})
+        cancel = runner[runner.index("public Task Cancel()"):runner.index("public static async Task<(bool Ok, string Text)> Check(")]
+        self.assertIn("EventWaitHandle.TryOpenExisting(stopEvent, out var stop)", cancel)
+        self.assertLess(cancel.index("stop.Set()"), cancel.index("p.WaitForExit(30000)"))
+        self.assertLess(cancel.index("p.WaitForExit(30000)"), cancel.index("Kill(entireProcessTree: true)"))
+        window = (ROOT / "builder" / "HookshotBuilder" / "MainWindow.xaml.cs").read_text(encoding="utf-8")
+        self.assertIn("runner?.Cancel().Wait();", window)
+        # (a Cancel whose preparation stopped well still reaches make_game.py's @@done: it is a Cancel all the same, back to
+        # the files, not "Your game is ready" with shortcuts made and the build's files freed)
+        self.assertIn('Finished?.Invoke(cancelled ? "cancelled" :', runner)
+        ended = window[window.index("void Ended(string? failure)"):window.index("void LogToggled(")]
+        self.assertLess(ended.index('if (failure == "cancelled")'), ended.index("if (finished.Length > 0)"))
 
     def test_steady_output_is_not_silence(self):
         code, lines = prepared(stub("import time\nfor i in range(6):\n    print('@@progress %.3f' % (i / 6), flush=True); "

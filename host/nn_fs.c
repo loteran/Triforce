@@ -526,6 +526,9 @@ HLE(_ZN2nn2fs6CommitEPKc) {
     AcquireSRWLockExclusive(&tx_lock);
     int i;
     for (i = 0; i < ntx && strcmp(tx_mounts[i].name, name); i++) {}
+    /* ((Triforce, 11-19) benchmark mode writes no save: the commit is left out (the working copy alone has the game's writes) */
+    int hos_bench_blocks_save(void);
+    if (i < ntx && hos_bench_blocks_save()) i = ntx;
     if (i < ntx) {
         const int away = hos_vcore_away();
         const ULONGLONG t0 = GetTickCount64();
@@ -562,6 +565,7 @@ HLE(_ZN2nn2fs8OpenFileEPNS0_10FileHandleEPKci) {
     if (!host_path(g, path, sizeof path, &writable)) { hos_log("fs: OpenFile(%s): unknown mount", g); RET(R_PATH_NOT_FOUND); return; }
     int want_write = (ARG(2) & 6) != 0;
     if (want_write && !writable) { RET(R_PATH_NOT_FOUND); return; }
+    { void hos_bench_file_opened(const char *guest); hos_bench_file_opened(g); }   /* ((Triforce) benchmark mode: which save file loads */
     /* (mkw-recomp) HOS_NO_MOVIES=1: MKW's WebM movies (cup openings, billboards, emblems) are not found, and the
        game goes on without them (decoded by nn_video.c otherwise) */
     if (!want_write && getenv("HOS_NO_MOVIES")) {

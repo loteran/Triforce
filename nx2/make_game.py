@@ -296,10 +296,28 @@ def output_lines(p, silence):
         yield line
 
 
-def run(cmd, env=None, on_line=None, check=True, output=None, show=None, cwd=ROOT, base=None, silence=None):
+def stop_asked(p, stop, wait):
+    """A silent step asked to stop by the file `stop` (written here), given `wait` seconds to end by itself, then killed. True:
+    it ended by itself"""
+    try:
+        with open(stop, "wb"):
+            pass
+    except OSError:
+        return False
+    try:
+        p.wait(timeout=wait)
+        return True
+    except subprocess.TimeoutExpired:
+        return False
+
+
+def run(cmd, env=None, on_line=None, check=True, output=None, show=None, cwd=ROOT, base=None, silence=None, stop=None,
+        stop_wait=60):
     """A step, its output printed as it comes. show: what of each line is printed (its None: nothing; on_line and a failure's
     reason still get the line itself). base: the environment it starts from (os.environ). silence: seconds without a line after
-    which the step is stopped; it returns None then (with check, the build fails)"""
+    which the step is stopped; it returns None then (with check, the build fails). stop: a file the step reads as a request to
+    stop (the game's triforce_prepare.stop): on silence it is written first, and the step killed only if it has not ended
+    stop_wait seconds later"""
     e = dict(os.environ if base is None else base, PYTHONIOENCODING="utf-8")
     e.update(env or {})
     p = subprocess.Popen(cmd, cwd=cwd, env=e, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8",
@@ -316,8 +334,9 @@ def run(cmd, env=None, on_line=None, check=True, output=None, show=None, cwd=ROO
             if on_line:
                 on_line(line)
     except Silent:
-        p.kill()
-        p.wait()
+        if not (stop and stop_asked(p, stop, stop_wait)):
+            p.kill()
+            p.wait()
         if check:
             fail("%s printed nothing for %s and was stopped" % (os.path.basename(cmd[0]), span(silence)))
         return None
@@ -1046,6 +1065,11 @@ NOT_PREPARED = "the shaders were not prepared now"
 # (a run that prints nothing this long is stopped. Not its whole length: that is 25 minutes on some AMD GPUs, and the driver's own
 # step near the end can sit at 99% for minutes)
 PREPARE_SILENCE = 15 * 60
+# ((Triforce, 11-18) a silent run is asked to stop first (gpu/vk/vk_main.cpp PrepareStopWatch: it ends its driver's part
+# cleanly and keeps what it made; killed, a start in that part used one of its three tries and left variants out for good),
+# and killed only when it has not ended this long after)
+PREPARE_STOP = "triforce_prepare.stop"
+PREPARE_STOP_WAIT = 60
 GAME_ENV_DROP = ("HOOKSHOT_", "PYTHON", "APPDIR", "APPIMAGE", "ARGV0", "OWD")
 
 
@@ -1084,17 +1108,24 @@ def show_prepared(line):
     return line if line.startswith(("@@stage ", "@@progress ")) or not line.startswith("@@") else line[2:]
 
 
-def prepare_shaders(cmd, folder=None, silence=PREPARE_SILENCE):
+def prepare_shaders(cmd, folder=None, silence=PREPARE_SILENCE, stop=None, stop_wait=PREPARE_STOP_WAIT):
     """The shaders prepared now, under the builder's progress bar, not at the game's first start behind a black window (minutes on
     some GPUs, issue 711): hookshot --prepare-shaders (host/hos_main.c, gpu/vk/vk_main.cpp), the same work as that first start, in
     the game's folder and environment, as the builders' Play starts it. A PC whose Vulkan can't (exit 3), a run silent for `silence` seconds (then stopped), or
-    any other failure leaves the work to the first start, as before: never a failed build. Returns its exit code (None: stopped)"""
+    any other failure leaves the work to the first start, as before: never a failed build. Returns its exit code (None: stopped).
+    stop: the game's stop request, PREPARE_STOP beside it (a stale one is removed first, and the one written here after)"""
+    stop = stop or os.path.join(os.path.dirname(os.path.abspath(cmd[0])), PREPARE_STOP)
+    with contextlib.suppress(OSError):
+        os.remove(stop)
     try:
         code = run(cmd, check=False, show=show_prepared, cwd=folder or os.path.dirname(cmd[0]) or None,
-                   base=game_env(), silence=silence)
+                   base=game_env(), silence=silence, stop=stop, stop_wait=stop_wait)
     except OSError as e:
         not_prepared(str(e))
         return 1
+    finally:
+        with contextlib.suppress(OSError):
+            os.remove(stop)
     if code is None:
         not_prepared("the game printed nothing for %s and was stopped" % span(silence))
     elif code == 3:
@@ -1397,11 +1428,11 @@ def lift_key_file(rel):
     return not (rel in LIFT_KEY_NOT or rel.startswith("prompt_faces/") or (name.startswith("test_") and name.endswith(".py")))
 
 
-def lift_key(exefs, work, env):
+def lift_key(exefs, work, env, chunks=True):
     """What the lift's output depends on: the game's code, the translator (nx2/ but for LIFT_KEY_NOT, the vendored a64-kit), the HLE
     functions host/ defines (hooked in the lift; the rest of host/ is compiled after it, so a change there alone does not lift again),
     the hot list and chunk boundaries, the lift's environment and the Python running it. A file the lift never reads may be in it (a
-    new build then lifts again); one it reads must be"""
+    new build then lifts again); one it reads must be. chunks=False: all of it but the chunk boundaries (key_after_lift)"""
     import kit  # noqa: F401  (a64-kit on the path, for standalone)
     import standalone
     h = hashlib.sha1(sys.version.encode(), usedforsecurity=False)
@@ -1413,7 +1444,9 @@ def lift_key(exefs, work, env):
             dirs[:] = sorted(x for x in dirs if x != "__pycache__")
             files += [(ROOT, os.path.join(d, f)) for f in sorted(fs) if f.endswith((".py", ".c", ".h", ".cpp", ".hpp", ".txt", ".json"))
                       and (top != HERE or lift_key_file(os.path.relpath(os.path.join(d, f), HERE).replace(os.sep, "/")))]
-    files += [(work, os.path.join(work, "hot_funcs.txt")), (work, os.path.join(work, "image", "chunks.txt"))]
+    files.append((work, os.path.join(work, "hot_funcs.txt")))
+    if chunks:
+        files.append((work, os.path.join(work, "image", "chunks.txt")))
     for base, f in files:
         if os.path.isfile(f):
             h.update(os.path.relpath(f, base).replace(os.sep, "/").encode() + bytes(1))
@@ -1422,6 +1455,20 @@ def lift_key(exefs, work, env):
     lift_env = dict(env, **{k: v for k, v in os.environ.items() if k.startswith(("A64_", "OOT_", "RX_"))})
     h.update(repr(sorted(lift_env.items())).encode())
     return h.hexdigest()
+
+
+def key_after_lift(exefs, work, env, key, before, copied):
+    """(Triforce, epicmemes46's 5df76bb) The key a finished lift is kept under. key: the one taken before it; before: that one
+    without the chunk boundaries (lift_key's chunks=False); copied: the boundaries were copied in from the source's
+    work/image/chunks.txt. The lift writes <work>/image/chunks.txt (nx2/chunks.py save): into a work folder that had none, the
+    boundaries the sizes gave. The key taken before it had none in it, the next build's has those, and so the build after every
+    lift into a fresh work folder translated the whole game again, the same game with the same tools. Boundaries the lift wrote
+    are what its own inputs give, so the key is taken again now, as the next build takes it, when nothing but chunks.txt changed
+    meanwhile (an update of the tools during the lift keeps the key from before it, and the next build lifts again). Boundaries
+    copied in from the source are an input, copied again at each build: the key from before the lift stays"""
+    if copied or lift_key(exefs, work, env, chunks=False) != before:
+        return key
+    return lift_key(exefs, work, env)
 
 
 def gen_print(gen):
@@ -1657,6 +1704,11 @@ def fsr_wanted(a, out):
     MIT headers are in third_party/fidelityfx and its DLLs are the player's (the readme)"""
     if getattr(a, "no_fsr", False):
         return False
+    # ((Triforce) 11-20, ticket "No FSR4 option in game even though provided library apparently loaded": HOOKSHOT_FSR=1, which
+    # nx2/build.py and the docs name, was taken away below unless --fsr was given too, so a Linux build with it set had no FSR 4.
+    # Set in the environment, it asks for FSR 4 as --fsr does)
+    if os.environ.get("HOOKSHOT_FSR", "") == "1":
+        return True
     return bool(getattr(a, "fsr", False)) or bool(getattr(a, "fetch_fsr4", False)) or bool(a.update and os.path.isfile(os.path.join(out, FSR_MARK)))
 
 
@@ -2008,7 +2060,8 @@ def main(a=None):
             copy_writable(src, dst)
     os.makedirs(os.path.join(work, "image"), exist_ok=True)
     src = os.path.join(ROOT, "work", "image", "chunks.txt")   # (where the lifted code's files begin: addresses)
-    if os.path.exists(src):
+    chunks_copied = os.path.exists(src)   # ((Triforce) an input then; otherwise the lift writes it: key_after_lift)
+    if chunks_copied:
         copy_writable(src, os.path.join(work, "image", "chunks.txt"))
     env = {"OOT_WORK": work, "OOT_EXEFS": exefs, "OOT_ROMFS": romfs, "OOT_DUMP": out, "RX_RELEASE": "1", "A64_HOT_CHUNK": "1"}
     if os.path.exists(os.path.join(work, "hot_funcs.txt")):
@@ -2033,6 +2086,7 @@ def main(a=None):
         if lifted_before(work, key):   # (never on the second pass: its key was taken away below)
             print("the game was translated with these tools before: translating it again is skipped", flush=True)
         else:
+            key_unchunked = lift_key(exefs, work, env, chunks=False)   # ((Triforce) the inputs but chunks.txt: key_after_lift)
             key_file = os.path.join(work, "sa", "gen", LIFT_KEY)
             if os.path.exists(key_file):
                 os.remove(key_file)   # (a lift stopped halfway leaves no key behind)
@@ -2056,6 +2110,7 @@ def main(a=None):
             if os.path.isfile(os.path.join(work, "sa", "gen", "code_hot.c")):
                 run(PY + ["nx2/split_hot.py", os.path.join(work, "sa", "gen")], env)   # (eight files side by side: ~6 minutes, not 79)
             early.finish()
+            key = key_after_lift(exefs, work, env, key, key_unchunked, chunks_copied)   # ((Triforce) the chunks.txt it wrote in it)
             write_lift_key(work, key)
         cut = lifted_cut_short(gen_dir)
         if not cut:

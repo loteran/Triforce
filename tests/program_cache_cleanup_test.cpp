@@ -59,7 +59,13 @@ struct Info {
 #include "spv_store.h"   // (Triforce: the store a packed stage has in its module's place, gpu/vk; Stage names it)
 #include "cache_types.inc"
 
-struct { uintptr_t device = 123; } dev;
+// ((Triforce) dev.fixes.nan_bits: AMD's older shader compiler, whose modules make_module gives selects of the bits
+// (spv_nan_select.h). Off here, as on every other card: every module is made of the record's words as they are.
+// tests/test_spv_nan_select.py has the selects)
+struct {
+    uintptr_t device = 123;
+    struct { bool nan_bits = false; } fixes;
+} dev;
 std::map<VkShaderModule, unsigned> destroyed;
 unsigned attempts = 0, created = 0, releases = 0, fail_at = 0;
 int vkCreateShaderModule(uintptr_t device, const VkShaderModuleCreateInfo* info, const void* allocator,
@@ -95,6 +101,10 @@ void dropped_note(uint64_t) {}
 // (local, RenoDX port: vk_renodx.h's, which make_module asks for a fragment module's replacement. None here: every module
 // is the cache's own, so the counts below are of what the loader made)
 const std::vector<uint32_t>* renodx_replacement(uint32_t) { return nullptr; }
+// ((Triforce) the fog's froxels, gpu/vk/spv_fog.h, which make_module asks of each module it makes: none here is the fog's, so
+// every module is made of the record's words as they are. tests/test_spv_fog.py has the fog)
+#include "spv_fog.h"
+#include "spv_nan_select.h"
 #define PROF_EXACT()   // (vk_prof.h's exact-timing scope, since #989: nothing to time here)
 // (local, texture detail: vk_shader.cpp's note of which bindings a module reads by exact texel. Nothing to note here)
 void exact_note(VkShaderModule, const std::vector<uint32_t>&) {}

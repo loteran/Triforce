@@ -8,8 +8,8 @@ and stamp it was resolved from is the same.
    out of the source and run against stand-ins for texture_view_of, sampler_for, uniform_range and the generations
    (tests/desc_keep_test.cpp), which count their calls: a texture is looked up again when its slot is registered anew, a sampler
    registration changed, a texture was destroyed or made again (issue 1126), a frame left a texture for later, or the submission
-   is a new one; a uniform buffer when an inline update came, a pool moved or a mirror was made (gpu_bind_stamp), or the recording
-   is another; c1 within its recording; never a failed one, a copy in the recording's stream, or a driver bank. A generation that
+   is a new one, or the draw is the jittered scene where the last was not (its own, biased sampler); a uniform buffer when an
+   inline update came, a pool moved or a mirror was made (gpu_bind_stamp), or the recording is another; c1 within its recording; never a failed one, a copy in the recording's stream, or a driver bank. A generation that
    moves while its lookup runs makes the next one look again. RX_VK_DESC_KEEP=check resolves every time and counts and logs one
    that comes out otherwise; =0, RX_VK_NO_DESC_REUSE, RX_VK_SAMPLER_CACHE=0 and RX_VK_LATE_DEFER turn it off.
 3. build_descriptors itself (source): only a draw's build keeps (not a dispatch's, a dump's or the temporal upscaler's second
@@ -27,8 +27,8 @@ from pathlib import Path
 RUN_ALL_ARGS = ["--cxx", "{cxx}", "--headers", "{vulkan_headers}"]
 
 ROOT = Path(__file__).resolve().parents[1]
-CASES = ["header", "on", "off", "no-reuse", "sampler-cache-off", "late-defer", "texture", "compute", "texture-moved", "texture-dummy",
-         "texture-no-sampler", "uniform", "uniform-stream", "uniform-moved", "c1", "storage", "check", "check-bad"]
+CASES = ["header", "on", "off", "no-reuse", "sampler-cache-off", "late-defer", "texture", "compute", "texture-moved", "texture-dummy", "texture-dummy-redrawn",
+         "texture-scene", "texture-no-sampler", "uniform", "uniform-stream", "uniform-moved", "c1", "storage", "check", "check-bad"]
 
 
 def block(text, marker):
@@ -50,11 +50,13 @@ def check_build(source):
     build = block(source, "void build_descriptors(")
     need("desc_keep::Prog* const kp = keep && desc_keep_mode() && !dump_on() && !pre_retarget_on" in build,
          "build_descriptors keeps descriptors outside a draw's own build")
-    need("build_descriptors(s, p, true);" in block(source, "void draw(VkCommandBuffer"), "a draw does not keep its descriptors")
-    need(source.count("build_descriptors(s, p, true)") == 1, "something other than a draw keeps descriptors")
+    need("build_descriptors(s, p, true, scene);" in block(source, "void draw(VkCommandBuffer"), "a draw does not keep its descriptors")
+    need(source.count("build_descriptors(s, p, true") == 1, "something other than a draw keeps descriptors")
     need(build.count("jn += d.count;") == 5, "a descriptor kind does not move the place counter: kept results would be another's")
     need("kept_uniform(kp, jb + k, s, st, d.index + k)" in build, "the uniform buffers do not go through kept_uniform")
     need("kept_texture(kp, jb + k, handle, vt, d.is_depth" in build, "the sampled textures do not go through kept_texture")
+    need("st.vk_stage == VK_SHADER_STAGE_COMPUTE_BIT,\n                                                   scene, &view, &tex);" in build,
+         "the sampled textures are not given the draw's scene flag (the upscaler's texture LOD bias)")
     need("sampler_for(" not in build and "texture_view_of(handle, vt, ViewUse::Sample" not in build,
          "a sampled texture is looked up past kept_texture")
     ssbo = build[build.index("for (const auto& d : info.storage_buffers_descriptors)"):build.index("auto texel_views")]

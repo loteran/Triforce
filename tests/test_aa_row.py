@@ -88,11 +88,17 @@ int main() {
         CHECK(chosen(row, 4) == GAME && chosen(row, 99) == GAME);
     }
     CHECK(chosen(-1, -1) == GAME && chosen(4, -1) == GAME && chosen(1000, -1) == GAME);
-    /* with the Upscaler row: the choice with the game's own upscaler, the game's own SMAA (the frame as before the row) while
-       DLSS, DLAA, FSR 3.1, FSR 4 or a native AA draws; the row then has nothing to choose, nor with RX_VK_AA set */
+    /* with the Upscaler row: the choice with the game's own upscaler; while DLSS, DLAA, FSR 3.1, FSR 4 or a native AA draws
+       from the tone mapped picture none, the game's SMAA left out of the jittered frames they gather (FSR3-06, FSR4-5); before
+       the bloom the game's own SMAA (the upscaler took the scene before it), and RX_VK_AA's choice over them for an A/B; the
+       row then has nothing to choose, nor with RX_VK_AA set */
     for (int up = 0; up < ur::kUpscalers; up++) {
         CHECK(upscaler_own(up) == (up != ur::GAME));
-        for (int v = 0; v < kValues; v++) CHECK(effective(v, up) == (up == ur::GAME ? v : GAME));
+        for (int v = 0; v < kValues; v++) {
+            CHECK(effective(v, up) == (up == ur::GAME ? v : OFF));
+            CHECK(effective(v, up, false) == effective(v, up) && effective(v, up, true) == (up == ur::GAME ? v : GAME));
+            CHECK(effective(v, up, false, true) == v && effective(v, up, true, true) == v);
+        }
         CHECK(fixed(up, false) == (up != ur::GAME) && fixed(up, true));
     }
     CHECK(upscaler_own(ur::DLSS) && upscaler_own(ur::DLAA) && upscaler_own(ur::FSR3) && upscaler_own(ur::FSR3_AA) &&
@@ -205,9 +211,12 @@ int main() {
         /* back to the game's own, then Off again: what was replaced before does not count, the passes run first */
         CHECK(!t.begin(10005, GAME) && !t.last_replaced && t.state == QUIET);
         CHECK(!t.begin(10006, OFF) && !t.last_replaced && !leave_out(EDGES, OFF, t.last_replaced, false));
-        /* an upscaler with its own anti-aliasing comes on (the choice in effect is the game's own): the same */
+        /* an upscaler with its own anti-aliasing comes on after the bloom: Off goes on in effect under it, the passes left out;
+           before the bloom the choice in effect is the game's own: the same as back to the game's own */
         t.composed(10006, true);
-        CHECK(!t.begin(10007, effective(OFF, ur::DLSS)) && !t.last_replaced);
+        CHECK(!t.begin(10007, effective(OFF, ur::DLSS)) && t.last_replaced && leave_out(EDGES, OFF, t.last_replaced, false));
+        CHECK(!t.begin(10008, effective(OFF, ur::DLSS, true)) && !t.last_replaced);
+        CHECK(!t.begin(10009, effective(GAME, ur::FSR4)) && !t.last_replaced && !leave_out(EDGES, OFF, t.last_replaced, false));
     }
     /* a choice in effect and no composition replaced for a minute (another game version, a long screen without the 3D):
        said once, and again only after one was replaced or the choice changed */
@@ -346,9 +355,10 @@ int main() {
             state_now = aa_rows::MISSING;
             CHECK(hn_aa(v, -1) == hn_aa(v, env == aa_rows::GAME ? 3 : 4));
         }
-    /* the other rows' fixing is theirs: the row's own value does not fix another */
+    /* the other rows' fixing is theirs: the row's own value does not fix another. ((Triforce, options_version 7) DLAA is the
+       Render resolution's Native (100%) step: that row has its steps) */
     up_now = ur::DLAA, env_now = -1;
-    CHECK(row_fixed(&opts.aa) && row_fixed(&opts.resolution) && !row_fixed(&opts.sharpness));
+    CHECK(row_fixed(&opts.aa) && !row_fixed(&opts.resolution) && !row_fixed(&opts.sharpness));
     std::puts("aa row: its entry, its saved line, its text with each Upscaler: all checks passed");
     return 0;
 }
@@ -364,20 +374,21 @@ def main():
     draw = (VK / "vk_draw.cpp").read_text(encoding="utf-8")
     aa = (VK / "vk_aa.cpp").read_text(encoding="utf-8")
 
-    # the row: with the scaling rows on the Graphics tab ((Triforce) 11-17: the tab in sections; Upscaling and edges holds the
-    # upscaler, the anti-aliasing, the sharpness and the window's filter, after the 3D's size in Quality)
-    order = ['"Render resolution", &opts.resolution', '"Upscaling and edges", nullptr', '"Upscaler", &opts.dlss',
-             '"Anti-aliasing", &opts.aa', '"Sharpness", &opts.sharpness', '"Window scaling filter", &opts.upscale']
+    # the row: on the Graphics tab, (Triforce, options_version 7) in its own group after the Upscaling group's rows (it shows
+    # only with the game's own upscaler, row_shown), the window's filter gone
+    order = ['"Upscaler", &opts.dlss', '"Render resolution", &opts.resolution', '"Sharpness", &opts.sharpness',
+             'MENU_HEADING(TAB_GRAPHICS, "Anti-aliasing")', '"Anti-aliasing", &opts.aa']
     at = [menu.find(row) for row in order]
-    check(-1 not in at and at == sorted(at), "vk_menu.cpp: the Anti-aliasing row is not in Upscaling and edges, after the upscaler")
-    # ((Triforce) rows, not every text: the Full overlay's settings say "Anti-aliasing" too, as NX2navi's)
-    check(len(re.findall(r'\{TAB_\w+, "Anti-aliasing",', menu)) == 1, "vk_menu.cpp: more than one Anti-aliasing row")
-    entry = block(menu, menu.rindex("{TAB_GRAPHICS,", 0, at[3]))   # (the Anti-aliasing row's entry)
+    check(-1 not in at and at == sorted(at), "vk_menu.cpp: the Anti-aliasing row is not in its group after the Upscaling group")
+    check(menu.count('"Anti-aliasing", &opts.aa') == 1, "vk_menu.cpp: more than one Anti-aliasing row")
+    check("(rows[i].value != &opts.aa || up == ur::GAME)" in definition(menu, "bool row_shown"),
+          "vk_menu.cpp: the Anti-aliasing row shows while DLSS or FSR smooths the edges itself")
+    entry = block(menu, menu.rindex("{TAB_GRAPHICS,", 0, at[4]))
     check(re.search(r"\bint aa = 0;", header), "vk_menu.h: Anti-aliasing is not the game's own by default")
     # a press on a row with nothing to choose changes and saves nothing, and a Quality preset does not set the row
     check(definition(menu, "void set_row").split("{", 1)[1].lstrip().startswith("// (nothing else to choose") and
           "if (row_fixed(r.value)) return;" in definition(menu, "void set_row"), "set_row no longer leaves a fixed row alone")
-    check("opts.aa" not in definition(menu, "void apply_preset"), "a Quality preset sets the Anti-aliasing row")
+    check("void apply_preset" not in menu, "a Quality preset is back, and could set the Anti-aliasing row")
     read = menu[menu.index("            for (Row& r : rows) {\n                if (!ini_row(r) || strcmp(line, ini_key(r))) continue;"):]
     read = block(read, 0)
     check("std::min(std::max(v, r.lo), r.hi)" in read, "menu_init no longer clamps a saved value to its row")
@@ -386,7 +397,7 @@ def main():
 
     # the renderer's side: what is in effect is the row's rule, asked with what upscales as the menu's Upscaler row shows it
     mode = definition(aa, "int aa_mode")
-    check("ar::chosen(opts.aa, env_choice())" in mode and "ar::effective(choice, upscaler_now())" in mode,
+    check("ar::chosen(opts.aa, env_choice())" in mode and "ar::effective(choice, upscaler_now(), temporal_before_bloom(), env_choice() >= 0)" in mode,
           "aa_mode does not take the row's choice (RX_VK_AA over it) through aa_rows.h's effective")
     check("frame_read.load(std::memory_order_acquire) == frame" in mode and "std::lock_guard lk(s.mu);" in mode,
           "aa_mode no longer takes the choice once a frame")
@@ -398,8 +409,12 @@ def main():
     check('getenv("RX_VK_AA")' in aa and 'getenv("RX_VK_AA_KEEP")' in aa, "vk_aa.cpp no longer reads its two switches")
     # the game's own chosen and nothing left to free: a dispatch asks a comparison and nothing else
     check(re.sub(r"\s+", " ", definition(aa, "bool aa_asked")) ==
-          "bool aa_asked() { return ar::chosen(opts.aa, env_choice()) != ar::GAME || engaged.load(std::memory_order_relaxed); }",
-          "aa_asked is no longer the row's choice and whether anything is left to free")
+          "bool aa_asked() { return ar::chosen(opts.aa, env_choice()) != ar::GAME || engaged.load(std::memory_order_relaxed) || upscaler_asks(); }",
+          "aa_asked is no longer the row's choice, whether anything is left to free and whether an upscaler leaves the SMAA out")
+    asks = definition(aa, "bool upscaler_asks")
+    check("ar::effective(ar::GAME, upscaler_now(), temporal_before_bloom(), env_choice() >= 0) != ar::GAME" in asks and
+          "frame.load(std::memory_order_acquire) != now" in asks,
+          "upscaler_asks does not ask aa_rows.h's effective once a frame whether an upscaler leaves the game's SMAA out")
     leave = definition(aa, "bool aa_leave_out")
     check(leave.split("{", 1)[1].lstrip().startswith("if (!aa_asked()) return false;") and
           "ar::leave_out(ar::role(key), mode, last_replaced.load(std::memory_order_acquire), keep_passes())" in leave,
@@ -454,7 +469,7 @@ def main():
                            ("@HINT@", definition(menu, "const char* hn_aa")),
                            ("@FIXED@", definition(menu, "bool row_fixed")),
                            ("@KEY@", definition(menu, "const char* ini_key")),
-                           ("@INI_ROW@", definition(menu, "bool ini_row")),
+                           ("@INI_ROW@", "bool is_merged(const int*) { return false; }   /* ((Triforce, options_version 7) no merged row here */\n" + definition(menu, "bool ini_row")),
                            ("@ENTRY@", entry + ","),
                            ("@READ@", read)):
             fixture = fixture.replace(mark, text)

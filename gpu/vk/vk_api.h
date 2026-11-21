@@ -15,7 +15,7 @@
 extern "C" {
 #endif
 
-#define MKWVK_API_VERSION 13
+#define MKWVK_API_VERSION 15
 enum { HOS_OPT_CHEAT_HEARTS = 32, HOS_OPT_CHEAT_FLIGHT, HOS_OPT_CHEAT_ACTION, HOS_OPT_CHEAT_CAMERA };
 /* (hookshot) the Motion page's rows (host/pad_sdl.c reads them, vk_replay.cpp's option answers them): Motion controls on
    or off, the horizontal's and the vertical's sensitivity in percent, each turned around, and the deadzone (0 to 2) */
@@ -134,14 +134,18 @@ enum { HOS_MENU_SOUND_OPEN = 1, HOS_MENU_SOUND_CLOSE, HOS_MENU_SOUND_CURSOR, HOS
    last button's box in the layout's units (3840 x 2160, the origin at the middle, y up), HOS_OPT_MODS_PITCH the distance to
    the button above it, then HOS_OPT_MODS_LIST: HOS_MODS_LIST_* bits (that frame's report is whole). HOS_OPT_MODS_ENTER,
    option_set: the cursor goes onto Mods (1: the game's Down there, which the game is not given, host/nn_hid.c), or Mods was
-   clicked (2: open it). HOS_OPT_MODS_SELECTED, option: 1 while the cursor is on Mods or its screen is open (the game gets
+   clicked (2: open it; (Triforce, 11-19) 3: Quit under it clicked, its dialog opens; 4: the mouse moved onto Quit; 5: a Down
+   held from higher up the list, its repeat onto Mods, which repeats on at the step). HOS_OPT_MODS_SELECTED, option: 1 while the cursor is on Mods or its screen is open (the game gets
    no input then: host/nn_hid.c). HOS_OPT_MODS_PRESS, option_set: presses the game was given meanwhile that are the menu's (a
-   test's scripted ones, which reach no window): HOS_MODS_PRESS_* bits */
+   test's scripted ones, which reach no window): HOS_MODS_PRESS_* bits. ((Triforce, 11-19) with HOS_MODS_REPORT, each read's
+   report: also the directions held then, HOS_MODS_PRESS_DIRS bits shifted by HOS_MODS_HELD_SHIFT, which the menu repeats
+   as it repeats a pad's held direction) */
 enum { HOS_OPT_MODS_LIST = 150, HOS_OPT_MODS_X0, HOS_OPT_MODS_X1, HOS_OPT_MODS_Y0, HOS_OPT_MODS_Y1, HOS_OPT_MODS_PITCH, HOS_OPT_MODS_ENTER,
        HOS_OPT_MODS_SELECTED, HOS_OPT_MODS_PRESS };
 enum { HOS_MODS_LIST_SHOWN = 1, HOS_MODS_LIST_LAST_FOCUSED = 2, HOS_MODS_LIST_TITLE = 4 };
 enum { HOS_MODS_PRESS_UP = 1, HOS_MODS_PRESS_DOWN = 2, HOS_MODS_PRESS_LEFT = 4, HOS_MODS_PRESS_RIGHT = 8, HOS_MODS_PRESS_A = 16,
-       HOS_MODS_PRESS_B = 32, HOS_MODS_PRESS_L = 64, HOS_MODS_PRESS_R = 128 };
+       HOS_MODS_PRESS_B = 32, HOS_MODS_PRESS_L = 64, HOS_MODS_PRESS_R = 128, HOS_MODS_PRESS_DIRS = 15, HOS_MODS_HELD_SHIFT = 8,
+       HOS_MODS_REPORT = 4096 };
 /* ((Triforce) 11-17) Text typed into the menu (the Mods screen's search). HOS_OPT_TEXT_WANTED, option: 1 while the menu takes
    text. HOS_OPT_TEXT_CHAR, option_set (the window's thread, host/display.c): a code point typed, or 8 Backspace, 127
    Ctrl+Backspace (a pasted text comes as its characters) */
@@ -157,6 +161,22 @@ typedef struct MkwVkPointer {
     uint32_t held, pressed;
     int32_t wheel;
 } MkwVkPointer;
+
+/* (Triforce, 11-19) Benchmark mode (host/hos_bench.c, HOS_BENCHMARK): what the renderer's benchmark panel shows
+   (gpu/vk/vk_menu.cpp draw_bench), read each frame through MkwVkHost.bench. phase: MKWVK_BENCH_*; scene: the place gone to or
+   measured, 1 to scenes (0 before the first); name: its name; progress: the whole run done, 0 to 1; fps: the frame rate of
+   the last second, low1: the 1% low of the scene so far (-1 under 100 frames); graph_ms: the newest graph_n frame times,
+   oldest first; line: what the panel says under the title when the phase has its own words (a failure's reason) */
+enum { MKWVK_BENCH_OFF, MKWVK_BENCH_BOOT, MKWVK_BENCH_TRAVEL, MKWVK_BENCH_SETTLE, MKWVK_BENCH_MEASURE, MKWVK_BENCH_DONE,
+       MKWVK_BENCH_STOPPED, MKWVK_BENCH_FAILED };
+#define MKWVK_BENCH_GRAPH 240
+typedef struct MkwVkBench {
+    int32_t phase, scene, scenes, graph_n;
+    float progress, fps, low1;
+    char name[48];
+    char line[96];
+    float graph_ms[MKWVK_BENCH_GRAPH];
+} MkwVkBench;
 
 /* what the executable gives the back end */
 typedef struct MkwVkHost {
@@ -238,6 +258,11 @@ typedef struct MkwVkHost {
        (a bit each; HOS_WIDE_KEEP=<hex> over it); returns the margin of the middle 16:9 at either side, a fraction of the
        picture's width (0: the picture is 16:9) */
     float (*wide_menus)(uint32_t keep_mask);
+    /* (Triforce, 11-19, version 14) benchmark mode's state for its panel: 1 while it runs (out filled), 0 otherwise */
+    int (*bench)(MkwVkBench *out);
+    /* (Triforce, 11-19, version 15) while the game has the keys' face (prompt_face): the face of the controller used last,
+       once host/prompts.c has built its icons for the overlay (prompts/External.pad.bfotf.zs); -1 none */
+    int (*prompt_pad_face)(void);
 } MkwVkHost;
 
 /* what the back end gives the executable: the rx_* functions (gpu/render/rx_nvn.h, rx_core) */

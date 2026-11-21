@@ -56,4 +56,44 @@ inline float view_distance(const Camera& c, float device_depth) {
     return c.device_to_view_depth[1] / (device_depth - c.device_to_view_depth[0]);
 }
 
+/// The jitter sequence's length for FSR 3.1, AMD's own rule (ffxFsr3GetJitterPhaseCount, ffx_upscale.h): 8 times the
+/// width's scale squared, truncated, with no upper bound: 18 at Quality (1.5x), 23 at Balanced, 32 at Performance, 71 or 72
+/// at Ultra Performance (3x), 8 for the Native AA. AMD FSR 4 on the frame chain takes it too ((Triforce, FSR4-10)
+/// vk_temporal.cpp chain); NVIDIA's rule (dlss_math.h dlss_jitter_phases, by area, rounded, 64 at most) stays DLSS's
+inline unsigned jitter_phases(unsigned render_width, unsigned display_width) {
+    if (!render_width || !display_width) return 8;
+    const float ratio = (float)display_width / (float)render_width;
+    const int n = (int)(8.0f * ratio * ratio);
+    return n < 1 ? 1u : (unsigned)n;
+}
+
+/// The size FSR 3.1's render-size images are made at (the SDK's maxRenderSize), and whether they are made again, for a frame
+/// of rw x rh into uw x uh with images of have_w x have_h for an output of have_uw x have_uh (0 x 0: none yet). They are kept
+/// for any frame that fits them, so the game's dynamic resolution (the Render resolution row's Auto) changes only the
+/// render size each dispatch is given and the history goes on, as the SDK's FFX_FSR3UPSCALER_ENABLE_DYNAMIC_RESOLUTION
+/// does: its passes clamp what they read to the frame's render size (ClampUv, ClampLoad). Made again only for another
+/// output, or for a frame larger than them: at the output's size then (a size that grew is the dynamic resolution's, and
+/// the images are not made again for its next step), and at once with dynamic (the row's Auto). A fixed share is made at
+/// its own size. Never smaller than the frame, nor larger than the output unless the frame is
+struct ImagePlan {
+    unsigned width = 0, height = 0;
+    bool remake = false;
+};
+inline ImagePlan plan_images(unsigned have_w, unsigned have_h, unsigned have_uw, unsigned have_uh, unsigned rw, unsigned rh,
+                             unsigned uw, unsigned uh, bool dynamic) {
+    ImagePlan p;
+    rw = rw ? rw : 1, rh = rh ? rh : 1, uw = uw ? uw : 1, uh = uh ? uh : 1;
+    const bool same_output = have_w && have_h && have_uw == uw && have_uh == uh;
+    if (same_output && rw <= have_w && rh <= have_h) {
+        p.width = have_w, p.height = have_h;
+        return p;
+    }
+    // (a larger frame for the same output: the dynamic resolution's step up)
+    const bool full = dynamic || same_output;
+    p.width = full && uw > rw ? uw : rw;
+    p.height = full && uh > rh ? uh : rh;
+    p.remake = true;
+    return p;
+}
+
 } // namespace mkwvk::fsr3_math

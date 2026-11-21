@@ -219,10 +219,12 @@ void hos_menu_sound_play(int id, int64_t now_ns) {
         if (voices[i].started < oldest) oldest = voices[i].started, pick = i;
     }
     /* A sound that replaces itself restarts instead of stacking up, and a decision replaces the tick of the same press
-       (a row changes its value in the tick the press is seen). */
+       (a row changes its value in the tick the press is seen). ((Triforce, 11-19) the system menu's tick too: the mouse
+       onto Mods or Quit and its click in one tick is their decide alone) */
     for (int i = 0; i < VOICES; i++) {
         const int64_t at = atomic_load_explicit(&voices[i].at, memory_order_acquire);
-        if (at >= 0 && (atomic_load(&voices[i].sound) == id || atomic_load(&voices[i].sound) == HOS_MENU_SOUND_CURSOR) &&
+        const int was = atomic_load(&voices[i].sound);
+        if (at >= 0 && (was == id || was == HOS_MENU_SOUND_CURSOR || was == HOS_MENU_SOUND_SYS_CURSOR) &&
             AT_FRAME(at) < 2400) {   /* started under 50 ms ago */
             pick = i;
             break;

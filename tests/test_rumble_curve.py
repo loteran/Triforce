@@ -209,7 +209,7 @@ def main():
                          ("/* TX_SENS */", block(menu, "const char* tx_sens(")),
                          ("/* THE_ROW */", row.group(0)),
                          ("/* STOPS */", block(menu, "bool stops_at_ends(")),
-                         ("/* INI_KEY */", block(menu, "bool ini_row(") + "\n" + block(menu, "const char* ini_key(")),
+                         ("/* INI_KEY */", "bool is_merged(const int*) { return false; }   /* ((Triforce, options_version 7) no merged row here */\n" + block(menu, "bool ini_row(") + "\n" + block(menu, "const char* ini_key(")),
                          ("/* LOAD_LOOP */", loop)):
         cxx = cxx.replace(marker, text)
     c = C.replace("/* CURVE */", block(pad, "static unsigned rumble_curve(")).replace(

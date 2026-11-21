@@ -2,8 +2,10 @@
 of AMD's files: AMD's library is a stand-in that notes every call it gets.
 
 1. gpu/vk/framegen_rows.h, compiled and run: the row's last value by what a build and a card support, the values from before
-   (0 Off, 1 Auto, 2 to 8) meaning what they did, the version taken from AMD's list (the newest FSR 4, never an FSR 3.1
-   under its name), the camera cut, when a context still fits and when it is let go, and the order it is taken down in.
+   (0 Off, 1 Auto, 2 to 8) meaning what they did, the version taken from AMD's list (FSR 4's where listed, else FSR 3.1's, as
+   an RX 7900 XT has alone; FSR 4's alone with RX_VK_FSR4_FG=4) and the row's name for it, RX_VK_FRAMEGEN_MULT's range, the
+   game's frame alone without a picture without the HUD and where that picture is cut, the camera cut, when a context still
+   fits and when it is let go, and the order it is taken down in.
 2. gpu/vk/vk_menu.cpp's own tx_framegen and hn_framegen_fsr4, cut out and run: the names an options file's values show,
    a saved AMD FSR 4 where it cannot run, and that the row's table, its end and the menu's opening are wired to them.
 3. gpu/vk/vk_fsr4.cpp's frame generation section (fsr4fg), cut out and run against the stand-in library (Windows, with
@@ -97,17 +99,60 @@ int main() {
     for (int w = 1; w < FG_WHY_COUNT; w++) CHECK(!fsr4_asked(9, (Why)w, false));
     CHECK(multiplier(-3, 2) == 1 && multiplier(12, 2) == 8);   // (a value outside the row)
 
-    // AMD's list: the newest FSR 4, the first of equal ones; never an FSR 3.1 under FSR 4's name
+    // AMD's list: the newest, the first of equal ones: FSR 4's where it is listed, else ((Triforce, FG-1)) FSR 3.1's, which
+    // RX 6000 and 7000 have alone (3.1.6 on the owner's RX 7900 XT); only_fsr4 (RX_VK_FSR4_FG=4): 4.x or nothing, as before
     unsigned v[3];
     CHECK(parse_version("4.0.2", v) && v[0] == 4 && v[1] == 0 && v[2] == 2);
     CHECK(parse_version("4.1.0*", v) && v[1] == 1);   // (a version the graphics driver brings)
     CHECK(!parse_version("FSR", v) && !parse_version(nullptr, v) && !parse_version("4.0", v));
-    { const char* n[] = {"4.0.2", "3.1.6"}; CHECK(pick_version(n, 2, false) == 0); }
+    { const char* n[] = {"4.0.2", "3.1.6"}; CHECK(pick_version(n, 2, false) == 0 && pick_version(n, 2, true) == 0); }
     { const char* n[] = {"3.1.6", "4.0.0", "4.0.2*", "4.0.2", "4.0.1"}; CHECK(pick_version(n, 5, false) == 2); }
-    { const char* n[] = {"3.1.6", "3.1.4"}; CHECK(pick_version(n, 2, false) == -1); CHECK(pick_version(n, 2, true) == 0); }
-    { const char* n[] = {"3.1.6", "4.0.2"}; CHECK(pick_version(n, 2, true) == 1); }   // (any: still the newest)
-    { const char* n[] = {nullptr, "?", "5.0.0"}; CHECK(pick_version(n, 3, false) == -1); CHECK(pick_version(n, 3, true) == 2); }
+    { const char* n[] = {"3.1.6", "3.1.4"}; CHECK(pick_version(n, 2, false) == 0); CHECK(pick_version(n, 2, true) == -1); }
+    { const char* n[] = {"3.1.4", "3.1.6"}; CHECK(pick_version(n, 2, false) == 1); }   // (the newest 3.1)
+    { const char* n[] = {"3.1.6"}; CHECK(pick_version(n, 1, false) == 0); }            // (an RX 7900 XT's whole list)
+    { const char* n[] = {"3.1.6", "4.0.2"}; CHECK(pick_version(n, 2, false) == 1); }   // (FSR 4's first wherever it is listed)
+    { const char* n[] = {nullptr, "?", "5.0.0"}; CHECK(pick_version(n, 3, true) == -1); CHECK(pick_version(n, 3, false) == 2); }
+    { const char* n[] = {nullptr, "?"}; CHECK(pick_version(n, 2, false) == -1); }      // (nothing it can read)
     CHECK(pick_version(nullptr, 0, false) == -1);
+    // each reason it is not used has words for the log
+    for (int w = 0; w < FG_WHY_COUNT; w++) CHECK(why_name((Why)w) && *why_name((Why)w) && std::strcmp(why_name((Why)w), "?"));
+    // the row's name for it, by the version in use
+    char label[32];
+    CHECK(!std::strcmp(row_label(label, sizeof label, "3.1.6"), "AMD FSR (3.1.6)"));
+    CHECK(!std::strcmp(row_label(label, sizeof label, "4.0.2*"), "AMD FSR (4.0.2)"));   // (the driver's star is not shown)
+    CHECK(!std::strcmp(row_label(label, sizeof label, ""), "AMD FSR") && !std::strcmp(row_label(label, sizeof label, nullptr), "AMD FSR"));
+    CHECK(!std::strcmp(row_label(label, 8, "3.1.6"), "AMD FSR"));   // (cut to what fits, never past the buffer)
+    // ((Triforce, FG-9) RX_VK_FRAMEGEN_MULT: the row's whole range, AMD's 9 among it; not a number, 2 as before
+    CHECK(env_row("9") == 9 && env_row("0") == 0 && env_row("1") == 1 && env_row("5") == 5);
+    CHECK(env_row("12") == 9 && env_row("-3") == 0 && env_row("x") == 2 && env_row("") == 2 && env_row(nullptr) == 2);
+    // ((Triforce, FG-2) the game's frame alone: a new history, or no picture without the HUD (HDR Native first)
+    CHECK(game_frame_alone(SKIP) && game_frame_alone(GAME) && !game_frame_alone(MADE) && !game_frame_alone(OWN));
+    for (int scene = 0; scene < 2; scene++)
+        for (int hl = 0; hl < 2; hl++) CHECK(held_for(true, scene != 0, hl != 0) == HELD_HDR_NATIVE);
+    CHECK(held_for(false, true, true) == HELD_HDR_SCENE && held_for(false, true, false) == HELD_HDR_SCENE);
+    CHECK(held_for(false, false, false) == HELD_NO_HUDLESS && held_for(false, false, true) == HELD_NONE);
+    // ((Triforce) HDR Native and RenoDX's RGBA16F scene hold for every present: the renderer's own makes the frame, as a saved
+    // 9 ran on an RX 6000 or 7000 before (shown(9, false) == 2); only a frame missing its picture without the HUD is the game's
+    // frame alone
+    CHECK(held_whole_run(HELD_HDR_NATIVE) && held_whole_run(HELD_HDR_SCENE));
+    CHECK(!held_whole_run(HELD_NO_HUDLESS) && !held_whole_run(HELD_NONE));
+    CHECK(held_made(HELD_HDR_NATIVE) == OWN && held_made(HELD_HDR_SCENE) == OWN && held_made(HELD_NO_HUDLESS) == GAME);
+    CHECK(!game_frame_alone(held_made(HELD_HDR_NATIVE)) && !game_frame_alone(held_made(HELD_HDR_SCENE)));
+    // the picture without the HUD, cut as the present is: the same rect at the same size, scaled at another
+    SourceRect r = hudless_source(3416, 1440, 3416, 1440, 0, 0, 3416, 1440);
+    CHECK(r.x0 == 0 && r.y0 == 0 && r.x1 == 3416 && r.y1 == 1440);
+    r = hudless_source(2560, 1440, 2560, 1440, 160, 90, 2240, 1260);
+    CHECK(r.x0 == 160 && r.y0 == 90 && r.x1 == 2400 && r.y1 == 1350);
+    r = hudless_source(1280, 720, 2560, 1440, 160, 90, 2240, 1260);   // (an output half the window texture's size)
+    CHECK(r.x0 == 80 && r.y0 == 45 && r.x1 == 1200 && r.y1 == 675);
+    r = hudless_source(2560, 1440, 2560, 1440, 2500, 1400, 100, 100);   // (clipped to the picture)
+    CHECK(r.x0 == 2500 && r.y0 == 1400 && r.x1 == 2560 && r.y1 == 1440);
+    r = hudless_source(0, 1440, 2560, 1440, 0, 0, 2560, 1440);
+    CHECK(r.x1 == 0 && r.y1 == 0);
+    r = hudless_source(2560, 1440, 2560, 1440, 2560, 0, 10, 10);
+    CHECK(r.x1 == 0);
+    r = hudless_source(2, 2, 2560, 1440, 0, 0, 1, 1);   // (nothing of a pixel left: none)
+    CHECK(r.x1 == 0 && r.y1 == 0);
 
     // the camera: the view matrix's rows are its axes, the position -R^T t
     const float still[12] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0};
@@ -160,7 +205,8 @@ int main() {
     CHECK((play.did == std::vector<std::string>{"stop", "wait_gpu", "destroy_context", "destroy_images"}));
     teardown(exit, true);
     CHECK((exit.did == std::vector<std::string>{"stop"}));
-    std::puts("PASS: the Frame generation row's AMD FSR 4, AMD's version list, camera cuts, context life and teardown order");
+    std::puts("PASS: the Frame generation row's AMD FSR, AMD's version list, its name, the env pin, the picture without the HUD's "
+              "rules, camera cuts, context life and teardown order");
 }
 '''
 
@@ -171,30 +217,54 @@ MENU = CHECK + r'''
 namespace framegen_rows = mkwvk::framegen_rows;
 namespace fsr4fg {
 framegen_rows::Why now = framegen_rows::FG_OK;
+const char* in_use = "3.1.6";
 framegen_rows::Why why() { return now; }
 bool offered() { return why() == framegen_rows::FG_OK; }
 framegen_rows::Why why_known() { return now; }   // ((Triforce) the menu's rows read the answer as known)
 bool offered_known() { return why_known() == framegen_rows::FG_OK; }
+const char* version() { return now == framegen_rows::FG_OK ? in_use : ""; }
+// ((Triforce) what holds AMD's library from every present: HDR Native's picture (present_native_pq), RenoDX's RGBA16F scene
+framegen_rows::Held held_now = framegen_rows::HELD_NONE;
+framegen_rows::Held held() { return held_now; }
 }
+struct { int hdr = 0; } opts;   // ((Triforce, FG-5) the HDR row: 2 Native, which alone is no pause (no HDR display, say)
 /* TX */
 /* HN */
 int main() {
     static const char* const before[] = {"Off", "Auto", "2x", "3x", "4x", "5x", "6x", "7x", "8x"};
-    for (int w = 0; w < framegen_rows::FG_WHY_COUNT; w++) {
-        fsr4fg::now = (framegen_rows::Why)w;
-        for (int v = 0; v <= 8; v++) CHECK(!std::strcmp(tx_framegen(v), before[v]));   // (an options file from before)
-        CHECK(!std::strcmp(tx_framegen(9), w == framegen_rows::FG_OK ? "AMD FSR 4" : "2x"));   // (a saved choice shows what runs)
-        const char* line = hn_framegen_fsr4(-1);
-        CHECK(line && *line);
-        CHECK((std::strstr(line, "AMD's FSR 4 library") != nullptr) == (w == framegen_rows::FG_OK));
-        if (w != framegen_rows::FG_OK && w != framegen_rows::FG_NOT_YET) CHECK(std::strstr(line, "the renderer's own makes"));
-        bool listed = false;   // (the menu measures every line a value can show: the one shown now is among them)
-        int k = 0;
-        for (; const char* t = hn_framegen_fsr4(k); k++) listed |= t == line;
-        CHECK(listed && k == framegen_rows::FG_WHY_COUNT);
-    }
-    CHECK(std::strstr(hn_framegen_fsr4(0), "HUD"));   // (said to the player: the HUD is in the picture it works from)
-    std::puts("PASS: the row's names for an options file's values, and what a saved AMD FSR 4 shows where it cannot run");
+    static const framegen_rows::Held holds[] = {framegen_rows::HELD_NONE, framegen_rows::HELD_NO_HUDLESS, framegen_rows::HELD_HDR_NATIVE,
+                                                framegen_rows::HELD_HDR_SCENE};
+    for (int hdr = 0; hdr <= 2; hdr++)
+      for (framegen_rows::Held held : holds)
+        for (int w = 0; w < framegen_rows::FG_WHY_COUNT; w++) {
+            fsr4fg::now = (framegen_rows::Why)w;
+            fsr4fg::held_now = held;
+            opts.hdr = hdr;
+            const bool paused = framegen_rows::held_whole_run(held);   // (HDR Native's picture, or RenoDX's scene, in any HDR mode)
+            for (int v = 0; v <= 8; v++) CHECK(!std::strcmp(tx_framegen(v), before[v]));   // (an options file from before)
+            // (a saved choice shows what runs: AMD's, by the version AMD's library makes the frames with, or 2x)
+            CHECK(!std::strcmp(tx_framegen(9), w == framegen_rows::FG_OK ? "AMD FSR (3.1.6)" : "2x"));
+            const char* line = hn_framegen_fsr4(-1);
+            CHECK(line && *line);
+            CHECK((std::strstr(line, "AMD's frame generation library (its version") != nullptr) == (w == framegen_rows::FG_OK && !paused));
+            CHECK((std::strstr(line, "Paused with HDR Native or RenoDX") != nullptr) == (w == framegen_rows::FG_OK && paused));
+            // (paused, the frame is still made: by the renderer's own, as a saved 9 ran on a card without AMD's)
+            if (w == framegen_rows::FG_OK && paused) CHECK(std::strstr(line, "renderer's own makes the one frame, as at 2x"));
+            if (w != framegen_rows::FG_OK && w != framegen_rows::FG_NOT_YET) CHECK(std::strstr(line, "the renderer's own makes"));
+            bool listed = false;   // (the menu measures every line a value can show: the one shown now is among them)
+            int k = 0;
+            for (; const char* t = hn_framegen_fsr4(k); k++) listed |= t == line;
+            CHECK(listed && k == framegen_rows::FG_WHY_COUNT + 1);
+        }
+    fsr4fg::now = framegen_rows::FG_OK, fsr4fg::in_use = "4.0.2";
+    CHECK(!std::strcmp(tx_framegen(9), "AMD FSR (4.0.2)"));   // (an RX 9000's)
+    fsr4fg::in_use = "";
+    CHECK(!std::strcmp(tx_framegen(9), "AMD FSR"));   // (offered, its version not read)
+    // (said to the player: the HUD is kept out of what is moved, and HDR Native pauses it)
+    CHECK(std::strstr(hn_framegen_fsr4(0), "HUD kept where the game drew it"));
+    CHECK(std::strstr(hn_framegen_fsr4(framegen_rows::FG_WHY_COUNT), "HDR Native") && !hn_framegen_fsr4(framegen_rows::FG_WHY_COUNT + 1));
+    std::puts("PASS: the row's names for an options file's values, AMD's by its version, what a saved AMD FSR shows where it "
+              "cannot run, and its pause with HDR Native or RenoDX's scene");
 }
 '''
 
@@ -326,6 +396,9 @@ framegen_rows::Why why();
 inline bool offered() { return why() == framegen_rows::FG_OK; }   // (as vk_fsr4.h has it)
 framegen_rows::Why why_known();
 inline bool offered_known() { return why_known() == framegen_rows::FG_OK; }
+// ((Triforce) vk_fsr4.cpp's held(), outside the section: HDR Native's picture or RenoDX's RGBA16F scene, set by a scene
+static framegen_rows::Held held_now = framegen_rows::HELD_NONE;
+framegen_rows::Held held() { return held_now; }
 }
 /* SECTION */
 } // namespace mkwvk
@@ -343,6 +416,7 @@ static bool fail_configure;
 static uint64_t chosen_id;
 static VkCommandBuffer const kCmd = (VkCommandBuffer)(uintptr_t)0x77;
 static VkImage const kColor = (VkImage)(uintptr_t)0xC0, kDepth = (VkImage)(uintptr_t)0xD0, kMotion = (VkImage)(uintptr_t)0xE0;
+static VkImage const kHudless = (VkImage)(uintptr_t)0xF0;   // ((Triforce, FG-2) the picture without the HUD)
 static uint64_t last_id;
 static uint32_t made_w, made_h, made_rw, made_rh, made_flags;
 
@@ -367,15 +441,18 @@ static ffxReturnCode_t amd_create(ffxContext* context, ffxCreateContextDescHeade
     amd_calls++;
     CHECK(d->type == FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATION);
     const auto* c = (const ffxCreateContextDescFrameGeneration*)d;
-    bool api = false, backend = false, pin = false;
+    bool api = false, backend = false, pin = false, hudless = false;
     for (const ffxApiHeader* h = d->pNext; h; h = h->pNext) {
         if (h->type == FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATION_VERSION)
             api = ((const ffxCreateContextDescFrameGenerationVersion*)h)->version == FFX_FRAMEGENERATION_VERSION;
         if (h->type == FFX_API_CREATE_CONTEXT_DESC_TYPE_BACKEND_VK)
             backend = ((const ffxCreateBackendVKDesc*)h)->deviceContext.vkDevice == lib().device_context.vkDevice;
         if (h->type == FFX_API_DESC_TYPE_OVERRIDE_VERSION) pin = ((const ffxOverrideVersion*)h)->versionId == chosen_id;
+        if (h->type == FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATION_HUDLESS)   // ((Triforce, FG-2) its format, the picture's)
+            hudless = ((const ffxCreateContextDescFrameGenerationHudless*)h)->hudlessBackBufferFormat ==
+                      ffxApiGetSurfaceFormatVK(VK_FORMAT_R8G8B8A8_UNORM);
     }
-    CHECK(api && backend && pin);   // (the API's version, the device, and the version asked for by its id)
+    CHECK(api && backend && pin && hudless);   // (the API's version, the device, the version asked for by its id, the HUD-less format)
     CHECK(c->backBufferFormat == ffxApiGetSurfaceFormatVK(VK_FORMAT_R8G8B8A8_UNORM));
     CHECK(c->flags & FFX_FRAMEGENERATION_ENABLE_DEPTH_INVERTED);
     CHECK(!(c->flags & (FFX_FRAMEGENERATION_ENABLE_ASYNC_WORKLOAD_SUPPORT | FFX_FRAMEGENERATION_ENABLE_DISPLAY_RESOLUTION_MOTION_VECTORS)));
@@ -399,7 +476,9 @@ static ffxReturnCode_t amd_configure(ffxContext* context, const ffxConfigureDesc
     const auto* c = (const ffxConfigureDescFrameGeneration*)d;
     // (no swapchain of AMD's and none of its callbacks: the frame is asked for, and presented by the renderer)
     CHECK((c->flags & FFX_FRAMEGENERATION_FLAG_NO_SWAPCHAIN_CONTEXT_NOTIFY) && !c->swapChain && !c->presentCallback && !c->frameGenerationCallback);
-    CHECK(c->frameGenerationEnabled && !c->allowAsyncWorkloads && !c->onlyPresentGenerated && !c->HUDLessColor.resource);
+    // ((Triforce, FG-2) and the picture without the HUD, every frame: the HUD is kept where the game drew it)
+    CHECK(c->frameGenerationEnabled && !c->allowAsyncWorkloads && !c->onlyPresentGenerated && c->HUDLessColor.resource == kHudless);
+    CHECK(c->HUDLessColor.description.width == made_w && c->HUDLessColor.state == FFX_API_RESOURCE_STATE_UNORDERED_ACCESS);
     CHECK(c->generationRect.left == 0 && c->generationRect.top == 0 && (uint32_t)c->generationRect.width == made_w);
     CHECK(c->frameID == last_id + 1);   // (one more for each frame handed over)
     last_id = c->frameID;
@@ -435,7 +514,7 @@ static ffxReturnCode_t amd_dispatch(ffxContext* context, const ffxDispatchDescHe
 
 static fsr4fg::Inputs frame(uint64_t sequence, float x = 0.0f, uint32_t w = 2560, uint32_t h = 1440, uint32_t rw = 1920, uint32_t rh = 1080) {
     fsr4fg::Inputs in;
-    in.color = kColor, in.width = w, in.height = h;
+    in.color = kColor, in.hudless = kHudless, in.width = w, in.height = h;
     in.depth = kDepth, in.motion = kMotion, in.render_width = rw, in.render_height = rh;
     in.near_plane = 0.1f, in.far_plane = FLT_MAX, in.fov_y = 1.0f;
     const float view[12] = {1, 0, 0, -x, 0, 1, 0, 0, 0, 0, 1, 0};   // (the camera at x, looking down -z)
@@ -489,19 +568,72 @@ int main(int argc, char** argv) {
         CHECK(fsr4fg::generate(kCmd, frame(1)) == fgr::OWN && events.empty());
         return std::puts("PASS no-file"), 0;
     }
-    if (scene == "no-model" || scene == "any-version" || scene == "none-listed") {
-        listed = {"3.1.6"};   // (a card without FSR 4's frame generation: AMD's library lists FSR 3.1's alone)
+    if (scene == "fsr31" || scene == "any-version" || scene == "only-fsr4" || scene == "none-listed") {
+        // ((Triforce, FG-1) a card without FSR 4's frame generation (RX 6000, 7000): AMD's library lists FSR 3.1's alone, and
+        // it is taken, by default and with RX_VK_FSR4_FG=1; RX_VK_FSR4_FG=4 refuses it, as every run did before
+        listed = {"3.1.6"};
         if (scene == "none-listed") listed.clear();
-        if (scene == "any-version") env["RX_VK_FSR4_FG"] = 1, chosen_id = kIds[0];
-        if (scene == "any-version") {
-            CHECK(fsr4fg::why() == fgr::FG_OK && !std::strcmp(fsr4fg::version(), "3.1.6"));
+        if (scene == "any-version") env["RX_VK_FSR4_FG"] = 1;
+        if (scene == "only-fsr4") env["RX_VK_FSR4_FG"] = 4;
+        chosen_id = kIds[0];
+        if (scene == "fsr31" || scene == "any-version") {
+            CHECK(fsr4fg::why() == fgr::FG_OK && fsr4fg::offered() && !std::strcmp(fsr4fg::version(), "3.1.6"));
+            CHECK(has_log("using 3.1.6") && has_log("FSR 3.1's frame generation"));
             CHECK(fsr4fg::generate(kCmd, frame(1)) == fgr::SKIP && fsr4fg::generate(kCmd, frame(2)) == fgr::MADE);
         } else {
             CHECK(fsr4fg::why() == fgr::FG_NO_MODEL && !fsr4fg::offered());
             CHECK(fsr4fg::generate(kCmd, frame(1)) == fgr::OWN && events.empty() && !contexts_made);
-            CHECK(scene == "none-listed" || has_log("3.1.6"));   // (the log names what AMD's library has)
+            CHECK(scene == "none-listed" || (has_log("3.1.6") && has_log("RX_VK_FSR4_FG=4")));   // (the log names what AMD's library has)
         }
         return std::puts("PASS versions"), 0;
+    }
+    if (scene == "no-hudless" || scene == "hdr-native") {
+        // ((Triforce, FG-2, FG-5) the scene's depth and motion are there, the picture without the HUD is not (or HDR Native's
+        // picture): AMD's library is not given the frame and no context is made for it. Without the picture without the HUD,
+        // the game's frame is shown alone (GAME); HDR Native's picture, which no picture without the HUD can follow, goes to
+        // the renderer's own (OWN: it makes the frame, as at 2x). Each reason said once. Then with it: a new history (the
+        // frames in between were not given), and on from there
+        CHECK(fsr4fg::why() == fgr::FG_OK);
+        const int calls = amd_calls;
+        for (uint64_t i = 1; i <= 3; i++) {
+            fsr4fg::Inputs in = frame(i);
+            if (scene == "no-hudless") in.hudless = VK_NULL_HANDLE;
+            else in.pq = true;   // (with the picture without the HUD too: HDR Native first)
+            CHECK(fsr4fg::generate(kCmd, in) == (scene == "no-hudless" ? fgr::GAME : fgr::OWN) && fsr4fg::made_image() == VK_NULL_HANDLE);
+        }
+        CHECK(amd_calls == calls && !contexts_made && events.empty());
+        CHECK(has_log(scene == "no-hudless" ? "no picture without the HUD this frame" : "paused with HDR Native"));
+        int said = 0;
+        for (const std::string& l : logged)
+            said += l.find(scene == "no-hudless" ? "the game's frame alone" : "the renderer's own makes the frame, as at 2x") != std::string::npos;
+        CHECK(said == 1);
+        CHECK(fsr4fg::generate(kCmd, frame(4)) == fgr::SKIP && fsr4fg::generate(kCmd, frame(5)) == fgr::MADE);
+        return std::puts("PASS held"), 0;
+    }
+    if (scene == "fsr31-hdr-native" || scene == "fsr31-hdr-scene" || scene == "hdr-scene") {
+        // ((Triforce) a saved 9 on an RX 6000 or 7000 (AMD's library lists 3.1.6 alone) with HDR Native's picture, or in a
+        // run with RenoDX's RGBA16F scene (the owner's: RX 7900 XT, HDR Native and RenoDX). Before AMD's FSR 3.1 frame
+        // generation was offered there, the row showed and ran 2x (shown(9, false)). It is offered now and its version on the
+        // row, but these hold it from every present: AMD's library is never asked for the frame, no input is wanted for it,
+        // and the renderer's own makes the one frame (OWN), never the game's frame alone. Gone again, AMD's makes them
+        if (scene != "hdr-scene") listed = {"3.1.6"};
+        const fgr::Held held = scene == "fsr31-hdr-native" ? fgr::HELD_HDR_NATIVE : fgr::HELD_HDR_SCENE;
+        CHECK(fsr4fg::why() == fgr::FG_OK && fsr4fg::offered() && fsr4fg::frames_wanted());
+        CHECK(!std::strcmp(fsr4fg::version(), scene == "hdr-scene" ? "4.0.2" : "3.1.6"));
+        const int calls = amd_calls;
+        fsr4fg::held_now = held;
+        CHECK(!fsr4fg::frames_wanted());   // (vk_fsr3_inputs.cpp wanted() and framegen_hudless_note make nothing for it)
+        for (uint64_t i = 1; i <= 4; i++) {
+            fsr4fg::Inputs in = frame(i);
+            in.pq = held == fgr::HELD_HDR_NATIVE;
+            const fgr::Made m = fsr4fg::generate(kCmd, in);
+            CHECK(m == fgr::OWN && !fgr::game_frame_alone(m) && fsr4fg::made_image() == VK_NULL_HANDLE);
+        }
+        CHECK(amd_calls == calls && !contexts_made && events.empty());
+        fsr4fg::held_now = fgr::HELD_NONE;
+        CHECK(fsr4fg::frames_wanted());
+        CHECK(fsr4fg::generate(kCmd, frame(5)) == fgr::SKIP && fsr4fg::generate(kCmd, frame(6)) == fgr::MADE);
+        return std::puts("PASS held for the run"), 0;
     }
     if (scene == "env-off" || scene == "fsr4-off") {
         env[scene == "env-off" ? "RX_VK_FSR4_FG" : "RX_VK_FSR4"] = 0;
@@ -611,6 +743,7 @@ int main(int argc, char** argv) {
     bare.depth = VK_NULL_HANDLE;
     const int calls = amd_calls;
     CHECK(fsr4fg::generate(kCmd, bare) == fgr::OWN && amd_calls == calls && take().empty());
+    CHECK(has_log("a present without the scene's depth and motion"));   // ((Triforce) said, once: the lab's run had no such line)
     // another picture size: the GPU idle, AMD's context destroyed, then the image; then both made again, a new history
     CHECK(fsr4fg::generate(kCmd, frame(12, 40.1f, 1920, 1080, 1920, 1080)) == fgr::SKIP);
     CHECK(is(take(), {"wait_gpu", "destroy_context", "destroy_image", "create_image 1920x1080", "create_context 1920x1080", "image to GENERAL",
@@ -652,9 +785,13 @@ def source_checks():
 
     # the default stays Off, and the row's table takes an options file's AMD FSR 4 before the graphics card is known
     need(header, "int framegen = 0;", "vk_menu.h (the Frame generation row's default)")
-    need(menu, '{TAB_GRAPHICS, "Frame generation", &opts.framegen, 0, 9, 1, tx_framegen,', "vk_menu.cpp rows[]")
+    # ((Triforce, options_version 7) the saved value's own row is hidden and ends at AMD FSR 4 (kRowMax, 9), so a file's 9
+    # loads before the card is known; the Graphics tab's Frame generation row is merged_rows.h's, its choices framegen_list)
+    need(menu, '{TAB_HIDDEN, "Frame generation", &opts.framegen, 0, framegen_rows::kRowMax, 1, tx_framegen, nullptr}',
+         "vk_menu.cpp rows[]")
     sync = function(menu, "void framegen_row_sync() {")
-    need(sync, "r.hi = framegen_rows::row_hi(fsr4fg::offered_known())", "framegen_row_sync")   # ((Triforce) as known: menu_ahead)
+    need(sync, "mr7::framegen_choices(framegen_list, fsr4fg::offered_known(), dlssg_offered())",
+         "framegen_row_sync")   # ((Triforce) as known: menu_ahead)
     need(sync, "framegen_rows::kRowMax == 9", "framegen_row_sync")
     if menu.count("framegen_row_sync();") < 2:
         raise SystemExit("vk_menu.cpp: the Frame generation row's end is not set at both places the menu opens")
@@ -665,15 +802,43 @@ def source_checks():
     need(function(framegen, "int multiplier() {"), "if (opts.framegen == framegen_rows::FSR4) return 2;", "vk_framegen.cpp multiplier")
     record = function(framegen, "bool framegen_record(")
     for what in ("if (opts.framegen == framegen_rows::FSR4) {", "fsr4_frame(cmd, *set, cur, uw, uh, sequence, blend)",
-                 "none = by_fsr4 == framegen_rows::SKIP;", "if (set->made == 0 && !none && blend && m > 1) {"):
+                 "none = framegen_rows::game_frame_alone(by_fsr4);", "if (set->made == 0 && !none && blend && m > 1) {",
+                 "fg.src_w = sw, fg.src_h = sh, fg.source = source;"):
         need(record, what, "framegen_record")
     # ((Triforce) the renderer's own vectors are make_vectors')
     if not record.index("fsr4_frame(") < record.index("fsr3fi_frame(") < record.index("make_vectors(cmd", record.index("fsr4_frame(")):
         raise SystemExit("framegen_record: AMD FSR 4 is not asked before the renderer's own interpolation")
     frame = function(framegen, "framegen_rows::Made fsr4_frame(")
-    for what in ("if (!fsr4fg::frames_wanted()) return framegen_rows::OWN;", "fsr3_inputs::take(f)", "in.reset = f.reset || !blend;",
-                 "in.sequence = sequence;", "fsr4fg::generate(cmd, in)", "set.frame[0].image"):
+    for what in ("if (!fsr4fg::frames_wanted()) {", "framegen_rows::why_name(", "fsr3_inputs::take(f)", "in.reset = f.reset || !blend;",
+                 "in.sequence = sequence;", "fsr4fg::generate(cmd, in)", "set.frame[0].image",
+                 # ((Triforce, FG-2) this frame's picture without the HUD, none with HDR Native; what it answered counted
+                 "in.hudless = in.pq ? VK_NULL_HANDLE : hudless_for(cmd, f.frame, uw, uh);",
+                 "framegen_rows::game_frame_alone(made) ? made : framegen_rows::OWN"):
         need(frame, what, "fsr4_frame")
+    # ((Triforce, FG-2) the picture without the HUD: this frame's alone, cut as the picture is, its bytes as AMD's library takes them
+    hudless = function(framegen, "VkImage hudless_for(VkCommandBuffer cmd, uint64_t frame, uint32_t w, uint32_t h) {")
+    for what in ("k.valid && k.frame == frame", "framegen_rows::hudless_source(t->w, t->h, fg.src_w, fg.src_h",
+                 "VK_FORMAT_R8G8B8A8_SRGB", "vkCmdCopyImage(cmd, hl.srgb.image, VK_IMAGE_LAYOUT_GENERAL, hl.out.image"):
+        need(hudless, what, "vk_framegen.cpp hudless_for")
+    note = function(framegen, "void framegen_hudless_note(VkCommandBuffer cmd, Texture* out, uint32_t level) {")
+    for what in ("fsr4fg::frames_wanted()", "present_native_pq.load", "VK_FORMAT_B10G11R11_UFLOAT_PACK32", "vkCmdBlitImage(",
+                 "t.frame = texture_frame_no()"):
+        need(note, what, "vk_framegen.cpp framegen_hudless_note")
+    need(fsr4, "c.HUDLessColor = image_resource(in.hudless,", "vk_fsr4.cpp generate")
+    # ((Triforce) HDR Native and RenoDX's RGBA16F scene hold AMD's library from every present: nothing is wanted for it, the
+    # renderer's own makes the frame, and the menu's line says so by the same rule, not by the HDR row alone
+    need(function(fsr4, "bool frames_wanted() {"), "!fgr::held_whole_run(held())", "vk_fsr4.cpp frames_wanted")
+    held = function(fsr4, "framegen_rows::Held fsr4fg::held() {")
+    for what in ("present_native_pq.load(", "temporal_scene_format(VK_FORMAT_R16G16B16A16_SFLOAT)"):
+        need(held, what, "vk_fsr4.cpp fsr4fg::held")
+    if fsr4.index("framegen_rows::Held fsr4fg::held() {") < fsr4.rindex("#endif"):
+        raise SystemExit("vk_fsr4.cpp: fsr4fg::held is not outside the build's FSR sections (the menu reads it in every build)")
+    need(function(fsr4, "framegen_rows::Made generate("), "return fgr::held_made(held);", "vk_fsr4.cpp generate")
+    hn = function(menu, "const char* hn_framegen_fsr4(int variant) {")
+    need(hn, "framegen_rows::held_whole_run(fsr4fg::held()) ? native : ok", "hn_framegen_fsr4")
+    if "opts.hdr" in hn:
+        raise SystemExit("hn_framegen_fsr4: the pause is read from the HDR row, not from what holds AMD's library (fsr4fg::held)")
+    need(fsr4, "s.desc.header.pNext = &s.hudless.header;", "vk_fsr4.cpp make (the HUD-less format linked)")
     # its inputs are gathered while it is asked, its context looked after each present, and the exit reaches it
     need(inputs, "|| fsr4fg::frames_wanted()", "vk_fsr3_inputs.cpp wanted()")
     need(framegen, "void framegen_present_tick() { fsr4fg::present_tick(); }", "vk_framegen.cpp")
@@ -699,13 +864,16 @@ def source_checks():
     # the rows are documented
     readme = (ROOT / "readme.md").read_text(encoding="utf-8")
     row = [line for line in readme.splitlines() if line.startswith("| Frame generation |")]
-    if len(row) != 1 or "AMD FSR 4" not in row[0] or "2x up to 8x" not in row[0]:
-        raise SystemExit("readme.md: the Frame generation row does not list its choices with AMD FSR 4")
+    if len(row) != 1 or "AMD FSR (" not in row[0] or "2x up to 8x" not in row[0] or "3.1.6" not in row[0]:
+        raise SystemExit("readme.md: the Frame generation row does not list its choices with AMD FSR and its version")
     dev = (ROOT / "docs" / "development.md").read_text(encoding="utf-8")
     key = [line for line in dev.splitlines() if line.startswith("| `frame_generation` |")]
-    if len(key) != 1 or "9 AMD FSR 4" not in key[0] or "2 to 8 the multiplier" not in key[0]:
-        raise SystemExit("docs/development.md: frame_generation's values do not list 9, AMD FSR 4")
-    need(dev, "`RX_VK_FSR4_FG=0/1`", "docs/development.md (the switches)")
+    if len(key) != 1 or "9 AMD FSR frame generation" not in key[0] or "2 to 8 the multiplier" not in key[0]:
+        raise SystemExit("docs/development.md: frame_generation's values do not list 9, AMD FSR frame generation")
+    need(dev, "`RX_VK_FSR4_FG=0/1/4`", "docs/development.md (the switches)")
+    need(dev, "`RX_VK_FRAMEGEN_MULT=<0..9>`", "docs/development.md (the row's pin, 9 among it)")
+    need(dev, "`RX_VK_FG_OWN_MOTION=0`", "docs/development.md (frame generation's motion)")
+    need(dev, "`RX_VK_FG_HUDLESS=0`", "docs/development.md (the picture without the HUD)")
     print("PASS: the row, the made frame, the present's tick, the exit and the documents are wired to AMD FSR 4's frame generation")
 
 
@@ -733,8 +901,9 @@ def main():
             there, bare = Path(tmp) / "with", Path(tmp) / "without"
             there.mkdir(), bare.mkdir()
             (there / "amd_fidelityfx_framegeneration_vk.dll").write_bytes(b"a stand-in: only looked for by its name")
-            scenes = ["play", "no-device", "no-library", "no-configure", "no-model", "none-listed", "any-version", "env-off", "fsr4-off",
-                      "row", "create-fails", "image-fails", "dispatch-fails", "configure-fails", "exit"]
+            scenes = ["play", "no-device", "no-library", "no-configure", "fsr31", "only-fsr4", "none-listed", "any-version", "env-off",
+                      "fsr4-off", "row", "no-hudless", "hdr-native", "fsr31-hdr-native", "fsr31-hdr-scene", "hdr-scene", "create-fails", "image-fails", "dispatch-fails", "configure-fails",
+                      "exit"]
             build_and_run(a.cxx, tmp, "fg", text,
                           ["-I" + str(a.headers), "-I" + str(ROOT / "third_party" / "fidelityfx"), "-I" + str(VK), "-Wno-unknown-pragmas",
                            "-Wno-unused-function", "-Wno-unused-variable", "-Wno-unused-const-variable", "-Wno-unused-parameter",

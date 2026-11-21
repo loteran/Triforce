@@ -67,52 +67,6 @@
   },
   "settings": [
     {
-      "id": "preset",
-      "label": "Quality preset",
-      "help": "Sets resolution, upscaling, frame generation and the video memory limits for a card with that much memory. Changing most other rows yourself sets it back to Custom.",
-      "choices": [
-        {
-          "label": "Custom",
-          "set": {
-            "quality_preset": "0"
-          }
-        },
-        {
-          "label": "Minimum (4 GB)",
-          "set": {
-            "quality_preset": "1"
-          }
-        },
-        {
-          "label": "Low (6 GB)",
-          "set": {
-            "quality_preset": "2"
-          }
-        },
-        {
-          "label": "Balanced (8 GB)",
-          "set": {
-            "quality_preset": "3"
-          }
-        },
-        {
-          "label": "High (12 GB)",
-          "set": {
-            "quality_preset": "4"
-          }
-        },
-        {
-          "label": "Ultra (16 GB+)",
-          "set": {
-            "quality_preset": "5"
-          }
-        }
-      ],
-      "defaults": {
-        "quality_preset": "0"
-      }
-    },
-    {
       "id": "fullscreen",
       "label": "Fullscreen",
       "help": "Fills the screen with the game, without the window's border.",
@@ -248,6 +202,12 @@
       "help": "The size of the game's whole frame before it is scaled to your window. Applies after a restart.",
       "choices": [
         {
+          "label": "1536x864 (handheld)",
+          "set": {
+            "output_res": "7"
+          }
+        },
+        {
           "label": "2048x1152",
           "set": {
             "output_res": "0"
@@ -271,37 +231,9 @@
       }
     },
     {
-      "id": "upscaling",
-      "label": "Upscaling",
-      "help": "The filter that scales the picture to your window. Lanczos is the sharpest.",
-      "choices": [
-        {
-          "label": "Off",
-          "set": {
-            "upscaling": "0"
-          }
-        },
-        {
-          "label": "Catmull-Rom",
-          "set": {
-            "upscaling": "1"
-          }
-        },
-        {
-          "label": "Lanczos",
-          "set": {
-            "upscaling": "2"
-          }
-        }
-      ],
-      "defaults": {
-        "upscaling": "0"
-      }
-    },
-    {
       "id": "sharpness",
       "label": "Sharpness",
-      "help": "Sharpens the picture on its way to the window. Too much shows halos around edges.",
+      "help": "With DLSS or FSR, sharpens the 3D before the HUD; with the game's own upscaler, the picture at the window. 0% is off. Too much shows halos around edges.",
       "choices": [
         {
           "label": "0%",
@@ -316,9 +248,21 @@
           }
         },
         {
+          "label": "50%",
+          "set": {
+            "sharpness": "50"
+          }
+        },
+        {
           "label": "60%",
           "set": {
             "sharpness": "60"
+          }
+        },
+        {
+          "label": "80%",
+          "set": {
+            "sharpness": "80"
           }
         },
         {
@@ -333,30 +277,8 @@
       }
     },
     {
-      "id": "handheld",
-      "label": "Handheld profile",
-      "help": "Runs the game as if the console were undocked: lower resolution, lighter on the graphics card. Applies after a restart.",
-      "choices": [
-        {
-          "label": "Off",
-          "set": {
-            "handheld_profile": "0"
-          }
-        },
-        {
-          "label": "On",
-          "set": {
-            "handheld_profile": "1"
-          }
-        }
-      ],
-      "defaults": {
-        "handheld_profile": "0"
-      }
-    },
-    {
       "id": "ultrawide",
-      "label": "Ultrawide",
+      "label": "Aspect ratio",
       "help": "Monitor's shape widens the camera to fill a screen wider than 16:9. The HUD stays stretched. Applies after a restart.",
       "choices": [
         {

@@ -125,7 +125,7 @@ private:
 // ---- the menus' skin: the textures the Options screen is drawn with (vk_ui.h), by the game's own names, and a few made
 // from them here as the game's layout shader makes them at each draw: a plate is its shape (BtnThinBase_00's alpha), its
 // colour between two browns by the grain texture (BtnThinBase_05), its fine frame line (BtnThinBase_04, or _02 with the
-// curls at its corners) over it. The browns are measured from the game's own screens (the Load screen's buttons).
+// curls at its corners) over it. The colours are the layouts' own (kPlateWhite and the others below).
 struct Skin {
     struct Entry {
         std::string name;
@@ -138,17 +138,60 @@ struct Skin {
         return nullptr;
     }
 };
-struct Rgb {
-    unsigned char r, g, b;
+// ---- (Triforce) the layouts' own material colours. Each pane of the game's layouts (UI/Layout2Archive/Common.*.blarc, BFFH)
+// has a material with a white colour and a black colour, linear RGBA floats in the layout's colour table, and its texture
+// picks between them: what shows is black + (white - black) x the texture's colour (linear), its alpha the texture's (the
+// black colours' alpha is 0, the whites' 1). Read from the player's own files once (PaOptionBtnL_00, PaMenuCategory_00) and
+// written here as numbers; the layout itself is never read at run time. They agree with the screen: the rows' plate measured
+// 98,74,37 at its rim and 111,84,44 at its middle, its value's orange 211,144,37 where the plate's texture is white.
+// (Before, the plates' browns ran the other way, dark in the middle; the value plates were the texture times one measured
+// colour, which made the orange's middle 168,115,29 where the game's is about 190,126,30.)
+struct Lin {
+    float r, g, b;
 };
-// (the plates' browns: the grain's dark and light ends, and the frame line's; the selected row's a little lighter)
-// (measured on the game's Options rows: 98,74,37 at a plate's rim to 111,84,44 at its middle, its edge line 122,103,61; the
-// selected row's plate is the same: the game marks the selection with the cursor alone)
-constexpr Rgb kPlateDark{96, 72, 36}, kPlateLight{112, 85, 45}, kPlateLine{124, 104, 62};
-constexpr Rgb kPlateSelDark = kPlateDark, kPlateSelLight = kPlateLight, kPlateSelLine = kPlateLine;
+// PaOptionBtnL_00 (an option's row): W_Base_03 the row's plate (BtnThinBase_05, the grain), W_BaseFlame_02 its fine line
+// (BtnThinBase_04), W_Base_01 the value's dark panel and W_CheckL_00 / W_CheckR_00 the chosen value's orange plate (both
+// OptionBtnThinElement_00, a grey colour texture, not a mask)
+constexpr Lin kPlateWhite{0.118689f, 0.0658853f, 0.017683f}, kPlateBlack{0.161467f, 0.0883403f, 0.0258325f},
+              kPlateLine{0.200063f, 0.139549f, 0.0484867f};
+constexpr Lin kValueWhite{0.00489631f, 0.00456596f, 0.00340996f}, kValueBlack{0.0331048f, 0.0257721f, 0.0108705f};
+constexpr Lin kValueOnWhite{0.655931f, 0.284227f, 0.0186829f}, kValueOnBlack{0.318547f, 0.0998504f, 0.00665673f};
+// PaMenuCategory_00 (the pause menu's chosen category, MenuHeaderSelect_00): P_PlusMenuBg_00's, the + menu's, where the
+// System tab is (its blue to red, 0.19, is the measured tint's, 62 / 190 = 0.33 against P_MinusMenuBg_00's 0.18)
+constexpr Lin kTabWhite{0.286275f, 0.164706f, 0.054902f}, kTabBlack{0.0313726f, 0.00392157f, 0.0f};
 
-/// A plate from the game's three layers (shape, grain, line): the same size as the shape
-inline Image make_plate(const Image& shape, const Image& grain, const Image* line, Rgb dark, Rgb light, Rgb line_col) {
+inline float srgb_to_linear(float v) { return v <= 0.04045f ? v / 12.92f : std::pow((v + 0.055f) / 1.055f, 2.4f); }
+inline unsigned char linear_to_srgb8(float v) {
+    v = std::clamp(v, 0.0f, 1.0f);
+    const float s = v <= 0.0031308f ? v * 12.92f : 1.055f * std::pow(v, 1 / 2.4f) - 0.055f;
+    return (unsigned char)(s * 255 + 0.5f);
+}
+/// A texel's colour channel, linear (a mask's is white, as the game samples it)
+struct ToLinear {
+    float lut[256];
+    explicit ToLinear(bool srgb) {
+        for (int i = 0; i < 256; i++) lut[i] = srgb ? srgb_to_linear(i / 255.0f) : i / 255.0f;
+    }
+};
+/// A texture as a pane of the game's layout shows it with its material's colours (black, white): the same size, sRGB
+inline Image make_tinted(const Image& tex, Lin black, Lin white) {
+    const ToLinear lin(tex.srgb);
+    Image out;
+    out.w = tex.w, out.h = tex.h, out.srgb = true;
+    out.rgba.resize(tex.rgba.size());
+    const float b[3] = {black.r, black.g, black.b}, w[3] = {white.r, white.g, white.b};
+    for (size_t i = 0; i + 3 < tex.rgba.size(); i += 4) {
+        for (int k = 0; k < 3; k++) out.rgba[i + k] = linear_to_srgb8(b[k] + (w[k] - b[k]) * lin.lut[tex.rgba[i + k]]);
+        out.rgba[i + 3] = tex.rgba[i + 3];
+    }
+    return out;
+}
+
+/// A plate from the game's three layers (shape, grain, line): the same size as the shape. The grain is W_Base_03's texture
+/// with its colours (black where the grain is dark: the plate's lighter middle; white where it is white: its rim), the line
+/// W_BaseFlame_02's over it, both in linear light as the game blends its panes
+inline Image make_plate(const Image& shape, const Image& grain, const Image* line, Lin black, Lin white, Lin line_col) {
+    const ToLinear lin(grain.srgb);
     Image out;
     out.w = shape.w, out.h = shape.h, out.srgb = true;
     out.rgba.resize((size_t)out.w * out.h * 4);
@@ -156,14 +199,29 @@ inline Image make_plate(const Image& shape, const Image& grain, const Image* lin
         for (uint32_t x = 0; x < out.w; x++) {
             const size_t i = ((size_t)y * out.w + x) * 4;
             const uint32_t gx = (std::min)(x, grain.w - 1), gy = (std::min)(y, grain.h - 1);
-            const float g = grain.rgba[((size_t)gy * grain.w + gx) * 4] / 255.0f;
-            float c[3] = {dark.r + (light.r - dark.r) * g, dark.g + (light.g - dark.g) * g, dark.b + (light.b - dark.b) * g};
+            const float g = lin.lut[grain.rgba[((size_t)gy * grain.w + gx) * 4]];
+            float c[3] = {black.r + (white.r - black.r) * g, black.g + (white.g - black.g) * g, black.b + (white.b - black.b) * g};
             if (line && x < line->w && y < line->h) {
                 const float a = line->rgba[((size_t)y * line->w + x) * 4 + 3] / 255.0f;
                 c[0] += (line_col.r - c[0]) * a, c[1] += (line_col.g - c[1]) * a, c[2] += (line_col.b - c[2]) * a;
             }
-            out.rgba[i] = (unsigned char)(c[0] + 0.5f), out.rgba[i + 1] = (unsigned char)(c[1] + 0.5f), out.rgba[i + 2] = (unsigned char)(c[2] + 0.5f);
+            out.rgba[i] = linear_to_srgb8(c[0]), out.rgba[i + 1] = linear_to_srgb8(c[1]), out.rgba[i + 2] = linear_to_srgb8(c[2]);
             out.rgba[i + 3] = shape.rgba[i + 3];
+        }
+    return out;
+}
+/// A mask made smaller by a whole factor (each texel the mean of its block): for a soft one that needs no more
+inline Image shrink_mask(const Image& m, uint32_t f) {
+    if (f <= 1 || m.w < f || m.h < f) return m;
+    Image out;
+    out.w = m.w / f, out.h = m.h / f, out.mask = true, out.srgb = m.srgb;
+    out.rgba.assign((size_t)out.w * out.h * 4, 255);
+    for (uint32_t y = 0; y < out.h; y++)
+        for (uint32_t x = 0; x < out.w; x++) {
+            uint32_t sum = 0;
+            for (uint32_t v = 0; v < f; v++)
+                for (uint32_t u = 0; u < f; u++) sum += m.rgba[((size_t)(y * f + v) * m.w + x * f + u) * 4 + 3];
+            out.rgba[((size_t)y * out.w + x) * 4 + 3] = (unsigned char)((sum + f * f / 2) / (f * f));
         }
     return out;
 }
@@ -190,13 +248,16 @@ inline void make_cursor(const Image& ramp, const Image& wide, Image* line, Image
     }
 }
 
-/// The skin from the archive's bytes (a BNTX): false when it is not the game's (a texture of the list missing)
+/// The skin from the archive's bytes (a BNTX): false when it is not the game's (a texture of the list missing). (Triforce)
+/// The optional ones are the standalone menu's background (SystemBG_00's shade and noise): one missing is left out, and the
+/// menu draws its plain dim there instead (vk_ui.h system_bg); the skin stays
 inline bool make_skin(std::vector<unsigned char>&& bntx_bytes, Skin& skin) {
     static const char* const names[] = {
         "SystemHeader_00", "SystemBg_05", "SystemCaptionBg_00", "SystemGuideBase_00", "BtnThinBase_00", "BtnThinBase_01",
         "BtnThinBase_02", "BtnThinBase_04", "BtnThinBase_05", "OptionBtnThinElement_00", "OptionBtnThinCursorLine_00",
         "OptionBtnThinCursorGlow_00", "ScrollBarBase_00", "ScrollBar_00", "OptionSeparateMark_00",
         "SystemLine_03", "MenuHeaderSelect_00", "OptionCheckMark_00"};
+    static const char* const optional[] = {"SystemBgSh_00", "DecoNoise_00"};
     Bntx bntx;
     if (!bntx.parse(std::move(bntx_bytes))) return false;
     skin.images.clear();
@@ -207,14 +268,75 @@ inline bool make_skin(std::vector<unsigned char>&& bntx_bytes, Skin& skin) {
         if (!e || !bntx.decode(*e, out.img)) return false;
         skin.images.push_back(std::move(out));
     }
+    for (const char* n : optional) {
+        const Bntx::Entry* e = bntx.find(n);
+        Skin::Entry out;
+        out.name = n;
+        if (!e || !bntx.decode(*e, out.img) || !out.img.mask) continue;
+        // (the shade, 2560 x 1440, is a soft vignette: a quarter of its size each way draws the same, 1 MB in place of 15)
+        if (out.name == "SystemBgSh_00") out.img = shrink_mask(out.img, 4);
+        skin.images.push_back(std::move(out));
+    }
     const Image *shape = skin.get("BtnThinBase_00"), *grain = skin.get("BtnThinBase_05");
-    Skin::Entry row{"plate_row", make_plate(*shape, *grain, skin.get("BtnThinBase_04"), kPlateDark, kPlateLight, kPlateLine)};
-    Skin::Entry row_sel{"plate_row_sel", make_plate(*shape, *grain, skin.get("BtnThinBase_04"), kPlateSelDark, kPlateSelLight, kPlateSelLine)};
-    Skin::Entry btn{"plate_btn", make_plate(*shape, *grain, skin.get("BtnThinBase_02"), kPlateDark, kPlateLight, kPlateLine)};
+    Skin::Entry row{"plate_row", make_plate(*shape, *grain, skin.get("BtnThinBase_04"), kPlateBlack, kPlateWhite, kPlateLine)};
+    Skin::Entry row_sel{"plate_row_sel", row.img};   // (the selected row's plate is the same: the game marks it with the cursor alone)
+    Skin::Entry btn{"plate_btn", make_plate(*shape, *grain, skin.get("BtnThinBase_02"), kPlateBlack, kPlateWhite, kPlateLine)};
     skin.images.push_back(std::move(row)), skin.images.push_back(std::move(row_sel)), skin.images.push_back(std::move(btn));
+    // (the value's panel, the chosen value's orange plate and the chosen tab's plate, as their panes show them: drawn untinted)
+    const Image *element = skin.get("OptionBtnThinElement_00"), *tab = skin.get("MenuHeaderSelect_00");
+    Skin::Entry value{"value_plate", make_tinted(*element, kValueBlack, kValueWhite)};
+    Skin::Entry value_on{"value_plate_on", make_tinted(*element, kValueOnBlack, kValueOnWhite)};
+    Skin::Entry tab_sel{"tab_select", make_tinted(*tab, kTabBlack, kTabWhite)};
+    skin.images.push_back(std::move(value)), skin.images.push_back(std::move(value_on)), skin.images.push_back(std::move(tab_sel));
     Skin::Entry line{"cursor_line", {}}, glow{"cursor_glow", {}};
     make_cursor(*skin.get("OptionBtnThinCursorLine_00"), *skin.get("OptionBtnThinCursorGlow_00"), &line.img, &glow.img);
     skin.images.push_back(std::move(line)), skin.images.push_back(std::move(glow));
+    return true;
+}
+
+// ---- (Triforce, 11-19) the title's list. Each of its entries (Continue, New Game, Options, ...) is the part
+// PaCommonBtnTitle_00 of UI/Layout2Archive/Title.Product.100.Nin_Ounce_NVN2.blarc, its textures in the Title archive's BNTX,
+// all BC4 masks the layout's materials colour. The Mods entry under the list is drawn with them as the game draws its own
+// (vk_menu.cpp draw_title_mods): W_Bg_00 the chosen entry's dark band (CtrlGuideBG_00 its shape, fading out at its ends;
+// CtrlGuideBGGrd_00 thinner toward its top and bottom), W_Bg_01 the decide's sparkle over it (DecideNoise_01), P_Deco_*_00
+// and P_DecoGlow_*_00 the filigree either side (TitleBtnDeco_00, TitleBtnDecoGlow_00, drawn as masks). The band's colour
+// and strength are measured from the lab's shot of the game's own chosen entry (runs/pt-menu, 3440 x 1440): (11,7,7) where
+// it is solid, about 60% at its top and bottom, no line along its edges (so CtrlGuideBGEdge_00 is not used)
+constexpr unsigned char kTitleBandRgb[3] = {7, 4, 4};
+constexpr float kTitleBandAlpha = 0.96f, kTitleBandThin = 0.4f;
+constexpr float kTitleNoiseAcross = 3.0f;   // (the sparkle's texels square on the band, about 3 times as wide as its texture)
+/// The band (W_Bg_00: its colour, its strength from the shape and the gradient) and the decide's sparkle (W_Bg_01: the noise
+/// where the band is, a mask) from the three masks, the size of the shape's
+inline void make_title_band(const Image& shape, const Image& grd, const Image& noise, Image* band, Image* decide) {
+    for (Image* o : {band, decide}) o->w = shape.w, o->h = shape.h, o->srgb = true, o->rgba.assign((size_t)shape.w * shape.h * 4, 255);
+    band->mask = false, decide->mask = true;
+    for (uint32_t y = 0; y < shape.h; y++)
+        for (uint32_t x = 0; x < shape.w; x++) {
+            const size_t i = ((size_t)y * shape.w + x) * 4;
+            const float a = shape.rgba[i + 3] / 255.0f;
+            const float g = x < grd.w && y < grd.h ? grd.rgba[((size_t)y * grd.w + x) * 4 + 3] / 255.0f : 0;
+            band->rgba[i] = kTitleBandRgb[0], band->rgba[i + 1] = kTitleBandRgb[1], band->rgba[i + 2] = kTitleBandRgb[2];
+            band->rgba[i + 3] = (unsigned char)(a * kTitleBandAlpha * (1 - kTitleBandThin * g) * 255 + 0.5f);
+            const uint32_t nx = (uint32_t)(x * kTitleNoiseAcross) % noise.w, ny = y % noise.h;
+            decide->rgba[i + 3] = (unsigned char)(a * noise.rgba[((size_t)ny * noise.w + nx) * 4 + 3] + 0.5f);
+        }
+}
+/// The title's textures from the archive's bytes (a BNTX): added to `skin` as "title_band", "title_decide",
+/// "TitleBtnDeco_00" and "TitleBtnDecoGlow_00"; false (the skin left as it was) when one is missing
+inline bool make_title_skin(std::vector<unsigned char>&& bntx_bytes, Skin& skin) {
+    static const char* const names[] = {"CtrlGuideBG_00", "CtrlGuideBGGrd_00", "DecideNoise_01", "TitleBtnDeco_00", "TitleBtnDecoGlow_00"};
+    constexpr int kN = (int)(sizeof names / sizeof *names);
+    Bntx bntx;
+    if (!bntx.parse(std::move(bntx_bytes))) return false;
+    Image img[kN];
+    for (int i = 0; i < kN; i++) {
+        const Bntx::Entry* e = bntx.find(names[i]);
+        if (!e || !bntx.decode(*e, img[i]) || !img[i].mask) return false;
+    }
+    Skin::Entry band{"title_band", {}}, decide{"title_decide", {}};
+    make_title_band(img[0], img[1], img[2], &band.img, &decide.img);
+    skin.images.push_back(std::move(band)), skin.images.push_back(std::move(decide));
+    skin.images.push_back({names[3], std::move(img[3])}), skin.images.push_back({names[4], std::move(img[4])});
     return true;
 }
 

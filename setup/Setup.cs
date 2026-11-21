@@ -41,6 +41,11 @@ static class Program
     public const string ReleaseApi = Home + "/api/v1/repos/triforce/downloads/releases?limit=1";
     public const string SetupAsset = "TriforceSetup.exe";
     public const string ToolsAsset = "Triforce-Tools.zip";
+    // ((Triforce, 11-18) the tools in two parts (setup/pack_tools.ps1): the base, which does not change from one release to the
+    // next (the compiler, Python, the libraries: 95 % of the zip), and the code, with the base's list (Tools.BaseList). An update
+    // fetches the code and keeps the base it has: 12 MB instead of 284. Triforce-Tools.zip stays for older Setups and a first install)
+    public const string ToolsCodeAsset = "Triforce-Tools-code.zip";
+    public const string ToolsBaseAsset = "Triforce-Tools-base.zip";
     public const string AppName = "Triforce";
 
     [STAThread]
@@ -373,6 +378,8 @@ sealed class Release
     public string Tag = "";
     public string? SetupUrl, ToolsUrl;
     public long SetupSize, ToolsSize;
+    public string? ToolsCodeUrl, ToolsBaseUrl;   // ((Triforce) the tools in parts, when the release has them: Tools.UnpackParts)
+    public long ToolsCodeSize, ToolsBaseSize;
 
     /// The latest release (TRIFORCE_RELEASE_API overrides the address, for testing against a local copy)
     public static async Task<Release> Latest(HttpClient http, CancellationToken token)
@@ -406,6 +413,8 @@ sealed class Release
                 var size = f.TryGetValue("size", out var s) && s != null ? Convert.ToInt64(s) : 0;
                 if (string.Equals(name, Program.SetupAsset, StringComparison.OrdinalIgnoreCase)) { r.SetupUrl = link; r.SetupSize = size; }
                 if (string.Equals(name, Program.ToolsAsset, StringComparison.OrdinalIgnoreCase)) { r.ToolsUrl = link; r.ToolsSize = size; }
+                if (string.Equals(name, Program.ToolsCodeAsset, StringComparison.OrdinalIgnoreCase)) { r.ToolsCodeUrl = link; r.ToolsCodeSize = size; }
+                if (string.Equals(name, Program.ToolsBaseAsset, StringComparison.OrdinalIgnoreCase)) { r.ToolsBaseUrl = link; r.ToolsBaseSize = size; }
             }
         return r;
     }
@@ -501,6 +510,8 @@ sealed class Tools
                 }
             }
             File.WriteAllText(Path.Combine(part, "version.txt"), tag + "\n");
+            // ((Triforce) a whole zip's base is the one its list names: the next update keeps it without reading it again)
+            if (ReadBaseList(Path.Combine(part, BaseList)) is { } listed) File.WriteAllText(Path.Combine(part, BaseHave), listed.Id + "\n");
         }
         catch (Exception)
         {
@@ -521,6 +532,169 @@ sealed class Tools
         }
         try { if (Directory.Exists(old)) Directory.Delete(old, true); } catch (Exception) { }
         progress(1);
+    }
+
+    // ---- (Triforce, 11-18) the tools in two parts: the base kept from one release to the next ----
+    // setup/pack_tools.ps1 lists the base (the compiler, Python, the libraries: the folders that do not change between releases,
+    // 95 % of Triforce-Tools.zip) in tools/base.list, which the code part and the whole zip carry. An update of tools that hold
+    // that base fetches the code part alone (12 MB, not 284; at a release the download server's line was full and each player got
+    // 75 KB/s) and moves the base folders over from the tools there now. The base is the list's when every file it names is there
+    // with its size and SHA-256 (read once: base.have then remembers the list's id, and later updates check the sizes alone).
+    // Anything else (no tools, another base, a file changed or gone) fetches the base part as well.
+    public const string BaseList = "base.list", BaseHave = "base.have";
+
+    public sealed class Base
+    {
+        public string Id = "";   // (the SHA-256 of the list's dir and file lines)
+        public readonly System.Collections.Generic.List<string> Dirs = new();
+        public readonly System.Collections.Generic.List<(string Path, long Size, string Sha)> Files = new();
+    }
+
+    /// A base list's text: "triforce-tools-base 1", "id <sha256>", then "dir <name>" and "file <size> <sha256> <path>"
+    /// lines (tab-separated, paths with /). Null when it is not one
+    public static Base? ParseBaseList(string text)
+    {
+        var lines = text.Replace("\r", "").Split('\n');
+        if (lines.Length < 2 || lines[0].Trim() != "triforce-tools-base\t1") return null;
+        var b = new Base();
+        foreach (var line in lines.Skip(1))
+        {
+            var f = line.Split('\t');
+            if (f.Length == 2 && f[0] == "id") b.Id = f[1].Trim().ToLowerInvariant();
+            else if (f.Length == 2 && f[0] == "dir" && f[1].Length > 0 && Mods.Unsafe(f[1], true) == null && !f[1].Contains('/')) b.Dirs.Add(f[1]);
+            else if (f.Length == 4 && f[0] == "file" && long.TryParse(f[1], out var size) && f[2].Length == 64 && Mods.Unsafe(f[3], true) == null)
+                b.Files.Add((f[3], size, f[2].ToLowerInvariant()));
+            else if (line.Length > 0) return null;   // (a line it does not know: another format, not guessed at)
+        }
+        return b.Id.Length == 64 && b.Dirs.Count > 0 && b.Files.Count > 0 ? b : null;
+    }
+    public static Base? ReadBaseList(string path)
+    {
+        try { return File.Exists(path) ? ParseBaseList(File.ReadAllText(path)) : null; } catch (Exception) { return null; }
+    }
+    /// The base list in a code (or whole) zip, null when it has none
+    public static Base? BaseListIn(string zip)
+    {
+        using var z = ZipFile.OpenRead(zip);
+        var e = z.Entries.FirstOrDefault(x => x.FullName.Replace('\\', '/') is var n && (n == "tools/" + BaseList || n == BaseList));
+        if (e == null) return null;
+        using var r = new StreamReader(e.Open());
+        return ParseBaseList(r.ReadToEnd());
+    }
+
+    /// Whether the tools in folder hold base b whole (progress: 0..1 while it reads the files). Remembers a match in base.have
+    public static bool HasBase(Base b, string folder, Action<double> progress)
+    {
+        foreach (var d in b.Dirs)
+            if (!Directory.Exists(Path.Combine(folder, d))) return false;
+        foreach (var f in b.Files)   // (every file there, at its size: quick, and enough once base.have says the rest was read)
+        {
+            var fi = new FileInfo(Path.Combine(folder, f.Path));
+            if (!fi.Exists || fi.Length != f.Size) return false;
+        }
+        string? had = null;
+        try { had = File.Exists(Path.Combine(folder, BaseHave)) ? File.ReadAllText(Path.Combine(folder, BaseHave)).Trim() : null; } catch (Exception) { }
+        if (had == b.Id) return true;
+        long total = Math.Max(1, b.Files.Sum(f => f.Size)), done = 0;
+        using (var sha = System.Security.Cryptography.SHA256.Create())
+            foreach (var f in b.Files)
+            {
+                string got;
+                using (var s = File.OpenRead(Path.Combine(folder, f.Path))) got = string.Concat(sha.ComputeHash(s).Select(x => x.ToString("x2")));
+                if (got != f.Sha) return false;
+                done += f.Size;
+                progress((double)done / total);
+            }
+        try { File.WriteAllText(Path.Combine(folder, BaseHave), b.Id + "\n"); } catch (Exception) { }
+        return true;
+    }
+
+    /// The tools folder made again from a code zip and either a base zip (baseZip) or the base folders of the tools there now
+    /// (baseZip null: HasBase said they are b's). The old folder is replaced only once the new one is complete; what fails on
+    /// the way puts the base folders back where they were
+    public static void UnpackParts(string codeZip, string? baseZip, Base b, string tag, Action<double> progress)
+    {
+        var target = Folder;
+        var part = target + ".part";
+        if (Directory.Exists(part)) Directory.Delete(part, true);
+        var moved = new System.Collections.Generic.List<string>();
+        void PutBack()
+        {
+            foreach (var d in moved)
+                try { if (Directory.Exists(target) && !Directory.Exists(Path.Combine(target, d))) Directory.Move(Path.Combine(part, d), Path.Combine(target, d)); }
+                catch (Exception) { }
+        }
+        try
+        {
+            Directory.CreateDirectory(part);
+            Extract(codeZip, part, f => progress(baseZip == null ? f * 0.9 : f * 0.1));
+            if (baseZip != null) Extract(baseZip, part, f => progress(0.1 + f * 0.8));
+            else
+                foreach (var d in b.Dirs)
+                {
+                    var into = Path.Combine(part, d);
+                    if (Directory.Exists(into)) Directory.Delete(into, true);   // (a code zip has none of them; never mixed)
+                    Directory.Move(Path.Combine(target, d), into);
+                    moved.Add(d);
+                }
+            foreach (var f in b.Files)   // (the base whole in the new folder, whichever way it came)
+            {
+                var fi = new FileInfo(Path.Combine(part, f.Path));
+                if (!fi.Exists || fi.Length != f.Size) throw new InvalidDataException("The tools' base lacks " + f.Path + " (or it has another size): they were not changed.");
+            }
+            File.WriteAllText(Path.Combine(part, "version.txt"), tag + "\n");
+            File.WriteAllText(Path.Combine(part, BaseHave), b.Id + "\n");
+        }
+        catch (Exception)
+        {
+            PutBack();
+            try { if (Directory.Exists(part)) Directory.Delete(part, true); } catch (Exception) { }
+            throw;
+        }
+        var old = target + ".old";
+        if (Directory.Exists(old)) Directory.Delete(old, true);
+        if (Directory.Exists(target)) Directory.Move(target, old);
+        try { Directory.Move(part, target); }
+        catch (Exception)
+        {
+            try
+            {
+                if (!Directory.Exists(target) && Directory.Exists(old)) Directory.Move(old, target);
+                PutBack();
+            }
+            catch (Exception) { }
+            throw;
+        }
+        try { if (Directory.Exists(old)) Directory.Delete(old, true); } catch (Exception) { }
+        progress(1);
+    }
+
+    /// A tools zip's files into folder, every name checked before the first is written (as Unpack does: Mods.Unsafe)
+    static void Extract(string zip, string folder, Action<double> progress)
+    {
+        using var z = ZipFile.OpenRead(zip);
+        var bytes = z.Entries.Sum(e => e.Length) + z.Entries.Count * 4096L;
+        if (Space.Problem("the Triforce tools", bytes, Space.Free(folder), Space.Disk(folder)) is { } none) throw new NoRoomException(none);
+        var prefix = z.Entries.All(e => e.FullName.Replace('\\', '/').StartsWith("tools/", StringComparison.OrdinalIgnoreCase)) ? "tools/" : "";
+        foreach (var e in z.Entries)
+        {
+            var name = e.FullName.Replace('\\', '/').Substring(prefix.Length);
+            if (name.Length > 0 && Mods.Unsafe(name, true) is { } why)
+                throw new InvalidDataException("The tools' zip holds " + why + " (\"" + (name.Length > 120 ? name.Substring(0, 117) + "..." : name) + "\"): it was not unpacked.");
+        }
+        var full = Path.GetFullPath(folder) + Path.DirectorySeparatorChar;
+        for (var i = 0; i < z.Entries.Count; i++)
+        {
+            var e = z.Entries[i];
+            var name = e.FullName.Replace('\\', '/').Substring(prefix.Length);
+            if (name.Length == 0) continue;
+            var dest = Path.GetFullPath(Path.Combine(folder, name));
+            if (!dest.StartsWith(full, StringComparison.OrdinalIgnoreCase)) continue;
+            if (name.EndsWith("/")) { Directory.CreateDirectory(dest); continue; }
+            Directory.CreateDirectory(Path.GetDirectoryName(dest)!);
+            e.ExtractToFile(dest, true);
+            if ((i & 15) == 0) progress((double)i / z.Entries.Count);
+        }
     }
 }
 

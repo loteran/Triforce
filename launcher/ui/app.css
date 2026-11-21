@@ -1,0 +1,178 @@
+/* The launcher's own additions on top of the approved look (v3.css) and the prototype's interaction styles (proto.css). */
+
+/* no game read yet: no game art anywhere (the crest stands in on the working screens) */
+.noart .gamelogo, .noart .rlogo .aura, .noart .rlogo .glowl, .noart .mini .aura, .noart .logo .aura { display: none; }
+.noart .mini { background: url(img/crest.png) center / 92px no-repeat; }
+.gamelogo[src=""] { visibility: hidden; }
+
+/* the bar with nothing to show (benchmark run) */
+.bar.bare { display: none; }
+
+/* off buttons: visible, quiet, and they say why when pressed (the launcher sends a toast) */
+.play.off { filter: grayscale(.85) brightness(.6); cursor: not-allowed; }
+.row-set.off { opacity: .5; }
+.row-set.danger b, .row-set.danger em { color: #ff8a92; }
+
+/* the reveal's choice rows can be 2 or 3 (NVIDIA: DLSS) */
+.choices { display: grid; gap: 0 40px; }
+.choices > div.bad b, .choices > div.bad small { color: #ff8a92; }
+
+/* the working screen */
+.workfoot { position: absolute; left: 64px; bottom: 26px; font-size: 13.5px; color: var(--text3); }
+.workfoot .lnk { color: var(--gold); }
+.workerr { position: absolute; left: 230px; width: 820px; top: 470px; text-align: center; }
+.workerr p { margin-top: 18px; font-size: 14px; color: var(--text3); } .workerr .lnk { color: var(--gold); }
+#s-work.failed .center h1 { color: #ffd6d9; }
+#s-work.failed .nowmusic, #s-work.failed .workfoot { display: none; }
+.drawer { position: absolute; left: 0; right: 0; bottom: 0; height: 0; overflow: hidden; z-index: 12; background: rgba(8, 7, 6, .97);
+  border-top: 1px solid rgba(var(--gold-rgb), .4); transition: height .25s ease; }
+.drawer.open { height: 330px; }
+.drawer .dhead { display: flex; gap: 22px; align-items: baseline; padding: 14px 64px 8px; font-size: 14px; }
+.drawer .dhead b { flex: 1; font-family: 'Cormorant Garamond', Georgia, serif; font-style: italic; font-size: 19px; color: var(--gold-hi); }
+.drawer .dhead .lnk { color: var(--gold); cursor: pointer; }
+.drawer pre { margin: 0 64px; height: 270px; overflow: auto; font: 12.5px/1.45 'Cascadia Mono', Consolas, 'DejaVu Sans Mono', monospace; color: var(--text2); white-space: pre-wrap; }
+
+/* sheets: lists to choose from and questions */
+.opts.many { display: grid; grid-template-columns: 1fr 1fr; gap: 0 10px; max-height: 420px; overflow: auto; }
+.opts.many .opt:first-of-type, .opts.many .opt:nth-of-type(2) { margin-top: 18px; }
+.opt.sel > span:last-child::before { content: '\25C6'; color: var(--gold-hi); }
+.asktext { margin-top: 12px; max-height: 360px; overflow: auto; font-size: 14px; color: var(--text2); line-height: 1.5; }
+.asktext p + p { margin-top: 8px; }
+.sheet { width: 600px; }
+
+/* saves */
+.sc.empty .p { display: grid; place-items: center; background: rgba(10, 9, 8, .45); }
+.sc.empty .p span { font-family: 'Cormorant Garamond', Georgia, serif; font-style: italic; font-size: 18px; color: var(--text3); }
+
+/* mods */
+.modtabs { position: absolute; left: 64px; top: 170px; display: flex; gap: 26px; font-size: 15px; color: var(--text3); }
+.modtabs span { padding-bottom: 6px; cursor: pointer; } .modtabs span.on { color: var(--gold-hi); font-weight: 600; box-shadow: inset 0 -2px 0 var(--gold); }
+.search { left: auto !important; right: 64px; top: 160px !important; width: 360px !important; padding: 0 !important; }
+.search input { width: 100%; height: 100%; padding: 0 14px; border: 0; outline: 0; background: transparent; color: var(--text); font: inherit; font-size: 14.5px; }
+.search input::placeholder { color: var(--text3); }
+.mods { top: 222px !important; max-height: 500px; overflow-y: auto; align-content: start; }
+.mods::-webkit-scrollbar { width: 6px; } .mods::-webkit-scrollbar-thumb { background: rgba(var(--gold-rgb), .35); }
+.mod { grid-template-columns: 64px 1fr auto !important; gap: 14px; }
+.mod .mi { width: 64px; height: 40px; background-size: cover; background-position: center; outline: 1px solid rgba(var(--gold-rgb), .3); }
+.mod .mi.none { background: rgba(255, 255, 255, .04); }
+.mod em.offm { color: var(--text3); }
+.mod.more b { color: var(--gold); }
+.modnote { position: absolute; left: 64px; right: 64px; bottom: 26px; font-size: 13.5px; color: var(--text2); }
+.modnote b { color: var(--gold-hi); }
+
+/* home with no save yet: no picture, the title alone */
+#s-home.nopic .frame, #s-home.nopic .glow { display: none; }
+
+/* in the real window: the bar is the title bar */
+.bar { app-region: drag; -webkit-app-region: drag; }
+.bar .nav a, .bar .state, .bar .spk, .bar .wc span { app-region: no-drag; -webkit-app-region: no-drag; }
+.nochrome .wc { display: none; }
+.hosted #protonote, .hosted #jump { display: none; }
+.choices > div > div { min-width: 0; flex: 1; }
+.choices b { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.choices small { display: block; margin: 2px 0 0 !important; }
+.choices .ch { flex: none; margin-left: 18px; }
+.found4 { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 1100px; left: 90px; right: 90px; }
+.choices label { white-space: nowrap; }
+.choices > div { padding: 16px 22px; }
+
+/* settings: a long value (a folder) keeps to its column */
+.row-set > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* mods: a description keeps its paragraphs */
+.asktext.modesc { white-space: pre-line; }
+.whatsnew h4 .lnk { font-family: Commissioner, sans-serif; font-style: normal; font-size: 13px; color: var(--gold); margin-left: 4px; }
+.sheet:has(.opts.many) { width: 720px; }
+.opts.many .opt { padding: 12px 14px; }
+.opt > div { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+/* a long text in a sheet scrolls with the launcher's own thin bar, not the system's */
+.asktext::-webkit-scrollbar { width: 6px; } .asktext::-webkit-scrollbar-thumb { background: rgba(var(--gold-rgb), .35); }
+.asktext::-webkit-scrollbar-button { display: none; } .asktext { padding-right: 10px; }
+/* settings: the list scrolls inside the page (it is longer than the window) */
+.set { max-height: 572px; overflow-y: auto; padding-right: 14px; }
+.set::-webkit-scrollbar { width: 6px; } .set::-webkit-scrollbar-thumb { background: rgba(var(--gold-rgb), .35); }
+.opts.grid::-webkit-scrollbar { width: 6px; } .opts.grid::-webkit-scrollbar-thumb { background: rgba(var(--gold-rgb), .35); }
+/* (Cormorant's old-style figures read "1" as "ı": lining figures everywhere) */
+body { font-variant-numeric: lining-nums; }
+/* Mods: the tabs under the title, not over it */
+.modtabs { top: 216px !important; }
+.search { top: 206px !important; }
+.mods { top: 268px !important; max-height: 470px !important; }
+.whatsnew p { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 440px; }
+/* benchmark places without a picture of their own: the hall's warm dark, the name carries it */
+.place.noimg { background: radial-gradient(120% 140% at 30% 0%, #2a2112 0%, #15110b 60%, #0a0908 100%); }
+.place.noimg::after { background: none; }
+/* Settings: Launcher and the game's own tabs */
+.settabs { position: absolute; left: 64px; top: 196px; display: flex; gap: 26px; font-size: 15px; color: var(--text3); }
+.settabs span { padding-bottom: 6px; cursor: pointer; } .settabs span.on { color: var(--gold-hi); font-weight: 600; box-shadow: inset 0 -2px 0 var(--gold); }
+#s-settings .set { top: 246px !important; max-height: 520px !important; overflow-y: auto; padding-right: 12px; }
+.gnote { font-size: 13px; color: var(--text3); margin: 0 0 4px; }
+.row-set.gs .slider { width: 260px; }
+.row-set .gval { min-width: 110px; display: inline-block; }
+#s-settings .benchcard { top: 246px; }
+.dot.grey { background: #8a8578; box-shadow: none; }
+/* benchmark: running, and the results' frame-time lines */
+.brun .bline { margin-top: 10px; font-size: 18px; color: var(--text); }
+.brun .bhint { margin-top: 8px; font-size: 14px; color: var(--text2); max-width: 720px; }
+.place .pg { position: absolute; left: 14px; right: 14px; top: 12px; height: 46px; z-index: 1; }
+.spark { position: absolute; inset: 0; width: 100%; height: 100%; overflow: visible; }
+.spark polyline { fill: none; stroke: var(--gold); stroke-width: 1.6; vector-effect: non-scaling-stroke; }
+.spark.b polyline { stroke: var(--emerald); }
+.spark .l60 { stroke: rgba(243, 234, 213, .25); stroke-dasharray: 4 4; vector-effect: non-scaling-stroke; }
+.place .vs { font-style: normal; color: var(--emerald); } .place .vs strong { color: var(--emerald); }
+.place.two { height: 150px; }
+.place > div.two { display: grid; grid-template-columns: 1fr; gap: 2px; align-items: end; }
+.place > div.two b { margin-bottom: 4px; }
+.place > div.two span { display: flex; align-items: baseline; gap: 6px; }
+.place > div.two span i { font-style: normal; font-size: 12.5px; color: var(--text3); min-width: 96px; }
+.place.two .pg { height: 40px; }
+.recs .compare { margin-top: 14px; width: 100%; }
+.recs .act .qlink { white-space: nowrap; }
+
+/* Color scheme (Settings > Launcher): any colour in place of the gold. theme.css holds the shades, app.js moves them. */
+/* the crest's metal turned to the colour; img/crest-gold.png is its mask, so the three stones and the dark stone stay */
+.tint .mark::after, .tint .seal::after, .tint.noart .mini::after { content: ''; position: absolute; inset: 0; pointer-events: none;
+  background: url(img/crest.png) center / contain no-repeat; -webkit-mask: url(img/crest-gold.png) center / contain no-repeat; mask: url(img/crest-gold.png) center / contain no-repeat;
+  filter: hue-rotate(var(--tint-h)) saturate(var(--tint-s)) brightness(var(--tint-b)); }
+.tint.noart .mini::after { background-size: 92px; -webkit-mask-size: 92px; mask-size: 92px; }
+/* the game's ornament and the logo's aura: the same sepia gold as drawn, turned by as much */
+.tint .orn { filter: sepia(1) saturate(calc(3.2 * var(--tint-s))) hue-rotate(calc(-10deg + var(--tint-h))) brightness(calc(1.05 * var(--tint-b))); }
+.tint .rule i, .tint .frame .top i { filter: sepia(1) saturate(calc(3.2 * var(--tint-s))) hue-rotate(calc(-10deg + var(--tint-h))) brightness(var(--tint-b)); }
+.tint .logo .aura, .tint .mini .aura { filter: sepia(1) saturate(calc(2.2 * var(--tint-s))) hue-rotate(calc(-6deg + var(--tint-h))) brightness(var(--tint-b)); }
+.tint .rlogo .aura { filter: sepia(1) saturate(calc(2.4 * var(--tint-s))) hue-rotate(calc(-8deg + var(--tint-h))) brightness(var(--tint-b)) blur(6px); }
+
+/* the row: its value is the colour (a diamond, as the sliders' knob) and its hex; selecting it drops the picker under it */
+.row-set .sw { display: inline-block; width: 11px; height: 11px; margin: 0 12px 0 3px; transform: rotate(45deg); vertical-align: 0; background: var(--gold);
+  box-shadow: 0 0 0 1px rgba(var(--gold-hi-rgb), .55), 0 0 0 3px rgba(10, 9, 8, .9); }
+.cpick { height: 0; overflow: hidden; visibility: hidden; border-bottom: 1px solid var(--line-soft); margin-bottom: -1px;
+  transition: height .25s ease, visibility 0s linear .25s; }
+.cpick.open { height: 222px; visibility: visible; margin-bottom: 0; transition: height .25s ease; }
+/* (16px on the left: the focus ring, the frame and the diamond at the left end stay inside the list, which clips there) */
+.cp { display: grid; grid-template-columns: 250px 1fr; gap: 38px; padding: 20px 4px 22px 16px; }
+/* the square: saturation across, brightness up; the hue under it as one of the launcher's sliders */
+.cp-sv { position: relative; height: 140px; cursor: crosshair; outline: 1px solid rgba(var(--gold-rgb), .42); outline-offset: 4px;
+  background: linear-gradient(0deg, #000, rgba(0, 0, 0, 0)), linear-gradient(90deg, #fff, hsl(var(--cp-h, 43), 100%, 50%)); }
+.cp-sv u, .cp-hue u { position: absolute; width: 14px; height: 14px; margin: -7px 0 0 -7px; transform: rotate(45deg); pointer-events: none;
+  background: var(--cp-c, var(--gold)); box-shadow: 0 0 0 2px var(--text), 0 0 0 4px rgba(10, 9, 8, .9); }
+.cp-sv.held { outline: 2px solid var(--gold-hi); }
+/* held (Enter / A: the arrows set it): a double ring over the focus ring, and the bigger diamond */
+body.kb .cp-sv.held.kf { outline: 4px double var(--gold-hi) !important; box-shadow: 0 0 0 9px rgba(var(--gold-hi-rgb), .3); }
+.cp-sv.held u { transform: rotate(45deg) scale(1.3); }
+.cp-hue { margin-top: 26px; background: linear-gradient(90deg, #f00, #ff0 16.667%, #0f0 33.333%, #0ff 50%, #00f 66.667%, #f0f 83.333%, #f00); }
+.cp-hue::before { content: ''; position: absolute; left: 0; right: 0; top: -10px; bottom: -10px; }
+.cp-hue u { top: 50%; box-shadow: 0 0 0 3px rgba(10, 9, 8, .9); }
+/* hex and r, g, b: the launcher's field (the mods search), checked as typed */
+.cp-f { display: flex; gap: 14px; }
+.cp-f label { display: block; font-size: 13px; font-weight: 600; color: var(--text3); }
+.cp-f input { display: block; width: 62px; height: 38px; margin-top: 5px; padding: 0 12px; font: inherit; font-size: 14.5px; font-variant-numeric: tabular-nums; color: var(--text);
+  background: rgba(10, 9, 8, .6); border: 1px solid rgba(var(--gold-rgb), .35); outline: 0; border-radius: 0; }
+.cp-f input#cpHex { width: 112px; letter-spacing: .03em; text-transform: uppercase; }
+.cp-f input:focus { border-color: var(--gold-hi); }
+.cp-f input.bad { border-color: #ff8a92; color: #ffd6d9; }
+.cp-msg { height: 18px; margin-top: 6px; font-size: 12.5px; color: var(--text3); } .cp-msg.bad { color: #ff8a92; }
+/* the ready colours (Triforce gold first) and the way back to it */
+.cp-pre { display: flex; gap: 17px; margin: 6px 0 0 4px; }
+.cp-pre span { width: 18px; height: 18px; transform: rotate(45deg); background: var(--c); box-shadow: 0 0 0 1px rgba(243, 234, 213, .25), 0 0 0 3px rgba(10, 9, 8, .9); cursor: pointer; }
+.cp-pre span.on { box-shadow: 0 0 0 2px var(--text), 0 0 0 4px rgba(10, 9, 8, .9); }
+.cp-foot { display: flex; justify-content: space-between; align-items: baseline; margin-top: 20px; font-size: 14px; }
+.cp-foot em { font-family: 'Cormorant Garamond', Georgia, serif; font-style: italic; font-weight: 600; font-size: 17px; color: var(--gold-hi); }
+.cp-foot .lnk { font-weight: 600; color: var(--gold); cursor: pointer; }

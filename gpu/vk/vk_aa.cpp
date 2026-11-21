@@ -59,6 +59,19 @@ int upscaler_now() {
     if (fsr3_wanted()) return fsr3_native() ? upscaler_rows::FSR3_AA : upscaler_rows::FSR3;
     return temporal_mode();
 }
+/// ((Triforce, FSR3-06, FSR4-5) An upscaler draws from the tone mapped picture, so the game's SMAA is left out with the game's
+/// own chosen too (aa_rows.h effective): the dispatches ask then. Taken once a frame, as every dispatch asks aa_asked
+bool upscaler_asks() {
+    static std::atomic<uint64_t> frame{~0ull};
+    static std::atomic<bool> asks{false};
+    const uint64_t now = texture_frame_no();
+    if (frame.load(std::memory_order_acquire) != now) {
+        asks.store(ar::effective(ar::GAME, upscaler_now(), temporal_before_bloom(), env_choice() >= 0) != ar::GAME,
+                   std::memory_order_relaxed);
+        frame.store(now, std::memory_order_release);
+    }
+    return asks.load(std::memory_order_relaxed);
+}
 
 // ---- the frame's choice, and what became of the game's passes ----
 
@@ -346,7 +359,8 @@ int aa_mode() {
     std::lock_guard lk(s.mu);
     if (frame_read.load(std::memory_order_relaxed) != frame) {
         const int choice = ar::chosen(opts.aa, env_choice());
-        const int want = choice == ar::GAME ? (int)ar::GAME : ar::effective(choice, upscaler_now());
+        // ((Triforce, FSR3-06, FSR4-5) with an upscaler after the bloom, none: aa_rows.h effective)
+        const int want = ar::effective(choice, upscaler_now(), temporal_before_bloom(), env_choice() >= 0);
         frame_begun(s, frame, want);
         mode_now.store(want, std::memory_order_release);
         frame_read.store(frame, std::memory_order_release);
@@ -356,7 +370,7 @@ int aa_mode() {
 
 int aa_env_choice() { return env_choice(); }
 
-bool aa_asked() { return ar::chosen(opts.aa, env_choice()) != ar::GAME || engaged.load(std::memory_order_relaxed); }
+bool aa_asked() { return ar::chosen(opts.aa, env_choice()) != ar::GAME || engaged.load(std::memory_order_relaxed) || upscaler_asks(); }
 
 bool aa_leave_out(uint64_t key) {
     if (!aa_asked()) return false;

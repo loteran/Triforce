@@ -85,6 +85,7 @@
 #define vkCmdSetColorBlendEnableEXT(...) (::mkwvk::rec::rx_vkCmdSetColorBlendEnableEXT(__VA_ARGS__))
 #define vkCmdSetColorBlendEquationEXT(...) (::mkwvk::rec::rx_vkCmdSetColorBlendEquationEXT(__VA_ARGS__))
 #define vkCmdSetColorWriteMaskEXT(...) (::mkwvk::rec::rx_vkCmdSetColorWriteMaskEXT(__VA_ARGS__))
+#define vkCmdSetFragmentShadingRateKHR(...) (::mkwvk::rec::rx_vkCmdSetFragmentShadingRateKHR(__VA_ARGS__))
 #define vkCmdWriteBufferMarkerAMD(...) (::mkwvk::rec::rx_vkCmdWriteBufferMarkerAMD(__VA_ARGS__))
 #define vkCmdSetCheckpointNV(...) (::mkwvk::rec::rx_vkCmdSetCheckpointNV(__VA_ARGS__))
 #define vkCmdWriteTimestamp2(...) (::mkwvk::rec::rx_vkCmdWriteTimestamp2(__VA_ARGS__))

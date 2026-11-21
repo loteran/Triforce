@@ -437,6 +437,13 @@ static void theme_caption(HWND w) {
     set(w, 34, &border, sizeof border);
 }
 
+/* ((Triforce, 11-19) benchmark mode's end, host/hos_bench.c: the window closed as by the player, on its own thread, so the game
+   quits the way its window's close does; with no window (HOS_HEADLESS) that same exit at once) */
+void hos_window_close(void) {
+    if (hwnd) PostMessageA(hwnd, WM_CLOSE, 0, 0);
+    else hos_window_closed_exit();
+}
+
 static void display_start_failed(const char *operation) {
     const DWORD error = GetLastError();
     hos_log("display: %s failed (error %lu)", operation, (unsigned long)error);

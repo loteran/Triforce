@@ -231,7 +231,7 @@ int main() {
         CHECK(r.lo == -1 && r.hi == 50 && r.step == 1);
         CHECK(r.preset_exempt && !r.restart);   // (a control: the quality preset stays, and it applies at once)
         CHECK(stops_at_ends(r));                // (a scale: 50% does not wrap round to As Stick dead zone)
-        CHECK(!strcmp(r.text(-1), "As Stick dead zone") && !strcmp(r.text(0), "0%") && !strcmp(r.text(8), "8%") && !strcmp(r.text(50), "50%"));
+        CHECK(!strcmp(r.text(-1), "Default (24%)") && !strcmp(r.text(0), "0%") && !strcmp(r.text(8), "8%") && !strcmp(r.text(50), "50%"));
     }
     CHECK(!strcmp(ini_key(rows[0]), "left_stick_dead_zone"));
     CHECK(!strcmp(ini_key(rows[1]), "right_stick_dead_zone"));
@@ -245,7 +245,7 @@ int main() {
     CHECK(opts.rstick_dead_zone == -1);
     parse("lstick_deadzone=20\n");   // (NX2navi's key is not this file's)
     CHECK(opts.lstick_dead_zone == -1);
-    printf("menu: Left and Right stick dead zone, As Stick dead zone then 0%% to 50%%, saved by their names\n");
+    printf("menu: Left and Right stick dead zone, Default then 0%% to 50%%, saved by their names\n");
     return 0;
 }
 '''
@@ -292,8 +292,11 @@ def main():
     rows = [re.search(r'\{TAB_CONTROLS, "%s stick dead zone", &opts\.%sstick_dead_zone, -1, 50, 1, tx_own_dead_zone,\s*"[^}]*\},'
                       % (name, name[0].lower()), menu) for name in ("Left", "Right")]
     check(all(rows), "the Controls tab has no Left and Right stick dead zone rows (-1 to 50)")
-    main_row = menu.index('{TAB_CONTROLS, "Stick dead zone", &opts.stick_dead_zone,')
-    check(main_row < rows[0].start() < rows[1].start(), "the two rows are not under Stick dead zone, the left first")
+    # ((Triforce, options_version 7) the shared Stick dead zone row is gone: the two rows are the Controller group's, the left
+    # first; their -1 is XInput's own, Default)
+    check(menu.index('MENU_HEADING(TAB_CONTROLS, "Controller"),') < rows[0].start() < rows[1].start(),
+          "the two rows are not in the Controller group, the left first")
+    check('"Stick dead zone", &opts.stick_dead_zone' not in menu, "the shared Stick dead zone row is still there")
     loop = block(block(menu, "void menu_init("), "for (Row& r : rows) {")
     cxx = CXX
     for marker, text in (("/* OPTIONS */", re.search(r"struct Options \{.*?\n\};", header, re.S).group(0)),
@@ -303,7 +306,7 @@ def main():
                          ("/* TX_OWN */", block(menu, "const char* tx_own_dead_zone(")),
                          ("/* THE_ROWS */", rows[0].group(0) + "\n" + rows[1].group(0)),
                          ("/* STOPS */", block(menu, "bool stops_at_ends(")),
-                         ("/* INI_KEY */", block(menu, "bool ini_row(") + "\n" + block(menu, "const char* ini_key(")),
+                         ("/* INI_KEY */", "bool is_merged(const int*) { return false; }   /* ((Triforce, options_version 7) no merged row here */\n" + block(menu, "bool ini_row(") + "\n" + block(menu, "const char* ini_key(")),
                          ("/* LOAD_LOOP */", loop)):
         cxx = cxx.replace(marker, text)
     c = C
@@ -318,9 +321,9 @@ def main():
         c = c.replace(marker, text)
 
     # ---- the tables that document them ----
-    check(re.search(r"^\| Left stick dead zone, Right stick dead zone \| As Stick dead zone, or 0% to 50%", read("readme.md"), re.M)
+    check(re.search(r"^\| Left stick dead zone, Right stick dead zone \| Default \(24%\), or 0% to 50%", read("readme.md"), re.M)
           is not None, "readme.md's settings table has no row for the sticks' own dead zones")
-    check(re.search(r"^\| `left_stick_dead_zone`, `right_stick_dead_zone` \| -1 As Stick dead zone, 0 to 50 percent \|",
+    check(re.search(r"^\| `left_stick_dead_zone`, `right_stick_dead_zone` \| -1 Default \(XInput's ~24%\), 0 to 50 percent",
                     read("docs", "development.md"), re.M) is not None,
           "docs/development.md's options table does not say what the two keys' numbers are")
 

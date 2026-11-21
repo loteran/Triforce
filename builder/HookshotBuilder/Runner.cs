@@ -81,7 +81,12 @@ sealed class Runner
         this.ngxSdk = ngxSdk;
     }
 
-    static ProcessStartInfo Info(Tools tools, IEnumerable<string> args, int? workers = null, string? ngxSdk = null)
+    /// (Triforce, 11-18) The event this run's game opens while it prepares its shaders (gpu/vk/vk_main.cpp PrepareStopWatch),
+    /// named for this run alone: a Cancel here never stops another builder's preparation
+    readonly string stopEvent = @"Local\TriforcePrepareStop." + Guid.NewGuid().ToString("N");
+
+    static ProcessStartInfo Info(Tools tools, IEnumerable<string> args, int? workers = null, string? ngxSdk = null,
+                                 string? stopEvent = null)
     {
         var si = new ProcessStartInfo(tools.Python)
         {
@@ -98,6 +103,9 @@ sealed class Runner
         // (NVIDIA DLSS: only when ticked. Without it, one set on the PC is not passed on either: a build is with DLSS only when asked)
         if (ngxSdk != null) si.Environment["HOOKSHOT_NGX_SDK"] = ngxSdk;
         else si.Environment.Remove("HOOKSHOT_NGX_SDK");
+        // (not a HOOKSHOT_ name: make_game.py's game_env keeps it for the game)
+        if (stopEvent != null) si.Environment["TRIFORCE_PREPARE_STOP"] = stopEvent;
+        else si.Environment.Remove("TRIFORCE_PREPARE_STOP");
         // (the folder's own compiler, headers and libraries, when it has them: nothing of the PC's but Windows' own)
         var sets = new[] { ("EMSDK", "emsdk"), ("RX_CPM", "cpm"), ("WGPU_NATIVE", "wgpu-native") };
         foreach (var (name, folder) in sets)
@@ -118,7 +126,7 @@ sealed class Runner
         {
             try
             {
-                using var p = Process.Start(Info(tools, args, workers, ngxSdk))!;
+                using var p = Process.Start(Info(tools, args, workers, ngxSdk, stopEvent))!;
                 process = p;
                 p.ErrorDataReceived += (_, e) => { if (e.Data != null) Line?.Invoke(e.Data); };
                 p.BeginErrorReadLine();
@@ -138,10 +146,26 @@ sealed class Runner
         });
     }
 
-    public void Cancel()
+    /// (Triforce, 11-18) The game's --prepare-shaders run, when that is the step under way, is asked to stop first (the event
+    /// gpu/vk/vk_main.cpp PrepareStopWatch waits on): it ends its driver's part cleanly and keeps what it made, where a kill
+    /// used one of that part's three tries and left shaders out for good. Killed as before when it has not ended in 30 s,
+    /// and at once when no preparation is under way. The wait is not on the caller's thread
+    public Task Cancel()
     {
         cancelled = true;
-        try { process?.Kill(entireProcessTree: true); } catch (Exception) { }
+        var p = process;
+        var asked = false;
+        try
+        {
+            if (EventWaitHandle.TryOpenExisting(stopEvent, out var stop))
+                using (stop) asked = stop.Set();
+        }
+        catch (Exception) { }
+        return Task.Run(() =>
+        {
+            try { if (asked && p != null && p.WaitForExit(30000)) return; } catch (Exception) { }
+            try { p?.Kill(entireProcessTree: true); } catch (Exception) { }
+        });
     }
 
     /// Is this the supported game and version? The answer in plain words.

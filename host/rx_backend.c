@@ -59,6 +59,7 @@ const char *hos_mic_name(int index);
 void hos_mic_select(int mode, const char *name, int index);
 void hos_bind(int set, int button, int slot, int code);
 int hos_prompts_face(void);         /* prompts.c */
+int hos_prompts_pad_face(void);
 #if defined(A64_WRITE_TRACK) && !defined(__EMSCRIPTEN__)
 void hos_mark_written(const void *p, size_t n);
 #endif
@@ -84,7 +85,80 @@ static int page_collected(uint64_t page) {   /* is the page in a range some coll
     return in;
 }
 #endif
+#ifndef A64_MARK_ONE
+/* RX_VK_COLLECT_FAST (default on; =0: the walk below): the same scan with unaligned loads at the ranges' edges. collect_in
+   skips clean marks 32 or 8 at a time only from a page number aligned to that size, so each of the ~1,500 capture ranges (and
+   ~760 the replay collects) began and ended with up to ~38 single-page atomic loads, twice a submit, six submits a frame.
+   Here the blocks are read wherever the walk is (the marks are bytes: memcpy into words is an unaligned load), 256 pages a
+   look, and only a non-zero byte of a non-zero block is exchanged. Same result: a page is taken when its mark reads non-zero
+   and the exchange that clears it returns non-zero (acquire), in ascending page order within a range and in range order. A
+   mark the game sets after the block was read is left for the next scan, as collect_in leaves a mark set after its own load
+   of that byte. The block reads are plain loads of bytes others store atomically, as collect_in's skips always were (x86-64:
+   a byte load is atomic) */
+static int collect_fast_on(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("RX_VK_COLLECT_FAST");
+        v = !e || atoi(e) != 0;
+    }
+    return v;
+}
+static inline void collect_take(uint64_t p, uint32_t **out, size_t *n, size_t *cap) {
+    if (__atomic_exchange_n(&a64_dirty[p], 0, __ATOMIC_ACQUIRE)) {
+        if (*n == *cap) *out = realloc(*out, (*cap *= 2) * sizeof **out);
+        (*out)[(*n)++] = (uint32_t)p;
+    }
+}
+static int64_t collect_in_fast(const uint64_t (*ranges)[2], int nranges, uint32_t **pages) {
+    size_t n = 0, cap = 4096;
+    uint32_t *out = malloc(cap * sizeof *out);
+    for (int r = 0; r < nranges; r++) {
+        const uint64_t lo = ranges[r][0], hi = ranges[r][1] < hos_guest_size() ? ranges[r][1] : hos_guest_size();
+        uint64_t p1 = (hi + 4095) >> 12;
+        if (p1 > A64_DIRTY_PAGES) p1 = A64_DIRTY_PAGES;
+        uint64_t p = lo >> 12;
+        while (p < p1) {
+            if (p + 256 <= p1) {
+                uint64_t w[32], any = 0;
+                memcpy(w, &a64_dirty[p], 256);
+                for (int k = 0; k < 32; k++) any |= w[k];
+                if (any)
+                    for (int k = 0; k < 32; k++)
+                        for (int b = 0; w[k] && b < 8; b++)
+                            if ((w[k] >> (8 * b)) & 0xFF) collect_take(p + 8 * k + b, &out, &n, &cap);
+                p += 256;
+                continue;
+            }
+            if (p + 32 <= p1) {
+                uint64_t w[4];
+                memcpy(w, &a64_dirty[p], 32);
+                if (w[0] | w[1] | w[2] | w[3])
+                    for (int k = 0; k < 4; k++)
+                        for (int b = 0; w[k] && b < 8; b++)
+                            if ((w[k] >> (8 * b)) & 0xFF) collect_take(p + 8 * k + b, &out, &n, &cap);
+                p += 32;
+                continue;
+            }
+            if (p + 8 <= p1) {
+                uint64_t w;
+                memcpy(&w, &a64_dirty[p], 8);
+                for (int b = 0; w && b < 8; b++)
+                    if ((w >> (8 * b)) & 0xFF) collect_take(p + b, &out, &n, &cap);
+                p += 8;
+                continue;
+            }
+            if (__atomic_load_n(&a64_dirty[p], __ATOMIC_RELAXED)) collect_take(p, &out, &n, &cap);
+            p++;
+        }
+    }
+    *pages = out;
+    return (int64_t)n;
+}
+#endif
 static int64_t collect_in(const uint64_t (*ranges)[2], int nranges, uint32_t **pages) {
+#ifndef A64_MARK_ONE
+    if (collect_fast_on()) return collect_in_fast(ranges, nranges, pages);
+#endif
     size_t n = 0, cap = 4096;
     uint32_t *out = malloc(cap * sizeof *out);
     for (int r = 0; r < nranges; r++) {
@@ -207,6 +281,7 @@ int hos_mouse_pointer(MkwVkPointer *out);   /* display.c, posix/display_sdl.c */
 int hos_sdl_gyro_status(void);   /* pad_sdl.c */
 extern const char *hos_romfs_dir;   /* nn_fs.c, set by hos_main.c */
 static const char *host_romfs_dir(void) { return hos_romfs_dir; }
+#include "hos_bench.h"   /* ((Triforce) MkwVkHost.bench: benchmark mode's panel, hos_bench_state) */
 
 #ifdef _WIN32
 static unsigned char menu_key_press[256];
@@ -229,7 +304,7 @@ static const MkwVkHost vk_host = {
     hos_gpu_maps_generation, nvn_vmap_generation, hos_reserved_cpus, host_collect_in, host_guest_alloc,
     host_watch_guest_writes, hos_pad_raw, hos_binding, hos_bind, host_aspect_ratio, host_take_key_press,
     hos_mouse_pointer, hos_mic_count, hos_mic_name, hos_mic_select, hos_sdl_gyro_status, hos_log_flush, hos_prompts_face,
-    host_romfs_dir, host_wide_menus,
+    host_romfs_dir, host_wide_menus, hos_bench_state, hos_prompts_pad_face,
 };
 
 static const MkwVkRenderer *vk;   /* the Vulkan back end, when it was chosen and started */
@@ -317,6 +392,32 @@ void hos_guest_io_end(int held) {
     if (held && end) end(held);
 }
 
+/* (Triforce, gpu/vk/async_rules.h) The replay on a thread of the back end's own (RX_VK_ASYNC=1, off by default): what the host
+   does differently then. rx_async_replay: whether it is on (the back end reads the same switch). rx_nvn_submit_waits: the events
+   the submit this thread makes next waits for (nvn_native.c resolve_deferred sees the wait ops), so that a signal of the CPU's
+   takes its capture only when a submission handed over may still wait for it. rx_nvn_replay_idle_wait: the game's present poll
+   waits for the replay thread without looking while its frame is still recorded (hos_thread.c present_poll); 1 when the thread
+   has nothing left, or there is none. Both back end calls are found by name, as the lazy write-back's; without them nothing is
+   told and the wait returns at once */
+static void (*volatile submit_waits_fn)(const uint64_t *, int);   /* (the back end's mkwvk_submit_waits, once it runs) */
+static int (*volatile replay_idle_wait_fn)(uint64_t);
+int rx_async_replay(void) {
+    static volatile int on = -1;
+    if (on < 0) {
+        const char *e = getenv("RX_VK_ASYNC");
+        on = e && atoi(e) != 0;
+    }
+    return on;
+}
+void rx_nvn_submit_waits(const uint64_t *events, int n) {
+    void (*fn)(const uint64_t *, int) = submit_waits_fn;
+    if (fn) fn(events, n);
+}
+int rx_nvn_replay_idle_wait(uint64_t timeout_ns) {
+    int (*fn)(uint64_t) = replay_idle_wait_fn;
+    return fn ? fn(timeout_ns) : 1;
+}
+
 /* dll: mkw_vk.dll (our Vulkan back end) or mkw_eden.dll (Eden's renderer driven natively, gpu/eden): one export */
 static const MkwVkRenderer *load_vulkan(const char *dll) {
     char path[MAX_PATH];
@@ -351,6 +452,9 @@ int rx_start(void *hwnd) {
             lazy_io_end = (void (*)(int))(void *)GetProcAddress(vk_module, "mkwvk_lazy_io_end");
             if (lazy_io_end)
                 lazy_io_begin = (int (*)(const void *, uint64_t))(void *)GetProcAddress(vk_module, "mkwvk_lazy_io_begin");
+            /* (Triforce: the replay thread's two calls, rx_async_replay above; a back end without them has none) */
+            submit_waits_fn = (void (*)(const uint64_t *, int))(void *)GetProcAddress(vk_module, "mkwvk_submit_waits");
+            replay_idle_wait_fn = (int (*)(uint64_t))(void *)GetProcAddress(vk_module, "mkwvk_replay_idle_wait");
             hos_log("rx: renderer: %s (%s)", eden ? "Eden's" : "Vulkan", dll);
             flush_early();
             return 1;
@@ -383,6 +487,17 @@ void rx_nvn_submit(const uint64_t *handles, int n) { vk ? vk->nvn_submit(handles
 void rx_nvn_submit_q(const uint64_t *handles, int n, uint64_t queue) {
     if (vk && vk->nvn_submit_q) vk->nvn_submit_q(handles, n, queue);
     else rx_nvn_submit(handles, n);
+}
+/* (HOS_NVN_HOLD=2, nvn_native.c held_flush_why) the next submit on this thread is a held one: the game's thread that made it is
+   already running again, so its capture copies every page before the replay (gpu/vk/vk_replay.cpp mkwvk_submit_held) */
+void rx_nvn_submit_held(int on) {
+    static void (*fn)(int);
+    static int looked;
+    if (!looked) {
+        if (vk_module) fn = (void (*)(int))(void *)GetProcAddress(vk_module, "mkwvk_submit_held");
+        looked = 1;
+    }
+    if (fn) fn(on);
 }
 uint64_t rx_nvn_fence(void) { return vk ? vk->nvn_fence() : wgr_nvn_fence(); }
 uint64_t rx_nvn_fence_q(uint64_t queue) { return vk && vk->nvn_fence_q ? vk->nvn_fence_q(queue) : rx_nvn_fence(); }

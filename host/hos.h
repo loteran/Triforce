@@ -60,6 +60,14 @@ int hos_commit(uint64_t addr, uint64_t size);
    zeroed in place (an import holds them); DISCARDED: let go, out of RAM but still committed */
 enum { HOS_MEM_COMMITTED, HOS_MEM_TOUCHED, HOS_MEM_PAGES, HOS_MEM_MAPPED, HOS_MEM_DECOMMITTED, HOS_MEM_ZEROED, HOS_MEM_DISCARDED };
 void hos_mem_note(int what, uint64_t addr, uint64_t size);
+/* ((Triforce) HOS_MEM_LIMIT, hos_mem.c) the limit in bytes (0: none), what the game holds, and whether it may take a range */
+int64_t hos_mem_limit(void);
+uint64_t hos_mem_used(void);
+int hos_mem_fits(uint64_t used, uint64_t fresh, uint64_t limit);
+int hos_mem_room(uint64_t addr, uint64_t size);
+/* ((Triforce) hos_mem.c) whether a freed address region's pages are discarded: not a region of the game's own with none of its pages
+   (game_region: the game's own, and the limit on) */
+int hos_region_discard_needed(int game_region, int census_on, uint64_t game_pages);
 int hos_mem_census_on(void);              /* (the notes are kept: HOS_MEM_CENSUS or HOS_MEM_GIVE_BACK) */
 int64_t hos_mem_give_back(uint64_t max_bytes);
 void hos_mem_census_start(void);          /* (mkw_glue.c: the census's thread) */

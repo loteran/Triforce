@@ -19,6 +19,7 @@ WANT = {
     "licenses/zstd/PROVENANCE.md": "third_party/zstd/PROVENANCE.md",
     "licenses/libertinus/OFL.txt": "third_party/fonts/libertinus/OFL.txt",
     "licenses/libertinus/PROVENANCE.md": "third_party/fonts/PROVENANCE.md",
+    "licenses/fidelityfx/LICENSE.md": "third_party/fidelityfx/LICENSE.md",   # ((Triforce) 11-20: FSR 4's headers in the image)
 }
 
 

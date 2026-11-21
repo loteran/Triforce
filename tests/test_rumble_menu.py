@@ -58,19 +58,23 @@ FIXTURE = r"""
 Options opts;
 %(tabs)s
 %(row)s
-int saves = 0, presets = 0;
+int saves = 0;
 void save() { saves++; }
 void apply_pad_layout(int) {}
-void apply_preset(int) { presets++; }
-void sync_preset_budgets(int) {}
-/* (stand-ins for the rest of set_row, which the Rumble strength row never reaches: the Upscaler's rows, the restart offer) */
+/* (stand-ins for the rest of set_row, which the Rumble strength row never reaches: the Upscaler's rows, the merged rows
+   ((Triforce, options_version 7) merged_rows.h), the restart offer) */
 bool row_fixed(const int*) { return false; }
 int upscaler() { return 0; }
 namespace ur {
-int step_upscaler(int, int, bool) { return 0; }
-int step(int, int v, int dir) { return v + dir; }
+struct Scaling { int upscaler, resolution; };
+Scaling step_engine(int, int v, int, unsigned) { return {0, v}; }
+Scaling step_resolution(int, int v, int dir) { return {0, v + dir}; }
 int snap(int, int v) { return v; }
 }
+bool is_merged(const int*) { return false; }
+int merged_step(const int*, int v, int) { return v; }
+void merged_store(const int*) {}
+void merged_sync() {}
 namespace mr { constexpr int kMax = 8; }
 void restart_values(int*) {}
 struct { void note(const int*) {} } restart_state;
@@ -96,7 +100,6 @@ int main() {
     CHECK(r.lo == 0 && r.hi == 300 && r.step == 25);
     CHECK(opts.rumble == 100);
     CHECK(!std::strcmp(ini_key(r), "rumble_strength"));
-    opts.preset = 3;
     /* the arrows (and clicks): Off stays Off, 300%% stays 300%% */
     opts.rumble = 0;
     arrow(r, false);
@@ -115,8 +118,8 @@ int main() {
     CHECK(opts.rumble == 300);
     set_row(r, -25, -1);
     CHECK(opts.rumble == 0);
-    /* it is a control: the quality preset stays */
-    CHECK(opts.preset == 3 && presets == 0 && saves > 0);
+    /* each change saved ((Triforce, options_version 7) no quality preset to keep any more) */
+    CHECK(saves > 0);
     /* an ini's value: on the steps, within the range */
     static const int in[] = {-10, 0, 12, 13, 60, 63, 100, 137, 138, 150, 151, 163, 287, 288, 300, 301, 999};
     static const int out[] = {0, 0, 0, 25, 50, 75, 100, 125, 150, 150, 150, 175, 275, 300, 300, 300, 300};

@@ -83,7 +83,11 @@ def main():
     # ci/made identities are checked at the boundary as well as inside the API spy.
     armed=arm.replace('VkPipeline made = VK_NULL_HANDLE;', 'VkPipeline made = VK_NULL_HANDLE; expected_ci=&ci; expected_out=&made;')
     assert armed != arm
-    cpp=HEAD+wrapper+'\nvoid actual_arm(Program&program,Pre*pre){std::vector<Program*>computes{&program};size_t i=0;'+armed+'\ncompleted=true;}\n'+r'''
+    # (the arm creates through cached_compute and the cache's gate; with no play cache cached_create is the guarded creation
+    # itself (tests/test_pcache_play.py runs its routes), so both are modeled as that)
+    shims='\nstruct PcacheUseFx{VkPipelineCache cache;};PcacheUseFx pcache_use(){return {pcache};}\n' \
+          'VkResult cached_compute(VkPipelineCache c,const VkComputePipelineCreateInfo*ci,VkPipeline*pl){return guarded_compute(c,ci,pl);}\n'
+    cpp=HEAD+wrapper+shims+'\nvoid actual_arm(Program&program,Pre*pre){std::vector<Program*>computes{&program};size_t i=0;'+armed+'\ncompleted=true;}\n'+r'''
 int main(int argc,char**argv){
  SetErrorMode(SEM_FAILCRITICALERRORS|SEM_NOGPFAULTERRORBOX|SEM_NOOPENFILEERRORBOX);
  CHECK(argc==2);int which=std::atoi(argv[1]);Program program;Pre pre;

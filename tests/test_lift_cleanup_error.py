@@ -21,7 +21,7 @@ SOURCE = ROOT / "nx2/make_game.py"
 
 def production():
     tree = ast.parse(SOURCE.read_text(encoding="utf-8"), filename=str(SOURCE))
-    helpers = {"say", "fail", "gen_print", "write_lift_key", "lifted_before"}
+    helpers = {"say", "fail", "gen_print", "write_lift_key", "lifted_before", "key_after_lift"}
     definitions = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name in helpers]
     assert {node.name for node in definitions} == helpers
     key = next(node for node in tree.body if isinstance(node, ast.Assign) and
@@ -48,8 +48,10 @@ class LiftCleanupErrorTests(unittest.TestCase):
         self.key = self.gen / ".lift_key"
         self.events = []
         self.namespace, self.branch = production()
-        self.namespace.update(work=str(self.work), exefs=str(self.root / "exefs"), env={}, key="b" * 40, PY=["authored-python"])
+        self.namespace.update(work=str(self.work), exefs=str(self.root / "exefs"), env={}, key="b" * 40, PY=["authored-python"],
+                              lift_key=self.lift_key, chunks_copied=False)
         self.actual_write = self.namespace["write_lift_key"]
+        self.tools = b""   # (what the stand-in key reads of the tools: changed by a test, as an update during the lift)
 
         def write_key(work, key):
             self.events.append("key")
@@ -82,6 +84,14 @@ class LiftCleanupErrorTests(unittest.TestCase):
 
         self.namespace.update(run=run, write_lift_key=write_key, EarlyCompile=Early, a=mock.Mock(jobs=None),
                               atexit=mock.Mock())
+
+    def lift_key(self, exefs, work, env, chunks=True):
+        """make_game.lift_key's stand-in: "b" * 40 for these inputs while there is no <work>/image/chunks.txt (the key the
+        tests begin with), another key with the chunk boundaries in it or other tools"""
+        self.assertEqual((exefs, work), (str(self.root / "exefs"), str(self.work)))
+        boundaries = self.work / "image/chunks.txt"
+        seen = self.tools + (boundaries.read_bytes() if chunks and boundaries.exists() else b"")
+        return hashlib.sha1(seen).hexdigest() if seen else "b" * 40
 
     def seed(self, same_key=False):
         self.gen.mkdir(parents=True)
@@ -188,6 +198,45 @@ class LiftCleanupErrorTests(unittest.TestCase):
         self.exercise()
         self.assertEqual(self.events, ["early", "lift", "early done", "key"])
         self.assertTrue(self.namespace["lifted_before"](str(self.work), "b" * 40))
+
+    def lift_writing_chunks(self, tools=b""):
+        """The lift as nx2/chunks.py save does it into a work folder without chunks.txt: the boundaries the sizes gave"""
+        child = self.namespace["run"]
+
+        def run(command, environment):
+            child(command, environment)
+            (self.work / "image").mkdir(parents=True, exist_ok=True)
+            (self.work / "image/chunks.txt").write_text("# first guest address\n80001000\n", encoding="utf-8")
+            self.tools = tools
+
+        self.namespace["run"] = run
+
+    def test_chunks_the_lift_wrote_are_in_the_kept_key(self):
+        # (the build after a first lift into a fresh work folder: its key has the boundaries that lift wrote, and it skips)
+        self.lift_writing_chunks()
+        self.exercise()
+        self.assertEqual(self.events, ["early", "lift", "early done", "key"])
+        next_build = self.lift_key(str(self.root / "exefs"), str(self.work), {})
+        self.assertNotEqual(next_build, "b" * 40)
+        self.assertTrue(self.namespace["lifted_before"](str(self.work), next_build))
+        self.events.clear()
+        self.namespace["key"] = next_build
+        self.exercise()
+        self.assertEqual(self.events, [], "the same game and tools were translated again")
+
+    def test_chunks_copied_from_the_source_keep_the_key_from_before(self):
+        # (an input, copied in at every build before its key is taken: that key is the one the next build takes)
+        self.namespace["chunks_copied"] = True
+        self.lift_writing_chunks()
+        self.exercise()
+        self.assertTrue(self.namespace["lifted_before"](str(self.work), "b" * 40))
+
+    def test_tools_changed_during_the_lift_keep_the_key_from_before(self):
+        # (an update of the tools while the lift ran: its C is the older tools', so the next build must lift again)
+        self.lift_writing_chunks(tools=b"tools updated meanwhile")
+        self.exercise()
+        self.assertTrue(self.namespace["lifted_before"](str(self.work), "b" * 40))
+        self.assertFalse(self.namespace["lifted_before"](str(self.work), self.lift_key(str(self.root / "exefs"), str(self.work), {})))
 
     def test_failed_lift_leaves_no_fresh_key(self):
         self.seed()

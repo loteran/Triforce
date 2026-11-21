@@ -161,11 +161,19 @@ def main():
     if "mesh_fallback_task_threads" not in block(get_set, "Id EmitWorkgroupId(EmitContext& ctx)"):
         raise SystemExit("a fallback mesh workgroup's id is its slot, not its index in its task")
     # (the records' header is reset after a barrier: the shared pair's last draw, of any program, has read it)
-    reset = record[record.index("end_pass(cmd);"):record.index("vkCmdFillBuffer(cmd, f->records")]
+    # ((Triforce, 11-18) one 32-byte update of the header now, not four fills: EstebanGGM's)
+    reset = record[record.index("end_pass(cmd);"):record.index("vkCmdUpdateBuffer(cmd, f->records, 0, sizeof hdr, hdr);")]
     if "full_barrier(cmd);" not in reset:
         raise SystemExit("a fallback draw resets the shared records before the last draw has read them")
-    if "vkCmdFillBuffer(cmd, f->records, 4, 4, 1);" not in record:
-        raise SystemExit("the draw's instance count is not set to one")
+    if "const uint32_t hdr[8] = {0u, 1u, 0u, 0u, 0u, 0u, 1u, 1u};" not in record:
+        raise SystemExit("the draw's instance count is not set to one, or the mesh dispatch's y and z")
+    after = record[record.index("vkCmdUpdateBuffer(cmd, f->records, 0, sizeof hdr, hdr);"):]
+    if "fb_barrier(VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT);" \
+            not in after[:400]:
+        raise SystemExit("the task and the mesh dispatch read the header before its update is done")
+    if not record.rstrip().endswith("full_barrier(cmd);   // (the records and the draw's command, which the draw reads as indirect arguments)\n    return true;") \
+            and "full_barrier(cmd);   // (the records and the draw's command, which the draw reads as indirect arguments)" not in record:
+        raise SystemExit("the draw reads its records before the mesh stage wrote them")
     if "VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT" not in block(draw, "bool fallback_buffers_of(const Program& p, FallbackBuffers*& out) {"):
         raise SystemExit("the records buffer cannot be read as indirect arguments")
     # (every fallback program a recording thread draws shares one pair of buffers: per-program pairs were ~2.2 GB of VRAM

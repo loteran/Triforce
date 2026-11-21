@@ -106,6 +106,84 @@ inline int step_upscaler(int v, int dir, unsigned available) {
 /// The same, where the choices are DLSS and DLAA only when dlss_ok (a build with NVIDIA's SDK, on a GPU DLSS runs on)
 inline int step_upscaler(int v, int dir, bool dlss_ok) { return step_upscaler(v, dir, bit(GAME) | dlss_bits(dlss_ok)); }
 
+// ---- (Triforce, options_version 7) The Upscaler row names the engine alone: Game, NVIDIA DLSS, AMD FSR 3.1, AMD FSR 4. An
+// engine's native anti-aliasing (DLAA, FSR 3.1's and FSR 4's Native AA: the same engine with the 3D at full size) is the
+// Render resolution row's "Native (100%)" step. opts.dlss keeps its saved values: 2, 5 and 6 are still DLAA and the native
+// AAs, shown as their engine at Native (100%) ----
+/// The engine of an Upscaler value: DLAA is DLSS's, FSR 4's and FSR 3.1's native AA their own
+inline int engine(int upscaler) {
+    return upscaler == DLAA ? DLSS : upscaler == FSR4_AA ? FSR4 : upscaler == FSR3_AA ? FSR3
+           : upscaler >= GAME && upscaler < kUpscalers ? upscaler : GAME;
+}
+/// An engine's native anti-aliasing (the game's own has none: itself)
+inline int native_of(int engine_value) {
+    return engine_value == DLSS ? DLAA : engine_value == FSR4 ? FSR4_AA : engine_value == FSR3 ? FSR3_AA : engine_value;
+}
+/// The engines in the order the Upscaler row shows them
+constexpr int kEngines[] = {GAME, DLSS, FSR3, FSR4};
+constexpr int kEngineCount = sizeof kEngines / sizeof kEngines[0];
+/// What the two rows choose together: the Upscaler's value (opts.dlss) and the Render resolution's (opts.resolution)
+struct Scaling {
+    int upscaler, resolution;
+};
+/// The 3D at the output's full size: an engine's native AA, or the game's own at 100%
+inline bool native_size(int upscaler, int resolution) { return full_scale(upscaler) || (upscaler == GAME && percent(resolution) == 100); }
+/// The Upscaler row's next engine from upscaler (dir +1 / -1), wrapping over those that run here (available: bit() of each).
+/// The Render resolution's Native (100%) goes with it: an engine's native AA becomes the next engine's (the game's own at
+/// 100%), and the game's own at 100% the engine's native AA. Otherwise the resolution is the caller's to snap (snap)
+inline Scaling step_engine(int upscaler, int resolution, int dir, unsigned available) {
+    available |= bit(GAME);
+    const bool native = native_size(upscaler, resolution);
+    int at = 0;
+    for (int i = 0; i < kEngineCount; i++)
+        if (kEngines[i] == engine(upscaler) && (available & bit(kEngines[i]))) at = i;
+    for (int i = 0; i < kEngineCount; i++) {
+        at = (at + (dir > 0 ? 1 : kEngineCount - 1)) % kEngineCount;
+        const int e = kEngines[at];
+        if (!(available & bit(e))) continue;
+        if (e == GAME) return {GAME, native ? 1 : resolution};
+        return {native ? native_of(e) : e, resolution};
+    }
+    return {GAME, resolution};
+}
+/// The Render resolution row's steps with DLSS or FSR: Auto, Native (100%), then their modes (kDlssSteps). kNativeStep stands
+/// for Native in the list: the engine's native AA, the saved resolution left as it is for the engine's other steps
+constexpr int kNativeStep = -1;
+constexpr int kTemporalSteps[] = {0, kNativeStep, 3, 5, 4, 6};
+constexpr int kTemporalStepCount = sizeof kTemporalSteps / sizeof kTemporalSteps[0];
+/// The Render resolution row's next value from (upscaler, resolution), dir +1 Right, -1 Left, wrapping. The game's own: its
+/// own steps (step). DLSS and FSR: kTemporalSteps, Native (100%) their native AA. A share that is not one of their steps (one
+/// saved with the game's own) moves as step does
+inline Scaling step_resolution(int upscaler, int resolution, int dir) {
+    const int e = engine(upscaler);
+    if (!scales_by_mode(e)) return {upscaler, step(upscaler, resolution, dir)};
+    const int now = full_scale(upscaler) ? kNativeStep : resolution;
+    for (int i = 0; i < kTemporalStepCount; i++) {
+        if (kTemporalSteps[i] != now) continue;
+        const int next = kTemporalSteps[(i + (dir > 0 ? 1 : kTemporalStepCount - 1)) % kTemporalStepCount];
+        return next == kNativeStep ? Scaling{native_of(e), resolution} : Scaling{e, next};
+    }
+    return {e, step(e, resolution, dir)};
+}
+/// How the finished picture is scaled to its place in the window (options_version 7: the Window scaling filter row is gone,
+/// this is its choice, opts.upscale's values): AMD FSR 1 (3: EASU, and RCAS only with Sharpness above 0, vk_framegen.cpp
+/// framegen_scale) when the picture is enlarged; otherwise the plain copy (0), the linear blit the row's default Off gave,
+/// which still scales the picture to its place: when the sizes are the same or not known yet, and when the picture is made
+/// smaller (or larger one way and smaller the other). (Not Lanczos there: fg_scale.comp's taps are one picture pixel apart,
+/// so a picture made smaller is no smoother for it, and the Steam Deck (2048 x 1152 to 1280 x 800) would pay a pass at every
+/// present for nothing)
+inline int auto_filter(unsigned picture_w, unsigned picture_h, unsigned dest_w, unsigned dest_h) {
+    if (!picture_w || !picture_h || !dest_w || !dest_h || (picture_w == dest_w && picture_h == dest_h)) return 0;
+    return dest_w >= picture_w && dest_h >= picture_h ? 3 : 0;
+}
+/// The window's filter for a present: auto_filter, but the plain copy (0) while the picture is HDR Native's own (HDR10 PQ codes
+/// in A2B10G10R10, vk_replay.cpp present_native_pq): the blit keeps the 10 bits as they are. (framegen_scale's rgba8 images
+/// gave the HDR10 swapchain 8-bit PQ, banding in skies, fog and dark gradients; it now takes PQ through RGBA16F images,
+/// (Triforce, S5) sharpen_rules.h, for Sharpness at the window and the sides, but adds no filter pass at every present)
+inline int window_filter(unsigned picture_w, unsigned picture_h, unsigned dest_w, unsigned dest_h, bool native_hdr) {
+    return native_hdr ? 0 : auto_filter(picture_w, picture_h, dest_w, dest_h);
+}
+
 /// The DLSS model row (opts.dlss_model, saved as dlss_model): which of NVIDIA's networks DLSS and DLAA draw with, by its
 /// preset (NVSDK_NGX_DLSS_Hint_Render_Preset_*). 0 the transformer, preset K (the default here, the one tested); 1 the second
 /// generation transformer, preset M (NVIDIA's own pick for Performance); 2 the same generation as tuned for Ultra
@@ -154,10 +232,5 @@ inline bool fsr_sharpen_shown(bool fsr4_built, bool ffx3_library) { return fsr4_
 inline bool model_shown(bool built) { return built; }
 /// (env_set: RX_VK_DLSS_PRESET names a preset, which wins over the row for this run)
 inline bool model_fixed(int upscaler, bool env_set) { return !is_dlss(upscaler) || env_set; }
-/// The Window scaling filter does something only when the window's size is not the game's picture's (the Output resolution);
-/// a size not known yet (0) counts as different
-inline bool filter_needed(unsigned picture_w, unsigned picture_h, unsigned window_w, unsigned window_h) {
-    return !picture_w || !window_w || picture_w != window_w || picture_h != window_h;
-}
 
 } // namespace mkwvk::upscaler_rows

@@ -29,6 +29,7 @@
 #include "vk_antilag.h"
 #include "vk_progress.h"
 #include "vk_dump.h"   // (write_png: RX_VK_STARTUP_SHOTS)
+#include "foliage_shadow.h"   // ((Triforce) RX_VK_FOLIAGE_SHADOW_VRS: whether the fragment shading rate is asked for)
 
 namespace vkx {
 #define VKX_DEFINE(f) PFN_##f f;
@@ -179,6 +180,30 @@ bool pick_device() {
         }
     }
     menu_set_gpu_count((int)valid_gpus.size());
+    {   // ((Triforce) 11-19, ticket "GPU read issue": the launcher named the GPU device row's choices in Windows' order of the
+        // display adapters (an Intel UHD 770 first, the RTX 3050 second) while this row counts Vulkan's (the RTX first): its
+        // "1: NVIDIA" saved the number that is the Intel here. The list as this row counts it, beside triforce_options.ini, for
+        // the launcher's row: "<the row's value>\t<name>" a line)
+        char exe[MAX_PATH];
+        const DWORD n = game_module_path(exe, MAX_PATH);
+        std::string dir(exe, n);
+        dir = dir.substr(0, dir.find_last_of("\\/") + 1);
+        std::string text;
+        for (size_t k = 0; k < gpu_device_names.size(); k++) {
+            std::string name = gpu_device_names[k];
+            for (char& c : name)
+                if ((unsigned char)c < 0x20) c = ' ';
+            text += std::to_string(k + 1) + "\t" + name + "\n";
+        }
+        if (n && !text.empty()) {
+            const std::string path = dir + "triforce_gpus.txt", part = path + ".part";
+            if (FILE* f = fopen(part.c_str(), "wb")) {
+                const bool ok = fwrite(text.data(), 1, text.size(), f) == text.size();
+                if (fclose(f) == 0 && ok) MoveFileExA(part.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING);
+                else remove(part.c_str());
+            }
+        }
+    }
 
     // (AMD laptops) With AMD graphics in the processor and an AMD card, Windows has two AMD drivers installed, one an
     // adapter, and each one's Vulkan driver lists every AMD GPU: the card shows up twice. It came first through the
@@ -191,8 +216,29 @@ bool pick_device() {
     int target_raw_idx = -1;
     if (const char* want = getenv("RX_VK_DEVICE")) {
         if (*want) target_raw_idx = atoi(want);
-    } else if (const int k = gpu_choice::menu_device(opts.gpu_device, (int)valid_gpus.size()); k >= 0) {
+    } else if (const int k = gpu_choice::pick(menu_gpu_name(), gpu_device_names, opts.gpu_device); k >= 0) {
         target_raw_idx = (int)valid_gpus[k];
+        if (opts.gpu_device != k + 1) {   // ((Triforce) 11-20: the saved name found the card under another number: the row follows it)
+            logf("vk: GPU device: \"%s\" by its name is device %d here, not the %d saved with it: the row now says %d",
+                 gpu_device_names[(size_t)k].c_str(), k + 1, opts.gpu_device, k + 1);
+            opts.gpu_device = k + 1;
+        }
+        // ((Triforce) 11-20, ticket "Crash on opening", RX 7900 XTX with AMD processor graphics: heap corruption in amdvlk64.dll at
+        // half the starts, the card driven through the processor graphics' older driver (device 0: Vulkan 1.3, 0x800126) because the
+        // row named the card and its first listing is that driver's; its own driver (device 1: Vulkan 1.4, 0x80018b) is the one Auto
+        // takes. The same card listed again with a newer driver (same vendor and device id, as the comment above has it): that one)
+        VkPhysicalDeviceProperties chosen;
+        vkGetPhysicalDeviceProperties(all[(size_t)target_raw_idx], &chosen);
+        for (uint32_t i : valid_gpus) {
+            VkPhysicalDeviceProperties p;
+            vkGetPhysicalDeviceProperties(all[i], &p);
+            if ((int)i == target_raw_idx || p.vendorID != chosen.vendorID || p.deviceID != chosen.deviceID ||
+                p.deviceType != chosen.deviceType || p.driverVersion <= chosen.driverVersion)
+                continue;
+            logf("vk: GPU device: %s is listed again with a newer driver (device %u: %#x, against device %d: %#x): that one",
+                 p.deviceName, i, p.driverVersion, target_raw_idx, chosen.driverVersion);
+            target_raw_idx = (int)i, chosen = p;
+        }
     }
 
     for (uint32_t i : valid_gpus) {
@@ -261,6 +307,11 @@ bool create_device() {
     optional(VK_EXT_SHADER_STENCIL_EXPORT_EXTENSION_NAME, dev.stencil_export);
     optional(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME, dev.memory_budget);
     optional(VK_EXT_IMAGE_2D_VIEW_OF_3D_EXTENSION_NAME, dev.view_2d_of_3d);
+    // ((Triforce) the far cascades' foliage at one fragment per 2 x 2 pixels, foliage_shadow.h: asked for only where mesh programs
+    // can draw natively and RX_VK_FOLIAGE_SHADOW_VRS is not off; enabled below only with pipelineFragmentShadingRate)
+    const int rate_from = foliage_shadow::parse_rate(getenv("RX_VK_FOLIAGE_SHADOW_VRS"));
+    bool rate_ext = false;
+    if (dev.mesh_shader && rate_from >= 0) optional(VK_KHR_FRAGMENT_SHADING_RATE_EXTENSION_NAME, rate_ext);
     // (hookshot) on by default: with a marker before each draw and dispatch the device has not been lost (five
     // runs); without them it was, every run, shortly after OoT's first gameplay frames (nvlddmkm event 153; the
     // extension alone, RX_VK_CHECKPOINTS=ext, did not keep it). The race they hide is not found yet.
@@ -411,6 +462,9 @@ bool create_device() {
     if (dev.coop_matrix) *tail = &coop, tail = &coop.pNext;
     VkPhysicalDeviceDescriptorBufferFeaturesEXT descriptor_buffer{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_BUFFER_FEATURES_EXT};
     if (fsr_descriptor_buffer) *tail = &descriptor_buffer, tail = &descriptor_buffer.pNext;
+    VkPhysicalDeviceFragmentShadingRateFeaturesKHR rate{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADING_RATE_FEATURES_KHR};
+    void** rate_at = nullptr;   // (the pNext that names it: taken out of the chain again when it is of no use)
+    if (rate_ext) rate_at = tail, *tail = &rate, tail = &rate.pNext;
     reflex_device_features(tail);   // (present ids, when NVIDIA Reflex's extensions are there)
     antilag_device_features(tail);   // (AMD Anti-Lag 2's, when its extension is there)
     vkGetPhysicalDeviceFeatures2(dev.physical, &f);
@@ -481,7 +535,22 @@ bool create_device() {
         logf("vk: vendor fixes for %s (%s): out-of-bounds texel fetches 0 %d, NaN tests by bits %d, gather offset %d",
              drv.driverName, drv.driverInfo, (int)dev.fixes.fetch_bounds, (int)dev.fixes.nan_bits, (int)dev.fixes.gather_offset);
     }
-    dev.eds3_a2c = dev.dynamic_state3 && eds3.extendedDynamicState3AlphaToCoverageEnable;
+    // ((Triforce, 11-18, EstebanGGM's port of NX2navi issue #67) AMD's older proprietary shader compiler (vk_vendor.h
+    // amd_older_compiler) applies alpha to coverage while the dynamic state says off: white stippling over foliage, grass, Link's
+    // hair and tunic on RX 470-590 (#bug-tracker "Texture glitch again ... (RX 580)", 11-18 screenshots). There the state goes in
+    // the pipeline instead. Only where the driver has no fast-linking pipeline libraries (the RX 580's 26.5.2: "pipeline
+    // libraries no"): fast pipeline link needs this dynamic state (gpl_wanted), and an RX 6000 card on the same driver keeps it.
+    // Those cards' pipelines are new to the driver's caches once (the state is in them now). RX_VK_DYN_A2C=0/1 decides outright
+    {
+        const bool eds3_a2c = dev.dynamic_state3 && eds3.extendedDynamicState3AlphaToCoverageEnable;
+        bool want = !(amd_older && !dev.graphics_pipeline_library);
+        if (const char* e = getenv("RX_VK_DYN_A2C"); e && *e) want = atoi(e) != 0;
+        dev.eds3_a2c = eds3_a2c && want;
+        if (eds3_a2c && !dev.eds3_a2c)
+            logf("vk: alpha to coverage in the pipelines, not dynamic (%s; RX_VK_DYN_A2C=1: dynamic)",
+                 getenv("RX_VK_DYN_A2C") && *getenv("RX_VK_DYN_A2C") ? "RX_VK_DYN_A2C=0"
+                                                                    : "AMD's older compiler draws it while it is off");
+    }
     dev.vk12 = f12;
     dev.vk13 = f13;
     {   // (hookshot, after TotK Recomp's vk_caps.c) NVN's programs are written for 32 lanes: the translator is told 32, and the lane
@@ -509,6 +578,23 @@ bool create_device() {
     }
     mesh.multiviewMeshShader = mesh.primitiveFragmentShadingRateMeshShader = VK_FALSE;   // (not used)
     dev.mesh_shader = dev.mesh_shader && mesh.meshShader && mesh.taskShader;
+    // ((Triforce) the shading rate per draw alone, set by the draws: no rate image, no rate a primitive writes. Neither of those
+    // two features is enabled, so the combiners stay KEEP. Of no use (no pipelineFragmentShadingRate, no native mesh shaders):
+    // the extension not enabled at all, the device as it was without it)
+    rate.attachmentFragmentShadingRate = rate.primitiveFragmentShadingRate = VK_FALSE;
+    dev.foliage_rate = rate_ext && rate.pipelineFragmentShadingRate && dev.mesh_shader;
+    if (rate_ext && !dev.foliage_rate) {
+        *rate_at = rate.pNext;
+        for (size_t i = 0; i < want.size(); i++)
+            if (!strcmp(want[i], VK_KHR_FRAGMENT_SHADING_RATE_EXTENSION_NAME)) want.erase(want.begin() + (ptrdiff_t)i--);
+    }
+    if (rate_from < 0) logf("vk: the far shadow cascades' foliage at 2 x 2: off (RX_VK_FOLIAGE_SHADOW_VRS)");
+    else if (dev.foliage_rate)
+        logf("vk: the far shadow cascades' foliage at 2 x 2: from layer %d (VK_KHR_fragment_shading_rate; RX_VK_FOLIAGE_SHADOW_VRS=off: "
+             "off)", rate_from);
+    else
+        logf("vk: the far shadow cascades' foliage at 2 x 2: not on this device (%s)",
+             !dev.mesh_shader ? "no native mesh shaders" : !rate_ext ? "no VK_KHR_fragment_shading_rate" : "no pipelineFragmentShadingRate");
     // (task and mesh shader counts in pipeline statistics, a feature of their own: RADV has it off on RDNA2, and a query
     // pool made with those counts all the same can hang the GPU)
     dev.mesh_queries = dev.mesh_shader && mesh.meshShaderQueries;
@@ -897,6 +983,61 @@ std::string skipped_path() {
     std::string path(exe, n);
     return path.substr(0, path.find_last_of("\\/") + 1) + "triforce_prepare_skipped";
 }
+// ((Triforce, 11-18) A --prepare-shaders run asked from outside to stop: the file triforce_prepare.stop beside the game
+// (nx2/make_game.py, when the run has been silent too long), or on Windows the event TRIFORCE_PREPARE_STOP names set (the
+// builder's Cancel: a name of its own run's, Local\TriforcePrepareStop.<id>, which reaches the game through make_game.py's
+// environment; not an RX_VK_ name, which would be in the shaders' stamp). Answered as a closed window is, prepare_stop:
+// the part under way ends "stopped", what was made is saved and no journal is left (vk_draw.cpp warm_end). Killed instead,
+// a start in the driver's part used one of its tries (gpl_rules.h kTries) and left what its workers had in the driver's
+// hands on the skip list for good. Whoever asks still kills the run when it has not ended in a while: a driver call that
+// hangs does not see the flag)
+std::string stop_path() {
+    char exe[MAX_PATH];
+    const DWORD n = game_module_path(exe, MAX_PATH);
+    std::string path(exe, n);
+    return path.substr(0, path.find_last_of("\\/") + 1) + "triforce_prepare.stop";
+}
+class PrepareStopWatch {
+public:
+    PrepareStopWatch() {
+#ifdef _WIN32
+        const char* name = getenv("TRIFORCE_PREPARE_STOP");
+        if (name && !strncmp(name, "Local\\TriforcePrepareStop.", 26)) event_ = CreateEventA(nullptr, TRUE, FALSE, name);
+#endif
+        thread_ = std::thread([this] {
+            const std::string stop = stop_path();
+            while (!over_.load()) {
+                bool asked = false;
+                if (FILE* f = fopen(stop.c_str(), "rb")) fclose(f), asked = true;
+#ifdef _WIN32
+                asked = asked || (event_ && WaitForSingleObject(event_, 0) == WAIT_OBJECT_0);
+#endif
+                if (asked) {
+                    logf("vk: the shaders' preparation was asked to stop (%s or the builder's Cancel): stopping, what is done is kept",
+                         stop.c_str());
+                    prepare_stop();
+                    return;
+                }
+                Sleep(200);
+            }
+        });
+    }
+    ~PrepareStopWatch() {
+        over_.store(true);
+        thread_.join();
+#ifdef _WIN32
+        if (event_) CloseHandle(event_);
+#endif
+        if (prepare_stopped()) remove(stop_path().c_str());   // (answered: the request is not left for a later run)
+    }
+
+private:
+    std::atomic<bool> over_{false};
+    std::thread thread_;
+#ifdef _WIN32
+    HANDLE event_ = nullptr;
+#endif
+};
 // (hookshot) The first start after an update prepares every shader (prepare_run) and the pipelines the last sessions noted
 // (precompile_run): a minute and more, before the game's first frame. They run on a thread of their own while this one, the
 // renderer's start, shows the window at once with what they are doing on it, and keeps it shown and sized; on Windows it is also
@@ -1238,15 +1379,39 @@ bool started_up() {
         };
         printf("@@stage shaders Preparing shaders\n");
         fflush(stdout);
-        part = 0;
-        const bool prepared = prepare_run(progress, false);
-        part = 1;
-        if (prepared) predict_run(progress);
-        part = 2;
-        predict_plan_ensure();
-        precompile_run(progress);
-        predict_background();
+        {
+            const PrepareStopWatch watch;   // ((Triforce, 11-18) a stop asked from outside, while the work lasts)
+            part = 0;
+            bool prepared = prepare_run(progress, false);
+            // ((Triforce) the pipeline cache carried over the stamp change grew past what it may hold, or would at the rate it
+            // grew (pcache_carry.h, the early drop): not kept, a fresh one built again, from the driver's own cache for what this
+            // run compiled. Nothing is translated again; the bar starts its part again, as it does between the programs and their
+            // driver part, and Setup's log says why. Not after a stop: pcache_carry_rebuild says no then)
+            if (pcache_carry_rebuild()) {
+                printf("The old pipeline cache grew, or would grow, too large to keep: building the shaders' driver part again "
+                       "into a fresh one (nothing is translated again)\n");
+                fflush(stdout);
+                prepared = prepare_run(progress, false);
+            }
+            part = 1;
+            if (prepared && !prepare_stopped()) predict_run(progress);
+            part = 2;
+            if (!prepare_stopped()) {   // (as prepare_with_screen: a stopped run goes no further, and keeps what it made)
+                predict_plan_ensure();
+                precompile_run(progress);
+                predict_background();
+            }
+        }
         pipeline_cache_save(true);
+        if (prepare_stopped()) {   // (the builders read this line's start: nx2/make_game.py NOT_PREPARED)
+            printf("the shaders were not prepared now (the preparation was asked to stop): the game goes on with them at its "
+                   "first start\n");
+            fflush(stdout);
+            return true;
+        }
+        // ((Triforce) gone through to its end and saved: a carried cache's history is no longer open, so the next start reads
+        // the file as these shaders' own. A stopped one stays open: the preparation begun again is carried still, capped)
+        pcache_carry_done();
         remove(skipped_path().c_str());
         return true;
     }
@@ -1436,6 +1601,9 @@ const MkwVkRenderer* mkwvk_init(const MkwVkHost* h) {
         return nullptr;
     }
     if (!create_instance() || !pick_device() || !create_device()) return nullptr;
+    // ((Triforce) the stamp is whole once the device is (coopmat_init's switches): the caches' kept set, before any of them
+    // is opened. cache_set.h)
+    cache_set_init();
     logf("vk: %s, Vulkan %u.%u, driver %#x; mesh shaders %s, host memory import %s, pipeline libraries %s",
          dev.props.deviceName, VK_VERSION_MAJOR(dev.props.apiVersion), VK_VERSION_MINOR(dev.props.apiVersion),
          dev.props.driverVersion, dev.mesh_shader ? "yes" : "no", dev.external_memory_host ? "yes" : "no",

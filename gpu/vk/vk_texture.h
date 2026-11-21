@@ -79,6 +79,7 @@ struct Texture {
     WriteGen release_gen;
     uint64_t gpu_wrote_seen = 0;   // (the newest finished GPU write into its storage it was uploaded after)
     uint64_t last_written = 0;     // (the frame the GPU last wrote it: a render target, each frame it is used)
+    uint64_t prev_written = 0;     // ((Triforce) the frame it was written in before last_written's, 0: none: redrawn.h)
     uint64_t first_written = 0;    // (the frame its GPU contents began: written in that frame alone, a table the game baked)
     uint64_t verify_hash = 0;      // (RX_VK_VERIFY_DIM: its guest memory's hash when last uploaded)
     uint32_t checked_epoch = 0;
@@ -221,6 +222,11 @@ VkBufferView texel_buffer_view(const nvn_tex* t, const nvn_view* v, bool storage
 Texture* texture_for_present(const nvn_tex* t);
 /// Ages the cache by one present; images nothing used for a while go, after the work that last read them
 void texture_frame(uint64_t completed_value);
+/// ((Triforce) tex_warm.h, RX_VK_TEX_WARM: a slot registered, noted; at a submission's start after a light frame, the noted
+/// textures made and uploaded ahead)
+bool texture_warm_on();   // ((Triforce) RX_VK_TEX_WARM: tex_warm.h)
+void texture_warm_note(int slot);
+void texture_warm_step(int64_t last_frame_work);
 void texture_released(const nvn_tex* t);
 /// (diagnostics: what guest memory holds of a texture's storage now, level by level, logged)
 void texture_log_guest(const Texture* t);
@@ -244,6 +250,14 @@ void barrier_stats(int64_t* made, int64_t* left_out);
 /// (hookshot) Set around a draw's sampled-texture lookups (vk_draw.cpp): a new ASTC texture there may wait for a later frame
 /// once this frame's uploads passed their budget (texture_touch). Never for compute: a dispatch may bake what it reads once
 extern thread_local bool upload_defer_ok;
+/// (Triforce, redrawn.h) Whether a draw's target t was written in the frame before too (the scene, drawn every frame), so that a
+/// texture the draw samples may be left for the next frame; false for one drawn once and kept (a text box). Null: true
+bool texture_redrawn(const Texture* t);
+/// (Triforce) Whether this frame left any texture for later so far (a new one not made or not uploaded, a re-upload left), so
+/// that a draw that may not leave one must not reuse descriptors a draw that might built in this frame (vk_draw.cpp)
+bool texture_frame_left_any();
+/// (Triforce) Whether t still owes bytes (its first upload or a re-upload left for later: upload_owed.h)
+inline bool texture_owes(const Texture* t) { return t && (t->owed.whole || !t->owed.ranges.empty()); }
 /// (Triforce) The hold of the last picture (present_hold.h, vk_replay.cpp do_present): what the draws of the next frame may do
 /// with a new texture once its uploads took their budget (present_hold::Mode), set at each present
 void texture_hold_mode(int mode);

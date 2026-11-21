@@ -49,6 +49,17 @@ while IFS= read -r src; do
 done < <(find "$T/host" "$T/gpu" -type f \( -name "*.c" -o -name "*.cpp" -o -name "*.h" \))
 [ "$missing" = 0 ] || exit 1
 echo "every relative include of the image's sources is in it"
+# ((Triforce) 11-20) and the folders nx2/build.py adds with -I for the optional parts a player's build may turn on: AMD FSR 4's
+# headers were not in the image, and the --update of a folder built with FSR 4 stopped at gpu/vk/vk_fsr4.cpp
+for need in third_party/fidelityfx/api/include/ffx_api.h third_party/fidelityfx/api/include/vk/ffx_api_vk.h; do
+    [ -f "$T/$need" ] || { echo "missing: $need (gpu/vk/vk_fsr4.cpp, a build with AMD FSR 4)"; exit 1; }
+done
+echo "AMD FSR 4's headers are in it"
+# ((Triforce) 11-20) and the back end a player's build reuses (HOOKSHOT_VK_PREBUILT) has FSR 4 compiled in: it names the Linux
+# library it looks for only then (vk_fsr4.cpp kLoader; the stubs do not). Built without it, no Linux player could have FSR 4
+grep -aq "amd_fidelityfx_upscaler_vk.so" "$R/usr/lib/hookshot/hookshot_vk.so" ||
+    { echo "usr/lib/hookshot/hookshot_vk.so was built without AMD FSR 4 (scripts/linux/appimage.sh: HOOKSHOT_FSR=1)"; exit 1; }
+echo "the Vulkan back end has AMD FSR 4"
 
 echo "== nx2/build.py --standalone --dry-run (as nx2/make_game.py runs it, with no game)"
 # (-B: no __pycache__ written into the image's tree. make_game.py's other settings: nx2/make_game.py, the compile's run())

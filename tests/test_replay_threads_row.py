@@ -86,15 +86,19 @@ int main(int argc, char** argv) {
     CHECK(replay_threads::of_row(8, 0) == 0 && replay_threads::of_row(8, 2) == 2 && replay_threads::of_row(8, 3) == 3 && replay_threads::of_row(9, 3) == 0);
     /* and with no key the row is Automatic (replay_threads.h: the audit's holes closed, the owner's choice) */
     CHECK(replay_threads::kDefaultRow == replay_threads::kRowAutomatic);
-    /* why, for the log's line ((Triforce) 11-17: one reason, none on every PC, and that the row still sets a count) */
+    /* why, for the log's line: one reason for each outcome */
     using replay_threads::why;
-    for (unsigned n : {4u, 8u, 12u, 16u, 32u})
-        CHECK(std::strstr(why(n, false), "none") && std::strstr(why(n, true), "none") && std::strstr(why(n, false), "row"));
-    /* Automatic's rule ((Triforce) 11-17): none on every PC, whatever its processors or driver (replay_threads.h automatic) */
+    CHECK(std::strstr(why(8, false), "four cores or fewer") && std::strstr(why(12, false), "2 with") && std::strstr(why(16, false), "3 with"));
+    CHECK(std::strstr(why(32, true), "AMD") && std::strstr(why(4, true), "AMD"));
+    /* Automatic's rule: by the cores (half the logical processors), none on AMD's driver for RDNA 1 and 2 */
     using replay_threads::automatic;
+    CHECK(automatic(0, false) == 0 && automatic(1, false) == 0 && automatic(4, false) == 0 && automatic(8, false) == 0 && automatic(9, false) == 0);
+    CHECK(automatic(10, false) == 2 && automatic(12, false) == 2 && automatic(15, false) == 2);
+    CHECK(automatic(16, false) == 3 && automatic(24, false) == 3 && automatic(32, false) == 3 && automatic(128, false) == 3);
     for (unsigned n = 0; n <= 256; n++) {
         CHECK(automatic(n, true) == 0);
-        CHECK(automatic(n, false) == 0);
+        CHECK(automatic(n, false) == 0 || automatic(n, false) == 2 || automatic(n, false) == 3);   /* (never a count nobody measured) */
+        if (n) CHECK(automatic(n, false) >= automatic(n - 1, false));
     }
     CHECK(hn_replay_threads(3, 0) && hn_replay_threads(3, 1) && !hn_replay_threads(3, 2) && !hn_replay_threads(0, 2));
     CHECK(hn_replay_threads(8, 0) && hn_replay_threads(8, 1) && hn_replay_threads(8, 2) && !hn_replay_threads(8, 3));
@@ -153,16 +157,18 @@ def main():
           "Used with DLSS or FSR on too" in row.group(0),
           "the Replay helper threads row is not a Developer row of the Debug tab that takes a restart and says what Off is")
     check(rows.index('"Developer", nullptr') < rows.index('"Descriptor reuse", &opts.descriptor_reuse') < rows.index('"Sampler cache", &opts.sampler_cache')
-          < rows.index('"Replay helper threads", &opts.replay_threads') < rows.index('{TAB_SYSTEM, "Restart"'),
+          < rows.index('"Replay helper threads", &opts.replay_threads'),   # ((Triforce, v0.5.2) no Restart row after it: the pause menu's Quit
           "the Replay helper threads row is not beside Descriptor reuse and Sampler cache, under the Developer heading")
     for tab in ("TAB_DISPLAY", "TAB_GRAPHICS", "TAB_AUDIO", "TAB_CONTROLS", "TAB_SYSTEM"):
         check('{%s, "Replay helper threads"' % tab not in rows, "the Replay helper threads row is on a tab players see")
     # the lab's other switch stays a switch
     check("RX_VK_EVENT_EARLY" not in menu and "event_early" not in menu.lower() and "RX_VK_EVENT_EARLY" in replay,
           "RX_VK_EVENT_EARLY has a row, or is gone from vk_replay.cpp")
-    # the Debug tab draws a row of more than two values as a choice (its Developer rows were Off and On alone)
-    draw = function(menu, "void draw_debug_rows(")
-    check("if (r.value && r.hi - r.lo > r.step) {" in draw and "choice_cell(c, va, vb, r.text(*r.value), selected, !fixed, !fixed, fixed);" in draw,
+    # the Debug tab draws a row of more than two values as a choice (its Developer rows were Off and On alone). ((Triforce,
+    # 11-17) The tab is drawn by draw_options' own loop now: only a row of On and Off is halves there)
+    draw = function(menu, "void draw_options(")
+    check("} else if (r.text == tx_onoff && !fixed) {" in draw and "choice_cell(c, va, vb, r.text(*r.value), selected, left, right, fixed);" in draw
+          and "if (cur_tab == TAB_DEBUG) listed = debug_list(list);" in draw,
           "the Debug tab draws the Replay helper threads row as Off and On halves")
     guide = (ROOT / "docs/development.md").read_text(encoding="utf-8")
     check("| `replay_helper_threads` | 0 Off, 1 to 7 the parallel replay tried on 2 to 8 threads, 8 Automatic (the default" in guide and

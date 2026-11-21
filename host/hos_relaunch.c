@@ -92,6 +92,7 @@ static void relaunch(void) {
    first when the menu asked for it */
 void hos_window_closed_exit(void) {
     const int again = relaunch_asked != 0;
+    { void hos_bench_closing(void); hos_bench_closing(); }   /* ((Triforce) benchmark mode: a run not finished writes that it stopped) */
     hos_log(again ? "display: window closed for a restart (the Insert menu's Restart now)" : "display: window closed, exiting");
     hos_log_flush();
     { void hos_fs_save_finish(void); hos_fs_save_finish(); }   /* (host/nn_fs.c: a save still being committed is finished first) */

@@ -31,15 +31,16 @@ ROOT = Path(__file__).resolve().parents[1]
 # (the row's name, its field of Options, lowest, highest, step, the function that words its value, its default, the
 # tonemapper it shows with: None any, 1 PsychoV35, 2 RenoDRT). NX2navi's menu: runtime/ui/menu.cpp row_hdr
 NEW_ROWS = [
-    ("RenoDX gamma correction", "rdx_gamma", 0, 2, 1, "tx_rdx_gamma", 0, None),
-    ("RenoDX match tone slope", "rdx_match_slope", 0, 1, 1, "tx_onoff", 1, 1),
-    ("RenoDX tone slope", "rdx_tone_slope", 0, 100, 1, "tx_rdx_grade", 50, 1),
-    ("RenoDX hue clip", "rdx_hue_clip", 0, 100, 5, "tx_percent", 50, 1),
-    ("RenoDX highlight saturation", "rdx_highlight_sat", 0, 100, 1, "tx_rdx_grade", 50, 2),
-    ("RenoDX blowout", "rdx_blowout", 0, 100, 1, "tx_rdx_grade", 0, 2),
-    ("RenoDX flare", "rdx_flare", 0, 100, 1, "tx_rdx_grade", 0, 2),
-    ("RenoDX hue correction", "rdx_hue", 0, 100, 5, "tx_percent", 100, 2),
-    ("RenoDX color grading", "rdx_grade", 0, 100, 5, "tx_percent", 100, 2),
+# ((Triforce, options_version 7) under the RenoDX group's heading their names lost "RenoDX "; their keys stayed: ini_key)
+    ("Gamma correction", "rdx_gamma", 0, 2, 1, "tx_rdx_gamma", 0, None),
+    ("Match tone slope", "rdx_match_slope", 0, 1, 1, "tx_onoff", 1, 1),
+    ("Tone slope", "rdx_tone_slope", 0, 100, 1, "tx_rdx_grade", 50, 1),
+    ("Hue clip", "rdx_hue_clip", 0, 100, 5, "tx_percent", 50, 1),
+    ("Highlight saturation", "rdx_highlight_sat", 0, 100, 1, "tx_rdx_grade", 50, 2),
+    ("Blowout", "rdx_blowout", 0, 100, 1, "tx_rdx_grade", 0, 2),
+    ("Flare", "rdx_flare", 0, 100, 1, "tx_rdx_grade", 0, 2),
+    ("Hue correction", "rdx_hue", 0, 100, 5, "tx_percent", 100, 2),
+    ("Color grading", "rdx_grade", 0, 100, 5, "tx_percent", 100, 2),
 ]
 KEYS = {"rdx_tonemap": "renodx_tonemapper", "rdx_gamma": "renodx_gamma_correction", "rdx_match_slope": "renodx_match_tone_slope",
         "rdx_tone_slope": "renodx_tone_slope", "rdx_hue_clip": "renodx_hue_clip",
@@ -94,7 +95,7 @@ def check_rows(menu, header):
     order = re.findall(r'\{(TAB_\w+), "([^"]+)", &opts\.(\w+),', table)
     names = [name for _, name, _ in order]
     # (the tonemapper row has RenoDRT)
-    row = re.search(r'\{TAB_DISPLAY, "RenoDX tonemapper", &opts\.rdx_tonemap, 0, 2, 1, tx_rdx_tonemap,(.*?)\},\n', table, re.S)
+    row = re.search(r'\{TAB_DISPLAY, "Tonemapper", &opts\.rdx_tonemap, 0, 2, 1, tx_rdx_tonemap,(.*?)\},\n', table, re.S)
     check(row and "RenoDRT" in row.group(1) and row.group(1).rstrip().endswith("nullptr, false, true"),
           "the RenoDX tonemapper row is not Vanilla, PsychoV35, RenoDRT, changing at once")
     check(re.search(r'const char\* tx_rdx_tonemap\(int v\) \{ return v == 2 \? "RenoDRT" : v \? "PsychoV35" : "Vanilla"; \}', menu),
@@ -102,7 +103,7 @@ def check_rows(menu, header):
     check(re.search(r'const char\* tx_rdx_gamma\(int v\) \{ return v == 1 \? "2\.2" : v == 2 \? "BT\.1886 \(2\.4\)" : "Off"; \}', menu),
           "tx_rdx_gamma does not name Off (0), 2.2 (1) and BT.1886 (2.4) (2)")
     check(re.search(r"int rdx_tonemap = 1;", header), "the tonemapper's default is no longer PsychoV35: an options file from before would change")
-    first, last = names.index("RenoDX tonemapper"), names.index("RenoDX bloom")
+    first, last = names.index("Tonemapper"), names.index("Bloom")
     for name, field, lo, hi, step, text, default, _ in NEW_ROWS:
         row = re.search(r'\{TAB_DISPLAY, "%s", &opts\.%s, (-?\d+), (-?\d+), (\d+), (\w+),(.*?)\},\n' % (re.escape(name), field), table, re.S)
         check(row, "vk_menu.cpp has no Display row \"%s\" on opts.%s" % (name, field))
@@ -157,7 +158,7 @@ int main() {
         const Row r{w.name, w.value};
         CHECK(!std::strcmp(ini_key(r), w.key));
     }
-    const Row tonemapper{"RenoDX tonemapper", &opts.rdx_tonemap};
+    const Row tonemapper{"Tonemapper", &opts.rdx_tonemap};
     CHECK(!std::strcmp(ini_key(tonemapper), "renodx_tonemapper"));
     /* every one of them is a RenoDX row (hidden without HDR Native and RenoDX HDR), and no other row is */
     for (const Want& w : news) CHECK(rdx_row(w.value));
@@ -371,11 +372,13 @@ def check_binding(source):
 
 def check_docs():
     readme = (ROOT / "readme.md").read_text(encoding="utf-8")
-    row = re.search(r"^\| RenoDX HDR \|(.*)\|$", readme, re.M)
-    check(row, "readme.md's settings table has no RenoDX HDR row")
-    for word in ("Vanilla", "PsychoV35", "RenoDRT", "gamma correction", "tone slope", "hue clip", "highlight saturation", "blowout", "flare",
-                 "hue correction", "colour grading"):
-        check(word in row.group(1), "readme.md's RenoDX HDR row does not name: " + word)
+    # ((Triforce, options_version 7) RenoDX is the HDR row's Native + RenoDX, and its rows a group of their own)
+    row = re.search(r"^\| RenoDX \|(.*)\|$", readme, re.M)
+    check(row, "readme.md's settings table has no RenoDX row")
+    check("Native + RenoDX" in readme[readme.index("| HDR |"):readme.index("| RenoDX |")], "readme.md's HDR row has no Native + RenoDX")
+    for word in ("Vanilla", "PsychoV35", "RenoDRT", "Gamma correction", "Tone slope", "Hue clip", "Highlight saturation", "Blowout", "Flare",
+                 "Hue correction", "Color grading"):
+        check(word in row.group(1), "readme.md's RenoDX row does not name: " + word)
     guide = (ROOT / "docs/development.md").read_text(encoding="utf-8")
     for line in ("| `renodx_tonemapper` | 0 Vanilla, 1 PsychoV35, 2 RenoDRT |",
                  "| `renodx_gamma_correction` | 0 Off, 1 2.2, 2 BT.1886 (2.4) |"):

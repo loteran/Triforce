@@ -38,6 +38,7 @@ int up_now = 0;   // (the Upscaler shown: 0 the game's own, 1 DLSS, 2 DLAA)
 int upscaler() { return up_now; }
 }
 #include "gpu/vk/upscaler_rows.h"
+#include "gpu/vk/merged_rows.h"   // ((Triforce, options_version 7) the Output resolution's handheld profile, 7)
 using namespace mkwvk;
 namespace ur = upscaler_rows;
 ''' + host[host.index("int hos_ini_option(const char *key, int otherwise);"):host.index("HLE(_ZN2nn2oe16GetOperationModeEv)")] + menu[
@@ -50,9 +51,12 @@ int main(int argc, char **argv) {
     assert(output_mode() == mode);
     assert(hos_output_size(0) == w && hos_output_size(1) == h);
     assert(hos_rt_pool_size(305ull << 20) == ((mode == 2 ? 687ull : mode == 4 ? 610ull : mode == 5 || mode == 6 ? 900ull : 512ull) << 20));   // (512 MB at least: nn_applet.c)
-    assert(kLastOutput == 6);
-    assert(output_choice(-1) == 0 && output_choice(4) == 4 && output_choice(5) == 5 && output_choice(6) == 6 && output_choice(7) == 0);
-    assert(step_output_choice(3, -1) == 3);
+    // ((Triforce, options_version 7) 7 is 1536x864, the handheld profile, the smallest: first in the row)
+    assert(kLastOutput == 7 && merged_rows::kHandheldOutput == 7);
+    assert(output_choice(-1) == 0 && output_choice(4) == 4 && output_choice(5) == 5 && output_choice(6) == 6 && output_choice(7) == 7 &&
+           output_choice(8) == 0);
+    assert(step_output_choice(7, -1) == 7 && step_output_choice(7, 1) == 3 && step_output_choice(3, -1) == 7);
+    assert(strcmp(tx_output_res(7), "1536x864 (handheld)") == 0);
     assert(step_output_choice(3, 1) == 0 && step_output_choice(0, -1) == 3);
     assert(step_output_choice(0, 1) == 1 && step_output_choice(1, -1) == 0);
     assert(step_output_choice(1, 1) == 2 && step_output_choice(2, -1) == 1);
@@ -63,6 +67,7 @@ int main(int argc, char **argv) {
     opts.output_res = mode;
     opts.handheld = handheld();
     assert(strcmp(tx_output_res(mode), argv[4]) == 0);
+    if (opts.handheld) opts.output_res = 7;   // (the menu's row: the handheld profile, as menu_init reads it, merged_rows.h migrate)
     unsigned scene_w, scene_h;
     game_size(1.0f, scene_w, scene_h);
     assert(scene_w == (opts.handheld ? 1536 : mode ? w : 2048));
@@ -76,8 +81,8 @@ int main(int argc, char **argv) {
             game_size(ur::percent(m[0]) / 100.0f, scene_w, scene_h);
             assert(scene_w == m[1] && scene_h == m[2] && scene_w * 1080 == scene_h * 1920);
         }
-        up_now = ur::DLAA;
-        assert(strcmp(tx_resolution(1), "Native (DLAA)") == 0);
+        up_now = ur::DLAA;   // ((Triforce, options_version 7) the Render resolution's Native (100%) step)
+        assert(strcmp(tx_resolution(1), "Native (100%)") == 0);
         up_now = ur::GAME;
     }
 }
@@ -95,6 +100,9 @@ int main(int argc, char **argv) {
         (4, 0, None, 4, 5120, 1440, "5120x1440"),
         (6, 0, None, 6, 5120, 2160, "5120x2160"),
         (1, 0, "6", 6, 5120, 2160, "5120x2160"),
+        # ((Triforce, options_version 7) the handheld profile as the Output resolution's 7, saved or for a run)
+        (1, 0, "7", 0, 2560, 1440, "2048x1152"),
+        (8, 0, None, 0, 2560, 1440, "2048x1152"),
     )
     with tempfile.TemporaryDirectory(prefix="output-resolution-") as tmp:
         work = Path(tmp)

@@ -161,18 +161,31 @@ bool gameplay_network(uint64_t key) {
     return key == 0xfd029a317a9a4b94ull || key == 0x9dc98871eb7fc101ull;
 }
 enum class ViewUse { Sample, Storage };
+constexpr VkImageView VK_NULL_HANDLE = 0;
 VkImageView texture_view(Texture *t, const nvn_tex *, const nvn_view *v, VkImageViewType type,
-                         ViewUse use, VkFormat *f, VkFormat forced = VK_FORMAT_UNDEFINED) {
+                         ViewUse use, VkFormat *f = nullptr, VkFormat forced = VK_FORMAT_UNDEFINED) {
     assert(!v && type == VK_IMAGE_VIEW_TYPE_2D && lock_depth > 0);
     views++;
     if (t == &src) {
         assert(use == ViewUse::Sample && forced == VK_FORMAT_UNDEFINED);
-        *f = VK_FORMAT_E5B9G9R9_UFLOAT_PACK32;
+        if (f) *f = VK_FORMAT_E5B9G9R9_UFLOAT_PACK32;
         return missing_input_view ? 0 : (VkImageView)101;
     }
     assert(t == &dst && use == ViewUse::Storage && forced == VK_FORMAT_B10G11R11_UFLOAT_PACK32);
-    *f = VK_FORMAT_B10G11R11_UFLOAT_PACK32;
+    if (f) *f = VK_FORMAT_B10G11R11_UFLOAT_PACK32;
     return missing_output_view ? 0 : (VkImageView)102;
+}
+// ((Triforce, 11-18) FSR 3.1 picked as the upscaler takes a rejected network's pass first, outside the recording lock, with
+// the two textures' views; off unless the case says)
+bool fsr3_on = false;
+unsigned fsr3_calls = 0;
+bool fsr3_wanted() { return fsr3_on; }
+bool fsr3_upscale(VkCommandBuffer, uint64_t, bool known, Texture *in, VkImageView in_view, Texture *out, VkImageView out_view,
+                  uint32_t level) {
+    assert(lock_depth == 0 && !known && in == &src && out == &dst && in_view == (VkImageView)101 &&
+           out_view == (VkImageView)102 && level == 0);
+    fsr3_calls++;
+    return true;
 }
 static bool typed_upscale(VkCommandBuffer, VkImageView input, VkImageView output, Texture *t,
                           uint32_t level, uint64_t, const char *, bool temporal) {
@@ -234,6 +247,8 @@ int main(int argc, char **argv) {
         missing_input_view = true;
     if (mode == "null-output-view" || mode == "fd-null-output-view")
         missing_output_view = true;
+    if (mode == "fsr3")
+        fsr3_on = true;
     NvnState state;
     state.tex[5][0] = 1;
     state.img[5][0] = 2;
@@ -245,6 +260,8 @@ int main(int argc, char **argv) {
         }
         assert(writes == 1);
         assert(gameplay_logs == (mode == "fd" ? 1u : 0u) && gameplay_warnings == 0);
+    } else if (mode == "fsr3") {
+        assert(fsr3_calls == 1 && views == 2 && typed_calls == 0 && blits == 0);
     } else if (mode == "movie") {
         assert(movie_calls == 1 && typed_calls == 0 && blits == 0 && writes == 1);
     } else if (mode == "pipeline-failure" || mode == "fd-pipeline-failure") {
@@ -289,7 +306,7 @@ def main():
                  'fd-view', 'fd-pipeline-failure', 'fd-no-storage', 'fd-no-e5-sample',
                  'fd-no-e5-linear', 'fd-null-input-view', 'fd-null-output-view', '9dc',
                  'pipeline-failure', 'no-storage', 'no-e5-sample', 'no-e5-linear',
-                 'null-input-view', 'null-output-view')
+                 'null-input-view', 'null-output-view', 'fsr3')
         for case in cases:
             subprocess.run([str(exe), case], env=env, check=True)
 

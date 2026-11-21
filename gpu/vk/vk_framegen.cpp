@@ -39,7 +39,10 @@
 #include "vk_ngxfg.h"   // (NVIDIA DLSS Frame Generation)
 #include "vk_pace.h"           // (Triforce: whether RivaTuner holds the frames this thread presents)
 #include "vk_present_rect.h"
+#include "vk_temporal.h"      // ((Triforce, S1) temporal_sharpens_3d: the upscaler sharpened the 3D before the HUD)
 #include "vk_texture.h"
+#include "sharpen_rules.h"    // ((Triforce, S1, S3-S6) the window pass's Sharpness and filter, the PQ picture's shaders)
+#include <vector>
 
 #include "shaders/fg_copy_comp_spv.h"
 #include "shaders/fg_fine_flow_comp_spv.h"
@@ -122,6 +125,16 @@ struct State {
     int mult = 0;   // (the multiplier the sets' frames were made for)
     int64_t game_ns = 0;     // (Auto: the game's frame time, smoothed: the delay its frames are shown at)
     int64_t slot_next = 0;   // (Auto: the display's next refresh to be given a frame, on the game's timeline)
+    // ((Triforce, FG-5) the frames' format: RGBA8, or for HDR Native's 10-bit picture (PQ codes) A2B10G10R10 (RGBA16F where the
+    // card stores no A2B10G10R10), so the game's frames and the made ones keep their 10 bits to the window: before, every frame
+    // shown was cut to 8 bits there. copy, synth and fine_synth are pipes_format's (their rgba8 storage images declared as the
+    // other format, sharpen_rules.h storage_format_patch: no new shader), the other format's kept in alt_*)
+    VkFormat format = VK_FORMAT_R8G8B8A8_UNORM, pipes_format = VK_FORMAT_R8G8B8A8_UNORM, alt_format = VK_FORMAT_UNDEFINED;
+    Pipe alt_copy, alt_synth, alt_fine_synth;
+    bool hdr_failed = false;   // (the 10-bit pipes could not be made: HDR Native's frames stay 8 bits, said once)
+    // ((Triforce, FG-2) this present's window texture size and its crop, for the picture without the HUD: fsr4_frame)
+    uint32_t src_w = 0, src_h = 0;
+    PresentSourceRect source{};
 } fg;
 
 // Used only by present_image, whose lock serializes direct and interpolated presents.
@@ -129,6 +142,11 @@ struct ScaleState {
     bool init = false, failed = false;
     Pipe pipe;
     Pipe easu, rcas;   // (Triforce: Upscaling = AMD FSR 1, shaders/fsr1_*.hlsl)
+    // ((Triforce, S5) the same three for HDR Native's PQ picture, their storage images rgba16f (sharpen_rules.h
+    // storage_format_patch): made at its first such frame; pq_init -1 when the filter's could not be)
+    Pipe pipe16, easu16, rcas16;
+    int pq_init = 0;
+    VkFormat format = VK_FORMAT_R8G8B8A8_UNORM;   // (the four images': RGBA8, or RGBA16F for a PQ picture)
     VkSampler linear = VK_NULL_HANDLE, nearest = VK_NULL_HANDLE;
     Img cropped, scaled, small;   // (small: the picture at 1/8, for ultrawide's blurred menu sides)
     Img easu_img;      // (FSR 1: EASU's output, RCAS's input, the window's size)
@@ -251,8 +269,10 @@ bool make_pipe(Pipe& p, const uint32_t* code, size_t bytes, std::initializer_lis
 
 // The optional interpolation is disabled after setup fails: retain none of its unused setup objects.
 void drop_setup() {
-    for (Pipe* p : {&fg.copy, &fg.luma, &fg.flow, &fg.median, &fg.synth, &fg.half, &fg.fine_flow, &fg.fine_pick, &fg.fine_synth})
+    for (Pipe* p : {&fg.copy, &fg.luma, &fg.flow, &fg.median, &fg.synth, &fg.half, &fg.fine_flow, &fg.fine_pick, &fg.fine_synth,
+                    &fg.alt_copy, &fg.alt_synth, &fg.alt_fine_synth})
         drop_pipe(*p);
+    fg.pipes_format = VK_FORMAT_R8G8B8A8_UNORM, fg.alt_format = VK_FORMAT_UNDEFINED;
     if (fg.nearest) vkDestroySampler(dev.device, fg.nearest, nullptr);
     if (fg.linear) vkDestroySampler(dev.device, fg.linear, nullptr);
     fg.nearest = fg.linear = VK_NULL_HANDLE;
@@ -334,6 +354,36 @@ bool init_scale() {
     return false;
 }
 
+/// ((Triforce, S5) The window pass's three shaders for HDR Native's PQ picture (the game's A2B10G10R10 codes): their rgba8
+/// storage images declared rgba16f (sharpen_rules.h storage_format_patch), so the picture goes through RGBA16F images and
+/// keeps its 10 bits. Before, it went through RGBA8 ones into the HDR10 window. False: the filter's could not be made (then the
+/// PQ picture is copied to the window as it is); FSR 1's two missing: Catmull-Rom in its place, as with RGBA8
+bool init_scale_pq() {
+    if (scale.pq_init) return scale.pq_init > 0;
+    scale.pq_init = -1;
+    if (!init_scale()) return false;
+    const VkDescriptorType S = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, I = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    const auto patched = [](const uint32_t* code, size_t bytes) {
+        std::vector<uint32_t> w(code, code + bytes / 4);
+        return sharpen_rules::storage_format_patch(w, sharpen_rules::kSpvRgba8, sharpen_rules::kSpvRgba16f) ? w
+                                                                                                           : std::vector<uint32_t>{};
+    };
+    const std::vector<uint32_t> f = patched(FG_SCALE_COMP_SPV, sizeof FG_SCALE_COMP_SPV);
+    if (f.empty() || !make_pipe(scale.pipe16, f.data(), f.size() * 4, {S, I, S}, 20)) {
+        logf("vk: HDR Native: the window's filter for its 10-bit picture could not be made: the picture goes to the window as it is");
+        return false;
+    }
+    scale.pq_init = 1;
+    const std::vector<uint32_t> e = patched(FSR1_EASU_COMP_SPV, sizeof FSR1_EASU_COMP_SPV);
+    const std::vector<uint32_t> r = patched(FSR1_RCAS_COMP_SPV, sizeof FSR1_RCAS_COMP_SPV);
+    if (!scale.easu.pipe || e.empty() || r.empty() || !make_pipe(scale.easu16, e.data(), e.size() * 4, {S, I}, 16) ||
+        !make_pipe(scale.rcas16, r.data(), r.size() * 4, {S, I}, 16))
+        drop_pipe(scale.easu16), drop_pipe(scale.rcas16);
+    logf("vk: HDR Native: the window's filter takes the 10-bit picture through RGBA16F images%s",
+         scale.easu16.pipe ? "" : " (AMD FSR 1 as Catmull-Rom)");
+    return true;
+}
+
 bool make_img(Img& i, uint32_t w, uint32_t h, VkFormat f, VkImageUsageFlags usage) {
     Img made;
     VkImageCreateInfo ci{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
@@ -392,8 +442,59 @@ void drop_size() {
     ngxfg::reset();   // (DLSS Frame Generation's history was of the pictures that are gone)
 }
 
+/// ((Triforce, FG-5) The format HDR Native's frames are kept in: A2B10G10R10, the game's own, where the card stores it in a
+/// compute shader (shaderStorageImageExtendedFormats), else RGBA16F, which every card stores and which holds 10-bit codes too
+VkFormat hdr_frames_format() {
+    static const VkFormat f = [] {
+        VkFormatProperties p{};
+        vkGetPhysicalDeviceFormatProperties(dev.physical, VK_FORMAT_A2B10G10R10_UNORM_PACK32, &p);
+        const VkFormatFeatureFlags need = VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT |
+                                          VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT | VK_FORMAT_FEATURE_TRANSFER_SRC_BIT |
+                                          VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
+        return dev.features.shaderStorageImageExtendedFormats && (p.optimalTilingFeatures & need) == need
+                   ? VK_FORMAT_A2B10G10R10_UNORM_PACK32 : VK_FORMAT_R16G16B16A16_SFLOAT;
+    }();
+    return f;
+}
+/// The three passes that store the frames (fg_copy, fg_synth, fg_fine_synth) for frames of format f, into alt_*: their rgba8
+/// storage images declared as f's (and, for A2B10G10R10's Rgb10A2, the capability SPIR-V asks for it)
+bool make_format_pipes(VkFormat f) {
+    const VkDescriptorType S = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, I = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    const bool rgb10 = f == VK_FORMAT_A2B10G10R10_UNORM_PACK32;
+    const auto patched = [rgb10](const uint32_t* code, size_t bytes) {
+        std::vector<uint32_t> w(code, code + bytes / 4);
+        if (sharpen_rules::storage_format_patch(w, sharpen_rules::kSpvRgba8, rgb10 ? sharpen_rules::kSpvRgb10A2 : sharpen_rules::kSpvRgba16f) != 1 ||
+            (rgb10 && !sharpen_rules::spv_require_capability(w, sharpen_rules::kSpvCapStorageImageExtendedFormats)))
+            w.clear();
+        return w;
+    };
+    const std::vector<uint32_t> c = patched(FG_COPY_COMP_SPV, sizeof FG_COPY_COMP_SPV);
+    const std::vector<uint32_t> m = fine_vectors() ? patched(FG_FINE_SYNTH_COMP_SPV, sizeof FG_FINE_SYNTH_COMP_SPV)
+                                                   : patched(FG_SYNTH_COMP_SPV, sizeof FG_SYNTH_COMP_SPV);
+    if (c.empty() || m.empty() || !make_pipe(fg.alt_copy, c.data(), c.size() * 4, {S, I}, 16) ||
+        !make_pipe(fine_vectors() ? fg.alt_fine_synth : fg.alt_synth, m.data(), m.size() * 4, {S, S, S, I}, 4)) {
+        drop_pipe(fg.alt_copy), drop_pipe(fg.alt_synth), drop_pipe(fg.alt_fine_synth);
+        return false;
+    }
+    return true;
+}
+/// The frames' format for this present: RGBA8, or HDR Native's (hdr_frames_format) once its passes are made
+VkFormat frames_format() {
+    if (!present_native_pq.load(std::memory_order_relaxed) || fg.hdr_failed) return VK_FORMAT_R8G8B8A8_UNORM;
+    const VkFormat f = hdr_frames_format();
+    if (fg.pipes_format == f || fg.alt_format == f) return f;
+    if (fg.alt_format == VK_FORMAT_UNDEFINED && make_format_pipes(f)) {
+        fg.alt_format = f;
+        return f;
+    }
+    fg.hdr_failed = true;
+    logf("vk: frame interpolation: its passes for HDR Native's 10-bit picture could not be made: its frames stay 8 bits");
+    return VK_FORMAT_R8G8B8A8_UNORM;
+}
+
 bool ensure_size(VkCommandBuffer cmd, uint32_t w, uint32_t h) {
-    if (fg.w == w && fg.h == h && fg.mult == multiplier()) return true;
+    const VkFormat format = frames_format();   // ((Triforce, FG-5))
+    if (fg.w == w && fg.h == h && fg.mult == multiplier() && fg.format == format) return true;
     {   // (the display thread is done with the old sets first)
         std::unique_lock lk(fg.mu);
         fg.cv.wait(lk, [] { return fg.jobs.empty() && !fg.sets[0].busy && !fg.sets[1].busy && !fg.sets[2].busy; });
@@ -403,11 +504,20 @@ bool ensure_size(VkCommandBuffer cmd, uint32_t w, uint32_t h) {
         device_wait_idle_locked();
     }
     drop_size();
+    if (format != fg.pipes_format) {   // ((Triforce, FG-5) the passes that store the frames, the format's: both kept, swapped)
+        std::swap(fg.copy, fg.alt_copy), std::swap(fg.synth, fg.alt_synth), std::swap(fg.fine_synth, fg.alt_fine_synth);
+        std::swap(fg.pipes_format, fg.alt_format);
+    }
+    if (format != fg.format)
+        logf("vk: frame interpolation: its frames are %s%s", format == VK_FORMAT_R8G8B8A8_UNORM ? "RGBA8" :
+             format == VK_FORMAT_A2B10G10R10_UNORM_PACK32 ? "A2B10G10R10" : "RGBA16F",
+             format == VK_FORMAT_R8G8B8A8_UNORM ? "" : ": HDR Native's 10-bit picture kept to the window");
+    fg.format = format;
     const uint32_t qw = (w + 3) / 4, qh = (h + 3) / 4, cw = (qw + 3) / 4, ch = (qh + 3) / 4;
     const VkImageUsageFlags rw = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
     bool ok = true;
     for (int i = 0; i < 2; i++) {
-        ok = ok && make_img(fg.frames[i], w, h, VK_FORMAT_R8G8B8A8_UNORM, rw | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
+        ok = ok && make_img(fg.frames[i], w, h, format, rw | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
         ok = ok && make_img(fg.lumas[i], qw, qh, VK_FORMAT_R16_SFLOAT, rw);
         ok = ok && make_img(fg.flows[i], cw, ch, VK_FORMAT_R16G16B16A16_SFLOAT, rw);
         if (fine_vectors()) {   // ((Triforce) the fine vectors': half-size luma, a vector per 8x8 pixels)
@@ -418,8 +528,7 @@ bool ensure_size(VkCommandBuffer cmd, uint32_t w, uint32_t h) {
     const int mult = multiplier();
     for (OutSet& set : fg.sets)
         for (int k = 0; k < mult; k++)
-            ok = ok && make_img(set.frame[k], w, h, VK_FORMAT_R8G8B8A8_UNORM,
-                                rw | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
+            ok = ok && make_img(set.frame[k], w, h, format, rw | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
     if (!ok) {
         fg.failed = true;
         drop_size();
@@ -656,11 +765,41 @@ bool wide_sides_possible() { return wide_possible.load(std::memory_order_relaxed
 
 VkImage framegen_scale(VkCommandBuffer cmd, VkImageView src, VkImage image, uint32_t sw, uint32_t sh, const int crop[4], uint32_t dw, uint32_t dh) {
     const WideSides wide = wide_now.load(std::memory_order_relaxed);   // (wide_sides_tick, each present)
-    if (!opts.upscale && !opts.sharpness && !wide.side) return VK_NULL_HANDLE;
+    // ((Triforce, S1) the Sharpness row: nothing here while the upscaler sharpens the 3D before the HUD (FSR 3.1, FSR 4, DLSS
+    // and DLAA: vk_temporal.h temporal_sharpens_3d), never twice and not the HUD; the finished picture with the game's own)
+    const int sharp = sharpen_rules::window_sharpness(opts.sharpness, temporal_sharpens_3d());
+    {   // (each change of where it sharpens, said: a report of a soft or an oversharpened picture then says which)
+        static int told = -1, told_value = -1;
+        const int where = !opts.sharpness ? 0 : sharp ? 1 : 2;
+        if (where != told || (where && opts.sharpness != told_value)) {
+            told = where, told_value = opts.sharpness;
+            static const char* const said[3] = {"off", "the finished picture at the window, the HUD with it",
+                                                "the 3D before the HUD, by the upscaler: nothing at the window"};
+            logf("vk: Sharpness %d%%: %s", opts.sharpness, said[where]);
+        }
+    }
+    if (!opts.upscale && !sharp && !wide.side) return VK_NULL_HANDLE;
     if (!src || !image || !sw || !sh || !dw || !dh) return VK_NULL_HANDLE;
     const PresentSourceRect source = present_source_rect(sw, sh, crop);
     if (!source.w || !source.h) return VK_NULL_HANDLE;
     if (!init_scale()) return VK_NULL_HANDLE;
+    // ((Triforce, S5) HDR Native: the game's PQ picture (10 bits) through RGBA16F images and the shaders' rgba16f builds, not
+    // RGBA8 ones, which took 2 bits off it before the HDR10 window. Those not made: the picture to the window as it is)
+    const bool pq = present_native_pq.load(std::memory_order_relaxed);
+    if (pq && !init_scale_pq()) return VK_NULL_HANDLE;
+    const VkFormat format = pq ? VK_FORMAT_R16G16B16A16_SFLOAT : VK_FORMAT_R8G8B8A8_UNORM;
+    if (scale.format != format) {   // (made again in the other format below, each at its size)
+        {
+            std::lock_guard qk(dev.present_mu);
+            device_wait_idle_locked();
+        }
+        drop_img(scale.cropped), drop_img(scale.scaled), drop_img(scale.easu_img), drop_img(scale.small);
+        scale.cropped_w = scale.cropped_h = scale.scaled_w = scale.scaled_h = scale.small_w = scale.small_h = 0;
+        scale.format = format;
+    }
+    const Pipe& filter = pq ? scale.pipe16 : scale.pipe;
+    const Pipe& easu = pq ? scale.easu16 : scale.easu;
+    const Pipe& rcas = pq ? scale.rcas16 : scale.rcas;
     // (the game draws into part of its window textures, 2048 x 1152 of 2560 x 1440 here: the filter was given the whole texture, and the
     // picture came out in the top left corner of the window with black around it. The crop first, then the filter)
     if (source.x || source.y || source.w != sw || source.h != sh) {
@@ -672,7 +811,7 @@ VkImage framegen_scale(VkCommandBuffer cmd, VkImageView src, VkImage image, uint
             }
             drop_img(scale.cropped);
             scale.cropped_w = scale.cropped_h = 0;
-            if (!make_img(scale.cropped, cw, ch, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT)) {
+            if (!make_img(scale.cropped, cw, ch, scale.format, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT)) {
                 drop_img(scale.cropped);
                 return VK_NULL_HANDLE;
             }
@@ -699,7 +838,7 @@ VkImage framegen_scale(VkCommandBuffer cmd, VkImageView src, VkImage image, uint
         // picture was scaled or sharpened first; made without that usage, sampling it is not allowed, and the window was
         // black with Sharpness or Upscaling on ("Sharpness slider deletes all visuals", RTX 3060 Ti on an HDR10 surface;
         // shown in the lab with RX_VK_TEST_HDR_PASS=1: the window's mean brightness 0 with Sharpness 70, 131 with 0))
-        if (!make_img(scale.scaled, dw, dh, VK_FORMAT_R8G8B8A8_UNORM,
+        if (!make_img(scale.scaled, dw, dh, scale.format,
                       VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT)) {
             drop_img(scale.scaled);
             return VK_NULL_HANDLE;
@@ -709,23 +848,36 @@ VkImage framegen_scale(VkCommandBuffer cmd, VkImageView src, VkImage image, uint
         // (Triforce: AMD FSR 1's middle image, EASU's output and RCAS's input, at the window's size. Without it Upscaling 3 falls
         // to the filter below)
         drop_img(scale.easu_img);
-        if (scale.easu.pipe && scale.rcas.pipe && scale.nearest &&
-            make_img(scale.easu_img, dw, dh, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT))
+        if (easu.pipe && rcas.pipe && scale.nearest &&
+            make_img(scale.easu_img, dw, dh, scale.format, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT))
             to_general(cmd, scale.easu_img.image);
         else
             drop_img(scale.easu_img);
     }
-    if (opts.upscale == 3 && scale.easu_img.view) {
-        // (Triforce: AMD FSR 1, EvilOOT's own window filter: EASU, the edge-adaptive upscale, then RCAS at the Sharpness row.
-        // The size the picture is at: the cropped one when the game drew into part of its texture)
-        const uint32_t iw = src == scale.cropped.view ? scale.cropped_w : sw, ih = src == scale.cropped.view ? scale.cropped_h : sh;
+    // (the size the picture is at: the cropped one when the game drew into part of its texture)
+    const uint32_t iw = src == scale.cropped.view ? scale.cropped_w : sw, ih = src == scale.cropped.view ? scale.cropped_h : sh;
+    // (Triforce: AMD FSR 1, EvilOOT's own window filter: EASU, the edge-adaptive upscale, then RCAS at the Sharpness row.
+    // ((Triforce, S4) only where it enlarges, as AMD's EASU is made for: not at 1:1, where the menu says the filter is not
+    // needed, nor to a smaller window; there Catmull-Rom or the plain copy with the other filters' Sharpness. (S6) Nor
+    // beside a menu with ultrawide's sides, which the filter below draws. (S3) At Sharpness 0 (or the 3D sharpened before
+    // the HUD) EASU alone, straight into the window's image: RCAS at its lightest still sharpened, 2 stops below its most)
+    const bool fsr1 = opts.upscale == 3 && scale.easu_img.view && !wide.side && sharpen_rules::fsr1_enlarges(iw, ih, dw, dh);
+    if (fsr1) {
         const uint32_t ep[4] = {iw, ih, dw, dh};
-        pass(cmd, scale.easu, {{src, scale.linear}, {scale.easu_img.view, VK_NULL_HANDLE}}, dw, dh, ep, sizeof ep);
-        const struct { uint32_t w, h; float sharp, pad; } rp{dw, dh, opts.sharpness / 100.0f, 0.0f};
-        pass(cmd, scale.rcas, {{scale.easu_img.view, scale.nearest}, {scale.scaled.view, VK_NULL_HANDLE}}, dw, dh, &rp, sizeof rp);
+        // ((Triforce, options_version 7) the window's filter is chosen by the sizes, not by the player (upscaler_rows.h
+        // window_filter), so it sharpens only when the Sharpness row asks: at 0, or with the 3D sharpened before the HUD
+        // (sharp 0), EASU alone straight into the image that is shown, both storage images of one format)
+        pass(cmd, easu, {{src, scale.linear}, {sharp ? scale.easu_img.view : scale.scaled.view, VK_NULL_HANDLE}}, dw, dh, ep, sizeof ep);
+        if (sharp) {
+            const struct { uint32_t w, h; float sharp, pad; } rp{dw, dh, sharp / 100.0f, 0.0f};
+            pass(cmd, rcas, {{scale.easu_img.view, scale.nearest}, {scale.scaled.view, VK_NULL_HANDLE}}, dw, dh, &rp, sizeof rp);
+        }
         return scale.scaled.image;
     }
-    struct { int mode; float sharp; float x0, x1; int side; } pc{opts.upscale, opts.sharpness / 100.0f, wide.x0, 1.0f - wide.x0, wide.side};
+    struct { int mode; float sharp; float x0, x1; int side; } pc{sharpen_rules::window_mode(opts.upscale, fsr1, iw, ih, dw, dh),
+                                                                 sharp / 100.0f, wide.x0, 1.0f - wide.x0, wide.side};
+    // (nothing left to do: the plain copy at 1:1, no Sharpness here, no sides. The picture goes to the window as it is)
+    if (!pc.mode && !sharp && !wide.side && iw == dw && ih == dh) return VK_NULL_HANDLE;
     if (wide.side == 1) {   // (the blurred sides: first the picture at 1/8, each pixel the mean of its 8 x 8, which they blur)
         // (from #1448's checked source rectangle, as the crop above: the picture src now holds)
         const uint32_t smw = std::max(1u, source.w / 8), smh = std::max(1u, source.h / 8);
@@ -736,7 +888,7 @@ VkImage framegen_scale(VkCommandBuffer cmd, VkImageView src, VkImage image, uint
             }
             drop_img(scale.small);
             scale.small_w = scale.small_h = 0;
-            if (!make_img(scale.small, smw, smh, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT)) {
+            if (!make_img(scale.small, smw, smh, scale.format, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT)) {
                 drop_img(scale.small);
                 return VK_NULL_HANDLE;
             }
@@ -744,20 +896,20 @@ VkImage framegen_scale(VkCommandBuffer cmd, VkImageView src, VkImage image, uint
             to_general(cmd, scale.small.image);
         }
         pc.side = 3;   // (fg_scale.comp: make the small copy)
-        pass(cmd, scale.pipe, {{src, scale.linear}, {scale.small.view, VK_NULL_HANDLE}, {src, scale.linear}}, smw, smh, &pc, sizeof pc);
+        pass(cmd, filter, {{src, scale.linear}, {scale.small.view, VK_NULL_HANDLE}, {src, scale.linear}}, smw, smh, &pc, sizeof pc);
         full_barrier(cmd);
         pc.side = 1;
     }
-    pass(cmd, scale.pipe, {{src, scale.linear}, {scale.scaled.view, VK_NULL_HANDLE}, {wide.side == 1 ? scale.small.view : src, scale.linear}},
+    pass(cmd, filter, {{src, scale.linear}, {scale.scaled.view, VK_NULL_HANDLE}, {wide.side == 1 ? scale.small.view : src, scale.linear}},
          dw, dh, &pc, sizeof pc);
     static const bool report = getenv("RX_VK_UPSCALE_LOG") != nullptr;
     static bool reported = false;
     if (report && !reported) {
         reported = true;
         logf("vk: upscale dispatched: mode %d, sharpness %d%% (of RCAS's strongest, neighbours one source pixel apart), source %ux%u, "
-             "crop request %d,%d %dx%d, destination %ux%u",
-             opts.upscale, opts.sharpness, sw, sh, crop ? crop[0] : 0, crop ? crop[1] : 0,
-             crop ? crop[2] : (int)sw, crop ? crop[3] : (int)sh, dw, dh);
+             "crop request %d,%d %dx%d, destination %ux%u%s",
+             pc.mode, sharp, sw, sh, crop ? crop[0] : 0, crop ? crop[1] : 0,
+             crop ? crop[2] : (int)sw, crop ? crop[3] : (int)sh, dw, dh, pq ? ", HDR Native's picture in RGBA16F" : "");
     }
     return scale.scaled.image;
 }
@@ -810,6 +962,172 @@ VkImage framegen_made_image(uint32_t* w, uint32_t* h) {
     return fg.recorded->frame[0].image;
 }
 
+// ((Triforce, FG-2) The picture without the HUD, for AMD's frame generation (vk_fsr4.h fsr4fg, HUDLessColor). OoT's gameplay
+// upscale writes the tone mapped scene, linear, into a B10G11R11 picture at the output's size; the HUD is drawn into that
+// picture after it, and the game's last pass encodes it to the 8-bit sRGB picture presented (NX2navi's measurement of the
+// same frame, its runtime/vk_dlaa.c: "a last draw copies that target into the 8-bit sRGB output target, encoding only").
+// So at the upscale's dispatch, once the output is written (by an upscaler of ours, before or after the bloom, or by the
+// game's own network), it is blitted into an R8G8B8A8_SRGB image (the blit encodes linear light to sRGB, as NX2navi's
+// hudless_from does), tagged with the frame (texture_frame_no). At the present, the part of it that is the present's crop
+// (framegen_rows.h hudless_source: scaled when the sizes differ) is blitted into one of the picture's size and its bytes
+// copied into an RGBA8 UNORM image, which is what AMD's library is given, beside the picture with the HUD in the same 8-bit
+// encoding. Only this frame's: a present whose frame has none (the upscale did not run, another format) makes no frame of
+// AMD's. Not for HDR Native's picture, which the game encodes to PQ itself (vk_fsr4.cpp: no frame then), nor for an RGBA16F
+// run's picture (RenoDX's: its own encoder). RX_VK_FG_HUDLESS=0: none taken (AMD's library then makes no frame: a test)
+namespace {
+struct Hudless {
+    std::mutex mu;
+    struct Taken {
+        Img img;   // (R8G8B8A8_SRGB, w x h: the upscale's output)
+        uint32_t w = 0, h = 0;
+        uint64_t frame = 0, seq = 0;   // (seq: the latest of a frame's, if it had two upscales)
+        bool valid = false;
+    } taken[2];   // (two: one taken while the frame before's is still to be used at its present)
+    int next = 0;
+    uint64_t seq = 0;
+    bool failed = false;               // (its images could not be made: none for the run, said once)
+    uint32_t want_w = 0, want_h = 0;   // (another size seen at a dispatch: the images made again at the present, hudless_for)
+    Img srgb, out;                     // (the present's crop: sRGB, then its bytes as UNORM, the picture's size)
+    uint32_t w = 0, h = 0;
+    int formats = 0;                   // (0 not asked, 1 the blits can be made, -1 not)
+    uint64_t taken_n = 0, given_n = 0, missing_n = 0;
+    bool told_first = false, told_format = false, told_formats = false, told_missing = false;
+} hl;
+
+bool hudless_off() {
+    static const bool off = getenv("RX_VK_FG_HUDLESS") && atoi(getenv("RX_VK_FG_HUDLESS")) == 0;
+    return off;
+}
+
+bool hudless_formats() {   // (hl.mu held)
+    if (hl.formats) return hl.formats > 0;
+    VkFormatProperties a{}, b{}, c{};
+    vkGetPhysicalDeviceFormatProperties(dev.physical, VK_FORMAT_B10G11R11_UFLOAT_PACK32, &a);
+    vkGetPhysicalDeviceFormatProperties(dev.physical, VK_FORMAT_R8G8B8A8_SRGB, &b);
+    vkGetPhysicalDeviceFormatProperties(dev.physical, VK_FORMAT_R8G8B8A8_UNORM, &c);
+    const bool ok = (a.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_SRC_BIT) &&
+                    (b.optimalTilingFeatures & (VK_FORMAT_FEATURE_BLIT_SRC_BIT | VK_FORMAT_FEATURE_BLIT_DST_BIT |
+                                                VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT)) ==
+                        (VK_FORMAT_FEATURE_BLIT_SRC_BIT | VK_FORMAT_FEATURE_BLIT_DST_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT) &&
+                    (c.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT);
+    hl.formats = ok ? 1 : -1;
+    if (!ok) logf("vk: AMD FSR frame generation: the card cannot blit the upscale's picture into sRGB: no picture without the HUD, "
+                  "so AMD's library makes no frame");
+    return ok;
+}
+}  // namespace
+
+void framegen_hudless_note(VkCommandBuffer cmd, Texture* out, uint32_t level) {
+    if (!cmd || !out || !out->image || !fsr4fg::frames_wanted() || hudless_off()) return;   // (the row elsewhere: nothing)
+    if (present_native_pq.load(std::memory_order_relaxed)) return;   // (HDR Native: the renderer's own makes the frame)
+    std::lock_guard lk(hl.mu);
+    if (hl.failed) return;
+    if (out->format != VK_FORMAT_B10G11R11_UFLOAT_PACK32 || out->samples != VK_SAMPLE_COUNT_1_BIT || out->layers != 1 ||
+        level >= out->levels) {
+        if (!hl.told_format)
+            hl.told_format = true, logf("vk: AMD FSR frame generation: the upscale's picture is vk format %d, not the game's "
+                                        "B10G11R11: no picture without the HUD from it", (int)out->format);
+        return;
+    }
+    if (!hudless_formats()) return;
+    const uint32_t w = std::max(1u, out->width >> level), h = std::max(1u, out->height >> level);
+    Hudless::Taken& t = hl.taken[hl.next];
+    if (!t.img.image || t.w != w || t.h != h) {   // (made at the present: none this frame)
+        hl.want_w = w, hl.want_h = h;
+        return;
+    }
+    hl.next ^= 1;
+    full_barrier(cmd);   // (the upscale's output, written just before)
+    VkImageBlit b{};
+    b.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level, 0, 1};
+    b.srcOffsets[1] = {(int32_t)w, (int32_t)h, 1};
+    b.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    b.dstOffsets[1] = {(int32_t)w, (int32_t)h, 1};
+    vkCmdBlitImage(cmd, out->image, VK_IMAGE_LAYOUT_GENERAL, t.img.image, VK_IMAGE_LAYOUT_GENERAL, 1, &b, VK_FILTER_NEAREST);
+    full_barrier(cmd);
+    t.frame = texture_frame_no(), t.seq = ++hl.seq, t.valid = true;
+    hl.taken_n++;
+    if (!hl.told_first)
+        hl.told_first = true, logf("vk: AMD FSR frame generation: the picture without the HUD is taken at the gameplay upscale's "
+                                   "output, %ux%u (frame %llu)", w, h, (unsigned long long)t.frame);
+}
+
+namespace {
+/// At the present: this frame's picture without the HUD (frame: the inputs' texture_frame_no), cut as the presented picture
+/// is (fg.source of fg.src_w x fg.src_h), the picture's size w x h, RGBA8 UNORM (GENERAL); null when there is none. Also makes
+/// the images a dispatch found missing (hl.want_*), the GPU idle first, as ensure_size does
+VkImage hudless_for(VkCommandBuffer cmd, uint64_t frame, uint32_t w, uint32_t h) {
+    if (hudless_off()) return VK_NULL_HANDLE;
+    std::lock_guard lk(hl.mu);
+    if (hl.failed) return VK_NULL_HANDLE;
+    // (the images a dispatch asked for: not while one of them holds this frame's, whose blit may be in a recording not yet
+    // submitted (RX_VK_SHOT_MADE records frame generation into the present's own): the next present makes them)
+    bool recorded_now = false;
+    for (const Hudless::Taken& k : hl.taken) recorded_now |= k.valid && k.frame == frame;
+    const bool retake = hl.want_w && (hl.taken[0].w != hl.want_w || hl.taken[0].h != hl.want_h) && !recorded_now;
+    const bool remake = retake || hl.w != w || hl.h != h;
+    if (remake) {
+        {
+            std::lock_guard qk(dev.present_mu);
+            device_wait_idle_locked();
+        }
+        const VkImageUsageFlags xfer = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        bool ok = true;
+        if (retake)
+            for (Hudless::Taken& t : hl.taken) {
+                drop_img(t.img), t = {};
+                ok = ok && make_img(t.img, hl.want_w, hl.want_h, VK_FORMAT_R8G8B8A8_SRGB, xfer);
+                if (ok) to_general(cmd, t.img.image), t.w = hl.want_w, t.h = hl.want_h;
+            }
+        if (hl.w != w || hl.h != h) {
+            drop_img(hl.srgb), drop_img(hl.out), hl.w = hl.h = 0;
+            ok = ok && make_img(hl.srgb, w, h, VK_FORMAT_R8G8B8A8_SRGB, xfer) &&
+                 make_img(hl.out, w, h, VK_FORMAT_R8G8B8A8_UNORM, xfer | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
+            if (ok) to_general(cmd, hl.srgb.image), to_general(cmd, hl.out.image), hl.w = w, hl.h = h;
+        }
+        if (!ok) {
+            for (Hudless::Taken& t : hl.taken) drop_img(t.img), t = {};
+            drop_img(hl.srgb), drop_img(hl.out), hl.w = hl.h = 0;
+            logf("vk: AMD FSR frame generation: the images of the picture without the HUD (%ux%u, %ux%u) were not made: AMD's "
+                 "library makes no frame in this run", hl.want_w, hl.want_h, w, h);
+            hl.want_w = hl.want_h = 0, hl.failed = true;
+        }
+        return VK_NULL_HANDLE;   // (this frame's was not taken: the images were not there)
+    }
+    Hudless::Taken* t = nullptr;
+    for (Hudless::Taken& k : hl.taken)
+        if (k.valid && k.frame == frame && (!t || k.seq > t->seq)) t = &k;
+    for (Hudless::Taken& k : hl.taken)
+        if (k.valid && k.frame <= frame) k.valid = false;   // (each frame's once; an older one is never used)
+    const framegen_rows::SourceRect r = t ? framegen_rows::hudless_source(t->w, t->h, fg.src_w, fg.src_h, fg.source.x,
+                                                                          fg.source.y, fg.source.w, fg.source.h)
+                                          : framegen_rows::SourceRect{};
+    if (!t || r.x1 <= r.x0 || !hl.out.image) {
+        hl.missing_n++;
+        if (!hl.told_missing && hl.taken_n)   // (the first frame after some were taken: what to look for when none is made)
+            hl.told_missing = true, logf("vk: AMD FSR frame generation: a present with the scene's depth and motion but no picture "
+                                         "without the HUD of its frame (frame %llu): the game's frame alone", (unsigned long long)frame);
+        return VK_NULL_HANDLE;
+    }
+    VkImageBlit b{};
+    b.srcSubresource = b.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    b.srcOffsets[0] = {r.x0, r.y0, 0}, b.srcOffsets[1] = {r.x1, r.y1, 1};
+    b.dstOffsets[1] = {(int32_t)w, (int32_t)h, 1};
+    const bool same = (uint32_t)(r.x1 - r.x0) == w && (uint32_t)(r.y1 - r.y0) == h;
+    full_barrier(cmd);
+    vkCmdBlitImage(cmd, t->img.image, VK_IMAGE_LAYOUT_GENERAL, hl.srgb.image, VK_IMAGE_LAYOUT_GENERAL, 1, &b,
+                   same ? VK_FILTER_NEAREST : VK_FILTER_LINEAR);
+    full_barrier(cmd);
+    const VkImageCopy c{{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {w, h, 1}};
+    vkCmdCopyImage(cmd, hl.srgb.image, VK_IMAGE_LAYOUT_GENERAL, hl.out.image, VK_IMAGE_LAYOUT_GENERAL, 1, &c);   // (the bytes)
+    full_barrier(cmd);
+    if (hl.given_n++ == 0)
+        logf("vk: AMD FSR frame generation: the first picture without the HUD given, %ux%u from %d,%d %dx%d of the upscale's %ux%u%s",
+             w, h, r.x0, r.y0, r.x1 - r.x0, r.y1 - r.y0, t->w, t->h, same ? "" : " (scaled)");
+    return hl.out.image;
+}
+}  // namespace
+
 /// (hookshot) The made frame of a 2x set by AMD FSR 3.1's frame interpolation (vk_fsr3fi.h), from this frame's colour and
 /// the scene's depth and motion (vk_fsr3_inputs.h): 1 when it made it into set.frame[0], 0 when it did not (no inputs this
 /// present, a reset, anything not made), which leaves the set to the interpolation below. sequence: framegen_record's count
@@ -821,6 +1139,7 @@ int fsr3fi_frame(VkCommandBuffer cmd, OutSet& set, int cur, uint32_t uw, uint32_
         logf("vk: fsr3fi: %llu of the last 600 made frames by FSR 3.1, %llu without its inputs (the renderer's own made them)",
              (unsigned long long)made, (unsigned long long)no_inputs),
             made = no_inputs = 0;
+    if (fg.format != VK_FORMAT_R8G8B8A8_UNORM) return 0;   // ((Triforce, FG-5) HDR Native's 10-bit frames: its passes take RGBA8)
     fsr3_inputs::Frame f;
     if (!fsr3_inputs::take(f)) return no_inputs++, 0;
     fsr3fi::Inputs in;
@@ -909,14 +1228,58 @@ bool dlssg_frames(VkCommandBuffer cmd, OutSet& set, const int* slots, int count,
 /// SKIP: the library was given the frame as a new history (the first frame, a gap, a camera cut) and no frame is to be made
 /// between two pictures that do not follow each other. OWN: it did not take the present (no scene in it, not available,
 /// failed), which leaves the set to the interpolation below, as a 2x. blend: the frame before is there to make a frame from
+/// ((Triforce, GAME) as well: the scene's depth and motion were there, this frame's picture without the HUD not, so nothing
+/// is made and the game's frame is shown alone. HDR Native and an RGBA16F scene hold for every present: OWN, framegen_rows.h
+/// held_made. Every 600 presents asked, a line of what became of them)
 framegen_rows::Made fsr4_frame(VkCommandBuffer cmd, OutSet& set, int cur, uint32_t uw, uint32_t uh, uint64_t sequence, bool blend) {
-    if (!fsr4fg::frames_wanted()) return framegen_rows::OWN;
+    if (!fsr4fg::frames_wanted()) {
+        // ((Triforce) the row at AMD FSR and AMD's library not asked for the frame: why, each time it changes
+        // ((Triforce) HDR Native or an RGBA16F scene, which hold it from every present, past FG_WHY_COUNT)
+        static int told = -1;
+        const framegen_rows::Held held = fsr4fg::held();
+        const int why = dlssg::active() ? framegen_rows::FG_WHY_COUNT : (int)fsr4fg::why();
+        const int key = why == framegen_rows::FG_OK ? framegen_rows::FG_WHY_COUNT + 1 + (int)held : why;
+        if (key != told)
+            told = key, logf("vk: AMD FSR frame generation is not used (%s): the renderer's own makes the frame, as at 2x",
+                             why == framegen_rows::FG_WHY_COUNT ? "NVIDIA DLSS frame generation runs"
+                             : why != framegen_rows::FG_OK ? framegen_rows::why_name((framegen_rows::Why)why)
+                             : held == framegen_rows::HELD_HDR_NATIVE
+                                 ? "paused with HDR Native: the game encodes its HDR picture itself, and no picture without the HUD can follow it"
+                             : held == framegen_rows::HELD_HDR_SCENE
+                                 ? "paused in this run: its scene is RenoDX's RGBA16F, which no picture without the HUD is taken from"
+                                 : "the row changed");
+        return framegen_rows::OWN;
+    }
+    static uint64_t asked = 0, n[4] = {}, bare = 0, own_motion = 0;   // (n: by Made; bare: OWN without depth and motion)
+    const auto counted = [&](framegen_rows::Made m) {
+        n[m]++;
+        if (++asked % 600 == 0) {
+            logf("vk: AMD FSR frame generation %s: of the last 600 presents %llu made by AMD's library, %llu new histories, %llu "
+                 "the game's frame alone (no picture without the HUD), %llu to the renderer's own (%llu of them "
+                 "without the scene's depth and motion); %llu with what moves by itself in the motion",
+                 fsr4fg::version(), (unsigned long long)n[framegen_rows::MADE], (unsigned long long)n[framegen_rows::SKIP],
+                 (unsigned long long)n[framegen_rows::GAME], (unsigned long long)n[framegen_rows::OWN], (unsigned long long)bare,
+                 (unsigned long long)own_motion);
+            n[0] = n[1] = n[2] = n[3] = bare = own_motion = 0;
+        }
+        return m;
+    };
     fsr3_inputs::Frame f;
-    if (!fsr3_inputs::take(f) || !f.depth_image || !f.motion_image) return framegen_rows::OWN;
+    if (!fsr3_inputs::take(f) || !f.depth_image || !f.motion_image) {
+        bare++;
+        static bool told = false;   // ((Triforce) the reason the lab's fgprobe1 run made no frame of AMD's: never said)
+        if (!told)
+            told = true, logf("vk: AMD FSR frame generation: a present without the scene's depth and motion (a menu or a movie, or "
+                              "no upscale made them this frame): the renderer's own interpolation makes its frame");
+        return counted(framegen_rows::OWN);
+    }
+    own_motion += f.chain_motion;
     fsr4fg::Inputs in;
-    in.color = fg.frames[cur].image;   // (R8G8B8A8_UNORM: ensure_size)
+    in.color = fg.frames[cur].image;   // (R8G8B8A8_UNORM: ensure_size; HDR Native's 10-bit format goes to the renderer's own)
     in.width = uw, in.height = uh;
-    in.pq = present_native_pq.load(std::memory_order_relaxed);
+    in.pq = present_native_pq.load(std::memory_order_relaxed) || fg.format != VK_FORMAT_R8G8B8A8_UNORM;
+    // ((Triforce, FG-2) this frame's picture without the HUD, cut as the picture is: AMD's library makes no frame without it)
+    in.hudless = in.pq ? VK_NULL_HANDLE : hudless_for(cmd, f.frame, uw, uh);
     in.peak_nits = (float)std::clamp(opts.hdr_peak, 400, 10000);
     in.depth = f.depth_image, in.motion = f.motion_image;
     in.render_width = f.width, in.render_height = f.height;
@@ -928,11 +1291,12 @@ framegen_rows::Made fsr4_frame(VkCommandBuffer cmd, OutSet& set, int cur, uint32
     in.sequence = sequence;
     const framegen_rows::Made made = fsr4fg::generate(cmd, in);
     const VkImage image = made == framegen_rows::MADE ? fsr4fg::made_image() : VK_NULL_HANDLE;
-    if (made != framegen_rows::MADE || !image) return made == framegen_rows::SKIP ? framegen_rows::SKIP : framegen_rows::OWN;
+    if (made != framegen_rows::MADE || !image)
+        return counted(framegen_rows::game_frame_alone(made) ? made : framegen_rows::OWN);
     const VkImageCopy c{{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0},
                         {uw, uh, 1}};
     vkCmdCopyImage(cmd, image, VK_IMAGE_LAYOUT_GENERAL, set.frame[0].image, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
-    return framegen_rows::MADE;
+    return counted(framegen_rows::MADE);
 }
 
 bool framegen_record(VkCommandBuffer cmd, VkImageView src, uint32_t sw, uint32_t sh, const int crop[4]) {
@@ -963,6 +1327,7 @@ bool framegen_record(VkCommandBuffer cmd, VkImageView src, uint32_t sw, uint32_t
     const bool blend = fg.have_prev && !gap;
     static uint64_t sequence = 0;
     sequence++;
+    fg.src_w = sw, fg.src_h = sh, fg.source = source;   // ((Triforce, FG-2) the picture without the HUD is cut as this one)
     const uint32_t uw = (uint32_t)w, uh = (uint32_t)h;
     const uint32_t qw = (uw + 3) / 4, qh = (uh + 3) / 4;
     full_barrier(cmd);
@@ -1058,7 +1423,9 @@ bool framegen_record(VkCommandBuffer cmd, VkImageView src, uint32_t sw, uint32_t
     if (opts.framegen == framegen_rows::FSR4) {
         const framegen_rows::Made by_fsr4 = fsr4_frame(cmd, *set, cur, uw, uh, sequence, blend);
         set->made = blend && by_fsr4 == framegen_rows::MADE ? 1 : 0;
-        none = none || by_fsr4 == framegen_rows::SKIP;
+        // ((Triforce, FG-2) a new history, or no picture without the HUD this frame: the game's frame alone, never the
+        // renderer's own frame in the place of AMD's. (HDR Native, an RGBA16F scene: OWN, the renderer's own below))
+        none = none || framegen_rows::game_frame_alone(by_fsr4);
     }
     if (set->made == 0 && !none && blend && m == 2 && fsr3fi::frames_wanted()) set->made = fsr3fi_frame(cmd, *set, cur, uw, uh, sequence);
     if (set->made == 0 && !none && blend && m > 1) {

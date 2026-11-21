@@ -227,6 +227,11 @@ int nvn_depth_minus_w(void);
 void rx_nvn_submit(const uint64_t *handles, int n);
 /* (the same with the queue it came from: the game's queues have their own state and order each other with events) */
 void rx_nvn_submit_q(const uint64_t *handles, int n, uint64_t queue);
+/* (Triforce, gpu/vk/async_rules.h; host/rx_backend.c) the replay on a thread of the back end's own (RX_VK_ASYNC=1): whether it
+   is on; the events the submit this thread makes next waits for; the present poll's wait for that thread (1: nothing left) */
+int rx_async_replay(void);
+void rx_nvn_submit_waits(const uint64_t *events, int n);
+int rx_nvn_replay_idle_wait(uint64_t timeout_ns);
 /* fence value of everything submitted so far; waits until the GPU reached a fence (1: reached, 0: timed out) */
 uint64_t rx_nvn_fence(void);
 uint64_t rx_nvn_fence_q(uint64_t queue);   /* (hookshot) a fence of one queue */

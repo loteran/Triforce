@@ -952,6 +952,15 @@ public partial class MainWindow : Window
         clock.Stop();
         elapsed.Stop();
         runner = null;
+        // ((Triforce, 11-18) a Cancel first, whatever the run said: Runner.Cancel asks the game's shader preparation to stop
+        // and it ends well, so make_game.py goes on to its @@done. Taken as done, a Cancel in "Preparing shaders" said "Your
+        // game is ready", made the shortcuts and freed the build's files, where it went back to the files, as before)
+        if (failure == "cancelled")
+        {
+            SetStep(0);
+            ShowPage(FilesPage);
+            return;
+        }
         if (finished.Length > 0)
         {
             foreach (var (id, r) in rows)
@@ -962,12 +971,6 @@ public partial class MainWindow : Window
             }
             SetProgress(1);
             ShowReady();
-            return;
-        }
-        if (failure == "cancelled")
-        {
-            SetStep(0);
-            ShowPage(FilesPage);
             return;
         }
         if (current != null && rows.TryGetValue(current, out var row)) row.Stopped();
@@ -1231,7 +1234,7 @@ public partial class MainWindow : Window
     void CloseWindow(object sender, RoutedEventArgs e)
     {
         if (runner != null && MessageBox.Show(this, T(S.CloseQuestion), "Hookshot", MessageBoxButton.YesNo) != MessageBoxResult.Yes) return;
-        runner?.Cancel();
+        runner?.Cancel().Wait();   // (the app ends with the window: a shader preparation asked to stop is waited for, or killed)
         Close();
     }
 }

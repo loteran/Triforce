@@ -343,8 +343,17 @@ NV(nvnMemoryPoolFinalize) {
         }
         InterlockedIncrement(&vmap_gen);
         ReleaseSRWLockExclusive(&vmap_lock);
-    } else if (o->mem) {
+    } else if (o->mem && o->magic == NVN_MAGIC('P', 'O', 'O', 'L')) {
         hos_gpu_track(o->gpu, o->size, 0);
+    } else if (o->mem) {
+        /* a pool object finalized again (its magic gone with the first Finalize): its range was untracked then, and untracking
+           it again took the counted entry of a newer live pool made over the same memory since (the actor heap's small pools
+           are made again at the same addresses): the renderer's capture would then take that live pool for heap memory
+           (RX_VK_CAP_ONLY_GPU). Nothing to do but say so */
+        static volatile LONG told;
+        if (InterlockedIncrement(&told) <= 8)
+            hos_log("nvn: memory pool %#llx+%#llx finalized again (lr %#llx): left alone", (unsigned long long)o->gpu,
+                    (unsigned long long)o->size, (unsigned long long)c->x[30]);
     }
     o->magic = 0;
 }
@@ -1106,25 +1115,102 @@ static int sync_log(void) {   /* (the first 30000 calls; HOS_NVN_SYNC_LOG=<n>: f
    fence): NVN starts a submission's work only then, and the game writes what it reads in between. Handed to the replay
    at the submit, a frame's draws read some of their constants before the game had written them: MKW's terrain tiles
    flashed as walls for a frame, we thought; measured, holding made them far more frequent (61 vs 0-9 in a 60 s drive):
-   MKW writes some of a frame's data in place right after its submit, as the console's GPU has read it by then. Off by
-   default; HOS_NVN_HOLD=1: held. */
-typedef struct { int n; uint64_t h[64]; } held_submit;
+   MKW writes some of a frame's data in place right after its submit, as the console's GPU has read it by then.
+   HOS_NVN_HOLD=1: every submit held. HOS_NVN_HOLD=2 (the default; =0: none held): only the submits of threads other than the
+   presenting one, replayed ~20 us later by a host thread (below). */
+typedef struct { int n; uint64_t h[64]; uint64_t queue; int64_t t; } held_submit;
 static held_submit held[256];
 static volatile LONG nheld;
-static CRITICAL_SECTION held_cs;
+static CRITICAL_SECTION held_cs, flush_cs;   /* (held_cs: the list; flush_cs: a flush and the presenting thread's submit, in order) */
 static int held_ready, hold_on = -1;
-static void held_init(void) {
-    if (!held_ready) { InitializeCriticalSection(&held_cs); held_ready = 1; }
-    if (hold_on < 0) { const char *e = getenv("HOS_NVN_HOLD"); hold_on = e && atoi(e) != 0; }   /* (off: see below) */
+/* HOS_NVN_HOLD=2: the submits of threads other than the presenting one (OoT's main thread: two a frame) are held, and a host
+   thread replays them at once, or the presenting thread before its own next submit or its present, or whoever waits for them
+   first (a fence wait, a finish, an event poll). The submit-time capture, the replay of those command buffers and their queue
+   submits leave the main thread's critical path for a thread of their own: the game's main thread was idle in its submit calls
+   for the whole capture and replay (3.4-4.8 ms a frame at the Market measured 11-17, while the Presentation Thread waited for
+   it). The capture is taken at the flush, ~20 us to ~1 ms after the game's submit: elsewhere measured, ~0.14% of the captured
+   pages were written again in between. A held submit's capture copies every page before its replay begins (no copies behind:
+   the game is already running, rx_nvn_submit_held) */
+static HosThread *present_thread;
+static HANDLE hold_event;
+static int64_t st_hold_flushes, st_hold_submits, st_hold_wait_ns, st_hold_replay_ns, st_hold_by[8];
+enum { HF_FLUSH, HF_FINISH, HF_PRESENT, HF_SYNC, HF_EVENT, HF_SUBMIT, HF_THREAD, HF_OTHER, HF_N };
+static void held_flush_why(int why);
+/* the held submits' replay thread: woken at each hold. A host thread: no virtual core, no guest code (the replay runs none) */
+static DWORD WINAPI hold_flush_thread(void *p) {
+    (void)p;
+    SetThreadDescription(GetCurrentThread(), L"mkw_vk held submits");   /* (named as the renderer's threads: HOS_SAMPLE_ALL samples it) */
+    for (;;) {
+        WaitForSingleObject(hold_event, INFINITE);
+        held_flush_why(HF_THREAD);
+    }
 }
-static void held_flush(void) {
+static void held_init(void) {
+    if (!held_ready) { InitializeCriticalSection(&held_cs); InitializeCriticalSection(&flush_cs); held_ready = 1; }
+    if (hold_on < 0) {
+        const char *e = getenv("HOS_NVN_HOLD");
+        hold_on = e ? atoi(e) : 2;
+        /* ((Triforce) with the replay on a thread of its own (RX_VK_ASYNC=1, gpu/vk/async_rules.h) every submit is already a
+           capture and a hand-over: no submit is held as well, unless HOS_NVN_HOLD is set) */
+        if (!e && rx_async_replay()) {
+            hold_on = 0;
+            hos_log("nvn: no submits held: the replay has a thread of its own (RX_VK_ASYNC=1; HOS_NVN_HOLD=2 to hold them too)");
+        }
+        if (hold_on) hos_log("nvn: submits held (HOS_NVN_HOLD=%d: %s)", hold_on,
+                             hold_on == 2 ? "other threads' submits, replayed by a host thread" : "all, until a flush");
+        if (hold_on == 2) {
+            hold_event = CreateEventA(NULL, FALSE, FALSE, NULL);   /* (A, not W: host/posix has CreateEventA only; v0.6.0's Linux builds stopped at the link) */
+            HANDLE h = CreateThread(NULL, 0, hold_flush_thread, NULL, 0, NULL);
+            if (h) CloseHandle(h);
+        }
+    }
+}
+void rx_nvn_submit_held(int on);   /* (rx_backend.c: the renderer's capture copies every page before the replay) */
+/* the held submits replayed now, on this thread, in their order: under flush_cs, so that no submit of the presenting thread
+   comes between them (held_cs is let go before the replay: the replay reads the recordings under copy_lock). The virtual core
+   is given up before flush_cs is taken and taken back after it is let go: flush_cs is held through a replay, up to hundreds of
+   ms while a zone loads, and a thread that waits for a core while it holds flush_cs, or holds a core while it waits for it,
+   stalls the threads on the other side until the 250 ms escape (the Presentation Thread at area loads). Nothing under flush_cs
+   runs guest code */
+static void held_flush_why(int why) {
     held_init();
     if (!nheld) return;
+    const int away = hos_vcore_away();
+    EnterCriticalSection(&flush_cs);
+    static held_submit local[256];
+    LONG n;
     EnterCriticalSection(&held_cs);
-    for (LONG i = 0; i < nheld; i++) rx_nvn_submit(held[i].h, held[i].n);
+    n = nheld;
+    memcpy(local, held, sizeof *held * (size_t)n);
     nheld = 0;
     LeaveCriticalSection(&held_cs);
+    if (n) {
+        const int64_t t0 = hos_now_ns();
+        for (LONG i = 0; i < n; i++) {
+            if (hold_on == 2) {
+                rx_nvn_submit_held(1);
+                rx_nvn_submit_q(local[i].h, local[i].n, local[i].queue);
+                rx_nvn_submit_held(0);
+            } else {
+                rx_nvn_submit(local[i].h, local[i].n);
+            }
+            st_hold_wait_ns += t0 - local[i].t;
+        }
+        st_hold_replay_ns += hos_now_ns() - t0;
+        st_hold_submits += n, st_hold_by[why < HF_N ? why : HF_OTHER]++;
+        if (++st_hold_flushes % 600 == 0)
+            hos_log("nvn: held submits: %lld flushes (by: queue flush %lld, finish %lld, present %lld, sync wait %lld, event poll %lld, "
+                    "the presenting thread's submit %lld, the held submits' thread %lld, other %lld), %lld submits, held %.3f ms each, "
+                    "replayed in %.2f ms a flush",
+                    (long long)st_hold_flushes, (long long)st_hold_by[0], (long long)st_hold_by[1], (long long)st_hold_by[2],
+                    (long long)st_hold_by[3], (long long)st_hold_by[4], (long long)st_hold_by[5], (long long)st_hold_by[6],
+                    (long long)st_hold_by[7], (long long)st_hold_submits, st_hold_wait_ns / 1e6 / (double)st_hold_submits,
+                    st_hold_replay_ns / 1e6 / (double)st_hold_flushes);
+    }
+    LeaveCriticalSection(&flush_cs);
+    if (away) hos_vcore_back();
 }
+static void held_flush(void) { held_flush_why(HF_OTHER); }
 static uint64_t held_count(void) { return (uint64_t)nheld; }
 
 NV(nvnQueueFenceSync) {
@@ -1201,6 +1287,7 @@ NV(nvnEventGetValue) {
         if (nowait && (c->x[30] == 0x805904a0 || c->x[30] == 0x80590530)) { RET(1); return; }
     }
     const uint64_t ev_gpu = ((const nvn_event *)P(0))->gpu;   /* (before RET: it writes x0) */
+    if (hold_on == 2 && nheld) held_flush_why(HF_EVENT);   /* (HOS_NVN_HOLD=2: a held submit may be what signals it) */
     uint32_t v = 0; nvn_gpu_read(ev_gpu, &v, 4); RET(v);
     if (sync_log()) hos_log("nvn: EventGetValue %#llx = %u (lr %#llx)", (unsigned long long)ev_gpu, v, (unsigned long long)c->x[30]);
     if (hos_ft_on()) hos_log("ft %.3f eventget %#llx = %u (lr %#llx)", hos_ft_ms(), (unsigned long long)ev_gpu, v, (unsigned long long)c->x[30]);
@@ -1242,9 +1329,9 @@ NV(nvnQueueBuilderSetQueueMemory) { QB(P(0))->mem = U64(1); QB(P(0))->mem_sz = U
 NV(nvnQueueInitialize) { nvn_queue *q = (nvn_queue *)P(0); q->magic = NVN_MAGIC('Q', 'U', 'E', 'U'); q->submits = 0; RET(1); }
 NV(nvnQueueFinalize) { ((nvn_queue *)P(0))->magic = 0; }
 NV(nvnQueueGetError) { if (P(1)) memset(P(1), 0, sizeof(NVNqueueErrorInfo)); RET(NVN_QUEUE_GET_ERROR_RESULT_GPU_NO_ERROR); }
-NV(nvnQueueFlush) { held_flush(); }
+NV(nvnQueueFlush) { if (hold_on != 2) held_flush_why(HF_FLUSH); }   /* (HOS_NVN_HOLD=2: the held submits' thread is on it) */
 NV(nvnQueueFinish) {
-    held_flush();
+    held_flush_why(HF_FINISH);
     const int away = hos_vcore_away();
     const int64_t t0 = hos_now_ns();
     rx_nvn_finish();
@@ -1464,24 +1551,44 @@ static size_t ndead, cap_dead;
    address, so it is used only when it is in the set, never on what the memory at that address holds. */
 static uint64_t *live_handles;
 static size_t live_cap, nlive;
+/* (hookshot) The set as check_handle reads it without copy_lock (live_handle_seen): the table and its size, published together
+   at each growth. A table is never freed, since a reader may still be in an older one; growth doubles it, so the old ones take
+   at most as much again. The slots are written with atomic stores, so a reader sees each slot whole */
+typedef struct { uint64_t *slots; size_t cap; } live_table;
+static live_table *live_pub;
 static size_t live_at(uint64_t h, size_t cap) { return (size_t)((h * 0x9E3779B97F4A7C15ull) >> 24) & (cap - 1); }
 static void live_handle_add(uint64_t h) {   /* (copy_lock held exclusively) */
     if ((nlive + 1) * 2 > live_cap) {
         const size_t cap = live_cap ? live_cap * 2 : 65536;
         uint64_t *t = (uint64_t *)calloc(cap, sizeof *t);
-        if (!t) die("recording handle set");
+        live_table *pub = (live_table *)malloc(sizeof *pub);
+        if (!t || !pub) die("recording handle set");
         for (size_t i = 0; i < live_cap; i++) {
             if (!live_handles[i]) continue;
             size_t k = live_at(live_handles[i], cap);
             while (t[k]) k = (k + 1) & (cap - 1);
             t[k] = live_handles[i];
         }
-        free(live_handles);
-        live_handles = t, live_cap = cap;
+        live_handles = t, live_cap = cap;   /* (the old table stays: live_pub) */
+        pub->slots = t, pub->cap = cap;
+        __atomic_store_n(&live_pub, pub, __ATOMIC_RELEASE);
     }
     size_t k = live_at(h, live_cap);
     while (live_handles[k] && live_handles[k] != h) k = (k + 1) & (live_cap - 1);
-    if (!live_handles[k]) live_handles[k] = h, nlive++;
+    if (!live_handles[k]) __atomic_store_n(&live_handles[k], h, __ATOMIC_RELEASE), nlive++;
+}
+/* Whether h is in the set, without copy_lock: a hit is a handle EndRecording added (the game got it from that call, so its
+   store is seen), a miss is not final. A removal running beside the probe can move an entry back past it (live_handle_remove's
+   backward shift), so check_handle asks a miss again under the lock. The probe ends at an empty slot or after the whole table */
+static int live_handle_seen(uint64_t h) {
+    const live_table *t = __atomic_load_n(&live_pub, __ATOMIC_ACQUIRE);
+    if (!h || !t) return 0;
+    for (size_t k = live_at(h, t->cap), n = 0; n < t->cap; k = (k + 1) & (t->cap - 1), n++) {
+        const uint64_t v = __atomic_load_n(&t->slots[k], __ATOMIC_ACQUIRE);
+        if (v == h) return 1;
+        if (!v) return 0;
+    }
+    return 0;
 }
 static int live_handle_has(uint64_t h) {   /* (copy_lock held) */
     if (!h || !live_cap) return 0;
@@ -1494,27 +1601,47 @@ static void live_handle_remove(uint64_t h) {   /* (copy_lock held exclusively; b
     size_t k = live_at(h, live_cap);
     while (live_handles[k] && live_handles[k] != h) k = (k + 1) & (live_cap - 1);
     if (!live_handles[k]) return;
-    live_handles[k] = 0, nlive--;
+    __atomic_store_n(&live_handles[k], 0, __ATOMIC_RELEASE), nlive--;
     for (size_t j = (k + 1) & (live_cap - 1); live_handles[j]; j = (j + 1) & (live_cap - 1)) {
         const size_t want = live_at(live_handles[j], live_cap);
-        /* (move it into the hole when its probe run starts at or before the hole) */
+        /* (move it into the hole when its probe run starts at or before the hole: into the hole first, then out of its slot, so a
+           reader without the lock sees it twice for a moment rather than not at all where it stops) */
         if (((j - want) & (live_cap - 1)) >= ((j - k) & (live_cap - 1))) {
-            live_handles[k] = live_handles[j], live_handles[j] = 0;
+            __atomic_store_n(&live_handles[k], live_handles[j], __ATOMIC_RELEASE);
+            __atomic_store_n(&live_handles[j], 0, __ATOMIC_RELEASE);
             k = j;
         }
     }
 }
+/* (hookshot) The least `after` of the dead copies (UINT64_MAX: none): every AddControlMemory went through all of them under the
+   exclusive lock, though none could go before the replay passed that one */
+static uint64_t dead_first = UINT64_MAX;
 static void free_dead_copies(void) {   /* (copy_lock held) */
     const uint64_t done = rx_nvn_replayed();
+    if (done < dead_first) return;
+    uint64_t first = UINT64_MAX;
     for (size_t i = 0; i < ndead;) {
         if (dead[i].after <= done) {
             InterlockedAdd64(&copy_bytes, -(LONG64)dead[i].p->bytes);
             pool_put(dead[i].p, (unsigned)dead[i].p->cls);
             dead[i] = dead[--ndead];
         } else {
+            if (dead[i].after < first) first = dead[i].after;
             i++;
         }
     }
+    dead_first = first;
+}
+static void dead_copy_add(copy_prefix *p, uint64_t after) {   /* (copy_lock held) */
+    if (ndead == cap_dead) {
+        cap_dead = cap_dead ? cap_dead * 2 : 1024;
+        dead = (dead_copy *)realloc(dead, cap_dead * sizeof *dead);
+        if (!dead) die("recording copies let go");
+    }
+    dead[ndead].p = p;
+    dead[ndead].after = after;
+    ndead++;
+    if (after < dead_first) dead_first = after;
 }
 static void release_copies(uint64_t lo, uint64_t hi) {
     if (hi <= lo || !rec_buckets) return;
@@ -1535,13 +1662,7 @@ static void release_copies(uint64_t lo, uint64_t hi) {
             copy_prefix *p = (copy_prefix *)n->copy - 1;
             p->magic = 0;   /* (no submit names it any more) */
             live_handle_remove((uint64_t)(uintptr_t)n->copy);
-            if (ndead == cap_dead) {
-                cap_dead = cap_dead ? cap_dead * 2 : 1024;
-                dead = (dead_copy *)realloc(dead, cap_dead * sizeof *dead);
-            }
-            dead[ndead].p = p;
-            dead[ndead].after = after;
-            ndead++;
+            dead_copy_add(p, after);
             *pn = n->next;
             free(n);
             ncopies--;
@@ -1555,6 +1676,12 @@ static void release_copies(uint64_t lo, uint64_t hi) {
    control memory was never added again (MKW frees and reallocates its control memory) were kept for good otherwise:
    ~40 per 1000 recordings, ~100,000 after 20 minutes. Swept every 25,000 recordings. HOS_NVN_NO_SWEEP=1: not. */
 #define COPY_MARK 0x4b52414d59504f43ull   /* "COPYMARK" */
+/* (hookshot) A slice of the buckets at a time: SWEEP_SLICE of them every SWEEP_EVERY recordings, every bucket once in
+   REC_BUCKETS / SWEEP_SLICE * SWEEP_EVERY (~25,000) recordings, as the whole sweep every 25,000 was. That one read every live
+   copy's mark (~68,000 in the Market, scattered in guest memory) with copy_lock held exclusively, and every thread recording
+   or calling a recording waited behind it */
+#define SWEEP_EVERY 1024u
+#define SWEEP_SLICE 2688u   /* (65536 / 2688 * 1024: every bucket once in ~25,000 recordings) */
 static void sweep_overwritten_copies(void) {   /* (copy_lock held) */
     static int off = -1;
     if (off < 0) off = getenv("HOS_NVN_NO_SWEEP") != NULL;
@@ -1562,7 +1689,11 @@ static void sweep_overwritten_copies(void) {   /* (copy_lock held) */
     free_dead_copies();
     const uint64_t after = rx_nvn_pushed() + held_count();
     size_t swept = 0;
-    for (unsigned b = 0; b < REC_BUCKETS; b++) {
+    static unsigned next_slice;   /* (the next slice's first bucket) */
+    const unsigned from = next_slice;
+    next_slice = (next_slice + SWEEP_SLICE) % REC_BUCKETS;
+    for (unsigned s = 0; s < SWEEP_SLICE; s++) {
+        const unsigned b = (from + s) % REC_BUCKETS;
         for (rec_node **pn = &rec_buckets[b]; *pn;) {
             rec_node *n = *pn;
             uint64_t mark[2];
@@ -1583,13 +1714,7 @@ static void sweep_overwritten_copies(void) {   /* (copy_lock held) */
             copy_prefix *pre = (copy_prefix *)n->copy - 1;
             pre->magic = 0;
             live_handle_remove((uint64_t)(uintptr_t)n->copy);
-            if (ndead == cap_dead) {
-                cap_dead = cap_dead ? cap_dead * 2 : 1024;
-                dead = (dead_copy *)realloc(dead, cap_dead * sizeof *dead);
-            }
-            dead[ndead].p = pre;
-            dead[ndead].after = after;
-            ndead++;
+            dead_copy_add(pre, after);
             *pn = n->next;
             free(n);
             ncopies--;
@@ -1690,7 +1815,7 @@ NV(nvnCommandBufferEndRecording) {
     ncopies++;
     live_handle_add((uint64_t)(uintptr_t)copy);
     static uint64_t made;
-    if (++made % 25000 == 0) sweep_overwritten_copies();
+    if (++made % SWEEP_EVERY == 0) sweep_overwritten_copies();
     if (made % 50000 == 0)
         hos_log("nvn: %llu recordings made, %zu live copies (%.1f MB), %zu texture copies; %lld command buffers' segments "
                 "(%.1f MB)", (unsigned long long)made, ncopies, copy_bytes / 1048576.0, npins, (long long)seg_count,
@@ -1704,10 +1829,18 @@ NV(nvnCommandBufferEndRecording) {
     RET((uint64_t)(uintptr_t)copy);
 }
 NV(nvnCommandBufferIsRecording) { RET(CB(P(0))->recording != 0); }
+/* (hookshot) Without copy_lock first: every CallCommands handle took it shared, and while a recording thread held it or waited
+   for it (EndRecording, AddControlMemory) the callers slept on it, about 5% of the time of the job workers on the frame's path in
+   the Market (RTX 3090, 7900X, Linux: the SRW lock is a pthread rwlock). A miss is asked again under the lock, as before. A hit
+   beside a removal of the same handle (the game calling a recording whose control memory it is adding again) reads the copy's
+   magic, which the removal cleared first; the copy itself is freed only once the replay passes the submits made before it */
 static void check_handle(uint64_t h) {
-    AcquireSRWLockShared(&copy_lock);
-    const int live = live_handle_has(h);
-    ReleaseSRWLockShared(&copy_lock);
+    int live = live_handle_seen(h);
+    if (!live) {
+        AcquireSRWLockShared(&copy_lock);
+        live = live_handle_has(h);
+        ReleaseSRWLockShared(&copy_lock);
+    }
     if (!live || ((const copy_prefix *)(uintptr_t)h - 1)->magic != COPY_MAGIC)
         die("command handle %#llx is not a live recording", (unsigned long long)h);
 }
@@ -2397,12 +2530,20 @@ NV(nvnVertexStreamStateSetDivisor) { ST(nvn_vs_st, P(0))->divisor = U32(1); }
 
 /* ---- submit ---- */
 /* deferred binds read the game's handle arrays now (it fills them for the next frame as soon as the submit returns) */
-static void resolve_deferred(uint8_t *p) {
+/* (Triforce, gpu/vk/async_rules.h) waits, nwaits: with the replay on a thread of its own, the events this recording waits for
+   (NOP_WAIT_EVENT) are added, for rx_nvn_submit_waits; *nwaits -1 once there are more than SUBMIT_WAITS_MAX (then nothing is
+   told, and the back end takes the submission as one that may wait for any event). NULL: not looked for */
+#define SUBMIT_WAITS_MAX 16
+static void resolve_deferred(uint8_t *p, uint64_t *waits, int *nwaits) {
     for (;;) {
         nvn_op_hdr h;
         memcpy(&h, p, sizeof h);
         if (h.size < 8 || (h.size & 7) || h.op >= NOP_COUNT_) die("corrupt recording at submit (op %u size %u)", h.op, h.size);
         if (h.op == NOP_END) return;
+        if (h.op == NOP_WAIT_EVENT && waits && *nwaits >= 0) {
+            if (*nwaits == SUBMIT_WAITS_MAX) *nwaits = -1;
+            else waits[(*nwaits)++] = ((const nvn_p_wait_event *)(p + 8))->gpu;
+        }
         if (h.op == NOP_BIND_TEX || h.op == NOP_BIND_IMG || h.op == NOP_BIND_SAMP) {
             nvn_p_bind_handles *b = (nvn_p_bind_handles *)(p + 8);
             if (b->src && b->n > 0 && b->n <= 32) memcpy(b->h, gw(b->src, 8 * (size_t)b->n), 8 * (size_t)b->n);
@@ -2429,32 +2570,55 @@ NV(nvnQueueSubmitCommands) {
             hos_log("nvn: QueueSubmitCommands #%ld: queue %p (its #%llu), %d handles (lr %#llx)", (long)i, (void *)q,
                     (unsigned long long)q->submits, n, (unsigned long long)c->x[30]);
     }
+    /* (Triforce, gpu/vk/async_rules.h) the replay on a thread of its own (RX_VK_ASYNC=1): the events this submit's recordings
+       wait for, told to the back end before the hand-over (resolve_deferred, rx_nvn_submit_waits) */
+    const int async = rx_async_replay();
+    uint64_t waits[SUBMIT_WAITS_MAX];
+    int nwaits = 0;
     for (int i = 0; i < n; i++) {
         check_handle(h[i]);
-        resolve_deferred((uint8_t *)(uintptr_t)h[i]);
+        resolve_deferred((uint8_t *)(uintptr_t)h[i], async ? waits : NULL, &nwaits);
     }
     held_init();
-    if (!hold_on) {
+    const int mine = hold_on == 2 && (!present_thread || hos_self() == present_thread);   /* (HOS_NVN_HOLD=2: the presenting thread's own) */
+    if (!hold_on || mine) {
         /* (the replay runs here, on this thread, for ~9 ms a frame (vk_replay.cpp submit_q, RX_VK_ASYNC off): the virtual
            core is given up for it, as Present and AcquireTexture do, so the game's other threads run on it meanwhile.
-           Nothing in the replay runs guest code or needs the core) */
-        const int away = hos_vcore_away();
+           Nothing in the replay runs guest code or needs the core. Given up before flush_cs is taken and taken back after it
+           is let go, as held_flush_why does) */
+        /* (Triforce, gpu/vk/async_rules.h 3) with the replay on its own thread this call is a capture and a hand-over, a
+           quarter millisecond: the core is kept, as the console's submit keeps it; giving it up meant taking it again while
+           the update's workers hold all of them. HOS_ASYNC_KEEP_CORE=0: given up, as before */
+        static int keep_core = -1;
+        if (keep_core < 0) {
+            const char *e = getenv("HOS_ASYNC_KEEP_CORE");
+            keep_core = async && !(e && atoi(e) == 0);
+            if (async)
+                hos_log("nvn: the replay on a thread of its own (RX_VK_ASYNC=1): a submit %s its virtual core for the hand-over "
+                        "(HOS_ASYNC_KEEP_CORE), and tells the events its recordings wait for", keep_core ? "keeps" : "gives up");
+        }
+        const int away = keep_core ? 0 : hos_vcore_away();
+        if (mine) EnterCriticalSection(&flush_cs);   /* (the held ones first, and nothing between them and this one) */
+        if (mine && nheld) held_flush_why(HF_SUBMIT);   /* (flush_cs already held: a critical section is re-entrant) */
         const int ft = hos_ft_on();
         if (ft) hos_log("ft %.3f submit> queue %p, %d handles (lr %#llx)", hos_ft_ms(), (void *)q, n, (unsigned long long)c->x[30]);
+        if (async && nwaits >= 0) rx_nvn_submit_waits(waits, nwaits);
         rx_nvn_submit_q(h, n, (uint64_t)(uintptr_t)q);
         if (ft) hos_log("ft %.3f submit< queue %p", hos_ft_ms(), (void *)q);
+        if (mine) LeaveCriticalSection(&flush_cs);
         if (away) hos_vcore_back();
         return;
     }
+    if (nheld >= (LONG)(sizeof held / sizeof *held) - 1) held_flush_why(HF_OTHER);   /* (full: what is held goes now) */
     EnterCriticalSection(&held_cs);
-    if (nheld == (LONG)(sizeof held / sizeof *held)) {   /* (full: what is held goes now) */
-        for (LONG i = 0; i < nheld; i++) rx_nvn_submit(held[i].h, held[i].n);
-        nheld = 0;
-    }
-    held[nheld].n = n;
-    memcpy(held[nheld].h, h, 8 * (size_t)n);
+    held_submit *hs = &held[nheld];
+    hs->n = n;
+    memcpy(hs->h, h, 8 * (size_t)n);
+    hs->queue = (uint64_t)(uintptr_t)q;
+    hs->t = hos_now_ns();
     nheld++;
     LeaveCriticalSection(&held_cs);
+    if (hold_event) SetEvent(hold_event);
 }
 
 /* ---- window ---- */
@@ -2556,7 +2720,8 @@ NV(nvnQueuePresentTexture) {
     nvn_win *o = (nvn_win *)P(1);
     const int i = I(2);
     if (i < 0 || i >= o->ntex) die("present of window texture %d", i);
-    held_flush();   /* (a present flushes the queue) */
+    present_thread = hos_self();   /* (HOS_NVN_HOLD=2: the presenting thread, whose submits are not held) */
+    held_flush_why(HF_PRESENT);   /* (a present flushes the queue) */
     {
         const int away = hos_vcore_away();
         const int ft = hos_ft_on();

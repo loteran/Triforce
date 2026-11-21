@@ -61,7 +61,10 @@ def check_source():
           "a submit other than the three parts' is a part's")
     finish = function(replay, "void finish_recording(uint64_t value) {")
     check("submit_recording(r, signal, at);" in finish, "finish_recording's submit does not end the recording")
-    check("submit_recording(r);   // (nothing is stopped at a present: drain)" in replay, "a present's submit does not end its recording")
+    # (Triforce-dev: a present that leaves work stopped (RX_VK_PRESENT_DRAIN=2) names its timeline signal as finish_recording
+    # does; it is still the submit that ends its recording, not a part's)
+    present = function(replay, "void do_present(const nvn_tex* t, const int crop[4]) {")
+    check("submit_recording(r, signal, at);" in present, "a present's submit does not end its recording")
 
     wait = function(replay, "void vk_timeline_wait(uint64_t v) {")
     for needle, why in (

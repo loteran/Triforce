@@ -161,7 +161,7 @@ int main() {
 
 
 def check_sources(menu, header, api, replay, readme):
-    table = menu[menu.index("Row rows[] = {"):menu.index("constexpr int kQuitRow")]
+    table = menu[menu.index("Row rows[] = {"):menu.index("constexpr int kRowsEnd")]
     # a row for every slot, after Bug capture (F8) and its heading, before the Controls tab's rows
     slots = int(re.search(r"constexpr int kSlots = (\d+);", (ROOT / "gpu/vk/mod_cheat_rows.h").read_text(encoding="utf-8")).group(1))
     starts = [int(n) for n in re.findall(r"MOD_CHEAT_ROWS8\((\d+)\)", table)]
@@ -170,11 +170,14 @@ def check_sources(menu, header, api, replay, readme):
     check("#define MOD_CHEAT_ROW(i) {TAB_SYSTEM, mod_cheats.names[i], nullptr, 0, 0, 0, nullptr, kModCheatHelp, nullptr, false, true}," in menu,
           "a cheat's row is not a row of the System tab without a value of the options file")
     at = table.index('{TAB_SYSTEM, "Bug capture (F8)", nullptr,')
-    heading = table.index('{TAB_SYSTEM, "Mod cheats", nullptr, 0, 0, 0, nullptr, nullptr, nullptr, false, true, -1, true},')
-    check(at < heading < table.index("MOD_CHEAT_ROWS8(0)") < table.index("// Controls ("), "the cheats' rows do not stand after Bug capture (F8) on the System tab")
+    # ((Triforce, options_version 7) the heading is a group's: MENU_HEADING, hidden while its group's rows are)
+    check("#define MENU_HEADING(tab, title) {tab, title, nullptr, 0, 0, 0, nullptr, nullptr, nullptr, false, true, -1, true}" in menu,
+          "a group's heading is not a row without a value that the selection steps over")
+    heading = table.index('MENU_HEADING(TAB_SYSTEM, "Mod cheats"),')
+    check(at < heading < table.index("MOD_CHEAT_ROWS8(0)") < table.index("// ---- Controls ("), "the cheats' rows do not stand after Bug capture (F8) on the System tab")
     check('constexpr char kModCheatHeading[] = "Mod cheats";' in menu, "the heading's name in the table is not the one row_shown tells it by")
     check(re.search(r"static_assert\(mod_cheat_rows::kSlots == %d," % slots, menu), "nothing holds the table to the list's slots")
-    check('bool ini_row(const Row& r) { return r.value && r.value != &opts.language; }' in menu, "a row without a value may be a row of the options file now")
+    check('bool ini_row(const Row& r) { return r.value && r.value != &opts.language && !is_merged(r.value); }' in menu, "a row without a value may be a row of the options file now")
     # shown only once named
     shown = block(menu, "bool row_shown(int i) {")
     check("(!rows[i].heading || strcmp(rows[i].name, kModCheatHeading) || mod_cheats.shown() > 0)" in shown
@@ -192,7 +195,7 @@ def check_sources(menu, header, api, replay, readme):
           "the guides do not say Change on a cheat's row")
     tick = block(menu, "void menu_tick() {")
     press = tick.index("else if (mod_cheat_slot(r.name) >= 0) changed |= mod_cheats.press(mod_cheat_slot(r.name), press[3], press[4], press[7]);")
-    check(tick.index("} else if (r.cheat >= 0) cheat_press(") < press < tick.index("else if (press[7] && share_row(r))")
+    check(tick.index("if (r.cheat >= 0) cheat_press(") < press < tick.index("else if (press[7] && share_row(r))")
           < tick.index("else if (press[7] && !r.value && can_bind()) page = 1"), "a press on a cheat's row is not taken before the rows that act by name or open a page")
     # the host's side of it
     ids = block(api, "enum { HOS_OPT_MODCHEAT_TEXT")

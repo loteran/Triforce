@@ -25,6 +25,15 @@
 // back from the driver's own cache in a moment. Only after kTries starts in a row that began the step and did not end it
 // is the step left out, as it was after the first. NX2navi's journal and skip list are not its owner's lines alone, so
 // nothing of them is copied: this is written from what they do.
+// ((Triforce, 11-18) A try is a start that died with the driver compiling for the step: the journal is opened before the
+// step, and its "began" word says whether that can be so. The stage libraries' pass (warm_libraries) writes it (and
+// flushes it) just before its first build_graphics, and it stays: their compiles run back to back. The program pass's
+// compute warms come first and are spread over the translation, which calls no compiler of the driver's: for them the
+// word is written just before a guarded_compute when none is under way (Journal::Compiling) and written back to 0 when the
+// last of them returned. A start that died or was stopped with the word at 0 used no try (the next one finds the count it
+// found itself): before the step, or in the translation between or after the compute warms, the 5-40 minutes after an
+// update. One with the word written counts as before, a kill in a hung driver call included. A journal of an older build,
+// without the word, counts as before)
 //
 // And the rules of the link itself, which were in graphics_pipeline's lines:
 //  - a draw is linked only from libraries that are all there; a cold or failed library, or a link the driver refuses,
@@ -123,10 +132,13 @@ inline constexpr uint32_t kJournalMagic = 0x4A574654;   // ("TFWJ")
 inline constexpr uint32_t kSkipMagic = 0x53574654;      // ("TFWS")
 inline constexpr int kSlots = 64;                       // (the workers of the preparation at most: prepare_threads.h)
 inline constexpr uint32_t kTries = 3;                   // (starts in a row that may begin the step and not end it)
+inline constexpr uint32_t kBeganMark = 0x42574654;      // ("TFWB": the driver may be compiling for the step)
+inline constexpr long kBeganAt = 16 + 16 * kSlots;      // (the word after the slots; a file without it is an older build's)
 
 /// What a start found of the last one's journal
 struct Left {
     bool found = false;       // (a journal was there: the last start began the step and did not end it)
+    bool began = true;        // (and the driver may have been compiling for it: false, it used no try)
     uint32_t tries = 0;       // (the starts in a row that did so, the last one counted; 0: none, or another driver's)
     std::vector<Id> in_hand;  // (the variants its workers had in the driver's hands when it ended)
 };
@@ -145,11 +157,16 @@ inline Left journal_left(const std::string& path, uint64_t stamp) {
         l.tries = 1;
     } else if (was == stamp) {
         l.tries = head[1] ? head[1] : 1;
-        for (int i = 0; i < kSlots; i++) {
+        int slots = 0;
+        for (; slots < kSlots; slots++) {
             uint64_t r[2];
             if (fread(r, 8, 2, f) != 2) break;
             if (r[0] || r[1]) l.in_hand.push_back({r[0], r[1]});
         }
+        // ((Triforce) the began word: 0, the start ended with no compile of the step under way, and it is not counted.
+        // Without the word (an older build's journal, or one cut short) or with anything else in it, it counts, as before)
+        uint32_t began = kBeganMark;
+        if (slots == kSlots && fread(&began, 4, 1, f) == 1 && began == 0 && l.in_hand.empty()) l.began = false, l.tries--;
     }
     fclose(f);
     return l;
@@ -165,18 +182,54 @@ public:
     Journal(const Journal&) = delete;
     Journal& operator=(const Journal&) = delete;
     ~Journal() { close(); }
-    /// tries: the starts in a row that began the step, this one counted
+    /// tries: the starts in a row that began the step, this one counted (it counts only while the word is on the disk: began(), Compiling)
     bool open(const std::string& path, uint64_t stamp, uint32_t tries) {
         std::lock_guard lk(mu_);
         if (f_) fclose(f_);
+        began_.store(false, std::memory_order_relaxed);
+        compiling_ = 0;
         f_ = fopen(path.c_str(), "wb");
         if (!f_) return false;
         const uint32_t head[2] = {kJournalMagic, tries};
         const uint64_t zero[2 * kSlots]{};
+        const uint32_t not_yet = 0;
         const bool ok = fwrite(head, 4, 2, f_) == 2 && fwrite(&stamp, 8, 1, f_) == 1 &&
-                        fwrite(zero, 8, (size_t)(2 * kSlots), f_) == (size_t)(2 * kSlots) && fflush(f_) == 0;
+                        fwrite(zero, 8, (size_t)(2 * kSlots), f_) == (size_t)(2 * kSlots) && fwrite(&not_yet, 4, 1, f_) == 1 &&
+                        fflush(f_) == 0;
         if (!ok) fclose(f_), f_ = nullptr;
         return ok;
+    }
+    /// ((Triforce) Any worker of the stage libraries' pass, just before a compile call: the start counts as a try from
+    /// here on, for good. The first call writes the word; the others wait for it on the lock, then go by the flag. No
+    /// journal: nothing. (A failed write, over bytes the file has already, is tried once: the marks go on as before it)
+    void began() {
+        if (began_.load(std::memory_order_acquire)) return;
+        std::lock_guard lk(mu_);
+        if (!f_ || began_.load(std::memory_order_relaxed)) return;
+        word(kBeganMark);
+        began_.store(true, std::memory_order_release);
+    }
+    bool has_begun() const { return began_.load(std::memory_order_acquire); }
+    /// ((Triforce) One compile of the step that is not one of a run of them (the program pass's compute warms), held for as
+    /// long as the driver has it: the first of those under way writes the word, the last to return writes 0 over it, so a
+    /// start that dies between them, in the translation, uses no try. Once began() wrote it, the word stays. No journal:
+    /// nothing. (A 0 that cannot be written leaves the word as it was: the start counts, as before)
+    class Compiling {
+    public:
+        explicit Compiling(Journal& j) : j_(j.enter() ? &j : nullptr) {}
+        Compiling(const Compiling&) = delete;
+        Compiling& operator=(const Compiling&) = delete;
+        ~Compiling() {
+            if (j_) j_->leave();
+        }
+
+    private:
+        Journal* j_;
+    };
+    /// Whether the word is written now (by began(), or a Compiling under way): what a start that died here would leave
+    bool counts() {
+        std::lock_guard lk(mu_);
+        return f_ && (began_.load(std::memory_order_relaxed) || compiling_ > 0);
     }
     /// Worker slot's variant, about to go to the driver ({0, 0}: it came back). A slot past the last has no line
     void mark(int slot, Id id) {
@@ -192,8 +245,24 @@ public:
     }
 
 private:
+    void word(uint32_t v) {   // (under mu_)
+        if (fseek(f_, kBeganAt, SEEK_SET) == 0 && fwrite(&v, 4, 1, f_) == 1) fflush(f_);
+    }
+    bool enter() {
+        std::lock_guard lk(mu_);
+        if (!f_ || began_.load(std::memory_order_relaxed)) return false;
+        if (compiling_++ == 0) word(kBeganMark);
+        return true;
+    }
+    void leave() {
+        std::lock_guard lk(mu_);
+        if (!f_ || compiling_ == 0) return;
+        if (--compiling_ == 0 && !began_.load(std::memory_order_relaxed)) word(0);
+    }
     std::mutex mu_;
     FILE* f_ = nullptr;
+    std::atomic<bool> began_{false};
+    unsigned compiling_ = 0;   // (the Compiling under way; mu_)
 };
 
 /// The skip list at path for this stamp (another stamp's, or no file: empty)

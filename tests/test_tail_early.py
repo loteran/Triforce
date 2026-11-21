@@ -200,11 +200,13 @@ def check_source():
     rows = re.findall(r'\{TAB_DEBUG, "Start next frame early", &opts\.tail_early, 0, 1, 1, tx_onoff,[^}]*nullptr, true, true\}', menu)
     check(len(rows) == 1, "vk_menu.cpp: the Debug tab's Start next frame early row (On/Off, applies after a restart) is missing")
     in_order(menu, ['{TAB_DEBUG, "Developer", nullptr', '{TAB_DEBUG, "Replay helper threads"', '"Start next frame early"',
-                    '{TAB_SYSTEM, "Restart"'], "vk_menu.cpp: the row among the Developer rows (after Replay helper threads)")
+                    'constexpr int kRowsEnd'], "vk_menu.cpp: the row among the Developer rows (after Replay helper threads)")
     check('"Start next frame early (experimental)"' not in menu, "vk_menu.cpp: the old Graphics row is still there")
     init = function(menu, "void menu_init() {")
     check("if (version < 6) opts.tail_early = 1;" in init, "vk_menu.cpp menu_init: an options file before version 6 keeps its old off")
-    check('out += "options_version=7\\n";' in menu, "vk_menu.cpp: the options file is not written as version 7 (6 or later)")
+    # (written as version 6 or later: (Triforce) options_version 7 merged rows, and a file of 7 keeps the row's own value)
+    written = re.findall(r'out \+= "options_version=(\d+)\\n";', menu)
+    check(len(written) == 1 and int(written[0]) >= 6, "vk_menu.cpp: the options file is not written as version 6 or later")
     check("if (version < 7) opts.pace = 1;" in init, "vk_menu.cpp menu_init: an options file before version 7 keeps Frame pacing off")
     check("int pace = 1;" in (ROOT / "gpu" / "vk" / "vk_menu.h").read_text(encoding="utf-8"),
           "vk_menu.h: Frame pacing is not on by default")

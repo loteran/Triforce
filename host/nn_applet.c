@@ -78,6 +78,8 @@ static const char *desired_language(void) {
     else hos_log("oe: language %s (%s)", lang, from);
     return lang;
 }
+/* (Triforce) prompts.c: the language the game shows (one of languages[]' codes), for the title's messages it serves */
+const char *hos_desired_language(void) { return desired_language(); }
 HLE(_ZN2nn2oe18GetDesiredLanguageEv) {
     uint64_t v = 0;
     memcpy(&v, desired_language(), strlen(desired_language()));
@@ -102,9 +104,14 @@ int hos_ini_option(const char *key, int otherwise) {   /* (hookshot: the Insert 
     fclose(f);
     return otherwise;
 }
+/* ((Triforce, options_version 7) The Insert menu's handheld profile is the Output resolution row's 1536 x 864: output_res=7,
+   or HOS_OUTPUT_RES=7. handheld_profile=1 is a file's from before version 7, the row that was, until the menu writes the file
+   again (gpu/vk/merged_rows.h migrate: it becomes output_res=7) */
+static int output_row(void) { return getenv("HOS_OUTPUT_RES") ? atoi(getenv("HOS_OUTPUT_RES")) : ini_option("output_res", 0); }
 static int handheld(void) {
     static int v = -1;
-    if (v < 0) v = getenv("HOS_HANDHELD") ? atoi(getenv("HOS_HANDHELD")) != 0 : ini_option("handheld_profile", 0) != 0;
+    if (v < 0)
+        v = getenv("HOS_HANDHELD") ? atoi(getenv("HOS_HANDHELD")) != 0 : output_row() == 7 || ini_option("handheld_profile", 0) != 0;
     return v;
 }
 /* (hookshot) The Insert menu's Output resolution (output_res=, HOS_OUTPUT_RES over it), docked only: 0 the game's 2048 x 1152,
@@ -116,9 +123,9 @@ static int output_mode(void) {
     static int v = -1;
     if (v < 0) {
         static const char *const names[] = {"2048x1152 (the game's)", "2560x1440", "3840x2160", "1920x1080", "5120x1440", "5120x2880", "5120x2160"};
-        v = getenv("HOS_OUTPUT_RES") ? atoi(getenv("HOS_OUTPUT_RES")) : ini_option("output_res", 0);
-        if ((unsigned)v >= sizeof names / sizeof *names || handheld()) v = 0;
-        hos_log("oe: output resolution %s", names[v]);
+        v = output_row();
+        if ((unsigned)v >= sizeof names / sizeof *names || handheld()) v = 0;   /* (7, the handheld profile's: handheld() sizes it) */
+        hos_log("oe: output resolution %s", handheld() ? "the handheld profile's (1536x864)" : names[v]);
     }
     return v;
 }

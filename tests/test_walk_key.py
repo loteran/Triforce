@@ -269,7 +269,7 @@ def main():
                          ("/* HN_WALK */", hints.group(0)),
                          ("/* THE_ROWS */", key_row.group(0) + "\n" + scale_row.group(0)),
                          ("/* STOPS */", block(menu, "bool stops_at_ends(")),
-                         ("/* INI_KEY */", block(menu, "bool ini_row(") + "\n" + block(menu, "const char* ini_key(")),
+                         ("/* INI_KEY */", "bool is_merged(const int*) { return false; }   /* ((Triforce, options_version 7) no merged row here */\n" + block(menu, "bool ini_row(") + "\n" + block(menu, "const char* ini_key(")),
                          ("/* LOAD_LOOP */", loop),
                          ("/* NAMES */", ", ".join('"%s"' % k[0] for k in KEYS)),
                          ("/* REPLACES */", ", ".join('"%s"' % r if r else "nullptr" for r in replaces))):

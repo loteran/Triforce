@@ -206,7 +206,9 @@ class WideHudTest(unittest.TestCase):
         wide = (ROOT / "nx2/oot_wide.py").read_text(encoding="utf-8")
         self.assertIn("hos_wide_hud_row(c, c->x[0] - 0x1b8, _row, &_tx);", wide)
         menu = (ROOT / "gpu/vk/vk_menu.cpp").read_text(encoding="utf-8")
-        self.assertIn('"Ultrawide HUD", &opts.wide_hud, 0, 1, 1, tx_wide_hud,', menu)
+        # ((Triforce, options_version 7) the Ultrawide group's HUD position, kept as ultrawide_hud=, which oot_wide_hud.c reads)
+        self.assertIn('"HUD position", &opts.wide_hud, 0, 1, 1, tx_wide_hud,', menu)
+        self.assertIn('{"HUD position", "ultrawide_hud"}', menu)
 
 
 if __name__ == "__main__":

@@ -18,7 +18,7 @@ no arguments and its own defaults.
     RUN_ALL_SKIP = {"windows": "needs spirv-val: checked on Linux"}       # OS ("linux", "windows") -> why it is skipped
 
 {name} in an argument is a tool or folder find_tools looks for (cxx, vulkan_headers, spirv_headers, spirv_val, glslang,
-dotnet); a check whose tool, compiler (the word after --cc or --cxx) or module is missing here is skipped, or fails
+dotnet, node); a check whose tool, compiler (the word after --cc or --cxx) or module is missing here is skipped, or fails
 with --strict. A check skipped on both OSes (a GPU, the game) names both. A declaration that is not a plain literal of
 that shape, names an unknown placeholder or OS, or any other RUN_ALL_ name, stops the run with the file and line; so
 does one set or changed anywhere but its own top-level line (inside an if or a try, .append(...), +=, a subscript).
@@ -82,6 +82,7 @@ def find_tools():
         "spirv_val": which("spirv-val"),
         "glslang": which("glslangValidator", "glslang"),
         "dotnet": which("dotnet"),
+        "node": which("node"),
         "cxx": which(os.environ.get("CXX", ""), "clang++", "g++", "c++"),
     }
 

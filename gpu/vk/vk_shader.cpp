@@ -741,6 +741,15 @@ namespace {
 // ---- (Triforce) Outside the translation stamp, to the next mark (nx2/build.py translation_text; the rule: program_carry.h): the
 // shader modules made of a translation's SPIR-V, which they take const, and their packing. A program read from the cache and one
 // just translated go through them alike, and a record holds the SPIR-V, not the module ----
+// ((Triforce) the fog's froxels behind last frame's depth, by the shape of its module: spv_fog.h, included here, outside the
+// stamp, as make_module patches the module made of a record and leaves the record as it was translated; and on AMD's older
+// shader compiler, the float selects of a NaN constant made selects of the bits: spv_nan_select.h, the same way)
+} // namespace
+} // namespace mkwvk
+#include "spv_fog.h"
+#include "spv_nan_select.h"
+namespace mkwvk {
+namespace {
 /// (local, RenoDX port) The CRC-32 of a module's words as the bytes they are: RenoDX names the shaders it replaces by it
 uint32_t spirv_crc32(const std::vector<uint32_t>& spirv) {
     static const std::array<uint32_t, 256> table = [] {
@@ -875,6 +884,150 @@ void program_pack(Program& p) {
     }
 }
 
+// ((Triforce, 11-18) EstebanGGM's port of NX2navi spirv_water.c spirv_water_simplify: the 8-tap water/shadow PCF loops made
+// 1 tap with RX_VK_WATER_QUALITY=1 (medium: the wave shaders) or 2 (low); 0 or high: as translated. On by default (1) only on
+// AMD's older compiler where the driver has no fast-linking pipeline libraries (the RX 580 class, whose frame rate it is
+// for), the cards whose pipelines the alpha-to-coverage rule (vk_main.cpp) makes new to the driver's caches anyway. Outside
+// the translation stamp: make_module rewrites the module, the record keeps the translation)
+int water_quality_mode() {
+    static const int mode = [] {
+        if (const char* e = getenv("RX_VK_WATER_QUALITY"); e && *e) {
+            if (!std::strcmp(e, "high")) return 0;
+            if (!std::strcmp(e, "medium")) return 1;
+            if (!std::strcmp(e, "low")) return 2;
+            const int v = std::atoi(e);
+            return v < 0 ? 0 : v > 2 ? 2 : v;
+        }
+        return dev.fixes.nan_bits && !dev.graphics_pipeline_library ? 1 : 0;
+    }();
+    return mode;
+}
+bool is_dref_op(uint32_t op) { return op == 89 || op == 91 || op == 92 || op == 93; }
+bool spirv_water_simplify(const std::vector<uint32_t>& w, int mode, std::vector<uint32_t>& out) {
+    const uint64_t n = w.size();
+    if (mode <= 0 || n < 6 || w[0] != 0x07230203u) return false;
+    const uint32_t bound = w[3];
+    if (!bound || bound > 2000000u) return false;
+    int em = -1, drv = 0, sin_cos = 0, dref = 0;
+    uint32_t glsl_id = 0, false_id = 0, u32_ty = 0, s32_ty = 0, izero[8]{};
+    int n_iz = 0;
+    for (uint64_t i = 5; i < n;) {
+        const uint32_t op = w[i] & 0xffffu, ln = w[i] >> 16;
+        if (!ln || i + ln > n) return false;
+        if (op == 11 && ln >= 6 && !std::memcmp(&w[i + 2], "GLSL.std.450", 13)) glsl_id = w[i + 1];
+        else if (op == 15 && ln >= 2) { if (em >= 0 && em != (int)w[i + 1]) return false; em = (int)w[i + 1]; }
+        else if (op == 21 && ln >= 4 && w[i + 2] == 32) {
+            if (!w[i + 3] && !u32_ty) u32_ty = w[i + 1];
+            else if (w[i + 3] == 1 && !s32_ty) s32_ty = w[i + 1];
+        } else if (op == 42 && ln >= 3 && !false_id) false_id = w[i + 2];
+        else if (op == 43 && ln == 4 && !w[i + 3] && (w[i + 1] == u32_ty || w[i + 1] == s32_ty) && n_iz < 8)
+            izero[n_iz++] = w[i + 2];
+        else if (op >= 207 && op <= 212) drv++;
+        else if (is_dref_op(op)) dref++;
+        else if (op == 12 && ln >= 5 && glsl_id && w[i + 3] == glsl_id && (w[i + 4] == 13 || w[i + 4] == 14)) sin_cos++;
+        i += ln;
+    }
+    if (em != 4 || !false_id || dref < 9) return false;
+    if (mode == 1 && !(drv > 0 && sin_cos > 0)) return false;
+
+    std::vector<uint64_t> lbl(bound, 0);
+    const bool trace_q = mode >= 2 && dref >= 26 && n_iz > 0;
+    std::vector<uint8_t> def_op(trace_q ? bound : 0, 0);
+    std::vector<uint32_t> def_op1(trace_q ? bound : 0, 0);
+    for (uint64_t i = 5; i < n;) {
+        const uint32_t op = w[i] & 0xffffu, ln = w[i] >> 16;
+        if (op == 248 && ln >= 2 && w[i + 1] < bound) lbl[w[i + 1]] = i;
+        else if (trace_q && (op == 61 || op == 124) && ln >= 4 && w[i + 2] < bound) {
+            def_op[w[i + 2]] = (uint8_t)op;
+            def_op1[w[i + 2]] = w[i + 3];
+        }
+        i += ln;
+    }
+    out.clear();
+    uint64_t prev = 0, last_dref = 0;
+    uint32_t var_q = 0;
+    int hits = 0, dref_cf = 0;
+    for (uint64_t i = 5; i < n;) {
+        const uint32_t op = w[i] & 0xffffu, ln = w[i] >> 16;
+        if (is_dref_op(op)) last_dref = i, dref_cf = 0;
+        if (op == 250 && ln >= 4 && prev && (w[prev] & 0xffffu) == 247 && w[prev + 1] == w[i + 3] &&
+            w[i + 2] != w[i + 3] && w[i + 1] != false_id && last_dref && i - last_dref < 160) {
+            const uint64_t m_off = w[i + 3] < bound ? lbl[w[i + 3]] : 0;
+            if (m_off > i) {
+                int idref = 0, iloop = 0;
+                for (uint64_t k = i + ln; k < m_off;) {
+                    const uint32_t kop = w[k] & 0xffffu, kln = w[k] >> 16;
+                    if (!kln || k + kln > n) break;
+                    if (is_dref_op(kop)) idref++;
+                    else if (kop == 246) iloop++;
+                    k += kln;
+                }
+                if (!iloop && idref == 8) {
+                    if (out.empty()) out = w;
+                    out[i + 1] = false_id;
+                    hits++;
+                } else if (trace_q && !var_q && !iloop && !dref_cf && idref == 25) {
+                    for (uint64_t k = i + ln; k < m_off;) {
+                        const uint32_t kop = w[k] & 0xffffu, kln = w[k] >> 16;
+                        if (!kln || k + kln > n) break;
+                        if (kop == 171 && kln >= 5) {
+                            uint32_t id = w[k + 3];
+                            if (id < bound && def_op[id] == 124) id = def_op1[id];
+                            if (id < bound && def_op[id] == 61) var_q = def_op1[id];
+                            break;
+                        }
+                        k += kln;
+                    }
+                }
+            }
+        }
+        if (op == 246 || op == 250 || op == 251 || op == 253) dref_cf = 1;
+        prev = i;
+        i += ln;
+    }
+    if (var_q && trace_q) {
+        int cnt_pcf = 0;
+        uint64_t store_off = 0;
+        uint32_t var_pcf = 0;
+        for (uint64_t i = 5; i < n;) {
+            const uint32_t op = w[i] & 0xffffu, ln = w[i] >> 16;
+            if (op == 171 && ln >= 5) {
+                int rhs0 = 0;
+                for (int z = 0; z < n_iz; z++) if (w[i + 4] == izero[z]) rhs0 = 1;
+                if (rhs0) {
+                    uint32_t id = w[i + 3];
+                    if (id < bound && def_op[id] == 124) id = def_op1[id];
+                    if (id < bound && def_op[id] == 61 && def_op1[id] == var_q) {
+                        const uint64_t nx = i + ln;
+                        if (nx < n && (w[nx] & 0xffffu) == 62 && (w[nx] >> 16) >= 3 && w[nx + 2] == w[i + 2]) {
+                            cnt_pcf++;
+                            store_off = nx;
+                            var_pcf = w[nx + 1];
+                        }
+                    }
+                }
+            }
+            i += ln;
+        }
+        if (cnt_pcf == 1 && var_pcf && store_off) {
+            int pv_stores = 0;
+            for (uint64_t i = 5; i < n;) {
+                const uint32_t op = w[i] & 0xffffu, ln = w[i] >> 16;
+                if (op == 62 && ln >= 3 && w[i + 1] == var_pcf) pv_stores++;
+                i += ln;
+            }
+            if (pv_stores == 1) {
+                if (out.empty()) out = w;
+                out[store_off + 2] = false_id;
+                hits++;
+            }
+        }
+    }
+    if (hits > 0 && !out.empty()) return true;
+    out.clear();
+    return false;
+}
+
 VkShaderModule make_module(const std::vector<uint32_t>& spirv, uint32_t* renodx = nullptr, uint32_t* crc_out = nullptr) {
     const uint32_t crc = spirv_crc32(spirv);
     if (crc_out) *crc_out = crc;
@@ -890,7 +1043,57 @@ VkShaderModule make_module(const std::vector<uint32_t>& spirv, uint32_t* renodx 
         static std::atomic<int> told{0};
         if (told++ < 16) logf("vk: RenoDX: module %08X replaced (%zu words for %zu)", crc, other->size(), spirv.size());
     }
-    const std::vector<uint32_t>& code = other ? *other : spirv;
+    std::vector<uint32_t> simplified;
+    const bool use_simple = !other && spirv_water_simplify(spirv, water_quality_mode(), simplified);
+    if (use_simple) {
+        static std::atomic<int> w_logged{0};
+        if (w_logged++ < 1)
+            logf("vk: water/shadow 8-tap PCF simplified to 1 tap (%s; RX_VK_WATER_QUALITY=0: off)",
+                 water_quality_mode() == 1 ? "medium: wave shaders" : "low");
+    }
+    // ((Triforce) the module the rewrites below start from: the water's simplified one when it was, else the translation)
+    const std::vector<uint32_t>& base = use_simple ? simplified : spirv;
+    // ((Triforce, after NX2navi's 0379b00) the volumetric fog's first compute pass computes the froxels behind last frame's
+    // coarse depth too, rather than writing them as empty: the dark trails beside near objects (spv_fog.h). Its module alone,
+    // found by its shape; the record keeps the translation, so nothing is translated again for it. RX_VK_FOG_CULL=1: the game's
+    // skip kept)
+    std::vector<uint32_t> fog;
+    if (!other) {
+        static const bool kept = spv_fog::cull_kept(getenv("RX_VK_FOG_CULL"));
+        spv_fog::Result found;
+        if (!kept) fog = spv_fog::keep_froxels(base.data(), base.size(), &found);
+        else found = spv_fog::find(base.data(), base.size());
+        if (found.exits) {
+            static std::atomic<int> told{0};
+            if (told++ < 4)
+                logf("vk: fog: module %08X, the volumetric fog's first pass: %s", crc,
+                     found.compare ? (kept ? "froxels behind last frame's depth skipped as the game does (RX_VK_FOG_CULL=1)"
+                                           : "froxels behind last frame's depth computed too (RX_VK_FOG_CULL=1: skipped as the game does)")
+                                   : found.branches + found.shared > 1 ? "its skip's comparison found more than once: left as it is"
+                                   : found.shared   ? "its skip's comparison is read elsewhere too: left as it is"
+                                                    : "its skip's exit found but not its comparison: left as it is");
+        }
+    }
+    // ((Triforce, after NX2navi's e38f42a, issue #156) on AMD's older shader compiler (dev.fixes.nan_bits: RX 5000 and RX 6000,
+    // or RX_VK_NAN_BITS=1), a float select of a constant whose bits are a NaN becomes a select of the bits, which that compiler
+    // cannot fold: stray black or white blocks (spv_nan_select.h). The modules that have one alone, on those cards alone; the
+    // record keeps the translation. RX_VK_NAN_SELECTS=0: left as they are)
+    std::vector<uint32_t> nan_sel;
+    if (!other && dev.fixes.nan_bits) {
+        static const bool selects = spv_nan_select::on(getenv("RX_VK_NAN_SELECTS"));
+        const std::vector<uint32_t>& in = !fog.empty() ? fog : base;
+        spv_nan_select::Result found;
+        if (selects) nan_sel = spv_nan_select::rewrite(in.data(), in.size(), &found);
+        static std::atomic<uint32_t> modules{0}, total{0};
+        if (found.selects) {
+            const uint32_t m = ++modules, t = total += found.selects;
+            if (m <= 4 || m % 64 == 0)
+                logf("vk: NaN selects: module %08X, %u float select(s) of a NaN constant made select(s) of the bits%s (%u modules, "
+                     "%u selects so far; RX_VK_NAN_SELECTS=0: not)", crc, found.selects,
+                     found.left ? ", 16-bit ones left (no 16-bit integer type)" : "", m, t);
+        }
+    }
+    const std::vector<uint32_t>& code = other ? *other : !nan_sel.empty() ? nan_sel : !fog.empty() ? fog : base;
     VkShaderModuleCreateInfo ci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
     ci.codeSize = code.size() * 4;
     ci.pCode = code.data();
@@ -900,7 +1103,7 @@ VkShaderModule make_module(const std::vector<uint32_t>& spirv, uint32_t* renodx 
     // touching that cache. An EDEN_ name: in the program cache's stamp
     static const uint32_t salt = getenv("EDEN_SPV_SALT") ? (uint32_t)strtoul(getenv("EDEN_SPV_SALT"), nullptr, 0) : 0;
     if (salt && spirv.size() > 5) {
-        std::vector<uint32_t> salted = spirv;
+        std::vector<uint32_t> salted = !nan_sel.empty() ? nan_sel : !fog.empty() ? fog : base;
         salted[2] ^= salt;
         ci.pCode = salted.data();
         vkCreateShaderModule(dev.device, &ci, nullptr, &m);
@@ -3653,6 +3856,12 @@ size_t program_cache_load_some(const std::unordered_set<uint64_t>& wanted, const
     }
     return n;
 }
+/// ((Triforce, 11-19) water_quality_mode for vk_draw.cpp's warmed stamp (module_patches): where make_module simplifies the water's
+/// and shadows' modules (by default AMD's older compiler without pipeline libraries: RX 470 to 590) those modules are new to the
+/// driver's caches. v0.5.2 brought it without a new stamp, so those cards' preparation took the old one as done and compiled in
+/// play (#bug-tracker "Texture glitch again ... (RX 580)": "the pre-shader compilation ... is no longer there ... compiling shaders
+/// repeatedly during gameplay"). Here, outside the translation stamp
+int shader_water_mode() { return water_quality_mode(); }
 
 /// (Triforce, test16) The pipeline notes' programs, one key a note in the notes' order (vk_draw.cpp precompile_run): the order the
 /// read-ahead reads in (program_readahead.h notes_order). RX_VK_PROGRAM_READAHEAD_NOTES=0: not used
@@ -3699,6 +3908,30 @@ std::vector<uint64_t> program_cache_keys(std::vector<Program*>* loaded) {
         for (const auto& p : kv.second)
             if (p->ready.load(std::memory_order_acquire) && !p->failed && !p->compute) loaded->push_back(p.get());
     return keys;
+}
+/// ((Triforce) cache_set.h, vk_cache_set.cpp) The part of disk_stamp that only a new build changes: the translator's words as
+/// disk_stamp takes them, and the C++ library and the sizes its records are laid out by. A stamp that changed while this did
+/// not changed by a setting (the depth mode, the GPU's mesh shaders and lanes, the vendor fixes, the Robust buffers row, an
+/// RX_VK_ switch), and the caches of the stamp before can serve again when the setting goes back
+uint64_t program_cache_build_part() {
+    uint64_t h = 0xCBF29CE484222325ull;
+    const auto add = [&h](const void* d, size_t n) {
+        for (size_t i = 0; i < n; i++) h = (h ^ ((const uint8_t*)d)[i]) * 1099511628211ull;
+    };
+    uint64_t translator[2];
+    program_carry::translator_words(carry_on(), kTranslationStamp, HOOKSHOT_SHADER_STAMP, translator);
+    add(translator, sizeof translator);
+    const uint32_t abi[] = {(uint32_t)sizeof(Program), (uint32_t)sizeof(std::vector<uint32_t>),
+#if defined(_LIBCPP_VERSION)
+                            1u, (uint32_t)_LIBCPP_VERSION
+#elif defined(_MSVC_STL_VERSION)
+                            2u, (uint32_t)_MSVC_STL_VERSION
+#else
+                            3u, 0u
+#endif
+    };
+    add(abi, sizeof abi);
+    return h;
 }
 // ---- (Triforce) Inside the translation stamp again ----
 

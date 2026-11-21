@@ -9,6 +9,9 @@
 
 namespace mkwvk::dlssg {
 
+/// (Triforce) This build has DLSS frame generation (made with NVIDIA's Streamline SDK): the Insert menu's Frame generation row
+/// offers NVIDIA DLSS 2x to 4x only then
+bool built();
 /// The frames shown for each of the game's as asked at the start, 2 to 4; 0: off. The Insert menu's DLSS frame
 /// generation row as the options file has it (dlss_frame_generation=), RX_VK_DLSSG=<0|2|3|4> over it. Read once: the
 /// Vulkan instance and device are made through Streamline, so a change takes a restart.

@@ -67,13 +67,17 @@ DlssWhy dlss_why() { return (DlssWhy)1; }
 bool fsr4_built() { return false; }
 void fsr4_probe() {}
 FsrWhy fsr4_why() { return (FsrWhy)1; }
+const char* fsr4_name(bool native_aa) { return native_aa ? "AMD FSR 4 Native AA" : "AMD FSR 4"; }   // ((Triforce, FSR4-7) before AMD's library is asked
 namespace fsr4fg {
 framegen_rows::Why why() { return framegen_rows::FG_NOT_BUILT; }   // (the Frame generation row ends at 8x, as in a build without FSR)
 framegen_rows::Why why_known() { return framegen_rows::FG_NOT_BUILT; }
-const char* version() { return ""; }
+const char* version() { return ""; }   // ((Triforce, FG-1) the row names AMD's by it)
+framegen_rows::Held held() { return framegen_rows::HELD_NONE; }   // ((Triforce) no HDR Native, no RGBA16F scene)
 }
 bool fsr3_wanted() { return false; }
 int temporal_mode() { return 0; }
+int temporal_stood_in() { return 0; }   // ((Triforce, FSR4-1) no engine stood in for
+bool temporal_sharpens_3d() { return false; }   // ((Triforce, S1) the game's own upscaler: Sharpness at the window
 void pipeline_cache_save(bool) {}
 // (a bug capture's picture, vk_bugshot.cpp: none here)
 void bugshot_record(VkCommandBuffer, uint32_t, uint32_t, uint32_t) {}
@@ -123,6 +127,7 @@ static int preview_dlssg() {
 bool framegen_on() { return opts.framegen >= 1 && preview_dlssg() < 2; }
 namespace dlssg {
 int asked() { return preview_dlssg() >= 2; }
+bool built() { return preview_dlssg() >= 2; }   // ((Triforce, options_version 7) the Frame generation row's NVIDIA DLSS values: UI_PREVIEW_DLSSG's
 bool active() { return preview_dlssg() >= 2; }
 int multiplier() { return preview_dlssg() >= 2 ? preview_dlssg() : 1; }
 const char* status() { return "Not asked for."; }

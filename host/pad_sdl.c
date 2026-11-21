@@ -64,6 +64,10 @@ static uint64_t state_buttons;
 static int32_t state_stick[4];
 static int state_count;
 static char state_name[128];   /* the first controller's name (host/prompts.c: the button prompts' Auto) */
+static char state_last_name[128];   /* ((Triforce) the name of the open controller used last (used_ns), "" none */
+/* ((Triforce, 11-19) the scans for controllers done (pads_poll), for Auto's wait at the game's start (host/prompts.c
+   choose_face): -1 when SDL will not run (HOS_NO_SDL, no SDL, or it would not start), 0 while it is starting */
+static volatile LONG scans;
 static volatile LONG rumble_low, rumble_high;   /* 0..65535, set by the vibration HLE */
 /* the game's own vibration values per side (0 left, 1 right: {amp_low, freq_low, amp_high, freq_high}), for the pads
    that play HD rumble; silence until the game sends one */
@@ -127,6 +131,7 @@ static int pads_start(void) {
     if (getenv("HOS_HEADLESS")) hos_sdl_hint("SDL_NO_SIGNAL_HANDLERS", "1");
     if (!hos_sdl_init(HOS_SDL_GAMEPAD)) {
         hos_log("hid: SDL could not start its controller support: %s", hos_sdl_error());
+        InterlockedExchange(&scans, -1);
         return 0;
     }
     hos_log("hid: SDL controller support ready (DualSense, DualShock 4, Switch Pro, Xbox and others)");
@@ -345,14 +350,17 @@ static void motion_poll(int64_t now, int count) {
     ReleaseSRWLockExclusive(&state_lock);
 }
 
-/* one poll: controllers plugged in or gone (each second), then every open one's buttons, sticks and rumble */
+/* one poll: controllers plugged in or gone (each second; (Triforce) each quarter second for the first two, while the
+   button prompts' Auto waits for them: SCANS_FAST), then every open one's buttons, sticks and rumble */
+#define SCANS_FAST 8
 static void pads_poll(void) {
     static int64_t next_scan = 0;
     static int64_t gone_ns;   /* (Triforce) when a controller last disconnected, for the log */
     hos_sdl_pads_update();
         const int64_t now = hos_now_ns();
-        if (now >= next_scan) {   /* new controllers (and ones that went away) */
-            next_scan = now + 1000000000LL;
+        const int scanned = now >= next_scan;
+        if (scanned) {   /* new controllers (and ones that went away) */
+            next_scan = now + (scans < SCANS_FAST ? 250000000LL : 1000000000LL);
             for (int i = 0; i < MAX_PADS; i++)
                 if (pads[i].gc && !hos_sdl_pad_connected(pads[i].gc)) {
                     /* (Triforce) how long it had been connected: a pad that leaves after seconds or minutes, again and
@@ -491,7 +499,15 @@ static void pads_poll(void) {
                 snprintf(state_name, sizeof state_name, "%s", name ? name : "");
                 break;
             }
+        {   /* ((Triforce) the one used last: its name, for the overlay's icons and Auto's next start) */
+            int last = -1;
+            for (int i = 0; i < MAX_PADS; i++)
+                if (pads[i].gc && (last < 0 || pads[i].used_ns > pads[last].used_ns)) last = i;
+            const char *name = last >= 0 ? hos_sdl_pad_name(pads[last].gc) : NULL;
+            snprintf(state_last_name, sizeof state_last_name, "%s", name ? name : "");
+        }
         ReleaseSRWLockExclusive(&state_lock);
+        if (scanned && scans >= 0) InterlockedIncrement(&scans);   /* (after the names: a scan counted has them) */
 }
 
 static DWORD WINAPI pad_main(void *arg) {
@@ -521,9 +537,13 @@ void hos_sdl_pads_pump(void) {
 int hos_sdl_pads(uint64_t *buttons, int32_t stick[4]) {
     static volatile LONG started;
     if (!started && !InterlockedExchange(&started, 1)) {
-        if (getenv("HOS_NO_SDL")) return 0;
+        if (getenv("HOS_NO_SDL")) {
+            InterlockedExchange(&scans, -1);
+            return 0;
+        }
         if (!hos_sdl_load()) {
             hos_log("hid: no SDL beside the exe or on the system: only XInput controllers (Xbox pads) work");
+            InterlockedExchange(&scans, -1);
             return 0;
         }
 #ifdef _WIN32
@@ -562,6 +582,15 @@ void hos_sdl_pad_first_name(char *out, size_t cap) {
     snprintf(out, cap, "%s", state_name);
     ReleaseSRWLockShared(&state_lock);
 }
+/* ((Triforce) The name of the open controller used last into out ("" with none) */
+void hos_sdl_pad_last_name(char *out, size_t cap) {
+    AcquireSRWLockShared(&state_lock);
+    snprintf(out, cap, "%s", state_last_name);
+    ReleaseSRWLockShared(&state_lock);
+}
+/* ((Triforce) The scans for controllers done so far (pads_poll's: the first at once, then each quarter second for the
+   first SCANS_FAST, then each second); -1 when SDL will not run */
+int hos_sdl_pad_scans(void) { return (int)scans; }
 
 /* Vibration from the game (0..1 amplitudes of the low and high bands), for the pads that rumble. */
 void hos_sdl_rumble(float low, float high) {

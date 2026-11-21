@@ -3,6 +3,7 @@
    out differently (both read here at their offsets: SDL_Event is 128 bytes in SDL3, 56 in SDL2). */
 #include "hos.h"
 #include "hos_sdl.h"
+#include "pad_kind.h"   /* ((Triforce) 11-20: instruments and dance mats left out of the game's input) */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -25,6 +26,7 @@ static struct {
     void *PadHasSensor, *PadSensorEnable, *PadSensorData;   /* (motion: optional, NULL in an SDL without them) */
     void *GetGamepads, *GetGamepadID, *Free;   /* (SDL3) */
     void *NumJoysticks, *IsGameController, *DeviceInstanceID, *GetJoystick, *JoystickInstanceID;   /* (SDL2) */
+    void *JoyTypeOf, *PadNameOf;   /* ((Triforce) 11-20, optional: a controller's type and name before it is opened: pad_kind.h) */
 } f;
 #define CALL(type, fn) ((type)f.fn)
 
@@ -74,6 +76,9 @@ static int get_all(HMODULE m, int three) {
     *(FARPROC *)&f.PadHasSensor = GetProcAddress(m, three ? "SDL_GamepadHasSensor" : "SDL_GameControllerHasSensor");
     *(FARPROC *)&f.PadSensorEnable = GetProcAddress(m, three ? "SDL_SetGamepadSensorEnabled" : "SDL_GameControllerSetSensorEnabled");
     *(FARPROC *)&f.PadSensorData = GetProcAddress(m, three ? "SDL_GetGamepadSensorData" : "SDL_GameControllerGetSensorData");
+    /* ((Triforce) 11-20) a controller's type and name by its place in the list, for the instruments left out (pad_kind.h) */
+    *(FARPROC *)&f.JoyTypeOf = GetProcAddress(m, three ? "SDL_GetJoystickTypeForID" : "SDL_JoystickGetDeviceType");
+    *(FARPROC *)&f.PadNameOf = GetProcAddress(m, three ? "SDL_GetGamepadNameForID" : "SDL_GameControllerNameForIndex");
     if (three) {
         GET(SetWindowPosition, "SDL_SetWindowPosition");
         GET(GetPrimaryDisplay, "SDL_GetPrimaryDisplay");
@@ -563,18 +568,44 @@ void hos_sdl_mic_close(void *mic) {
 }
 
 /* ---- controllers ---- */
+/* ((Triforce) 11-20) whether the controller at SDL's place `what` (SDL3: its id; SDL2: its device index) is an instrument or a
+   dance mat, left out of the game's input (pad_kind.h); each one said once (by its id) */
+static int pad_left_out(int what, int32_t id) {
+    static int all = -1;
+    if (all < 0) all = getenv("HOS_SDL_ALL_PADS") && atoi(getenv("HOS_SDL_ALL_PADS")) != 0;
+    if (all) return 0;
+    const int type = !f.JoyTypeOf ? 0 : version == 3 ? CALL(int (*)(uint32_t), JoyTypeOf)((uint32_t)what) : CALL(int (*)(int), JoyTypeOf)(what);
+    const char *name = !f.PadNameOf ? NULL : version == 3 ? CALL(const char *(*)(uint32_t), PadNameOf)((uint32_t)what)
+                                                          : CALL(const char *(*)(int), PadNameOf)(what);
+    const char *why = pad_kind_left_out(type, name);
+    if (!why) return 0;
+    static int32_t said[8];
+    static int nsaid;
+    int known = 0;
+    for (int i = 0; i < nsaid; i++) known |= said[i] == id;
+    if (!known) {
+        if (nsaid < 8) said[nsaid++] = id;
+        hos_log("hid: controller \"%s\" left out: %s, not a gamepad (its whammy, tilt or pads would read as held buttons for "
+                "player 1; HOS_SDL_ALL_PADS=1 keeps it)", name ? name : "?", why);
+    }
+    return 1;
+}
 int hos_sdl_pads_list(int32_t *ids, int *opens, int max) {   /* (SDL3 opens by id; SDL2 by device index) */
     int n = 0;
     if (version == 3) {
         int count = 0;
         uint32_t *got = CALL(uint32_t *(*)(int *), GetGamepads)(&count);
-        for (int i = 0; got && i < count && n < max; i++) ids[n] = (int32_t)got[i], opens[n] = (int)got[i], n++;
+        for (int i = 0; got && i < count && n < max; i++)
+            if (!pad_left_out((int)got[i], (int32_t)got[i])) ids[n] = (int32_t)got[i], opens[n] = (int)got[i], n++;
         if (got) CALL(void (*)(void *), Free)(got);
         return n;
     }
     const int nj = CALL(int (*)(void), NumJoysticks)();
-    for (int j = 0; j < nj && n < max; j++)
-        if (CALL(int (*)(int), IsGameController)(j)) ids[n] = CALL(int32_t (*)(int), DeviceInstanceID)(j), opens[n] = j, n++;
+    for (int j = 0; j < nj && n < max; j++) {
+        if (!CALL(int (*)(int), IsGameController)(j)) continue;
+        const int32_t id = CALL(int32_t (*)(int), DeviceInstanceID)(j);
+        if (!pad_left_out(j, id)) ids[n] = id, opens[n] = j, n++;
+    }
     return n;
 }
 void *hos_sdl_pad_open(int what) {

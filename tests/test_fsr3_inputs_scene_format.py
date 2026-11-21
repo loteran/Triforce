@@ -35,7 +35,8 @@ def checks(inputs, fsr3):
           "fsr3_upscale still leaves an RGBA16F network before the inputs")
     # (the inputs are made before the network's own upscale is left to DLSS: prepare comes after the format check and before
     # the return for frame interpolation's inputs alone)
-    check(up.index("!temporal_scene_format(in->format)") < up.index("fsr3_inputs::prepare(cmd, in, in_view, f)") <
+    # ((Triforce) with hdr: an RGBA16F network's colour unclamped, tests/test_fsr3_hdr_scene.py)
+    check(up.index("!temporal_scene_format(in->format)") < up.index("fsr3_inputs::prepare(cmd, in, in_view, f, hdr)") <
           up.index("if (!upscaling) return false;"), "fsr3_upscale: the inputs are not made where DLSS upscales")
 
 

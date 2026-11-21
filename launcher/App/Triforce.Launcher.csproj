@@ -1,0 +1,63 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- One launcher, two window hosts: Windows draws with WebView2 directly (file paths from drops, a real custom title bar),
+       Linux with Photino (WebKitGTK). The page (ui/) and the logic (Core) are the same on both. -->
+  <PropertyGroup>
+    <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
+    <TargetFrameworks>net10.0-windows;net10.0</TargetFrameworks>
+    <OutputType>WinExe</OutputType>
+    <AssemblyName>Triforce</AssemblyName>
+    <RootNamespace>Triforce.Launcher</RootNamespace>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <Version>1.0.0</Version>
+  </PropertyGroup>
+
+  <PropertyGroup Condition="'$(TargetFramework)' == 'net10.0-windows'">
+    <DefineConstants>$(DefineConstants);WINDOWS</DefineConstants>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <!-- Old installs update by downloading the release asset TriforceSetup.exe and starting it (research/02 §2): this IS it. -->
+    <AssemblyName>TriforceSetup</AssemblyName>
+    <ApplicationIcon Condition="Exists('$(MSBuildThisFileDirectory)obj/gen/triforce.ico')">obj/gen/triforce.ico</ApplicationIcon>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(TargetFramework)' == 'net10.0'">
+    <AssemblyName>triforce-launcher</AssemblyName>
+  </PropertyGroup>
+  <!-- one self-contained file per system (no .NET needed on the player's PC) -->
+  <PropertyGroup Condition="'$(RuntimeIdentifier)' != ''">
+    <SelfContained>true</SelfContained>
+    <PublishSingleFile>true</PublishSingleFile>
+    <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
+    <EnableCompressionInSingleFile>true</EnableCompressionInSingleFile>
+    <DebugType>none</DebugType>
+    <PublishReadyToRun>false</PublishReadyToRun>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Core\Triforce.Core.csproj" />
+    <ProjectReference Include="..\Logic\Triforce.Logic.csproj" />
+  </ItemGroup>
+
+  <ItemGroup Condition="'$(TargetFramework)' == 'net10.0-windows'">
+    <PackageReference Include="Microsoft.Web.WebView2" Version="1.0.4314.35" />
+    <!-- only the Core API is used: leave the WinForms/WPF controls out of the build -->
+    <Reference Remove="Microsoft.Web.WebView2.WinForms" /><Reference Remove="Microsoft.Web.WebView2.Wpf" />
+  </ItemGroup>
+  <ItemGroup Condition="'$(TargetFramework)' == 'net10.0'">
+    <PackageReference Include="Photino.NET" Version="4.0.16" />
+  </ItemGroup>
+  <ItemGroup Condition="'$(TargetFramework)' == 'net10.0-windows'">
+    <Compile Remove="Host\LinuxHost.cs" />
+  </ItemGroup>
+  <ItemGroup Condition="'$(TargetFramework)' == 'net10.0'">
+    <Compile Remove="Host\WinHost.cs" />
+  </ItemGroup>
+
+  <!-- The page, its styles, scripts, fonts and our own crest ride inside the exe. Nothing of the game is in here: its logo,
+       music and sounds are read from the player's own files at run time (Core/GameFiles). -->
+  <ItemGroup>
+    <EmbeddedResource Include="..\ui\**\*" LogicalName="ui/%(RecursiveDir)%(Filename)%(Extension)" />
+  </ItemGroup>
+
+</Project>

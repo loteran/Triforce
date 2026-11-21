@@ -38,6 +38,24 @@ namespace {
 
 constexpr int kGame = 26242;   // (GameBanana: The Legend of Zelda: Ocarina of Time (Switch 2))
 
+// ((Triforce) 11-18, his "make sure the multiplayer mod is included" and "Download, unzip and start it") Programs of their own
+// posted in the section, not romfs mods: unpacked into kits\<folder> beside the game and started with their own start file in
+// a window of their own. Only the ones named here: a download is never started because of what it holds
+struct Kit {
+    bool wip;            // (GameBanana's Wip/<id> or Mod/<id>)
+    int id;
+    const char* folder;  // (kits\<folder>)
+    const char* start;   // (the file that starts it, in the kit's top folder)
+};
+constexpr Kit kKits[] = {
+    {true, 105323, "Squadala", "Start Squadala.bat"},   // (daurosk's Squadala!: online co-op, github.com/daurosk/oot-remake-multiplayer)
+};
+const Kit* kit_for(bool wip, int id) {
+    for (const Kit& k : kKits)
+        if (k.wip == wip && k.id == id) return &k;
+    return nullptr;
+}
+
 // ---- a small JSON reader (GameBanana's answers): objects, arrays, strings with their escapes, numbers, true/false/null ----
 struct J {
     enum T { Null, Bool, Num, Str, Arr, Obj } t = Null;
@@ -255,6 +273,10 @@ struct FeedData {
     unsigned gen = 0;
     std::string query;          // (found: the search's text, trimmed)
     bool name_filter = false;   // (found: the name filter's pages, the whole-word search having found none)
+    // ((Triforce) 11-18) the next page asked for already (they come one after another until the list is whole: before, only
+    // when the cursor neared the list's end, so the wheel, or a category's few cards, showed a page or two of 9 pages)
+    bool queued = false;
+    int retries = 0;            // (a failed page tried again, a few times, before the list stops)
 };
 FeedData browse, found;
 FeedData* active = &browse;
@@ -263,7 +285,7 @@ std::vector<void*> clear_list(FeedData& fd) {
     std::vector<void*> textures;
     for (Mod& m : fd.mods)
         if (m.texture) textures.push_back(m.texture), m.texture = nullptr;
-    fd.mods.clear(), fd.pages_loaded = 0, fd.total = 0, fd.complete = false, fd.error.clear();
+    fd.mods.clear(), fd.pages_loaded = 0, fd.total = 0, fd.complete = false, fd.error.clear(), fd.queued = false, fd.retries = 0;
     return textures;
 }
 InstallState inst;
@@ -518,15 +540,27 @@ bool write_file(const std::string& path, const std::string& text) {
     return ok;
 }
 
-/// The folders in the mods folder that came from GameBanana: the mod's id -> the file's date there
-std::vector<std::pair<int, int64_t>> installed_ids() {
-    std::vector<std::pair<int, int64_t>> out;
+struct Installed {
+    int id;
+    bool wip;
+    int64_t date;
+};
+/// ((Triforce) a triforce_mod.json / triforce_kit.json: a WiP's says "gamebanana_model": "Wip" (a Mod's, from before, none)
+bool info_is_wip(const J& j) { return j["gamebanana_model"].str() == "Wip"; }
+/// The folders in the mods folder that came from GameBanana, and the kits installed: the id -> the file's date there
+std::vector<Installed> installed_ids() {
+    std::vector<Installed> out;
     const std::string root = game_folder() + "\\mods";
     for (const std::string& d : subdirs(root)) {
         J j;
         const std::string text = read_file(root + "\\" + d + "\\triforce_mod.json");
         if (text.empty() || !parse(text, j)) continue;
-        if (const long long id = j["gamebanana_id"].num()) out.emplace_back((int)id, (int64_t)j["file_date"].num());
+        if (const long long id = j["gamebanana_id"].num()) out.push_back({(int)id, info_is_wip(j), (int64_t)j["file_date"].num()});
+    }
+    for (const Kit& k : kKits) {
+        J j;
+        const std::string text = read_file(game_folder() + "\\kits\\" + k.folder + "\\triforce_kit.json");
+        if (!text.empty() && parse(text, j) && (int)j["gamebanana_id"].num() == k.id) out.push_back({k.id, k.wip, (int64_t)j["file_date"].num()});
     }
     return out;
 }
@@ -535,8 +569,8 @@ void mark_installed() {   // (mu held)
     for (FeedData* fd : {&browse, &found})
         for (Mod& m : fd->mods) {
             m.installed = m.update = false;
-            for (const auto& [id, date] : ids)
-                if (id == m.id) {
+            for (const auto& [id, wip, date] : ids)
+                if (id == m.id && wip == m.wip) {
                     m.installed = true;
                     int64_t newest = 0;
                     for (const File& f : m.files) newest = std::max(newest, f.added);
@@ -545,10 +579,10 @@ void mark_installed() {   // (mu held)
         }
 }
 /// ((Triforce) mu held) every entry for mod id, in either list (a mod a search found is in both): what came for it goes to each
-template <typename F> void each_with_id(int id, F f) {
+template <typename F> void each_with_id(int id, bool wip, F f) {
     for (FeedData* fd : {&browse, &found})
         for (Mod& m : fd->mods)
-            if (m.id == id) f(m);
+            if (m.id == id && m.wip == wip) f(m);   // ((Triforce) a WiP's ids and a Mod's are counted apart on GameBanana)
 }
 /// ((Triforce) a search's text in a URL: its UTF-8 bytes, letters, digits and - _ . ~ as they are, the rest %XX. Sent in
 /// another code page GameBanana drops every filter, and & or + cut or change the query)
@@ -571,44 +605,77 @@ void fetch_page(FeedData* fd, unsigned gen, int page) {
         std::lock_guard<std::mutex> g(mu);
         if (fd->gen != gen) return;   // ((Triforce) another search since: not asked any more)
         query = fd->query, name_filter = fd->name_filter;
+        fd->queued = false;
     }
-    char head[160];
+    // ((Triforce) 11-18) mods and WiPs (_csvModelInclusions: the section's requests, questions and tools left out by GameBanana,
+    // 15 a page either way): a WiP with files is often a mod all the same, and the online co-op (a kit) is posted as one
+    char head[200];
+    std::string wip_url;   // (GameBanana's search takes one kind a request: the WiPs' asked too, with the first page)
     if (fd == &browse) {
-        snprintf(head, sizeof head, "https://gamebanana.com/apiv11/Game/%d/Subfeed?_sSort=default&_nPage=%d", kGame, page);
+        snprintf(head, sizeof head, "https://gamebanana.com/apiv11/Game/%d/Subfeed?_sSort=default&_csvModelInclusions=Mod,Wip&_nPage=%d", kGame, page);
         url = head;
     } else if (!name_filter) {   // (GameBanana's own search, as its search page asks it: whole words, the best matches first)
         snprintf(head, sizeof head, "https://gamebanana.com/apiv11/Util/Search/Results?_sModelName=Mod&_idGameRow=%d&_sOrder=best_match&_nPage=%d&_sSearchString=", kGame, page);
         url = head + url_encode(query);
+        if (page == 1) {
+            snprintf(head, sizeof head, "https://gamebanana.com/apiv11/Util/Search/Results?_sModelName=Wip&_idGameRow=%d&_sOrder=best_match&_nPage=1&_sSearchString=", kGame);
+            wip_url = head + url_encode(query);
+        }
     } else {   // (the section's name filter, as the game's page asks it: a part of a name, 3 letters at least)
-        snprintf(head, sizeof head, "https://gamebanana.com/apiv11/Game/%d/Subfeed?_sSort=default&_csvModelInclusions=Mod&_nPage=%d&_sName=", kGame, page);
+        snprintf(head, sizeof head, "https://gamebanana.com/apiv11/Game/%d/Subfeed?_sSort=default&_csvModelInclusions=Mod,Wip&_nPage=%d&_sName=", kGame, page);
         url = head + url_encode(query);
     }
     std::string text, err;
-    J j;
+    J j, jw;
     const bool ok = get_text(url.c_str(), text, &err) && parse(text, j);
+    std::string wtext, werr;
+    const bool wok = ok && !wip_url.empty() && get_text(wip_url.c_str(), wtext, &werr) && parse(wtext, jw);
+    if (ok && !wip_url.empty() && !wok) logf("mods: search \"%s\": the WiPs could not be read (%s): the mods alone", query.c_str(), werr.c_str());
     std::lock_guard<std::mutex> g(mu);
     if (fd->gen != gen) return;   // ((Triforce) an answer for an older search: dropped)
     const char* what = fd == &browse ? "page" : name_filter ? "search (names)" : "search";
     if (!ok) {
-        fd->feed = Feed::Failed;
         fd->error = err.empty() ? "GameBanana's answer could not be read" : err;
         logf("mods: %s %d: %s", what, page, fd->error.c_str());
+        // ((Triforce) 11-18) a page that failed with cards already listed: tried again after 2, 4, 8 s; then the list stops
+        // there (load_more, or the page opened again, goes on from it)
+        if (!fd->mods.empty() && fd->retries < 3) {
+            const int wait_ms = 2000 << fd->retries++;
+            fd->queued = true;
+            std::thread([fd, gen, page, wait_ms] {
+                std::this_thread::sleep_for(std::chrono::milliseconds(wait_ms));
+                work().push([fd, gen, page] { fetch_page(fd, gen, page); });
+            }).detach();
+            return;
+        }
+        fd->feed = Feed::Failed;
         return;
     }
-    fd->total = (int)j["_aMetadata"]["_nRecordCount"].num();
+    fd->retries = 0;
+    fd->total = (int)j["_aMetadata"]["_nRecordCount"].num() + (wok ? (int)jw["_aMetadata"]["_nRecordCount"].num() : 0);
     fd->complete = j["_aMetadata"]["_bIsComplete"].t == J::Bool && j["_aMetadata"]["_bIsComplete"].b;
     int added = 0;
     std::vector<Mod>& list_now = fd->mods;
-    for (const J& r : j["_aRecords"].a) {
-        if (r["_sModelName"].str() != "Mod") continue;   // (the section's WiPs, requests and questions: not mods)
+    std::vector<const J*> records;
+    for (const J& r : j["_aRecords"].a) records.push_back(&r);
+    if (wok)
+        for (const J& r : jw["_aRecords"].a) records.push_back(&r);
+    for (const J* rp : records) {
+        const J& r = *rp;
+        const std::string model = r["_sModelName"].str();
+        if (model != "Mod" && model != "Wip") continue;   // (the section's requests, questions and tools: not mods)
+        // ((Triforce) a WiP with nothing to download (a showcase) left out; a search's records may not say: kept, its details tell)
+        if (model == "Wip" && r["_bHasFiles"].t == J::Bool && !r["_bHasFiles"].b) continue;
         // ((Triforce) the search's records name their game: another game's, only when the query's filters were lost, left out)
         if (r["_aGame"].t == J::Obj && (int)r["_aGame"]["_idRow"].num() != kGame) continue;
         Mod m;
         m.id = (int)r["_idRow"].num();
-        if (std::any_of(list_now.begin(), list_now.end(), [&](const Mod& o) { return o.id == m.id; })) continue;
+        m.wip = model == "Wip";
+        m.kit = kit_for(m.wip, m.id) != nullptr;
+        if (std::any_of(list_now.begin(), list_now.end(), [&](const Mod& o) { return o.id == m.id && o.wip == m.wip; })) continue;
         if (fd == &found)   // ((Triforce) one the section's list has already: its details and its picture's file taken along)
             for (const Mod& b : browse.mods)
-                if (b.id == m.id) {
+                if (b.id == m.id && b.wip == m.wip) {
                     m.details_state = b.details_state == 1 ? 0 : b.details_state;
                     m.text = b.text, m.files = b.files, m.downloads = b.downloads, m.thumb_file = b.thumb_file;
                     break;
@@ -641,15 +708,21 @@ void fetch_page(FeedData* fd, unsigned gen, int page) {
     fd->feed = Feed::Ready;
     mark_installed();
     if (fd == &browse)
-        logf("mods: page %d: %d mods (%zu in the list, %d submissions in the section)", page, added, list_now.size(), fd->total);
+        logf("mods: page %d: %d mods (%zu in the list, %d mods and WiPs in the section)", page, added, list_now.size(), fd->total);
     else
         logf("mods: %s \"%s\" page %d: %d mods (%zu found, about %d)", what, fd->query.c_str(), page, added, list_now.size(), fd->total);
+    // ((Triforce) 11-18) the next page at once, behind the details and pictures asked for, until GameBanana says the list is whole
+    // (before: only when the cursor came near the list's end; the wheel, and a category's few cards, never asked)
+    if (!fd->complete && !fd->queued) {
+        fd->queued = true;
+        work().push([fd, gen, page] { fetch_page(fd, gen, page + 1); });
+    }
 }
 
-void fetch_details(int id) {
+void fetch_details(int id, bool wip) {
     std::string text, err;
     char url[256];
-    snprintf(url, sizeof url, "https://gamebanana.com/apiv11/Mod/%d/ProfilePage", id);
+    snprintf(url, sizeof url, "https://gamebanana.com/apiv11/%s/%d/ProfilePage", wip ? "Wip" : "Mod", id);
     J j;
     const bool ok = get_text(url, text, &err) && parse(text, j);
     std::vector<File> files;
@@ -667,7 +740,7 @@ void fetch_details(int id) {
     const std::string body = ok ? plain(j["_sText"].str()) : std::string();
     std::lock_guard<std::mutex> g(mu);
     bool any = false;
-    each_with_id(id, [&](Mod& m) {   // ((Triforce) the section's list and a search's: each entry for the mod still waiting)
+    each_with_id(id, wip, [&](Mod& m) {   // ((Triforce) the section's list and a search's: each entry for the mod still waiting)
         if (m.details_state == 2) return;
         any = true;
         if (!ok) { m.details_state = 3; return; }
@@ -675,13 +748,16 @@ void fetch_details(int id) {
         m.downloads = (int)j["_nDownloadCount"].num();
         m.files = files;
         m.file_choice = 0;
+        if (m.kit)   // ((Triforce) 11-18) a kit's Windows file first (Squadala posts a -windows and a -linux zip)
+            for (size_t k = 0; k < files.size(); k++)
+                if (files[k].name.find("windows") != std::string::npos || files[k].name.find("Windows") != std::string::npos) { m.file_choice = (int)k; break; }
         m.details_state = 2;
     });
-    if (!ok && any) logf("mods: details of %d: %s", id, err.c_str());
+    if (!ok && any) logf("mods: details of %s %d: %s", wip ? "WiP" : "mod", id, err.c_str());
     if (ok && any) mark_installed();
 }
 
-void fetch_thumb(int id, std::string url, std::string kept) {
+void fetch_thumb(int id, bool wip, std::string url, std::string kept) {
     std::string bytes = std::move(kept), err;   // ((Triforce) kept: downloaded before; the menu let its picture go)
     std::vector<unsigned char> rgba;
     int w = 0, h = 0;
@@ -690,7 +766,7 @@ void fetch_thumb(int id, std::string url, std::string kept) {
                     decode(bytes, 440, rgba, &w, &h);
     std::lock_guard<std::mutex> g(mu);
     // ((Triforce) each entry for the mod that asked (state 1) gets the pixels; the file is kept in every entry for it)
-    each_with_id(id, [&](Mod& m) {
+    each_with_id(id, wip, [&](Mod& m) {
         if (ok && !had && bytes.size() < (1u << 20)) m.thumb_file = bytes;   // (a picture under 1 MB kept)
         if (m.thumb_state != 1) return;
         if (ok) m.thumb_rgba = rgba, m.thumb_w = w, m.thumb_h = h, m.thumb_state = 2;
@@ -757,8 +833,10 @@ void set_state(Job j, const std::string& message = std::string()) {
     if (!message.empty()) inst.message = message;
 }
 
-void run_install(Mod m, File f) {
-    const std::string game = game_folder(), root = game + "\\mods", stage_dir = root + "\\.triforce-download";
+/// ((Triforce) 11-18, from run_install) The file downloaded into stage_dir (made anew, hidden; its folder made) and unpacked
+/// into stage_dir\unpacked, the progress in inst as it comes; false: the state set (Failed or Cancelled), stage_dir gone
+bool download_unpack(const Mod& m, const File& f, const std::string& stage_dir) {
+    const std::string root = stage_dir.substr(0, stage_dir.find_last_of('\\'));
     CreateDirectoryW(wide(root).c_str(), nullptr);
     remove_tree(stage_dir);
     CreateDirectoryW(wide(stage_dir).c_str(), nullptr);
@@ -767,14 +845,24 @@ void run_install(Mod m, File f) {
     const std::string archive = stage_dir + "\\" + name;
     logf("mods: installing %s (%d), file %s (%llu bytes) from %s", m.name.c_str(), m.id, f.name.c_str(), (unsigned long long)f.bytes, f.url.c_str());
     // (download, the progress as it comes)
-    HANDLE out = CreateFileW(wide(archive).c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (out == INVALID_HANDLE_VALUE) { set_state(Job::Failed, "Could not write in " + root + " (error " + std::to_string(GetLastError()) + ")."); return; }
+    // ((Triforce) 11-19, ticket "Mods not installing": "no answer from https://gamebanana.com/dl/... (error 12002)", WinHTTP's
+    // timeout, twice for one player while GameBanana answered here in half a second. A download that got no answer or stopped is
+    // tried again from the start, three times in all, 2 and 5 s apart; each try and the outcome go to the log)
     std::string err;
+    bool got = false, written = true;
+    for (int attempt = 1;; attempt++) {
+    HANDLE out = CreateFileW(wide(archive).c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (out == INVALID_HANDLE_VALUE) { set_state(Job::Failed, "Could not write in " + root + " (error " + std::to_string(GetLastError()) + ")."); return false; }
+    {
+        std::lock_guard<std::mutex> g(mu);
+        inst.done = 0, inst.rate = 0;
+    }
+    err.clear();
     auto t0 = std::chrono::steady_clock::now();
     auto last = t0;
     uint64_t last_done = 0;
-    bool written = true;
-    const bool got = get(f.url, [&](const char* p, size_t n, uint64_t length) {
+    written = true;
+    got = get(f.url, [&](const char* p, size_t n, uint64_t length) {
         DWORD put = 0;
         if (!WriteFile(out, p, (DWORD)n, &put, nullptr) || put != n) { written = false; return false; }
         std::lock_guard<std::mutex> g(mu);
@@ -790,11 +878,18 @@ void run_install(Mod m, File f) {
         return !cancel_flag.load();
     }, &err);
     CloseHandle(out);
-    if (cancel_flag.load()) { remove_tree(stage_dir); set_state(Job::Cancelled, "Cancelled: nothing was installed."); return; }
+    if (got || !written || cancel_flag.load() || attempt >= 3 ||
+        (err.rfind("no answer", 0) != 0 && err.rfind("the download stopped", 0) != 0 && err.rfind("could not reach", 0) != 0))
+        break;
+    logf("mods: %s: try %d of 3 failed (%s), trying again", m.name.c_str(), attempt, err.c_str());
+    for (int w = 0; w < (attempt == 1 ? 20 : 50) && !cancel_flag.load(); w++) Sleep(100);
+    }
+    if (cancel_flag.load()) { remove_tree(stage_dir); logf("mods: %s: cancelled", m.name.c_str()); set_state(Job::Cancelled, "Cancelled: nothing was installed."); return false; }
     if (!got || !written) {
+        logf("mods: %s: not installed: %s", m.name.c_str(), !written ? "the file could not be written" : err.c_str());
         remove_tree(stage_dir);
         set_state(Job::Failed, !written ? "The file could not be written (is the drive full?)." : "The download failed: " + err + ".");
-        return;
+        return false;
     }
     // (unpack)
     set_state(Job::Unpacking);
@@ -803,8 +898,111 @@ void run_install(Mod m, File f) {
     if (!tar_extract(archive, unpacked, &err)) {
         remove_tree(stage_dir);
         set_state(cancel_flag.load() ? Job::Cancelled : Job::Failed, cancel_flag.load() ? "Cancelled: nothing was installed." : "It could not be unpacked: " + err + ".");
+        return false;
+    }
+    return true;
+}
+
+// ((Triforce) 11-18) ---- a kit: a program of its own (kKits), in kits\<its folder> beside the game ----
+/// The folder under dir (dir itself, or 3 levels down at most) whose files hold the kit's start file
+std::string find_kit_top(const std::string& dir, const char* start, int depth = 0) {
+    for (const std::string& f : files_in(dir))
+        if (_stricmp(f.c_str(), start) == 0) return dir;
+    if (depth >= 3) return std::string();
+    for (const std::string& d : subdirs(dir)) {
+        const std::string t = find_kit_top(dir + "\\" + d, start, depth + 1);
+        if (!t.empty()) return t;
+    }
+    return std::string();
+}
+/// from's files moved over into's (folders made, files there replaced; what into has more stays: the kit's own settings and
+/// the game it built); false with the first file that could not be put (in use: the kit is running)
+bool move_over(const std::string& from, const std::string& into, std::string* err) {
+    CreateDirectoryW(wide(into).c_str(), nullptr);
+    for (const std::string& f : files_in(from)) {
+        const std::wstring a = wide(from + "\\" + f), b = wide(into + "\\" + f);
+        SetFileAttributesW(b.c_str(), FILE_ATTRIBUTE_NORMAL);
+        if (!MoveFileExW(a.c_str(), b.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_COPY_ALLOWED)) {
+            *err = into + "\\" + f + " (error " + std::to_string(GetLastError()) + ")";
+            return false;
+        }
+    }
+    for (const std::string& d : subdirs(from))
+        if (!move_over(from + "\\" + d, into + "\\" + d, err)) return false;
+    return true;
+}
+/// The kit's start file run in a console of its own, from its folder (cmd /c: a .bat, or any start file Windows runs)
+bool start_kit(const std::string& dir, const Kit& k, std::string* err) {
+    char sys[MAX_PATH];
+    GetSystemDirectoryA(sys, sizeof sys);
+    std::wstring cmd = L"\"" + wide(std::string(sys) + "\\cmd.exe") + L"\" /c \"\"" + wide(dir + "\\" + k.start) + L"\"\"";
+    STARTUPINFOW si{};
+    si.cb = sizeof si;
+    PROCESS_INFORMATION pi{};
+    if (!CreateProcessW(nullptr, &cmd[0], nullptr, nullptr, FALSE, CREATE_NEW_CONSOLE, nullptr, wide(dir).c_str(), &si, &pi)) {
+        *err = "error " + std::to_string(GetLastError());
+        return false;
+    }
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+    return true;
+}
+
+void run_kit(const Mod& m, const File& f, const Kit& k) {
+    const std::string kits = game_folder() + "\\kits", dir = kits + "\\" + k.folder, stage_dir = kits + "\\.triforce-download";
+    std::string err;
+    // (this file installed already, and its start file there: started again, nothing downloaded)
+    bool have = false;
+    {
+        J j;
+        const std::string text = read_file(dir + "\\triforce_kit.json");
+        have = !text.empty() && parse(text, j) && (int)j["gamebanana_id"].num() == k.id && (int64_t)j["file_date"].num() >= f.added &&
+               GetFileAttributesW(wide(dir + "\\" + k.start).c_str()) != INVALID_FILE_ATTRIBUTES;
+    }
+    if (!have) {
+        logf("mods: %s is a kit: into %s", m.name.c_str(), dir.c_str());
+        if (!download_unpack(m, f, stage_dir)) return;
+        const std::string top = find_kit_top(stage_dir + "\\unpacked", k.start);
+        if (top.empty()) {
+            remove_tree(stage_dir);
+            set_state(Job::Failed, std::string("This download has no \"") + k.start + "\" in it: GameBanana's file may have changed. Nothing was installed.");
+            return;
+        }
+        if (!move_over(top, dir, &err)) {
+            remove_tree(stage_dir);
+            set_state(Job::Failed, "It could not be put into kits\\" + std::string(k.folder) + ": " + err + ". If " + m.name +
+                                       " is running, close it and try again.");
+            return;
+        }
+        remove_tree(stage_dir);
+        write_file(dir + "\\triforce_kit.json",
+                   "{\n  \"name\": \"" + json_text(m.name) + "\",\n  \"author\": \"" + json_text(m.author) + "\",\n  \"page\": \"" + json_text(m.page) +
+                       "\",\n  \"gamebanana_id\": " + std::to_string(m.id) + ",\n  \"gamebanana_model\": \"" + (m.wip ? "Wip" : "Mod") +
+                       "\",\n  \"file\": \"" + json_text(f.name) + "\",\n  \"file_date\": " + std::to_string((long long)f.added) +
+                       ",\n  \"installed_by\": \"Triforce's Mods menu\"\n}\n");
+        std::lock_guard<std::mutex> g(mu);
+        mark_installed();
+    }
+    if (!start_kit(dir, k, &err)) {
+        set_state(Job::Failed, std::string(k.start) + " could not be started (" + err + "). It is in kits\\" + k.folder +
+                                   " beside the game: start it from there.");
         return;
     }
+    logf("mods: kit %s %s, started: %s\\%s", m.name.c_str(), have ? "installed already" : "installed", dir.c_str(), k.start);
+    {
+        std::lock_guard<std::mutex> g(mu);
+        inst.kit = true;
+    }
+    set_state(Job::Done, std::string(have ? "Started" : "Installed into kits\\" + std::string(k.folder) + " and started") +
+                             " in a window of its own. Follow its steps there.");
+}
+
+void run_install(Mod m, File f) {
+    if (const Kit* k = kit_for(m.wip, m.id)) { run_kit(m, f, *k); return; }   // ((Triforce) 11-18) a program of its own: into kits, not mods
+    const std::string game = game_folder(), root = game + "\\mods", stage_dir = root + "\\.triforce-download";
+    if (!download_unpack(m, f, stage_dir)) return;
+    std::string err;
+    const std::string unpacked = stage_dir + "\\unpacked";
     std::vector<std::string> roots, bare;
     find_roots(unpacked, 0, roots, bare);
     if (roots.empty() && !bare.empty()) {   // (packed without a romfs folder: one made around the game's folders)
@@ -866,6 +1064,7 @@ void run_install(Mod m, File f) {
         int64_t date = f.added;
         const std::string info = "{\n  \"name\": \"" + json_text(roots.size() > 1 ? label : m.name) + "\",\n  \"author\": \"" + json_text(m.author) +
                                  "\",\n  \"page\": \"" + json_text(m.page) + "\",\n  \"gamebanana_id\": " + std::to_string(m.id) +
+                                 (m.wip ? ",\n  \"gamebanana_model\": \"Wip\"" : "") +   // ((Triforce) 11-18: a WiP's id is its own)
                                  ",\n  \"file\": \"" + json_text(f.name) + "\",\n  \"file_date\": " + std::to_string((long long)date) +
                                  ",\n  \"installed_by\": \"Triforce's Mods menu\"\n}\n";
         write_file(target + "\\triforce_mod.json", info);
@@ -932,6 +1131,15 @@ std::vector<void*> open() {
         if (active == &found) textures = clear_list(found), found.gen++, found.query.clear(), found.feed = Feed::Idle, active = &browse;
         if (browse.feed == Feed::Loading) return textures;
         if (browse.feed == Feed::Ready && !browse.mods.empty()) { mark_installed(); return textures; }
+        // ((Triforce) 11-18) stopped on a failed page with cards listed: on from that page, the cards kept
+        if (browse.feed == Feed::Failed && !browse.mods.empty() && !browse.queued) {
+            browse.feed = Feed::Ready, browse.error.clear(), browse.retries = 0, browse.queued = true;
+            const unsigned gen = browse.gen;
+            const int page = browse.pages_loaded + 1;
+            work().push([gen, page] { fetch_page(&browse, gen, page); });
+            mark_installed();
+            return textures;
+        }
         browse.feed = Feed::Loading;
         // ((Triforce) the list emptied after a failure: its pictures' textures handed back, not left behind)
         for (void* t : clear_list(browse)) textures.push_back(t);
@@ -950,8 +1158,9 @@ void load_more() {
     {
         std::lock_guard<std::mutex> g(mu);
         fd = active;
-        if (fd->feed != Feed::Ready || fd->complete) return;
-        fd->feed = Feed::Loading;
+        // ((Triforce) 11-18) the pages come by themselves (fetch_page): this one only for a list that stopped on a failed page
+        if (fd->complete || fd->queued || fd->feed == Feed::Loading || fd->mods.empty()) return;
+        fd->feed = Feed::Ready, fd->error.clear(), fd->retries = 0, fd->queued = true;
         page = fd->pages_loaded + 1, gen = fd->gen;
     }
     work().push([fd, gen, page] { fetch_page(fd, gen, page); });
@@ -1006,14 +1215,15 @@ bool search_by_name() {
 void want_details(int i) {
 #ifdef _WIN32
     int id;
+    bool wip;
     {
         std::lock_guard<std::mutex> g(mu);
         std::vector<Mod>& l = active->mods;
         if (i < 0 || i >= (int)l.size() || l[i].details_state) return;
-        id = l[i].id;
-        each_with_id(id, [](Mod& m) { if (!m.details_state) m.details_state = 1; });
+        id = l[i].id, wip = l[i].wip;
+        each_with_id(id, wip, [](Mod& m) { if (!m.details_state) m.details_state = 1; });
     }
-    work().push([id] { fetch_details(id); }, true);   // (the one looked at: before more pages)
+    work().push([id, wip] { fetch_details(id, wip); }, true);   // (the one looked at: before more pages)
 #else
     (void)i;
 #endif
@@ -1022,6 +1232,7 @@ void want_details(int i) {
 void want_thumb(int i) {
 #ifdef _WIN32
     int id;
+    bool wip;
     std::string url, kept;
     {
         std::lock_guard<std::mutex> g(mu);
@@ -1029,9 +1240,9 @@ void want_thumb(int i) {
         if (i < 0 || i >= (int)l.size() || l[i].thumb_state) return;
         if (l[i].thumb_url.empty()) { l[i].thumb_state = 3; return; }
         l[i].thumb_state = 1;
-        id = l[i].id, url = l[i].thumb_url, kept = l[i].thumb_file;
+        id = l[i].id, wip = l[i].wip, url = l[i].thumb_url, kept = l[i].thumb_file;
     }
-    pictures().push([id, url, kept] { fetch_thumb(id, url, kept); });
+    pictures().push([id, wip, url, kept] { fetch_thumb(id, wip, url, kept); });
 #else
     (void)i;
 #endif

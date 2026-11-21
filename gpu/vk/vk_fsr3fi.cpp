@@ -675,8 +675,11 @@ bool capable() {
 }
 
 uint32_t frames_wanted() {
-    // (the row first: a device is not asked anything, and nothing is logged, while frame generation is not at 2x)
-    return asked() && !dlssg::active() && capable() ? 1u : 0u;   // (Triforce: not beside NVIDIA DLSS frame generation)
+    // (the row first: a device is not asked anything, and nothing is logged, while frame generation is not at 2x.
+    // (Triforce, FG-6) It was not read: with RX_VK_FSR_FG=1 and the row Off, FSR 3.1's inputs were made every frame and its
+    // upscale moved after the bloom for frames nothing was made for. Still RX_VK_FSR_FG=1 alone: it has no picture without
+    // the HUD, and the row's AMD FSR frame generation is AMD's own library, which has)
+    return opts.framegen == 2 && asked() && !dlssg::active() && capable() ? 1u : 0u;   // (Triforce: not beside NVIDIA DLSS frame generation)
 }
 
 bool prepare(uint32_t width, uint32_t height, uint32_t render_width, uint32_t render_height,

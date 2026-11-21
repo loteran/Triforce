@@ -59,6 +59,13 @@ def main():
         raise SystemExit("behind another window the pads are never read")
     if "key(" in behind or "mouse" in behind:
         raise SystemExit("behind another window the keyboard or mouse would reach the game")
+    # ((Triforce, 11-18) the Insert menu reads the pads in the background as the game does, and while it is open there the
+    # pads are its own, not the game's too)
+    if "if (!rx_option(1, 0)) {" not in behind or "*buttons |= pb;" not in behind:
+        raise SystemExit("behind another window the pads reach the game while the Insert menu is open")
+    if "const bool pads_ok = mine || (pad_bg_env ? atoi(pad_bg_env) != 0 : opts.pad_background != 0);" not in menu or \
+            "const uint32_t raw = pads_ok && host && host->pad_raw ? host->pad_raw() : 0" not in menu:
+        raise SystemExit("the Insert menu takes the pads only from the window in front, while the game takes them behind it")
     option = replay[replay.index("t.option = "):]
     option = option[:option.index("};") + 2]
     if "id == 4 ? opts.pad_background" not in option:

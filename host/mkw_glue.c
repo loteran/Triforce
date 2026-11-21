@@ -103,6 +103,10 @@ static LONG WINAPI report_crash(EXCEPTION_POINTERS *info) {
        report, or the same crash handed here twice (report_fatal below, then the unhandled filter), is not reported again */
     int hos_ending_enter(void);
     if (!hos_ending_enter()) return EXCEPTION_CONTINUE_SEARCH;
+    /* (Triforce) first of all, what the other threads are doing now: taken on a helper thread while this one writes its
+       report, written at the report's end (host/crash_threads.h) */
+    void hos_crash_threads_begin(void), hos_crash_threads_end(void);
+    hos_crash_threads_begin();
     EXCEPTION_RECORD *rec = info->ExceptionRecord;
     const uint64_t rip = info->ContextRecord->Rip;
     HMODULE mod = NULL;
@@ -185,6 +189,8 @@ static LONG WINAPI report_crash(EXCEPTION_POINTERS *info) {
                         (unsigned long long)peek_guest(base + row + 16), (unsigned long long)peek_guest(base + row + 24));
         }
     }
+    hos_log_flush();   /* (the report so far is written before the wait for the other threads' stacks) */
+    hos_crash_threads_end();
     hos_log_flush();
     void hos_hostcall_stats(void);
     hos_hostcall_stats();   /* (HOS_HOSTCALL_STATS=1: the host calls made, and the last 256 of them) */
@@ -206,6 +212,16 @@ void hos_backtrace(void) {
     }
     fprintf(stderr, "[hos] %s\n", bt);
     fflush(stderr);
+}
+
+/* (Triforce) HOS_CRASH_TEST_S=<seconds>, a lab switch: a host thread reads address 8 that long after the start, so that a
+   crash report (and its other threads' lines, host/crash_threads.h) can be looked at from a run in the game */
+static DWORD WINAPI crash_test_after(void *p) {
+    Sleep((DWORD)(uintptr_t)p * 1000);
+    hos_log("crash test: a read of address 8 now (HOS_CRASH_TEST_S)");
+    hos_log_flush();
+    volatile int *bad = (volatile int *)(uintptr_t)8;
+    return (DWORD)*bad;
 }
 
 /* HOS_STATS_AFTER=<seconds> (with HOS_HOSTCALL_STATS=1): the host call counts and the last calls at that time, for
@@ -235,6 +251,8 @@ void hos_commit_init(void) {
     SetUnhandledExceptionFilter(report_crash);
     const char *after = getenv("HOS_STATS_AFTER");
     if (after && atoi(after) > 0) CreateThread(NULL, 0, stats_after, (void *)(uintptr_t)atoi(after), 0, NULL);
+    const char *crash = getenv("HOS_CRASH_TEST_S");
+    if (crash && atoi(crash) > 0) CreateThread(NULL, 0, crash_test_after, (void *)(uintptr_t)atoi(crash), 0, NULL);
 }
 
 /* ---- stand-ins --------------------------------------------------------------------------------------------- */

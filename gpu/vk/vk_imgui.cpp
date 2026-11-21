@@ -120,20 +120,38 @@ void load_fonts() {
 std::atomic<int> glyphs_state{0};   // (0 not asked, 1 being read, 2 read, 3 made a font or found none)
 std::vector<unsigned char> glyph_bytes;   // (read_glyphs's, until load_glyphs takes them: glyphs_state orders the two)
 const char* glyph_from = "the game's own";
+// ((Triforce, 11-19) while the game has the keys' face: the controller face whose icons the font read has (host->
+// prompt_pad_face when it was read), -1 none. Another one built since: read again (glyphs_follow))
+std::atomic<int> glyph_pad{-1};
+// ((Triforce, 11-19) each controller face's font once made (the presenting thread's): a face shown again is that font again,
+// not another copy in the atlas)
+ImFont* pad_glyphs[HOS_PROMPT_N] = {};
+int pad_face_now() {
+    return host && host->prompt_pad_face && host->prompt_face && host->prompt_face() == HOS_PROMPT_KEYBOARD
+               ? host->prompt_pad_face()
+               : -1;
+}
 void read_glyphs() {
     std::vector<unsigned char> font;
     const char* from = "the game's own";
     // (host/prompts.c: prompts/External.bfotf.zs, no dictionary. (Triforce) Not the keyboard and mouse face's: these icons
-    // show while a controller is the menu's last input, and that face's are keys; the menu draws its own caps for the keys)
-    if (host && host->prompt_face && host->prompt_face() >= 0 && host->prompt_face() != HOS_PROMPT_KEYBOARD) {
+    // show while a controller is the menu's last input, and that face's are keys; the menu draws its own caps for the keys.
+    // (11-19) With the keys' face, those of the controller used last: prompts/External.pad.<n>.bfotf.zs, n its face, once
+    // the host built it)
+    const int pad = pad_face_now();
+    const bool face = host && host->prompt_face && host->prompt_face() >= 0 && host->prompt_face() != HOS_PROMPT_KEYBOARD;
+    if (face || pad >= 0) {
         char exe[MAX_PATH];
         const DWORD n = game_module_path(exe, MAX_PATH);
         std::string dir(exe, n);
         dir = dir.substr(0, dir.find_last_of("\\/") + 1);
         std::vector<unsigned char> packed, raw;
-        if (game_font::read_file(dir + "prompts/External.bfotf.zs", packed) && game_font::unzstd(packed, nullptr, raw))
-            font = game_font::bfotf_font(raw), from = "this controller's (prompts/External.bfotf.zs)";
+        const std::string file = face ? "prompts/External.bfotf.zs" : "prompts/External.pad." + std::to_string(pad) + ".bfotf.zs";
+        if (game_font::read_file(dir + file, packed) && game_font::unzstd(packed, nullptr, raw))
+            font = game_font::bfotf_font(raw), from = face ? "this controller's (prompts/External.bfotf.zs)"
+                                                           : "the controller used last's (prompts/External.pad.<n>.bfotf.zs)";
     }
+    glyph_pad.store(pad, std::memory_order_relaxed);
     if (font.empty()) {
         bool open = false;
         game_font::Reader& reader = font_reader(&open);
@@ -144,13 +162,32 @@ void read_glyphs() {
 }
 void load_glyphs() {
     glyphs_state.store(3, std::memory_order_relaxed);
+    // ((Triforce) a font read before, for another controller (glyphs_follow), stays in the atlas: frames in flight may still
+    // draw its glyphs, and one is read again only when the controller used last is of another face)
     if (glyph_bytes.empty()) {
         logf("vk: ui: no button icons (the game's files have no External font): the prompts name the buttons");
         return;
     }
     fonts_.glyph = add_font(glyph_bytes, "External");
+    const int pad = glyph_pad.load(std::memory_order_relaxed);
+    if (pad >= 0 && pad < HOS_PROMPT_N) pad_glyphs[pad] = fonts_.glyph;
     std::vector<unsigned char>().swap(glyph_bytes);
     logf("vk: ui: the button icons: %s", glyph_from);
+}
+
+// ((Triforce, 11-19) the icons read again, on read_glyphs's thread, once the host has built another controller's than the font
+// read has (glyph_pad): only after they were read once (want_glyphs), and only while the game has the keys' face. A face
+// made into a font before is that font again (pad_glyphs), read once a run)
+void glyphs_follow() {
+    if (glyphs_state.load(std::memory_order_acquire) != 3) return;
+    const int pad = pad_face_now();
+    if (pad < 0 || pad >= HOS_PROMPT_N || pad == glyph_pad.load(std::memory_order_relaxed)) return;
+    if (pad_glyphs[pad]) {
+        fonts_.glyph = pad_glyphs[pad], glyph_pad.store(pad, std::memory_order_relaxed);
+        return;
+    }
+    int done = 3;
+    if (glyphs_state.compare_exchange_strong(done, 1)) std::thread(read_glyphs).detach();
 }
 
 // ---- (Triforce) the game's menu textures (vk_game_tex.h): read and decoded on a thread of its own, made ImGui textures at
@@ -166,11 +203,19 @@ void art_thread() {
     game_font::Reader reader;   // (its own: the fonts' is the presenting thread's)
     std::vector<unsigned char> bytes;
     const int64_t t0 = prof_now();
-    const bool ok = reader.open(romfs_dir()) && reader.read_packed("UI/Layout2Archive/Common.Product.100.Nin_Ounce_NVN2.bntx.zs", bytes) &&
+    const bool open = reader.open(romfs_dir());
+    const bool ok = open && reader.read_packed("UI/Layout2Archive/Common.Product.100.Nin_Ounce_NVN2.bntx.zs", bytes) &&
                     game_tex::make_skin(std::move(bytes), skin_);
+    if (!ok) skin_.images.clear();   // (none of a skin made in part)
     if (ok) logf("vk: ui: the game's own menu textures, from its files (%d, %.0f ms)", (int)skin_.images.size(), (prof_now() - t0) / 1e6);
     else logf("vk: ui: the game's files have no menu textures: the menu draws plain plates");
-    art_state.store(ok ? 2 : 4, std::memory_order_release);
+    // ((Triforce, 11-19) and the title list's own (vk_game_tex.h make_title_skin), for the Mods entry under it: one missing
+    // leaves the menu's skin as it is, and the entry its plain band)
+    std::vector<unsigned char>().swap(bytes);
+    const bool title = open && reader.read_packed("UI/Layout2Archive/Title.Product.100.Nin_Ounce_NVN2.bntx.zs", bytes) &&
+                       game_tex::make_title_skin(std::move(bytes), skin_);
+    if (!title) logf("vk: ui: the game's files have no title list textures: the Mods entry draws its plain band");
+    art_state.store(ok || title ? 2 : 4, std::memory_order_release);
 }
 void art_start() {
     int none = 0;
@@ -502,6 +547,7 @@ bool begin(uint32_t w, uint32_t h) {
     last = now;
     if (art_state.load(std::memory_order_acquire) == 2) art_make();
     if (glyphs_state.load(std::memory_order_acquire) == 2) load_glyphs();
+    glyphs_follow();
     ImGui_ImplVulkan_NewFrame();
     ImGui::NewFrame();
     bake_some();

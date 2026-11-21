@@ -78,8 +78,11 @@ def function(source, start):
 
 def sources():
     menu = (ROOT / "gpu" / "vk" / "vk_menu.cpp").read_text(encoding="utf-8")
-    for row in ('"GPU device", &opts.gpu_device', '"Output resolution", &opts.output_res', '"Handheld profile", &opts.handheld',
-                '"Ultrawide", &opts.ultrawide', '"Robust buffers", &opts.robust'):
+    # ((Triforce, options_version 7) the handheld profile is an Output resolution; the merged rows take a restart for what of
+    # them is read at the start: restart_value_of)
+    for row in ('"GPU device", &opts.gpu_device', '"Output resolution", &opts.output_res', '"Aspect ratio", &opts.ultrawide',
+                '"Robust buffers", &opts.robust', '"HDR", &merged.hdr', '"Frame generation", &merged.framegen',
+                '"Frame pacing", &merged.pacing'):
         at = menu.find(row)
         if at < 0:
             raise SystemExit("vk_menu.cpp: a row that takes a restart is missing: " + row)

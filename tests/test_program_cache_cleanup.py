@@ -46,6 +46,12 @@ class CacheModuleCleanupTests(unittest.TestCase):
         crc = ('uint32_t spirv_crc32(',) if 'uint32_t spirv_crc32(' in source else ()
         functions = '\n'.join(block(source, marker) for marker in crc + (
             'VkShaderModule make_module(', 'uint64_t answers_hash(', 'bool answers_fit(', 'void idx_put('))
+        # ((Triforce, 11-18) make_module asks the water/shadow PCF rewrite (EstebanGGM's spirv_water_simplify), which reads
+        # the device: stubbed as off, the module as translated, as the fixture's device would have it)
+        if 'bool spirv_water_simplify(' in source:
+            functions = ('static int water_quality_mode() { return 0; }\n'
+                         'static bool spirv_water_simplify(const std::vector<uint32_t>&, int, std::vector<uint32_t>&) '
+                         '{ return false; }\n') + functions
         serialization = source[source.index('void put_bytes('):source.index('void program_cache_save(')]
         functions += '\n' + serialization + block(source, 'void program_cache_save(')
         functions += '\n' + block(source, 'void program_cache_read(')

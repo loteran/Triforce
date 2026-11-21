@@ -162,6 +162,8 @@ __attribute__((visibility("default"))) void hos_posix_post_message(uint32_t msg,
     if (msg == WM_APP + 9) __atomic_store_n(&restart_asked, 1, __ATOMIC_RELEASE);
     if (msg == WM_CLOSE) __atomic_store_n(&close_asked, 1, __ATOMIC_RELEASE);
 }
+/* ((Triforce, 11-19) benchmark mode's end, host/hos_bench.c: the window closes as at the Insert menu's Quit, on its own thread) */
+void hos_window_close(void) { __atomic_store_n(&close_asked, 1, __ATOMIC_RELEASE); }
 /* the menu opened: the mouse let go (its capture kept for later); closed: the capture back, if the window still has the focus */
 static int captured_before_menu;
 static void menu_mouse(int open) {

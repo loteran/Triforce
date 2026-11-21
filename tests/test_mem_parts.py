@@ -209,6 +209,14 @@ int main() {
     CHECK(keep_all_pipelines(32 * GB, 20 * GB, 2 * GB) && !keep_all_pipelines(32 * GB, 13 * GB, 5 * GB));
     CHECK(!keep_all_pipelines(16 * GB, 30 * GB, 0) && keep_all_pipelines(64 * GB, 40 * GB, 1 * GB));
     CHECK(!keep_all_pipelines(32 * GB, 18455 * MB, 1 * GB));   // (v0.4.0-test9's start)
+    // (11-18: the pipeline cache's read is not the game's room, but on AMD's driver. Panda: 18165 MB available, 7048 held, the
+    // read 4747; Swampy: 19121, 7696, 4874. Both were kept and ran short; without the read neither is)
+    CHECK(own_for_keep(7048 * MB, 4747 * MB, false) == 2301 * MB && own_for_keep(7048 * MB, 4747 * MB, true) == 7048 * MB);
+    CHECK(own_for_keep(1 * GB, 2 * GB, false) == 0 && own_for_keep(3 * GB, 0, false) == 3 * GB);
+    CHECK(keep_all_pipelines(32 * GB, 18165 * MB, 7048 * MB) && !keep_all_pipelines(32 * GB, 18165 * MB, own_for_keep(7048 * MB, 4747 * MB, false)));
+    CHECK(keep_all_pipelines(32 * GB, 19121 * MB, 7696 * MB) && !keep_all_pipelines(32 * GB, 19121 * MB, own_for_keep(7696 * MB, 4874 * MB, false)));
+    CHECK(keep_all_pipelines(32 * GB, 19121 * MB, own_for_keep(7696 * MB, 4874 * MB, true)));   // (AMD: as before)
+    CHECK(keep_all_pipelines(64 * GB, 40 * GB, own_for_keep(6 * GB, 5 * GB, false)));   // (a 64 GB PC keeps all still)
     // (the RAM's rules)
     CHECK(short_now(1535 * MB) && !short_now(1536 * MB) && short_now(0));
     CHECK(low_now(3 * GB - 1, 16 * GB) && !low_now(3 * GB, 16 * GB) && !low_now(3 * GB, 30 * GB));
@@ -254,8 +262,13 @@ def check_source():
     if "if (guest.empty() || lines++ % 8 == 0) {" not in parts or "glo, ghi, &c->other_regions" not in parts:
         raise SystemExit("the guest window is walked at every line, or the rest's walk does not step over it")
     keep = between(draw, "bool precompile_keeps_all() {", "\n}\n")
-    if "mem_parts::keep_all_pipelines(ms.ullTotalPhys, ms.ullAvailPhys, ws)" not in keep:
+    if "mem_parts::keep_all_pipelines(ms.ullTotalPhys, ms.ullAvailPhys, own)" not in keep:
         raise SystemExit("the precompile's keep goes by the PC's total RAM, not the RAM the game can have")
+    if "mem_parts::own_for_keep(ws, cache_read, amd)" not in keep or "pcache_read_ws.load()" not in keep:
+        raise SystemExit("the precompile's keep counts the pipeline cache's read as room for the pipelines")
+    init = between(draw, "void pcache_init() {", "\n}\n")
+    if "pcache_read_ws = ws1 > ws0 ? ws1 - ws0 : 0;" not in init:
+        raise SystemExit("pcache_init does not record what the cache's read added to the working set")
     save = between(draw, "void pipeline_cache_save(bool force) {", "\n}\n")
     if "if (!force && !memory_ram_fits(n)) {" not in save or save.index("memory_ram_fits(n)") > save.index("std::vector<uint8_t> data(n);"):
         raise SystemExit("the save in play fetches the cache before it asks whether a copy fits in the RAM")

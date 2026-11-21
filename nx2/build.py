@@ -352,6 +352,101 @@ def translation_stamp(vk, translator):
     return stamp.hexdigest()[:16]
 
 
+TRANSLATION_RECORD = "translation_stamp.json"   # (in the build's folder: translation_stamp_keep)
+
+
+def translation_files(vk, translator):
+    """(Triforce) Each file of the translation stamp (translation_stamp's, in its order) to a hash of its text as the stamp takes
+    it (translation_text), for the build's record of which files moved the stamp (translation_stamp_note). Its own copy of what an
+    unpaired mark prints is left out: translation_stamp has said it"""
+    import contextlib
+    import io
+    files = {}
+    for f in sorted(translator) + [os.path.join(vk, n) for n in ("vk_shader.cpp", "vk_bank.cpp", "vk_state.h")]:
+        rel = os.path.relpath(f, vk).replace("\\", "/")
+        with open(f, "rb") as src, contextlib.redirect_stdout(io.StringIO()):
+            text = translation_text(rel, src.read())
+        files[rel] = hashlib.sha1(text, usedforsecurity=False).hexdigest()[:16]
+    return files
+
+
+# (Triforce) The translation stamp of the last release, the one players' shader caches are for: its stamp and each stamped file's
+# hash, as translation_files gives them (made from that release's source). Changed only when a release goes out, to its stamp
+RELEASED_STAMP = os.path.join(os.path.dirname(os.path.abspath(__file__)), "released_translation_stamp.json")
+
+
+def translation_record_read(record):
+    """(Triforce) A record of translation_stamp_keep's (or RELEASED_STAMP): (its stamp, its files, its release's name or None),
+    or None when there is none or it is not one"""
+    try:
+        with open(record, encoding="utf-8") as f:
+            old = json.load(f)
+        old_stamp, old_files = old["stamp"], old["files"]
+        if not isinstance(old_stamp, str) or not isinstance(old_files, dict):
+            raise ValueError(record)
+        release = old.get("release")
+        return old_stamp, old_files, release if isinstance(release, str) else None
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return None
+
+
+def translation_changed(old_files, files):
+    """(Triforce) The stamped files whose text differs between two records (new and gone ones too), and the same as the log names
+    them: with (new)/(gone), 12 at most and then a count"""
+    changed = sorted(n for n in set(old_files) | set(files) if old_files.get(n) != files.get(n))
+    named = ["%s%s" % (n, " (new)" if n not in old_files else " (gone)" if n not in files else "") for n in changed]
+    if not named:
+        named = ["no file's text (the stamp's own rule changed)"]
+    elif len(named) > 12:
+        named = named[:12] + ["%d more" % (len(named) - 12)]
+    return changed, ", ".join(named)
+
+
+def translation_stamp_note(record, stamp, files, released=RELEASED_STAMP):
+    """(Triforce) The build log's lines on the translation stamp. First against the last release's (released: RELEASED_STAMP),
+    which is what players' caches are for: a stamp other than that release's starts their program and pipeline caches again at
+    the update (gpu/vk/program_carry.h), hours of shader preparation on some cards, so the build names the files that moved it.
+    This is the build's part of the program cache's stamp only: the runtime adds its own (disk_stamp: RX_VK_* settings, the
+    robust buffers), and RX_VK_PROGRAM_CARRY=0 takes the whole translator. Then, as a note, against the previous build in this
+    folder (record: its translation_stamp.json, written by translation_stamp_keep once its objects were compiled). Returns the
+    files changed against the release (None without its record) and against the previous build (None without one)"""
+    was = translation_record_read(released)
+    against_release = None
+    if was is None:
+        print("build: translation stamp %s (no record of the last release's to compare with: %s)" % (stamp, released), flush=True)
+    else:
+        rel_stamp, rel_files, release = was
+        release = release or "the last release"
+        against_release, named = translation_changed(rel_files, files)
+        if rel_stamp == stamp:
+            print("build: translation stamp %s, as %s's: the build's part of the shader caches' stamp is kept (the runtime adds "
+                  "its own settings to it: disk_stamp)" % (stamp, release), flush=True)
+        else:
+            print("build: translation stamp %s, NOT %s's (%s): at this update a player's program and pipeline caches from %s "
+                  "start again (programs translated, pipelines compiled anew: hours on some cards). Changed against it by: %s"
+                  % (stamp, release, rel_stamp, release, named), flush=True)
+    old = translation_record_read(record)
+    if old is None:
+        print("build: (no record of the previous build's translation stamp in this folder)", flush=True)
+        return against_release, None
+    old_stamp, old_files, _ = old
+    changed, named = translation_changed(old_files, files)
+    if old_stamp == stamp:
+        print("build: (the translation stamp is the previous build's in this folder)", flush=True)
+    else:
+        print("build: (the previous build's translation stamp in this folder was %s; changed since by: %s)" % (old_stamp, named),
+              flush=True)
+    return against_release, changed
+
+
+def translation_stamp_keep(record, stamp, files):
+    """(Triforce) This build's record for the next one's translation_stamp_note: its stamp and each stamped file's hash"""
+    tmp = record + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump({"stamp": stamp, "files": files}, f, indent=0, sort_keys=True)
+    os.replace(tmp, record)
+
+
 def cpm_dirs():
     """CPM packages: RX_CPM, packaged tools/cpm, then legacy project caches.
     The packages provide Vulkan and SPIR-V headers, VMA and FFmpeg."""
@@ -1112,7 +1207,8 @@ def main():
                 stamp.update(os.path.relpath(f, vk).replace("\\", "/").encode() + src.read().replace(bytes((13, 10)), bytes((10,))))
         shader_stamp = "-DHOOKSHOT_SHADER_STAMP=0x%sull" % stamp.hexdigest()[:16]
         # ((Triforce) and what of those translates: the program cache is carried over an update by it, translation_stamp)
-        translation_def = "-DHOOKSHOT_TRANSLATION_STAMP=0x%sull" % translation_stamp(vk, translator)
+        translation_now = translation_stamp(vk, translator)
+        translation_def = "-DHOOKSHOT_TRANSLATION_STAMP=0x%sull" % translation_now
         vflags = target() + CPU + (["-fPIC", "-I" + POSIX, "-D_GNU_SOURCE"] if LINUX else []) + [   # (hookshot: the replay is the frame's limit now)
             # (what the code takes for granted, which newer C++ libraries bring in by themselves and older ones do not: issue 48)
             "-include", "algorithm", "-include", "cstdio", "-include", "cstdlib", "-include", "cstring", "-include", "functional",
@@ -1225,6 +1321,10 @@ def main():
             for f in ("win32_posix.c",):
                 vk_jobs.append((cc, os.path.join(POSIX, f), os.path.join(obj_dir, "vk_posix_" + f[:-2] + ".o"), cflags, pdeps))
         jobs += vk_jobs
+    if build_vk:   # ((Triforce) which files of the translation stamp changed it against the last release's and the previous
+        # build's, said in the log; the record is kept below, once the objects are compiled)
+        translation_record = (os.path.join(out, TRANSLATION_RECORD), translation_now, translation_files(vk, translator))
+        translation_stamp_note(*translation_record)
     vk_only = bool(os.environ.get("RX_VK_ONLY"))   # (the renderer alone, the game's objects as they are)
     if vk_only:
         jobs = list(vk_jobs)
@@ -1309,6 +1409,8 @@ def main():
     print("compiled in %.0fs, %d failed" % (time.time() - t0, still), flush=True)
     if still:
         return 1
+    if build_vk:   # ((Triforce) the translation stamp this build compiled, for the next build's line: translation_stamp_note)
+        translation_stamp_keep(*translation_record)
     if EARLY:   # (nothing to link yet: the game's own objects come with the build after the lift)
         return 0
     vk_objs = {j[2] for j in vk_jobs}

@@ -97,6 +97,14 @@ int asked() {
     return v;
 }
 
+bool built() {
+#ifdef HOOKSHOT_DLSSG
+    return true;
+#else
+    return false;
+#endif
+}
+
 #ifndef HOOKSHOT_DLSSG
 
 PFN_vkGetInstanceProcAddr early() {
@@ -379,7 +387,20 @@ void device_ready(VkPhysicalDevice physical, VkDevice) {
         logf("vk: dlssg: frame generation does not run here (the DLSS-G plugin loaded: %d, its options: %d, the latency marker: %d; "
              "Streamline's support check: %s (%d)). It needs an RTX 40 or 50 card and a current driver", (int)feature,
              p_dlssg_options != nullptr, p_marker != nullptr, sl::getResultAsStr(why), (int)why);
-        state_line = "Not on this graphics card or driver: it needs an RTX 40 or 50 card.";
+        // ((Triforce, 11-20, ticket "DLSS frame gen not working no matter what troubleshooting i try": an RTX 5070 Ti on a
+        // current driver was told it needs an RTX 40 or 50 card. Streamline's answer was eErrorOSDisabledHWS: Windows'
+        // "Hardware-accelerated GPU scheduling" was off. The reasons a player can act on are said as they are)
+        if (why == sl::Result::eErrorOSDisabledHWS) {
+            logf("vk: dlssg: Windows' Hardware-accelerated GPU scheduling is off: DLSS frame generation needs it (Windows "
+                 "Settings > System > Display > Graphics > Advanced graphics settings, then restart the PC)");
+            state_line = "Off: turn on Hardware-accelerated GPU scheduling in Windows' graphics settings, then restart the PC.";
+        } else if (why == sl::Result::eErrorDriverOutOfDate) {
+            state_line = "Off: the NVIDIA driver is too old for it. Update the driver.";
+        } else if (why == sl::Result::eErrorOSOutOfDate) {
+            state_line = "Off: this version of Windows is too old for it.";
+        } else {
+            state_line = "Not on this graphics card or driver: it needs an RTX 40 or 50 card.";
+        }
         return;
     }
     sl::DLSSGState s{};
@@ -427,7 +448,7 @@ void pace_say(int reflex, uint32_t us, const char* why) {
 
 bool pace(int64_t period_ns) {
     if (!active()) return false;
-    // (the Reflex frame limit row off, the default: nothing is decided, asked of Streamline or logged, and the frame is the
+    // (the Reflex frame limit off, the default ((Triforce, options_version 7) no row: RX_VK_REFLEX_LIMIT=1): nothing is decided, asked of Streamline or logged, and the frame is the
     // game's own wait's as before the row; a limit Reflex held until now is taken back at the next present, frame)
     if (!opts.reflex_limit && !limit_want.load(std::memory_order_relaxed) && pace_said < 0) return false;
     const int64_t hosted = hosted_ns.load(std::memory_order_acquire), now = host->now_ns();   // (in this order: now is not before hosted)
@@ -476,7 +497,7 @@ bool pace(int64_t period_ns) {
     game_sleeps.store(held, std::memory_order_release);
     if (held) pace_say(1, want, nullptr);
     else if (!want)   // (a limit Streamline has yet to take is no change: it is handed over at the next present)
-        pace_say(0, 0, !opts.reflex_limit ? "the Reflex frame limit row is Off"
+        pace_say(0, 0, !opts.reflex_limit ? "the Reflex frame limit is off: RX_VK_REFLEX_LIMIT=1 turns it on"
                        : !p_reflex || !p_sleep ? "this Streamline has no Reflex sleep"
                        : refused ? "Streamline refused the limit"
                        : !sleeps ? "Reflex's sleep does not run on this card and driver"

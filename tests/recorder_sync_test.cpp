@@ -167,6 +167,7 @@ static void L(const VkImageSubresourceRange& r) { put(r.aspectMask), put(r.baseM
 static void L(const VkImageSubresourceLayers& r) { put(r.aspectMask), put(r.mipLevel), put(r.baseArrayLayer), put(r.layerCount); }
 static void L(const VkOffset3D& o) { put(o.x), put(o.y), put(o.z); }
 static void L(const VkExtent3D& e) { put(e.width), put(e.height), put(e.depth); }
+static void L(const VkExtent2D& e) { put(e.width), put(e.height); }
 static void L(const VkRect2D& r) { put(r.offset.x), put(r.offset.y), put(r.extent.width), put(r.extent.height); }
 static void L(const VkViewport& v) { put(v.x), put(v.y), put(v.width), put(v.height), put(v.minDepth), put(v.maxDepth); }
 static void L(const VkClearValue& v) { raw(&v, sizeof v); }   // (a union of 16 bytes, no padding)
@@ -398,6 +399,8 @@ F(vkCmdSetColorBlendEnableEXT, (VkCommandBuffer cb, uint32_t first, uint32_t n, 
 F(vkCmdSetColorBlendEquationEXT, (VkCommandBuffer cb, uint32_t first, uint32_t n, const VkColorBlendEquationEXT* v), handle(cb), put(first); A(v, n);)
 F(vkCmdSetColorWriteMaskEXT, (VkCommandBuffer cb, uint32_t first, uint32_t n, const VkColorComponentFlags* v), handle(cb), put(first);
   each(v, n, [](VkColorComponentFlags x) { put(x); });)
+F(vkCmdSetFragmentShadingRateKHR, (VkCommandBuffer cb, const VkExtent2D* e, const VkFragmentShadingRateCombinerOpKHR ops[2]), handle(cb);
+  opt(e, [](const VkExtent2D& v) { L(v); }); each(ops, 2, [](VkFragmentShadingRateCombinerOpKHR x) { put(x); });)
 F(vkCmdWriteBufferMarkerAMD, (VkCommandBuffer cb, VkPipelineStageFlagBits s, VkBuffer b, VkDeviceSize o, uint32_t m),
   handle(cb), put(s), handle(b), put(o), put(m);)
 F(vkCmdSetCheckpointNV, (VkCommandBuffer cb, const void* m), handle(cb), handle(m); fx(cb, 2, (uint64_t)(uintptr_t)m);)   // (an opaque value: the pointer is the datum)
@@ -606,6 +609,8 @@ struct DynState {   // (vk_draw.cpp's DynState: the arrays the dynamic state cal
     VkBool32 en[8];
     VkColorBlendEquationEXT eq[8];
     VkColorComponentFlags wm[8];
+    VkExtent2D rate;                            // ((Triforce) draw_rate's, foliage_shadow.h)
+    VkFragmentShadingRateCombinerOpKHR keep[2];
 };
 static void dynamic_state(VkCommandBuffer cmd, int d) {
     DynState s{};
@@ -645,6 +650,9 @@ static void dynamic_state(VkCommandBuffer cmd, int d) {
     vkCmdSetColorBlendEnableEXT(cmd, 0, 3, s.en);
     vkCmdSetColorBlendEquationEXT(cmd, 0, 3, s.eq);
     vkCmdSetColorWriteMaskEXT(cmd, 0, 3, s.wm);
+    s.rate = {1u + (uint32_t)(d & 1), 1u + (uint32_t)(d & 1)};
+    s.keep[0] = s.keep[1] = VK_FRAGMENT_SHADING_RATE_COMBINER_OP_KEEP_KHR;
+    vkCmdSetFragmentShadingRateKHR(cmd, &s.rate, s.keep);
     if (g_mutate) poison(&s);
 }
 

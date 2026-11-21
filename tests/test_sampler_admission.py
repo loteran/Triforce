@@ -31,7 +31,7 @@ def main():
     nvn = (a.source / "gpu/render/rx_nvn.h").read_text(encoding="utf-8")
     actual = "\n".join(block(source, marker) for marker in [
         "VkSamplerAddressMode wrap(", "uint32_t aniso_override() {", "VkCompareOp compare_op(",
-        "VkSampler sampler_make(int id, bool compare) {", "VkSampler sampler_for(int id, bool compare) {"])
+        "VkSampler sampler_make(int id, bool compare, bool scene) {", "VkSampler sampler_for(int id, bool compare, bool scene) {"])
     # Keep standard-container behavior, replacing only the allocator to target an individual cache.
     for old, new in [
         ("std::unordered_map<int, std::pair<uint32_t, nvn_samp_par>> seen", "FaultMap<int, std::pair<uint32_t, nvn_samp_par>, Seen> seen"),
@@ -49,17 +49,23 @@ def main():
         "void write_words(", "void words_append(", "int words_same_store(", "bool bind_descriptors("])
     fixture = fixture.replace("/* DESCRIPTORS */", descriptors)
     fixture = fixture.replace("/* PARAMS */", params).replace("/* ENUMS */", enums).replace("/* ACTUAL */", actual)
+    # ((Triforce, S8) sampler_make adds the upscaler's texture LOD bias by sharpen_rules.h's rule, in the scene's draws only:
+    # the real rule, the bias 0 here (no upscaler drawing) but in the scene cases, which set it)
+    fixture = fixture.replace("namespace fixture {", '#include "sharpen_rules.h"\nnamespace fixture {\n'
+                              "namespace sharpen_rules = ::mkwvk::sharpen_rules;\n"
+                              "std::atomic<float> upscale_lod_bias{0.0f};\n", 1)
     cases = ["healthy", "host-oom", "device-oom", "unknown", "error-output", "generation-retry", "thread-retry",
              "independent", "valid-after-failure", "owner-commit", "seen-commit", "mine-commit", "failure-commit",
              "registration", "shared-thread", "concurrent", "nearest", "linear", "compare", "compare-explicit",
-             "compare-pcf-off", "custom-border", "standard-border", "reduction", "compare-reduction", "anisotropy",
+             "compare-pcf-off", "custom-border", "standard-border", "reduction", "compare-reduction", "anisotropy", "anisotropy-clamped",
              "unknown-id", "force-linear", "wrap", "lod-clamp", "custom-reduction",
-             "descriptor-push", "descriptor-pool", "descriptor-compute", "descriptor-old", "descriptor-whole"]
+             "descriptor-push", "descriptor-pool", "descriptor-compute", "descriptor-old", "descriptor-whole",
+             "scene-bias", "scene-clamped", "scene-off"]
     with tempfile.TemporaryDirectory(prefix="sampler-admission-") as temp:
         cpp, exe = Path(temp) / "fixture.cpp", Path(temp) / "fixture.exe"
         cpp.write_text(fixture, encoding="utf-8")
         subprocess.run([a.cxx, "-std=c++20", "-O1", "-Wall", "-Wextra", "-Werror", "-Wno-missing-field-initializers",
-                        "-pthread", "-I" + str(a.headers),
+                        "-pthread", "-I" + str(a.headers), "-I" + str(a.source / "gpu/vk"),
                         *(["-fsanitize=address,undefined", "-fno-omit-frame-pointer", "-fno-pie", "-no-pie"] if a.sanitize else []),
                         str(cpp), "-o", str(exe)], check=True)
         for route in ["id", "make", "cache-off"]:

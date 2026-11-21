@@ -1,4 +1,6 @@
 # Packs Triforce-Tools.zip, the release asset Triforce Setup downloads: a "tools" folder with everything a build needs.
+# ((Triforce, 11-18) and the same in two parts, Triforce-Tools-code.zip and Triforce-Tools-base.zip, with tools/base.list:
+# an update fetches the code part alone and keeps the base it has. Publish all three)
 #   powershell -File setup\pack_tools.ps1 -Tag v1.0.0 [-Deps D:\src\release\triforce-deps] [-Out setup\out\release]
 # From this checkout: nx2, host, gpu, scripts, third_party (tracked files, as they are on disk), the speed profile in work\.
 # From -Deps (not in git, too big or binary): python\ (with lz4 numpy capstone unicorn zstandard), cpm\ (Vulkan headers, FFmpeg),
@@ -108,18 +110,51 @@ $e = ResEntry 14 1 $group.ToArray() 0x1030; $res.Write($e, 0, $e.Length)
 # 4. the release name, read by nx2/version.py and Triforce Setup
 Set-Content (Join-Path $tools 'version.txt') $Tag -Encoding ASCII
 
-# 5. zip (tools/... inside)
-$zip = Join-Path $Out 'Triforce-Tools.zip'
-if (Test-Path $zip) { Remove-Item $zip }
-Add-Type -AssemblyName System.IO.Compression, System.IO.Compression.FileSystem
-# (entries written one by one: Windows PowerShell's CreateFromDirectory names them with backslashes)
-$fs = [IO.File]::Open($zip, 'CreateNew')
-$archive = New-Object IO.Compression.ZipArchive $fs, ([IO.Compression.ZipArchiveMode]::Create)
-$base = (Resolve-Path $stage).Path.TrimEnd('\') + '\'
-foreach ($f in Get-ChildItem $tools -Recurse -File) {
-    $name = $f.FullName.Substring($base.Length).Replace('\', '/')
-    [void][IO.Compression.ZipFileExtensions]::CreateEntryFromFile($archive, $f.FullName, $name, [IO.Compression.CompressionLevel]::Optimal)
+# 4b. ((Triforce, 11-18) the base list: the folders that do not change from one release to the next (the compiler, Python, the
+# libraries; 95 % of the zip), each file with its size and SHA-256 (setup/Setup.cs Tools.ParseBaseList reads it). Triforce Setup
+# then updates tools that hold this base with the code part alone (Triforce-Tools-code.zip, 12 MB) and keeps the base it has;
+# Triforce-Tools-base.zip only for tools that do not. third_party and assets hold tracked files, so they stay in the code)
+$baseDirs = @('llvm-mingw', 'python', 'cpm', 'wgpu-native') | Where-Object { Test-Path (Join-Path $tools $_) }
+$sha = [Security.Cryptography.SHA256]::Create()
+$rows = New-Object Collections.Generic.List[string]
+$toolsRoot = (Resolve-Path $tools).Path.TrimEnd('\') + '\'
+foreach ($d in $baseDirs) {
+    foreach ($f in Get-ChildItem (Join-Path $tools $d) -Recurse -File) {
+        $rel = $f.FullName.Substring($toolsRoot.Length).Replace('\', '/')
+        $s = [IO.File]::OpenRead($f.FullName)
+        try { $h = -join ($sha.ComputeHash($s) | ForEach-Object { $_.ToString('x2') }) } finally { $s.Dispose() }
+        $rows.Add("file`t$($f.Length)`t$h`t$rel")
+    }
 }
-$archive.Dispose(); $fs.Dispose()
+$rows.Sort([StringComparer]::Ordinal)
+$body = (($baseDirs | ForEach-Object { "dir`t$_" }) + $rows) -join "`n"
+$body += "`n"
+$id = -join ($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($body)) | ForEach-Object { $_.ToString('x2') })
+[IO.File]::WriteAllText((Join-Path $tools 'base.list'), "triforce-tools-base`t1`nid`t$id`n" + $body, (New-Object Text.UTF8Encoding $false))
+"base: $($baseDirs -join ', '): $($rows.Count) files, id $($id.Substring(0, 12))"
+
+# 5. the zips (tools/... inside): the whole one (older Setups, a first install), the code part and the base part
+Add-Type -AssemblyName System.IO.Compression, System.IO.Compression.FileSystem
+$base = (Resolve-Path $stage).Path.TrimEnd('\') + '\'
+$all = Get-ChildItem $tools -Recurse -File
+function Test-InBase($f) {
+    $rel = $f.FullName.Substring($toolsRoot.Length)
+    foreach ($d in $baseDirs) { if ($rel.StartsWith($d + '\', [StringComparison]::OrdinalIgnoreCase)) { return $true } }
+    return $false
+}
+function Write-ToolsZip([string]$zip, $files) {
+    if (Test-Path $zip) { Remove-Item $zip }
+    # (entries written one by one: Windows PowerShell's CreateFromDirectory names them with backslashes)
+    $fs = [IO.File]::Open($zip, 'CreateNew')
+    $archive = New-Object IO.Compression.ZipArchive $fs, ([IO.Compression.ZipArchiveMode]::Create)
+    foreach ($f in $files) {
+        $name = $f.FullName.Substring($base.Length).Replace('\', '/')
+        [void][IO.Compression.ZipFileExtensions]::CreateEntryFromFile($archive, $f.FullName, $name, [IO.Compression.CompressionLevel]::Optimal)
+    }
+    $archive.Dispose(); $fs.Dispose()
+    "packed $zip ({0:N1} MB)" -f ((Get-Item $zip).Length / 1MB)
+}
+Write-ToolsZip (Join-Path $Out 'Triforce-Tools.zip') $all
+Write-ToolsZip (Join-Path $Out 'Triforce-Tools-code.zip') ($all | Where-Object { -not (Test-InBase $_) })
+Write-ToolsZip (Join-Path $Out 'Triforce-Tools-base.zip') ($all | Where-Object { Test-InBase $_ })
 Remove-Item -Recurse -Force $stage
-"packed $zip ({0:N0} MB)" -f ((Get-Item $zip).Length / 1MB)

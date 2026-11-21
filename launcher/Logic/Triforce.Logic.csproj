@@ -1,0 +1,37 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- The launcher's logic without a window: install, update, tools, game intake, the build, play, saves, mods, Steam,
+       uninstall. Ported from the old WPF Setup (setup/*.cs) and the Linux Tk builder (builder/linux/*.py). The App calls it;
+       nothing here draws. -->
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <RootNamespace>Triforce.Logic</RootNamespace>
+    <AssemblyName>Triforce.Logic</AssemblyName>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <!-- (the release tag this launcher is: the ONE place it is set. build/release: dotnet publish -p:TriforceVersion=v0.5.2.
+         Old Setups compare it with the release's tag_name by plain string inequality (research/02 2.3, 2.8 point 6): it must
+         be the tag exactly, "v" included, or every Setup downloads it again at every start. "dev" for a local build, which
+         never replaces itself) -->
+    <TriforceVersion Condition="'$(TriforceVersion)' == ''">dev</TriforceVersion>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="Triforce.LogicTests" />
+  </ItemGroup>
+
+  <!-- BuildInfo.Version as a const, written from TriforceVersion before each compile -->
+  <Target Name="TriforceVersionFile" BeforeTargets="CoreCompile">
+    <PropertyGroup>
+      <TriforceVersionFile>$(IntermediateOutputPath)TriforceVersion.g.cs</TriforceVersionFile>
+    </PropertyGroup>
+    <WriteLinesToFile File="$(TriforceVersionFile)" Overwrite="true" WriteOnlyWhenDifferent="true"
+                      Lines="// generated from the TriforceVersion property (Triforce.Logic.csproj): do not edit;namespace Triforce.Logic%3B;public static partial class BuildInfo { public const string Version = &quot;$(TriforceVersion)&quot;%3B }" />
+    <ItemGroup>
+      <Compile Include="$(TriforceVersionFile)" />
+      <FileWrites Include="$(TriforceVersionFile)" />
+    </ItemGroup>
+  </Target>
+
+</Project>

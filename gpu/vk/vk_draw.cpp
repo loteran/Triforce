@@ -14,6 +14,7 @@
 #include <memory>
 #include <cstdio>
 #include <cstring>
+#include <ctime>     // ((Triforce) clock_gettime off Windows: the preparation's timing, PrepTimes)
 #include <cstdarg>
 #include <deque>
 #include <exception>
@@ -29,17 +30,26 @@
 #include <thread>
 #include <setjmp.h>
 #include <signal.h>
+#ifndef _WIN32
+#include <cerrno>
+#include <sys/resource.h>   // ((Triforce) getpriority: prepare_priority off Windows)
+#include <unistd.h>         // ((Triforce) fsync: a checkpoint's file on the disk off Windows, pcache_file_flush)
+#else
+#include <io.h>             // ((Triforce) _get_osfhandle: the same on Windows)
+#endif
 
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
 
 #include "vk_paths.h"
 #include "vk_draw.h"
+#include "flat_map.h"   // (flat open-addressing maps for the per-draw lookups)
 #include "aa_rows.h"
 #include "vk_aa.h"            // (Triforce: the Anti-aliasing row in place of the game's SMAA)
 #include "dlss_actor.h"
 #include "vk_temporal.h"
 #include "vk_fsr3.h"          // (AMD FSR 3.1 in the gameplay upscale's place)
 #include "vk_fsr3_inputs.h"
+#include "vk_framegen.h"      // ((Triforce, FG-2) framegen_hudless_note: the upscale's output before the HUD)
 #include "vk_dump.h"
 #include "vk_gprof.h"
 #include "vk_jobs.h"
@@ -49,13 +59,18 @@
 #include "movie_upscale_policy.h"
 #include "prepare_threads.h"
 #include "pcache_bound.h"
+#include "pcache_carry.h"     // ((Triforce) the file carried over a stamp change at an update's preparation, capped)
 #include "pcache_gate.h"
 #include "pcache_play.h"      // ((Triforce) the pipeline cache's play file: cached_create, pcache_play_open, pipeline_cache_save)
+#include "warm_checkpoint.h"  // ((Triforce) the preparation's checkpoint saves of the pipeline cache: PcacheCheckpoints)
 #include "mem_parts.h"
 #include "pipe_release.h"
 #include "pipe_warm.h"        // ((Triforce) a load's pipelines made behind its draws: pipelines_warm)
 #include "pipe_order.h"       // ((Triforce, wp18) and in the order the last sessions' draws first needed them: order_met)
 #include "gpl_rules.h"
+#include "lib_check.h"        // ((Triforce) whether the prepared stage libraries are still in the cache: lib_check_cold, prepare_run)
+#include "spv_nan_select.h"   // ((Triforce) whether make_module rewrites modules on this device, for the stamps: module_patches)
+#include "spv_fog.h"          // ((Triforce) whether make_module patches the fog's module, for the light precompile's record: built_computes_key)
 #include "pipe_wait.h"        // ((Triforce) what a draw does whose pipeline is not ready, NX2navi's rules: draw, graphics_pipeline)
 #include "present_hold.h"     // ((Triforce) the hold's mode for this frame's draws: pipe_hold_mode)
 #include "skip_code.h"
@@ -68,6 +83,7 @@
 #include "checkpoint_kinds.h" // (Triforce: the markers' kinds and what lies after each, checkpoints_report)
 #include "rect_clamp.h"       // (Triforce: a scissor's x + width without int overflow: dynamic_state, clear_rect, draw)
 #include "file_whole.h"       // ((Triforce, handoff §8) the writes of threads of their own, and the process's end: file_writers.h)
+#include "sharpen_rules.h"    // ((Triforce, S8) the texture LOD bias under DLSS and FSR: lod_bias, lod_biased)
 
 #include "shaders/clear_f_frag_spv.h"
 #include "shaders/clear_i_frag_spv.h"
@@ -85,6 +101,8 @@ struct PointerEntry { uint64_t addr, size; };
 const PointerEntry* pointer_table(const NvnState& s, int stage);
 uint32_t stage_cbuf_word(const NvnState& s, const Stage& st, uint32_t index, uint32_t offset);   // (vk_shader.cpp)
 uint64_t sampler_registrations_generation();   // (vk_bank.cpp: sampler_for's cache)
+void sampler_bias_changed();   // ((Triforce, S8) vk_bank.cpp: the texture LOD bias changed, every sampler made anew)
+uint64_t pcache_own_stamp();   // ((Triforce) what a pipeline cache file of this session's own is for: pcache_own_mark, below)
 namespace {
 // ---- (hookshot) this file's per-thread objects that need a constructor or a destructor ----
 // With llvm-mingw every use of such a thread_local calls the file's TLS init function, which saves registers, finds the
@@ -412,7 +430,8 @@ struct RecordingRes {
     size_t si = 0;                 // (the one in use)
     uint64_t before = 0;           // (what the recording used of the streams before this one)
     uint32_t idle = 0;             // (recordings of the slot that stayed in the first stream)
-    std::unordered_map<const void*, std::pair<VkBuffer, uint64_t>> c1_at;   // (c1 of a stage: uploaded once a recording)
+    // (flat (flat_map.h): an unordered_map put a malloc into every c1 upload kept, and a free into the next recording's clear)
+    FlatMap<uintptr_t, std::pair<VkBuffer, uint64_t>> c1_at;   // (c1 of a stage, by the stage's address: uploaded once a recording)
 };
 // (a recording's first stream: one for each of the kRecordings slots. RX_VK_STREAM_MB=<n>: that size, 2 by default; a recording
 // that needs more is given a bigger stream for the rest of it (RX_VK_STREAM_GROW_OFF=1: draws are skipped instead, and the default
@@ -745,6 +764,13 @@ std::atomic<int64_t> pcache_built_since_save{0};
 // most precompiled pipelines as not found in the app's cache (~460 of ~12,900 here), which it then serves from its own.
 std::atomic<size_t> pcache_saved_size{0};
 uint64_t pcache_bound_bytes = 0;   // ((Triforce) the file's bound, 0: none: pcache_bound.h; set by pcache_init, before any save)
+// ((Triforce, 11-18) what reading the pipeline cache added to the working set (pcache_init, before the precompile): the
+// driver holds it all session, so it is no room for the precompile's pipelines (precompile_keeps_all)
+std::atomic<uint64_t> pcache_read_ws{0};
+// ((Triforce) pcache_init handed the driver a file's data: the cache began with what earlier starts saved, which may hold
+// pipelines nothing asks for any more (a carried file after an update whose modules differ on this device: warm_libraries).
+// Not pcache_carried, which says the file was of another stamp (pcache_carry.h); this one is any file's data, that stamp's too
+bool pcache_from_file = false;
 // ((Triforce) The gate of the cache: every creation that may run in play takes it through pcache_use(), held for the call
 // (a temporary in the call's full expression), and pcache_let_go destroys it once the PC's RAM runs short and nobody is
 // inside (pcache_gate.h has why). Closed, pcache_use() gives no cache: the creation goes without one)
@@ -766,6 +792,173 @@ struct PcachePreparing {   // (prepare_run, for its length)
     PcachePreparing() { pcache_preparing++; }
     ~PcachePreparing() { pcache_preparing--; }
 };
+// ---- (Triforce) The carry's state and its rules in use: tests/pipeline_cache_save_test.cpp builds this part as it is ----
+// ((Triforce) The carry over a stamp change (pcache_carry.h has why and the rules): the session's history of the file (its
+// base and carries, written beside it as <file>.base at each save), whether this session read a file of another stamp
+// (pcache_carried: written by pcache_init and pcache_carry_rebuild alone, with no worker building), and whether its cache went
+// past what a carried one may hold (pcache_carry_over: nothing more is built into it, it is not written, and
+// pcache_carry_rebuild builds again into a fresh cache)
+std::mutex pcache_side_mu;
+pcache_carry::Side pcache_side;
+bool pcache_carried = false;
+std::atomic<bool> pcache_carry_over{false};
+/// The carry refused for these shaders (pcache_carry_past, pcache_carry_early): their stamp written to <file>.nocarry, so that a
+/// preparation begun again (Setup's Cancel, a kill) starts fresh rather than carrying the same file once more
+void pcache_carry_refused() {
+    char stamp[20];
+    snprintf(stamp, sizeof stamp, "%016llx", (unsigned long long)program_cache_stamp());
+    if (!file_writers::write_whole(pcache_path + ".nocarry", stamp, 16))
+        logf("vk: %s.nocarry cannot be written: a preparation begun again carries the file once more", pcache_path.c_str());
+}
+/// Whether this session's cache of n bytes is past what a carried one may hold (pcache_carry::over: its cap, or the file's
+/// bound where that is lower). The first time: said, pcache_carry_over set, and the carry refused for these shaders
+/// (pcache_carry_refused)
+bool pcache_carry_past(size_t n) {
+    uint64_t base = 0;
+    {
+        std::lock_guard lk(pcache_side_mu);
+        if (!pcache_carry::over(pcache_carried, n, pcache_side, pcache_bound_bytes)) return false;
+        base = pcache_side.base;
+    }
+    if (!pcache_carry_over.exchange(true)) {
+        logf("vk: the pipeline cache carried over a stamp change holds %zu MB, past the %llu MB it may hold (1.25 x base %llu MB, "
+             "or the file's bound of %llu MB where lower): nothing more is built into it, it is not written, the file stays as it "
+             "was, and the preparation builds the shaders' driver part again into a fresh cache (RX_VK_PCACHE_CARRY=0: never "
+             "carried)", n >> 20, (unsigned long long)(pcache_carry::limit(base, pcache_bound_bytes) >> 20),
+             (unsigned long long)(base >> 20), (unsigned long long)(pcache_bound_bytes >> 20));
+        pcache_carry_refused();
+    }
+    return true;
+}
+/// pipeline_cache_save's, before the bound and before the data is fetched: whether data of n bytes is written as far as the
+/// carry goes (not past what a carried cache may hold: pcache_carry_past; nor dropped early under it, pcache_carry_early)
+bool pcache_carry_save_ok(size_t n) { return !pcache_carry_over.load() && !pcache_carry_past(n); }
+/// The preparation's look at its cache's size (prepare_run, warm_libraries): true once a carried one is past what it may hold.
+/// building: its workers are building into the cache meanwhile, and on Intel the size is not asked then (its driver crashed in
+/// vkGetPipelineCacheData while pipelines were built with the same cache: pipeline_cache_save); asked once they are joined
+bool pcache_carry_check(bool building) {
+    if (pcache_carry_over.load()) return true;
+    {
+        std::lock_guard lk(pcache_side_mu);
+        if (!pcache_carried) return false;
+    }
+    if (building && dev.props.vendorID == 0x8086) return false;
+    const auto use = pcache_use();
+    size_t n = 0;
+    return use.cache && vkGetPipelineCacheData(dev.device, use.cache, &n, nullptr) == VK_SUCCESS && pcache_carry_past(n);
+}
+/// warm_libraries' start, before its workers: the size of a carried cache, for its projection (pcache_carry_early), which takes
+/// its sample first. False: not carried, the projection switched off, Intel (its size is not asked while workers build:
+/// pcache_carry_check), or the size not given (no projection then: the growth would be counted from nothing), and the warm
+/// in its own order
+bool pcache_carry_held(size_t* n) {
+    *n = 0;
+    if (!pcache_carry::project_on(getenv("RX_VK_PCACHE_CARRY_PROJECT"))) return false;
+    {
+        std::lock_guard lk(pcache_side_mu);
+        if (!pcache_carried) return false;
+    }
+    if (dev.props.vendorID == 0x8086) return false;
+    const auto use = pcache_use();
+    return use.cache && vkGetPipelineCacheData(dev.device, use.cache, n, nullptr) == VK_SUCCESS;
+}
+/// warm_libraries' look once its sample is built (pcache_carry::sample_order), the others not begun: whether a carried cache
+/// that held from bytes when the workers began, its sample of done of the total programs built with libs stage libraries, would
+/// grow past what it may hold at this rate by the margin (pcache_carry::drop_early). True: said why, and dropped now as past it
+/// (pcache_carry_over set, the carry refused for these shaders, pcache_carry_rebuild after). Past it already, false:
+/// pcache_carry_check says that. Not on Intel, whose size is not asked while workers build (pcache_carry_check)
+bool pcache_carry_early(size_t from, size_t done, size_t total, size_t libs) {
+    if (pcache_carry_over.load() || !pcache_carry::project_on(getenv("RX_VK_PCACHE_CARRY_PROJECT"))) return false;
+    uint64_t lim = 0;
+    {
+        std::lock_guard lk(pcache_side_mu);
+        if (!pcache_carried) return false;
+        lim = pcache_carry::limit(pcache_side.base, pcache_bound_bytes);
+    }
+    if (dev.props.vendorID == 0x8086) return false;
+    const auto use = pcache_use();
+    size_t n = 0;
+    if (!use.cache || vkGetPipelineCacheData(dev.device, use.cache, &n, nullptr) != VK_SUCCESS) return false;
+    if (n > lim || !pcache_carry::drop_early(n, from, done, total, libs, lim)) return false;
+    if (pcache_carry_over.exchange(true)) return true;
+    logf("vk: the pipeline cache carried over a stamp change would grow to about %llu MB at this rate (%zu MB for the %zu "
+         "stage libraries of a sample of %zu of the %zu programs, every %llu-th of the order), past the %llu MB it may hold: "
+         "dropped now and built into a fresh cache (RX_VK_PCACHE_CARRY_PROJECT=0: only when it is past)",
+         (unsigned long long)(pcache_carry::projected(n, from, done, total) >> 20), (n - from) >> 20, libs, done, total,
+         (unsigned long long)pcache_carry::kSampleStride, (unsigned long long)(lim >> 20));
+    pcache_carry_refused();
+    return true;
+}
+/// pipeline_cache_save's, once n bytes are in place with the stamp stamp (16 hex digits) beside them: the history beside it too
+void pcache_carry_saved(size_t n, const char* stamp) {
+    uint8_t out[pcache_carry::kSideBytes];
+    {
+        std::lock_guard lk(pcache_side_mu);
+        pcache_side = pcache_carry::saved(pcache_side, n, stamp);
+        pcache_carry::put(pcache_side, out);
+    }
+    file_writers::write_whole(pcache_path + ".base", out, sizeof out);
+}
+/// pipeline_cache_save's, before the data of n bytes takes the old file's place: a carried session whose history is open
+/// writes it with these shaders' stamp first (pcache_carry::begun), so that a save cut before its .for (a crash, a power cut,
+/// a kill in a checkpoint of warm_checkpoint.h) is read as that session's still, capped, and never as these shaders' own file
+/// uncapped. False: it could not be written, and the data is not put in place (the old file and its history stay)
+bool pcache_carry_saving(size_t n, const char* stamp) {
+    uint8_t out[pcache_carry::kSideBytes];
+    {
+        std::lock_guard lk(pcache_side_mu);
+        if (!pcache_carried || !pcache_side.open) return true;
+        pcache_carry::put(pcache_carry::saved(pcache_side, n, stamp), out);
+    }
+    return file_writers::write_whole(pcache_path + ".base", out, sizeof out);
+}
+// ((Triforce) Whether the file holds only what this driver's part is made for (<file>.own names pcache_own_stamp: these
+// shaders, this driver, the part's recipe): written beside every save of a session that began with no file, with a fresh
+// cache, or with such a file, and removed by any other. A checkpoint (warm_checkpoint.h) writes the part's libraries before
+// it is made, and the start after a crash begins from that file; where the part's cache then ends over the file's bound
+// (2 GB on a 16 GB PC, 2.6 GB of libraries on AMD) it is these shaders' own new file over the bound (warm_unsaved), not a
+// file with an older build's pipelines beside them, which warm_libraries drops and makes again from nothing (pcache_from_own)
+bool pcache_from_own = false;
+/// pipeline_cache_save's, before the data takes the old file's place: <file>.own written or removed
+void pcache_own_mark() {
+    const std::string own = pcache_path + ".own";
+    if (pcache_carried || (pcache_from_file && !pcache_from_own)) {
+        remove(own.c_str());
+        return;
+    }
+    char stamp[20];
+    snprintf(stamp, sizeof stamp, "%016llx", (unsigned long long)pcache_own_stamp());
+    if (!file_writers::write_whole(own, stamp, 16)) remove(own.c_str());
+}
+/// pcache_init's: whether <file>.own names what this session's driver part is made for
+bool pcache_own_named() {
+    FILE* f = fopen((pcache_path + ".own").c_str(), "rb");
+    if (!f) return false;
+    char own[20]{}, want[20];
+    snprintf(want, sizeof want, "%016llx", (unsigned long long)pcache_own_stamp());
+    const bool named = fread(own, 1, 16, f) == 16 && !memcmp(own, want, 16);
+    fclose(f);
+    return named;
+}
+/// vk_main.cpp's preparation, gone through to its end (not stopped) and saved: a carried session's history is no longer open
+/// (pcache_carry.h Side::open), so the next start reads the file as these shaders' own. Not when its cache went past what it
+/// may hold (not written: the file keeps its last save, still open). Beside the file now when a save of this session named
+/// these shaders already; else the next save writes it
+void pcache_carry_close() {
+    if (pcache_carry_over.load()) return;
+    char stamp[20];
+    snprintf(stamp, sizeof stamp, "%016llx", (unsigned long long)program_cache_stamp());
+    uint8_t out[pcache_carry::kSideBytes];
+    {
+        std::lock_guard lk(pcache_side_mu);
+        if (!pcache_carried || !pcache_side.open) return;
+        pcache_side.open = 0;
+        if (std::memcmp(pcache_side.stamp, stamp, 16)) return;
+        pcache_carry::put(pcache_side, out);
+    }
+    file_writers::write_whole(pcache_path + ".base", out, sizeof out);
+}
+// ---- (Triforce) The carry's part ends ----
 void pcache_init() {
     if (pcache) return;
     uint64_t ws0 = 0, priv0 = 0;   // ((Triforce) what the cache costs the RAM once the driver has it: the line below)
@@ -786,17 +979,36 @@ void pcache_init() {
     char pcache_for[20];
     snprintf(pcache_for, sizeof pcache_for, "%016llx", (unsigned long long)program_cache_stamp());
     bool pcache_same = getenv("RX_VK_PCACHE_KEEP_OLD") != nullptr;
+    char had_for[20]{};   // ((Triforce) the stamp the file was saved for, when it names one: the carry's history is that file's)
+    bool for_read = false;
     if (!pcache_same) {
         if (FILE* f = fopen((pcache_path + ".for").c_str(), "rb")) {
-            char had[20]{};
-            pcache_same = fread(had, 1, 16, f) == 16 && !memcmp(had, pcache_for, 16);
+            for_read = fread(had_for, 1, 16, f) == 16;
+            pcache_same = for_read && !memcmp(had_for, pcache_for, 16);
             fclose(f);
         }
     }
+    // ((Triforce) The file's history beside it (<file>.base, pcache_carry.h): its base and carries, when written for its stamp)
+    pcache_carry::Side side_had;
+    bool side_read = false;
+    if (FILE* f = fopen((pcache_path + ".base").c_str(), "rb")) {
+        uint8_t raw[pcache_carry::kSideBytes]{};
+        side_read = pcache_carry::get(raw, fread(raw, 1, sizeof raw, f), &side_had);
+        fclose(f);
+    }
+    if (pcache_same && !for_read) memcpy(had_for, pcache_for, 16);   // (RX_VK_PCACHE_KEEP_OLD: read as these shaders')
+    // ((Triforce) and whether a carry was refused for these shaders already (pcache_carry_past wrote <file>.nocarry): a
+    // preparation begun again after that starts fresh, rather than carrying the same file and building past its cap once more
+    bool carry_refused = false;
+    if (FILE* f = fopen((pcache_path + ".nocarry").c_str(), "rb")) {
+        char refused[20]{};
+        carry_refused = fread(refused, 1, 16, f) == 16 && !memcmp(refused, pcache_for, 16);
+        fclose(f);
+    }
     // (Triforce) And the file has a bound (pcache_bound.h, where the reasons and the sizes are): one over it is not read, and
     // data over it is not written (pipeline_cache_save). RX_VK_PCACHE_MAX_MB=<MB> sets it, 0 lifts it
+    uint64_t ram = 0;   // ((Triforce) the PC's RAM: the bound's, and the carry's below)
     {
-        uint64_t ram = 0;
 #ifdef _WIN32
         MEMORYSTATUSEX ms{};
         ms.dwLength = sizeof ms;
@@ -805,14 +1017,55 @@ void pcache_init() {
         pcache_bound_bytes = pcache_bound::bytes(getenv("RX_VK_PCACHE_MAX_MB"), ram);
     }
     std::vector<uint8_t> data;
+    pcache_carry::Side history;   // (the file's, as read: pcache_carry::history)
+    bool resumed = false;   // ((Triforce) these shaders' file, its carried preparation not done: pcache_carry::resumed)
+    bool carried = false;   // ((Triforce, 11-18) a file for other shaders read all the same outside the preparation: below)
     if (FILE* f = fopen(pcache_path.c_str(), "rb")) {
         _fseeki64(f, 0, SEEK_END);
         const int64_t sz = _ftelli64(f);
         fclose(f);
-        if (!pcache_same) {
+        // ((Triforce) a carried session's save cut before its .for (pcache_carry::begun): its own history, read as resumed below
+        const bool begun = !getenv("RX_VK_PCACHE_KEEP_OLD") && pcache_carry::begun(side_read, side_had, pcache_for, for_read ? had_for : nullptr);
+        history = begun ? side_had
+                        : pcache_carry::history(side_read, side_had, for_read || pcache_same ? had_for : nullptr, sz > 0 ? (uint64_t)sz : 0);
+        // ((Triforce) For other shaders, at an update's preparation (Setup's, HOOKSHOT_PREPARE_ONLY): read all the same while it
+        // is within its bound and at most 1.25 times its base (pcache_carry.h): the pipelines of shaders the update did not
+        // change are hits, and the rest is built as before. The device's header is checked below as for any file)
+        pcache_carried = !pcache_same && !begun && pcache_carry::may_carry(pcache_carry::on(getenv("RX_VK_PCACHE_CARRY")),
+                                                                 getenv("HOOKSHOT_PREPARE_ONLY") != nullptr, carry_refused,
+                                                                 sz > 0 && pcache_bound::within((uint64_t)sz, pcache_bound_bytes),
+                                                                 sz > 0 ? (uint64_t)sz : 0, history);
+        // ((Triforce) For these shaders, but saved by a carried preparation that did not go through to its end (stopped:
+        // pcache_carry.h Side::open): read as carried, capped as that run was, with its history (no carry counted again).
+        // Refused by .nocarry (that run went past its limit), not read: the preparation starts fresh, as the carried run's
+        // own rebuild would have)
+        resumed = !getenv("RX_VK_PCACHE_KEEP_OLD") &&
+                  pcache_carry::resumed(pcache_carry::on(getenv("RX_VK_PCACHE_CARRY")), getenv("HOOKSHOT_PREPARE_ONLY") != nullptr,
+                                        pcache_same || begun, history);
+        if (resumed && !carry_refused) pcache_carried = true;
+        // ((Triforce, 11-18) pcache_bound.h carried: one for other shaders, no larger than the carry limit, read all the same.
+        // Outside Setup's preparation, which carries by the rule above (capped, its history kept); read as these shaders' own
+        // file from here on: its first save names them. (11-19) Not over a refusal for these shaders (.nocarry: the file
+        // warm_libraries dropped is not read again) nor for a carried save cut short: pcache_carry::plain_carry)
+        static const uint64_t carry = pcache_bound::carry_limit(getenv("RX_VK_PCACHE_CARRY_MB"));
+        carried = pcache_carry::plain_carry(getenv("HOOKSHOT_PREPARE_ONLY") != nullptr, pcache_carried, resumed, carry_refused, begun) &&
+                  pcache_bound::carried(pcache_same, (uint64_t)std::max<int64_t>(sz, 0), carry, pcache_bound_bytes, ram);
+        if (carried)
+            logf("vk: pipeline cache %s (%lld MB) is for other shaders than these: read all the same (carried over the update: "
+                 "what the driver compiled for the shaders that did not change is found again; a file over %llu MB is not, nor on "
+                 "a PC under %llu GB of RAM; RX_VK_PCACHE_CARRY_MB=<MB>, 0: never)", pcache_path.c_str(), (long long)(sz >> 20),
+                 (unsigned long long)(carry >> 20), (unsigned long long)pcache_bound::kCarryRamGb);
+        if (resumed && carry_refused) {
+            logf("vk: pipeline cache %s (%lld MB) was saved by a carried preparation that went past what it may hold (1.25 x base "
+                 "%llu MB, or the bound) and did not go through to its end: not read; a new one is made", pcache_path.c_str(),
+                 (long long)(sz >> 20), (unsigned long long)(history.base >> 20));
+        } else if (!pcache_same && !pcache_carried && !carried) {
             if (sz > 32)
                 logf("vk: pipeline cache %s (%lld MB) is for other shaders than these, or older than this rule: not read; a new "
-                     "one is made (RX_VK_PCACHE_KEEP_OLD=1: read)", pcache_path.c_str(), (long long)(sz >> 20));
+                     "one is made (RX_VK_PCACHE_KEEP_OLD=1: read; at an update's preparation it is carried while at most %llu MB, "
+                     "1.25 x base %llu MB%s)", pcache_path.c_str(), (long long)(sz >> 20),
+                     (unsigned long long)(pcache_carry::cap(history.base) >> 20), (unsigned long long)(history.base >> 20),
+                     carry_refused ? ", but a carry for these shaders went past that already" : "");
         } else {
             // (whole or not at all: a file over the bound, or one whose read ends early, leaves data empty)
             uint64_t len = 0;
@@ -841,19 +1094,42 @@ void pcache_init() {
     VkPipelineCacheCreateInfo ci{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
     ci.initialDataSize = data.size();
     ci.pInitialData = data.empty() ? nullptr : data.data();
+    bool with_data = !data.empty();
     if (vkCreatePipelineCache(dev.device, &ci, nullptr, &pcache) != VK_SUCCESS) {
         ci.initialDataSize = 0, ci.pInitialData = nullptr;
         vkCreatePipelineCache(dev.device, &ci, nullptr, &pcache);
+        with_data = false;
     }
+    {   // ((Triforce) the session's history, pcache_carry.h: fresh (nothing read), the file's own, or one carry more)
+        using pcache_carry::Start;
+        if (!with_data) pcache_carried = false;
+        const Start how = !with_data ? Start::Fresh : pcache_carried && !resumed ? Start::Carried : Start::Same;
+        std::lock_guard lk(pcache_side_mu);
+        pcache_side = pcache_carry::session(how, history);
+        if (with_data && carried) pcache_side.carried++;   // (pcache_bound.h carried: one carry more, the base as it was)
+    }
+    pcache_from_file = pcache && ci.initialDataSize > 0;
+    // ((Triforce) and whether that file holds only what this driver's part is made for: <file>.own, pcache_own_mark)
+    pcache_from_own = pcache_from_file && !pcache_carried && pcache_own_named();
     // (what it holds as read: a save of data that size has nothing to add to the file)
     size_t held = 0;
-    if (pcache && vkGetPipelineCacheData(dev.device, pcache, &held, nullptr) == VK_SUCCESS) pcache_saved_size = held;
+    // ((Triforce) but for a carried one (pcache_carry.h): the file is for other shaders, and its first save in the preparation
+    // writes it, with these shaders' stamp beside it, even when nothing was added)
+    if (pcache && vkGetPipelineCacheData(dev.device, pcache, &held, nullptr) == VK_SUCCESS) pcache_saved_size = pcache_carried ? 0 : held;
     logf("vk: pipeline cache %s (%zu KB)", pcache_path.c_str(), data.size() >> 10);
+    if (pcache_carried)
+        logf("vk: pipeline cache carried over a stamp change (%zu MB, base %llu MB)%s: the update's preparation reads it, the "
+             "pipelines of shaders it did not change are hits, its saves are written up to %llu MB (1.25 x base) and name these "
+             "shaders; carry %u since the base was built (RX_VK_PCACHE_CARRY=0: not carried)", data.size() >> 20,
+             (unsigned long long)(pcache_side.base >> 20),
+             resumed ? ", saved by a carried preparation that did not go through to its end: carried still" : "",
+             (unsigned long long)(pcache_carry::cap(pcache_side.base) >> 20), pcache_side.carried);
     pcache_play_open(pcache_same);   // ((Triforce) and what earlier runs compiled, beside it: pcache_play.h)
     if (data.size() >= (64u << 20)) {   // ((Triforce) our copy let go first: what is left is the driver's)
         std::vector<uint8_t>().swap(data);
         uint64_t ws1 = 0, priv1 = 0;
         memory_process(&ws1, &priv1);
+        pcache_read_ws = ws1 > ws0 ? ws1 - ws0 : 0;
         logf("vk: memory: the pipeline cache read, the working set %llu -> %llu MB, private %llu -> %llu MB",
              (unsigned long long)(ws0 >> 20), (unsigned long long)(ws1 >> 20), (unsigned long long)(priv0 >> 20),
              (unsigned long long)(priv1 >> 20));
@@ -999,6 +1275,23 @@ void note_wait(std::chrono::steady_clock::time_point t0, std::atomic<int64_t>& i
 
 bool depth_aspect(VkFormat f) {
     return is_depth_format(f) && f != VK_FORMAT_S8_UINT;
+}
+/// ((Triforce) RX_VK_FOLIAGE_SHADOW_VRS, foliage_shadow.h) Whether a graphics pipeline has the fragment shading rate as dynamic
+/// state: a native mesh program's with no colour target and a depth one, on a device with dev.foliage_rate. By what the
+/// pipeline's key names alone (the program, the colour targets, the depth format), so that each pipeline of a key, whole or
+/// linked, by a draw, the precompile or the warm, is made alike and its draws know whether to set the rate. Every other pipeline
+/// is made as before
+bool pipeline_rate(const Program& p, const Targets& at) {
+    return foliage_shadow::pipeline_rate(dev.foliage_rate, p.mesh && !p.fallback, at.n, depth_aspect(at.depth_format));
+}
+constexpr uint64_t kRateLibrary = 0x52415445ull;   // ((Triforce) mixed into the stage libraries' keys of those pipelines: gpl_keys)
+/// ((Triforce) The targets a depth-only pipeline's two shader libraries are made with by the warm and the check (warm_libraries,
+/// lib_check_sample): no colour target and a depth format, so that pipeline_rate holds for a native mesh program. Those two
+/// libraries take no attachment of the targets (build_graphics clears them), so any depth format makes the same library
+Targets rate_targets() {
+    Targets t{};
+    t.depth_format = VK_FORMAT_D32_SFLOAT;
+    return t;
 }
 
 // (hookshot) A driver's compiler that faults on a shader (amdvlk64.dll on a mesh program, Hookshot issue 26) costs that one draw, not the game
@@ -1575,6 +1868,115 @@ bool state_shipped_new() {
     }
     return had != id;
 }
+/// (Triforce) The priority of the workers of the shader preparation before the title (prepare_run, warm_libraries,
+/// state_list_prepare, predict_run): below normal at a game's start, so that the rest of the PC gets its turn while the game
+/// waits; normal in a start that only prepares (HOOKSHOT_PREPARE_ONLY: Setup's build and update, --prepare-shaders) whose
+/// process was started below normal priority, where nothing of the game runs and a normal thread is still below every
+/// program of normal priority. Only where that is known: on Windows a process of the below normal or idle class (the Windows
+/// builders start their build tools so: Runner.cs, builder/py core.py BELOW_NORMAL_PRIORITY_CLASS), elsewhere a process with
+/// a nice value above 0 (the Linux builder sets none, and there the posix SetThreadPriority leaves a normal thread at the
+/// process's nice). Any other process keeps them below normal: a process of normal priority (a --prepare-shaders from a
+/// shell) would have them compete with the desktop for the whole preparation, and in one above normal a normal thread is
+/// above every other program (prepare_threads.h: "on all of them at High the driver's compiles froze the whole PC"). As the
+/// process is at the first call
+int prepare_priority() {
+    static const int v = [] {
+        if (!getenv("HOOKSHOT_PREPARE_ONLY")) return (int)THREAD_PRIORITY_BELOW_NORMAL;   // (vk_main.cpp prepare_only)
+#ifdef _WIN32
+        const DWORD cls = GetPriorityClass(GetCurrentProcess());
+        if (cls != BELOW_NORMAL_PRIORITY_CLASS && cls != IDLE_PRIORITY_CLASS) return (int)THREAD_PRIORITY_BELOW_NORMAL;
+#else
+        errno = 0;
+        const int nice_now = getpriority(PRIO_PROCESS, 0);
+        if (errno != 0 || nice_now <= 0) return (int)THREAD_PRIORITY_BELOW_NORMAL;
+#endif
+        return (int)THREAD_PRIORITY_NORMAL;
+    }();
+    return v;
+}
+// ---- (Triforce) The preparation's timing, for the log: a cold driver's part on AMD (26.10.1) made ~91,600 stage libraries
+// in 5608 s on 16 workers, 16 a second, and the log could not say whether the workers compiled all that time or waited (on
+// one another in the driver, on the cache). warm_libraries and precompile_run say now what each kind of build took, summed
+// over the workers' threads, and what share of their time the workers were on a processor (their own CPU time over the
+// time they ran) beside the process's share of every processor (the driver's own threads in it too). Only clocks are read:
+// nothing is built otherwise than before ----
+/// This thread's CPU time so far, user and kernel, in microseconds
+uint64_t thread_cpu_us() {
+#ifdef _WIN32
+    FILETIME c, e, k, u;
+    if (!GetThreadTimes(GetCurrentThread(), &c, &e, &k, &u)) return 0;
+    const auto t = [](const FILETIME& f) { return ((uint64_t)f.dwHighDateTime << 32 | f.dwLowDateTime) / 10; };
+    return t(k) + t(u);
+#else
+    timespec ts{};
+    if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts)) return 0;
+    return (uint64_t)ts.tv_sec * 1000000 + (uint64_t)ts.tv_nsec / 1000;
+#endif
+}
+/// The process's CPU time so far (every thread's), in microseconds
+uint64_t process_cpu_us() {
+#ifdef _WIN32
+    FILETIME c, e, k, u;
+    if (!GetProcessTimes(GetCurrentProcess(), &c, &e, &k, &u)) return 0;
+    const auto t = [](const FILETIME& f) { return ((uint64_t)f.dwHighDateTime << 32 | f.dwLowDateTime) / 10; };
+    return t(k) + t(u);
+#else
+    timespec ts{};
+    if (clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &ts)) return 0;
+    return (uint64_t)ts.tv_sec * 1000000 + (uint64_t)ts.tv_nsec / 1000;
+#endif
+}
+uint64_t us_since(std::chrono::steady_clock::time_point t) {
+    return (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t).count();
+}
+/// What a preparation's workers took: each worker adds its CPU time and the time it ran after each item and when it ends
+/// (PrepTimes::Worker, on its stack: tick), so that a line before the end has them too; the kinds of build add their summed
+/// time as they go
+struct PrepTimes {
+    std::atomic<uint64_t> cpu_us{0}, run_us{0};
+    std::atomic<uint64_t> kind_us[3]{}, kind_n[3]{};
+    const std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+    const uint64_t process0 = process_cpu_us();
+    struct Worker {
+        PrepTimes& t;
+        uint64_t cpu = thread_cpu_us();
+        std::chrono::steady_clock::time_point at = std::chrono::steady_clock::now();
+        explicit Worker(PrepTimes& t) : t(t) {}
+        ~Worker() { tick(); }
+        void tick() {
+            const uint64_t now_cpu = thread_cpu_us();
+            const auto now = std::chrono::steady_clock::now();
+            t.cpu_us += now_cpu > cpu ? now_cpu - cpu : 0;
+            t.run_us += (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(now - at).count();
+            cpu = now_cpu, at = now;
+        }
+    };
+    void add(int kind, std::chrono::steady_clock::time_point since) {
+        kind_us[kind] += us_since(since);
+        kind_n[kind]++;
+    }
+    /// "<kind> <ms> ms over <n> (<ms> ms each)"
+    std::string kind_text(int kind, const char* name) const {
+        const uint64_t n = kind_n[kind].load(), us = kind_us[kind].load();
+        char s[160];
+        snprintf(s, sizeof s, "%s %.0f ms over %llu (%.1f ms each)", name, us / 1000.0, (unsigned long long)n,
+                 n ? us / 1000.0 / (double)n : 0.0);
+        return s;
+    }
+    /// "the <n> workers on a processor <p>% of the time they ran (...), the process <p>% of the <c> processors (...)": the
+    /// first well under 100 while the second is too, the workers waited (on one another, on a lock) rather than compiled
+    std::string cpu_text(unsigned workers) const {
+        const double wall = us_since(t0) / 1e6;
+        const unsigned cpus = std::max(1u, std::thread::hardware_concurrency());
+        const uint64_t p1 = process_cpu_us(), used = p1 > process0 ? p1 - process0 : 0, run = run_us.load(), cpu = cpu_us.load();
+        char s[320];
+        snprintf(s, sizeof s, "the %u workers on a processor %.0f%% of the time they ran (%.0f s of CPU in %.0f s), the process "
+                 "%.0f%% of the %u processors (%.0f s of CPU in %.0f s)", workers, run ? 100.0 * (double)cpu / (double)run : 0.0,
+                 cpu / 1e6, run / 1e6, wall > 0 ? 100.0 * (double)used / 1e6 / (wall * cpus) : 0.0, cpus, used / 1e6, wall);
+        return s;
+    }
+};
+// ---- (end of the preparation's timing) ----
 /// (Triforce) The workers of the shader preparation before the title (prepare_run, warm_libraries, state_list_prepare): every
 /// processor where that is safe, by prepare_threads.h's rule, as the PC is at the first call; said once in the log. It was
 /// half of them. Not the preparation behind the game (prepare_run's background), nor predict_run and precompile_run, which
@@ -1608,6 +2010,33 @@ unsigned prepare_workers() {
     }();
     return n;
 }
+/// ((Triforce) The translation pass's workers (prepare_run): prepare_workers's, fewer on AMD's Windows driver for RDNA 1 and 2,
+/// whose compute compiles slow down with more of them at once (prepare_threads.h translate)
+unsigned prepare_translate_workers() {
+    static const unsigned n = [] {
+        bool amd_older = false;
+        VkPhysicalDeviceDriverProperties drv{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
+        VkPhysicalDeviceProperties2 p2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+        p2.pNext = &drv;
+        if (dev.physical) {
+            vkGetPhysicalDeviceProperties2(dev.physical, &p2);
+            VendorFacts facts;
+            facts.vendor_id = p2.properties.vendorID;
+            facts.driver_id = drv.driverID;
+            facts.device_type = p2.properties.deviceType;
+            facts.driver_info = drv.driverInfo;
+            amd_older = amd_older_compiler(facts);
+        }
+        const char* e = getenv("RX_VK_PREPARE_THREADS");
+        const unsigned all = prepare_workers();
+        const unsigned v = prepare_threads::translate(all, amd_older, e && atoi(e) > 0);
+        if (v != all)
+            logf("vk: the shaders' translation runs on %u of those threads (AMD's driver for RDNA 1 and 2: its compute compiles "
+                 "slow down with more at once; RX_VK_PREPARE_THREADS=<n>: on n)", v);
+        return v;
+    }();
+    return n;
+}
 /// (prepare_run, the seed open) every pipeline of the state lists (the player's own and the shipped one): its program translated
 /// when the program cache lacks it, then noted in triforce_pipelines.bin for precompile_run to build. RX_VK_NO_STATE_LIST=1: off
 void state_list_prepare(void (*progress)(size_t done, size_t total)) {
@@ -1621,6 +2050,14 @@ void state_list_prepare(void (*progress)(size_t done, size_t total)) {
             if (FILE* f = fopen(state_list_path("triforce_states_applied.bin").c_str(), "wb")) fwrite(&id, 8, 1, f), fclose(f);
         }
     } applied{shipped_id};
+    struct ListsDone {   // ((Triforce) the lists gone through: a kept set put back has its notes now, cache_set.h. Not after
+        // a stop (stopped, below): the lists are gone through again at the next start, and only the marker says that a set
+        // put back still wants its notes)
+        bool stopped = false;
+        ~ListsDone() {
+            if (!stopped) cache_set_states_done();
+        }
+    } lists_done;
     std::vector<StateRec> recs = state_list_read(state_list_path("triforce_pipeline_states_shipped.bin"));
     const size_t shipped = recs.size();
     for (const StateRec& r : state_list_read(state_list_path("triforce_pipeline_states.bin"))) recs.push_back(r);
@@ -1651,8 +2088,9 @@ void state_list_prepare(void (*progress)(size_t done, size_t total)) {
     std::atomic<size_t> why_missing[3]{};
     const auto worker = [&] {
         ub_thread_off();   // (a background thread: see ub_thread_off; the pipeline state list's builds raced the replay's updates)
-        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+        SetThreadPriority(GetCurrentThread(), prepare_priority());
         for (;;) {
+            if (prepare_stopped()) return;   // ((Triforce, 11-18) a stop: the lists are gone through at the next start, below)
             const size_t i = next++;
             if (i >= want.size()) return;
             const StateRec& r = *want[i].r;
@@ -1680,6 +2118,17 @@ void state_list_prepare(void (*progress)(size_t done, size_t total)) {
     const unsigned workers = prepare_workers();   // (Triforce: before the title only; it was half the processors)
     for (unsigned i = 0; i < workers; i++) threads.emplace_back(worker);
     for (std::thread& t : threads) t.join();
+    // ((Triforce, 11-18) stopped (a closed window, the builder's Cancel: prepare_stop): what was translated is in the program
+    // cache, and the lists are not written down as gone through, so the next start goes through them again, as for a list
+    // it has not seen. Gone on with, they held the stop for minutes after an update, past the waits that then kill it)
+    const auto stopped = [&] {
+        if (!prepare_stopped()) return false;
+        applied.id = 0;
+        lists_done.stopped = true;
+        logf("vk: state list: stopped (the preparation was asked to stop): gone through again at the next start");
+        return true;
+    };
+    if (stopped()) return;
     // then each pipeline, noted as a draw would note it
     std::unordered_set<uint64_t> keys;
     for (const Want& w : want)
@@ -1700,8 +2149,9 @@ void state_list_prepare(void (*progress)(size_t done, size_t total)) {
     std::atomic<size_t> variants_made{0};
     next = 0;
     const auto variant_worker = [&] {
-        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+        SetThreadPriority(GetCurrentThread(), prepare_priority());
         for (;;) {
+            if (prepare_stopped()) return;
             const size_t i = next++;
             if (i >= variant_of.size()) return;
             const StateRec& r = recs[variant_of[i]];
@@ -1719,6 +2169,7 @@ void state_list_prepare(void (*progress)(size_t done, size_t total)) {
     threads.clear();
     for (unsigned i = 0; i < workers; i++) threads.emplace_back(variant_worker);
     for (std::thread& t : threads) t.join();
+    if (stopped()) return;
     size_t noted_n = 0, no_variant = 0;
     auto s = std::make_unique<NvnState>();
     for (size_t i = 0; i < recs.size(); i++) {
@@ -1850,7 +2301,10 @@ void gpl_keys(const Program& p, const NvnState& s, const Targets& at, VkPrimitiv
     uint64_t output = (uint64_t)at.samples << 8 | (uint64_t)at.n;
     for (int i = 0; i < at.n; i++) output = mix(output, (uint64_t)at.color_format[i]);
     output = mix(output, at.depth ? (uint64_t)at.depth_format : 0);
-    keys[0] = input, keys[1] = program, keys[2] = mix(program, (uint64_t)at.samples), keys[3] = output;
+    // ((Triforce) the two shader libraries of a pipeline with the shading rate dynamic have it too (it is state of both): theirs
+    // apart from the same program's other libraries, which stay as they were. pipeline_rate)
+    const uint64_t shaders = pipeline_rate(p, at) ? mix(program, kRateLibrary) : program;
+    keys[0] = input, keys[1] = shaders, keys[2] = mix(shaders, (uint64_t)at.samples), keys[3] = output;
 }
 /// ((Triforce) the link of n libraries, all there: gpl_link's, and the warm's)
 VkPipeline gpl_link_libs(const Program& p, const VkPipeline* libs, uint32_t n) {
@@ -2559,7 +3013,7 @@ PipeEntry* graphics_pipeline(const Program& p, const NvnState& s, const Targets&
         return e;
     };
     const uint64_t key = pipeline_key(p, s, at, topo);
-    static thread_local std::unordered_map<uint64_t, PipeEntry*> mine;   // (entries live as long as the cache)
+    static thread_local FlatMap<uint64_t, PipeEntry*> mine;   // (entries live as long as the cache; flat, flat_map.h)
     if (auto m = mine.find(key); m != mine.end()) return FINE_X(FC_PIPE_MAP, 1), remember(m->second);
     PROF_EXACT();   // (new to this thread, or new: rare, and a pipeline made can take milliseconds)
     ParLock lk;
@@ -2776,6 +3230,10 @@ VkPipeline build_graphics(const Program& p, const NvnState& s, const Targets& at
     if (dev.eds3_polygon) dyn.push_back(VK_DYNAMIC_STATE_POLYGON_MODE_EXT);
     if (dev.eds3_clamp) dyn.push_back(VK_DYNAMIC_STATE_DEPTH_CLAMP_ENABLE_EXT);
     if (dev.eds3_a2c) dyn.push_back(VK_DYNAMIC_STATE_ALPHA_TO_COVERAGE_ENABLE_EXT);
+    // ((Triforce) the shading rate, the far cascades' foliage at 2 x 2 (foliage_shadow.h): in these pipelines alone, whole or their
+    // two shader libraries (state of both; the vertex input and output libraries would ignore it, and are shared with pipelines
+    // without it). Their draws set it, draw_rate
+    if (pipeline_rate(p, at) && (part < 0 || part == 1 || part == 2)) dyn.push_back(VK_DYNAMIC_STATE_FRAGMENT_SHADING_RATE_KHR);
     VkPipelineDynamicStateCreateInfo dy{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
     dy.dynamicStateCount = (uint32_t)dyn.size();
     dy.pDynamicStates = dyn.data();
@@ -2920,26 +3378,54 @@ uint32_t aniso_override() {
     static const uint32_t n = getenv("RX_VK_ANISO") ? (uint32_t)std::clamp(atoi(getenv("RX_VK_ANISO")), 0, 16) : 0u;
     return n;
 }
-/// compare: the shader reads depth with a reference (a sampler without one cannot compare)
-VkSampler sampler_make(int id, bool compare);
+// ((Triforce, S8, FSR3-07) the texture LOD bias while DLSS or FSR scales the 3D with jitter (upscale_lod_tick, after this
+// namespace): added to the scene's material samplers' own in sampler_make, so it is part of their key. Before, the textures
+// were sampled for the render size, softer than the output shows. Only in the draws into the jittered scene at the render
+// size (draw_in_scene): every pass had it before, the shadow cascades too, whose foliage then crawled)
+std::atomic<float> upscale_lod_bias{0.0f};
+std::atomic<uint32_t> upscale_lod_render{0}, upscale_lod_output{0};   // (the last upscale's widths: upscale_lod_note)
+std::atomic<uint32_t> upscale_lod_render_h{0};                        // (and its render height)
+// ((Triforce, S8) this frame's scene size, from the upscaler's camera note in stream order (upscale_lod_scene): the
+// game's dynamic resolution makes new targets at each size, which the last upscale's size (the frame before's) misses)
+std::atomic<uint64_t> upscale_lod_scene_now{0};   // (sharpen_rules.h lod_scene_pack)
+/// ((Triforce, S8) Whether a draw into these targets renders the jittered scene (sharpen_rules.h lod_scene_now): its colour
+/// targets, or a depth-only draw's depth target (lod_scene_size), at the last upscale's render size or this frame's scene
+/// camera's. False while no bias is in use
+bool draw_in_scene(const Targets& at) {
+    if (upscale_lod_bias.load(std::memory_order_relaxed) == 0.0f) return false;
+    sharpen_rules::LodTarget color[8], depth;
+    const int n = std::min(at.n, 8);
+    for (int i = 0; i < n; i++)
+        if (const Texture* t = at.color[i]) color[i] = {t->width, t->height, at.color_level[i]};
+    if (at.depth) depth = {at.depth->width, at.depth->height, at.depth_level};
+    uint32_t w, h;
+    sharpen_rules::lod_scene_size(color, n, depth, &w, &h);
+    return sharpen_rules::lod_scene_now(w, h, upscale_lod_render.load(std::memory_order_relaxed),
+                                        upscale_lod_render_h.load(std::memory_order_relaxed),
+                                        upscale_lod_scene_now.load(std::memory_order_relaxed), texture_frame_no());
+}
+/// compare: the shader reads depth with a reference (a sampler without one cannot compare). scene: for a draw into the
+/// jittered scene (draw_in_scene), the only one the upscaler's texture LOD bias is added for
+VkSampler sampler_make(int id, bool compare, bool scene);
 // (each texture of each draw found its sampler through reg_mu, a copy of the registration, a hash of it and a map lookup:
-// ~48000 times a frame at 3000 draws. Now a thread's table by id and compare, good while no sampler registration's contents
-// changed (sampler_registrations_generation). RX_VK_SAMPLER_CACHE=0 turns off both this table and the parameters' cache inside
-// sampler_make; =1 or the Sampler cache row turns the parameters' cache on (this table stays on, as it is without the option)
+// ~48000 times a frame at 3000 draws. Now a thread's table by id, compare and scene, good while no sampler registration's
+// contents changed and the bias did not (sampler_registrations_generation; sampler_bias_changed moves it). RX_VK_SAMPLER_CACHE=0
+// turns off both this table and the parameters' cache inside sampler_make; =1 or the Sampler cache row turns the parameters'
+// cache on (this table stays on, as it is without the option)
 bool sampler_cache_on();   // (hookshot, RX_VK_SAMPLER_CACHE and the Sampler cache row: defined below with the descriptor fingerprint's)
-VkSampler sampler_for(int id, bool compare) {
+VkSampler sampler_for(int id, bool compare, bool scene) {
     static const bool on = !getenv("RX_VK_SAMPLER_CACHE") || atoi(getenv("RX_VK_SAMPLER_CACHE")) != 0;
-    if (!on || id < 0 || id >= 4096) return sampler_make(id, compare);
+    if (!on || id < 0 || id >= 4096) return sampler_make(id, compare, scene);
     struct Entry { uint64_t gen; VkSampler s; };
-    static thread_local Entry table[2][4096];   // (gen 0: never filled; the generation starts at 1)
+    static thread_local Entry table[2][2][4096];   // (gen 0: never filled; the generation starts at 1)
     const uint64_t gen = sampler_registrations_generation();   // (read first: a registration after it makes the next call miss)
-    Entry& e = table[compare ? 1 : 0][id];
+    Entry& e = table[scene ? 1 : 0][compare ? 1 : 0][id];
     if (e.gen == gen) return e.s;
-    const VkSampler made = sampler_make(id, compare);
+    const VkSampler made = sampler_make(id, compare, scene);
     if (made) e = {gen, made};   // (a failed creation is retryable without a new registration)
     return made;
 }
-VkSampler sampler_make(int id, bool compare) {
+VkSampler sampler_make(int id, bool compare, bool scene) {
     nvn_samp_par p{};
     bool known = false;
     if (sampler_cache_on()) {   // (hookshot: what an id holds stays cached with its version on this thread: resolving an id
@@ -2958,11 +3444,28 @@ VkSampler sampler_make(int id, bool compare) {
     // the samplers Eden would add it to (TSCEntry::MaxAnisotropy): linear, mipmapped, averaging, no depth compare, from level 0.
     // The game's own is kept where it asks for more; the rest (render targets, lookup tables, shadows) stay as they are.
     // p is hashed into the key below, so a sampler made for another setting is not taken. RX_VK_ANISO is upstream's switch, below)
+    // ((Triforce, 11-18, EstebanGGM's port of NX2navi vk_texture.c) and only where U and V repeat and the magnification is
+    // linear: a clamped sampler reads a screen buffer, where steep derivatives along edges sample across its boundary and
+    // leave a speckled fringe around objects)
+    const bool aniso_tiled = (p.ws == NVN_WRAP_MODE_REPEAT || p.ws == NVN_WRAP_MODE_MIRRORED_REPEAT) &&
+                             (p.wt == NVN_WRAP_MODE_REPEAT || p.wt == NVN_WRAP_MODE_MIRRORED_REPEAT);
     if (opts.aniso > 0 && !aniso_override()) {
         const int want = 1 << std::min(opts.aniso, 4);
         const bool suitable = (p.minf == NVN_MIN_FILTER_LINEAR_MIPMAP_LINEAR || p.minf == NVN_MIN_FILTER_LINEAR_MIPMAP_NEAREST) &&
+                              p.magf == NVN_MAG_FILTER_LINEAR && aniso_tiled &&
                               p.reduction == 0 && p.cmp_mode == 0 && !compare && p.lod_min <= 0.0f && p.lod_max >= 1.0f;
         if (suitable) p.aniso = std::max(p.aniso, (float)want);
+    }
+    if (const float bias = upscale_lod_bias.load(std::memory_order_relaxed); scene && bias != 0.0f) {
+        // ((Triforce, S8) DLSS or FSR with jitter, in a draw into the jittered scene (scene: draw_in_scene; never a dispatch,
+        // a shadow cascade, a capture or a pass at another size): the material textures, filtered within and between levels
+        // and wrapping, sampled for the output's size and half a level finer (sharpen_rules.h lod_bias); clamped ones (post
+        // effects, lookup tables, the HUD and text) keep the game's own. p is hashed below: a sampler of another bias, or
+        // the unbiased one of the other passes, is not taken)
+        const auto wraps = [](uint32_t w) { return w == NVN_WRAP_MODE_REPEAT || w == NVN_WRAP_MODE_MIRRORED_REPEAT; };
+        if (sharpen_rules::lod_biased(p.minf == NVN_MIN_FILTER_LINEAR_MIPMAP_LINEAR, wraps(p.ws), wraps(p.wt),
+                                      compare || p.cmp_mode != 0, p.reduction != 0))
+            p.lod_bias += bias;
     }
     uint64_t key = mix(compare ? 0xC0 : 0xAB, aniso_override());
     if (compare && getenv("RX_VK_DREF_OP")) key = mix(key, 0xD0EFull + (uint64_t)atoi(getenv("RX_VK_DREF_OP")));
@@ -3026,7 +3529,8 @@ VkSampler sampler_make(int id, bool compare) {
             logf("vk: sampler anisotropy: the game asks for %g (min filter %u, mip filter %s; RX_VK_ANISO=%u)", (double)p.aniso, (unsigned)p.minf,
                  ci.mipmapMode == VK_SAMPLER_MIPMAP_MODE_LINEAR ? "linear" : "nearest", aniso_override());
     }
-    if (aniso_override() && ci.minFilter == VK_FILTER_LINEAR && ci.mipmapMode == VK_SAMPLER_MIPMAP_MODE_LINEAR)
+    if (aniso_override() && aniso_tiled && ci.magFilter == VK_FILTER_LINEAR &&
+        ci.minFilter == VK_FILTER_LINEAR && ci.mipmapMode == VK_SAMPLER_MIPMAP_MODE_LINEAR)
         aniso = std::max(aniso, (float)aniso_override());
     ci.anisotropyEnable = aniso > 1.0f && dev.features.samplerAnisotropy;
     ci.maxAnisotropy = std::clamp(aniso, 1.0f, dev.props.limits.maxSamplerAnisotropy);
@@ -3176,7 +3680,9 @@ struct HandleHit {
     uint32_t id = 0;      // ((Triforce) the texture's creation number, and whether the view is of its own image and stays while
     bool stable = false;  // its views do: kept through other textures' ends, view_keep.h)
 };
-TLS_OBJECT(handle_hits, std::unordered_map<uint64_t, HandleHit>)
+// (flat (flat_map.h): searched at every texture binding on every recording thread; a std::unordered_map divided by a prime and
+// followed a node pointer each time, 0.35 ms a frame of the Presentation Thread alone at the Market, all-thread sample 11-20)
+TLS_OBJECT(handle_hits, FlatMap<uint64_t, HandleHit>)
 // ((Triforce) a recording thread's passes over its looks when the destroy generation moved, and the numbers of the textures whose
 // views went since its last (view_keep.h); RX_VK_VIEW_KEEP=0: every look resolved anew at any texture's end, as before)
 thread_local view_keep::Pass view_pass;
@@ -3286,7 +3792,7 @@ VkImageView texture_view_of(uint32_t handle, VkImageViewType want, ViewUse use, 
     // ((Triforce) the generation moved: this thread's looks of textures whose views did not go take it, before any look is read.
     // view_keep.h; the generation read above, the record inside)
     if (view_pass.gen != dgen && view_keep_on() &&
-        view_keep::pass(view_pass, dgen, [](auto&& fn) { for (auto& kv : handle_hits()) fn(kv.second.destroy_gen, kv.second.id, kv.second.stable); },
+        view_keep::pass(view_pass, dgen, [](auto&& fn) { handle_hits().each([&fn](uint64_t, HandleHit& h) { fn(h.destroy_gen, h.id, h.stable); }); },
                         texture_views_gone_since, view_gone())) {
         const int64_t passes = st_view_passes.fetch_add(1, std::memory_order_relaxed) + 1;
         const int64_t kept = st_view_kept.fetch_add((int64_t)view_pass.moved, std::memory_order_relaxed) + (int64_t)view_pass.moved;
@@ -3310,9 +3816,17 @@ VkImageView texture_view_of(uint32_t handle, VkImageViewType want, ViewUse use, 
     }
     // ((Triforce) a registered slot that resolved to the dummy for want of its texture (a new one left for a later frame) stands only
     // until the frame that left it ends: its tex_epoch holds texture_dummy_generation then, vk_texture.cpp)
+    // ((Triforce, redrawn.h) and only for a look that may leave textures for later: one that may not (a draw into a target not
+    // drawn in the frame before, a dispatch) resolves it again, and the texture is made now. Such a look also looks again at a
+    // texture that still owes bytes (left for later by an earlier draw of this frame), which uploads them now)
     if (it != handle_hits().end() && it->second.version == version && it->second.destroy_gen == dgen &&
-        (it->second.view || it->second.tex || !it->second.known || it->second.tex_epoch == texture_dummy_generation())) {
-        if (it->second.tex && it->second.tex_epoch != texture_epoch()) {   // (once a submission: its age and contents)
+        (it->second.view || it->second.tex || !it->second.known ||
+         (it->second.tex_epoch == texture_dummy_generation() && upload_defer_ok))) {
+        if (it->second.tex && !upload_defer_ok && texture_owes(it->second.tex)) {
+            ParLock lk;
+            texture_touch(it->second.tex, it->second.sampling);
+            it->second.tex_epoch = texture_epoch();
+        } else if (it->second.tex && it->second.tex_epoch != texture_epoch()) {   // (once a submission: its age and contents)
             if (!texture_touch_quick(it->second.tex, it->second.sampling)) {
                 ParLock lk;
                 texture_touch(it->second.tex, it->second.sampling);
@@ -3475,7 +3989,7 @@ VkDescriptorBufferInfo uniform_range(const NvnState& s, const Stage& st, uint32_
     if (index == 1) {
         FINE_SCOPE(FT_C1);
         FINE_N(FC_C1_CALLS, 1);
-        const void* key = &st;
+        const uintptr_t key = (uintptr_t)&st;
         auto it = cur->c1_at.find(key);
         const uint64_t n = std::max<uint64_t>((st.c1.size() + 15) & ~15ull, 16);
         if (it != cur->c1_at.end()) return {it->second.first, it->second.second, n};
@@ -3508,9 +4022,10 @@ VkDescriptorBufferInfo uniform_range(const NvnState& s, const Stage& st, uint32_
         // game has written the next frame's uniforms over the ones submitted. Kokiri's depth prepass drew the ground with other
         // objects' matrices, and the fog pass painted sky over it (the white forest on Intel Core Ultra iGPUs). Other GPUs with
         // no mirror keep it off until it is measured there. RX_VK_UB_SNAPSHOT=0: off; any other value: on)
-        // ((Triforce, 11-18) and on AMD's integrated GPUs too, which have no mirror either: the same white forest over Kokiri on
+        // ((Triforce, 11-18) and on AMD's integrated GPUs too, which had no mirror either: the same white forest over Kokiri on
         // an AMD Radeon iGPU (#bug-tracker "Texture White and Glow"), and the scene and the interface flickering on a ROG Ally X
-        // (Radeon 890M class, "Screen flicker, UI flicker ... on Ally X"). A discrete GPU without its mirror keeps it off)
+        // (Radeon 890M class, "Screen flicker, UI flicker ... on Ally X"). A discrete GPU without its mirror keeps it off.
+        // (11-19) AMD's integrated GPUs have mirrors now (vk_memory.cpp mirror_on), so this is off there unless RX_VK_MIRROR=0)
         static const bool snapshot = [] {
             const char* e = getenv("RX_VK_UB_SNAPSHOT");
             if (e) return !(*e == '0' && !e[1]);
@@ -3546,6 +4061,10 @@ TLS_OBJECT(dw, DescWriter)
 TLS_OBJECT(draw_sampled, std::vector<const Texture*>)   // (the textures the descriptors being built sample or store)
 TLS_OBJECT(gfx_sampled, std::vector<const Texture*>)    // (the last draw's: kept while its descriptors are reused)
 TLS_OBJECT(built_textures, std::vector<const void*>)    // ((Triforce) the textures the build sampled through a view: desc_sig.h)
+// ((Triforce, redrawn.h) set by draw() before its descriptors: every target it writes was written in the frame before too and its
+// program writes no memory, so a texture it samples may be left for the next frame (the budget). Otherwise its textures are made
+// and uploaded now, and nothing it reuses may hold a dummy or a texture still owed its bytes)
+thread_local bool draw_may_defer = true;
 thread_local int64_t desc_dummies = 0, desc_dummies_known = 0;   // ((Triforce) this thread's builds' st_dummy_textures, st_dummy_known)
 
 /// Fills dw with the program's descriptors for the bound state (bindings in Eden's order). Storage the program
@@ -3622,6 +4141,52 @@ bool menu_env_on(const char* env_name, const char* ini_key_name, bool def = fals
     return v != 0;
 }
 }  // namespace
+void upscale_lod_note(uint32_t render_w, uint32_t render_h, uint32_t output_w) {
+    upscale_lod_render_h.store(render_h, std::memory_order_relaxed);   // (before the width: draw_in_scene reads both)
+    upscale_lod_render.store(render_w, std::memory_order_relaxed);
+    upscale_lod_output.store(output_w, std::memory_order_relaxed);
+}
+void upscale_lod_scene(uint32_t width, uint32_t height) {
+    upscale_lod_scene_now.store(sharpen_rules::lod_scene_pack(width, height, texture_frame_no()), std::memory_order_relaxed);
+}
+void upscale_lod_tick() {
+    // ((Triforce, S8) RX_VK_UPSCALE_LOD_BIAS: unset, the computed bias; 0, none; a negative number, that bias where the
+    // computed one would apply: sharpen_rules.h lod_bias_switch)
+    static float fixed = 0.0f;
+    static const sharpen_rules::LodBiasSwitch mode = [] {
+        const auto m = sharpen_rules::lod_bias_switch(getenv("RX_VK_UPSCALE_LOD_BIAS"), &fixed);
+        if (m == sharpen_rules::LodBiasSwitch::Off)
+            logf("vk: texture LOD bias: none (RX_VK_UPSCALE_LOD_BIAS=0): the game's own while DLSS or FSR scales the 3D");
+        else if (m == sharpen_rules::LodBiasSwitch::Fixed)
+            logf("vk: texture LOD bias: %+.2f (RX_VK_UPSCALE_LOD_BIAS) on the scene's tiled textures while DLSS or FSR scales the 3D "
+                 "with jitter", (double)fixed);
+        return m;
+    }();
+    const bool off = mode == sharpen_rules::LodBiasSwitch::Off, fixed_on = mode == sharpen_rules::LodBiasSwitch::Fixed;
+    // (while the upscaler is chosen the widths and the jitter are kept from its last frames: a pause or a menu, where it does
+    // not draw, makes no samplers anew twice; without it, none)
+    static bool jitter = false;
+    float want = 0.0f;
+    if (!off && (temporal_wanted() || fsr3_wanted())) {
+        if (temporal_jitter_size(0) || fsr3_inputs::jitter_size(0)) jitter = true;
+        want = sharpen_rules::lod_bias_want(mode, fixed, upscale_lod_render.load(std::memory_order_relaxed),
+                                            upscale_lod_output.load(std::memory_order_relaxed), jitter);
+    } else {
+        jitter = false;
+        upscale_lod_render.store(0, std::memory_order_relaxed);
+        upscale_lod_scene_now.store(0, std::memory_order_relaxed);
+    }
+    const float now = upscale_lod_bias.load(std::memory_order_relaxed);
+    const float next = sharpen_rules::lod_bias_step(mode, now, want);   // (a fixed one as it is asked)
+    if (next == now) return;
+    upscale_lod_bias.store(next, std::memory_order_relaxed);
+    sampler_bias_changed();
+    logf("vk: texture LOD bias %+.2f on the scene's tiled textures (%s; was %+.2f)", (double)next,
+         next == 0.0f ? "no upscaler: the game's own"
+         : fixed_on   ? "RX_VK_UPSCALE_LOD_BIAS"
+         : jitter     ? "the upscaler's render scale, -0.5 for its jitter"
+                      : "the upscaler's render scale", (double)now);
+}
 /// (Triforce) The texture views resolved anew so far (texture_view_of's lookups that did not come from its cache), for the stall
 /// line (vk_replay.cpp status_tick)
 int64_t draw_view_lookups() { return st_view_lookups.load(std::memory_order_relaxed); }
@@ -3764,6 +4329,7 @@ uint32_t sampled_handle(const NvnState& s, const Stage& st, const Shader::Textur
 // (the counts of the frame statistics' "a frame's descriptors" line, desc_report. Each added as a load and a store, not an atomic add:
 // a few a draw on the replay thread, and the helper threads' racing adds lose a count at worst, as the file's other counters do)
 std::atomic<int64_t> st_dk_builds{0}, st_dk_resolved{0}, st_dk_taken{0}, st_dk_checked{0}, st_dk_bad{0};
+std::atomic<int64_t> st_strict_builds{0};   // ((Triforce, redrawn.h) draws that built their own descriptors, a frame having left some)
 std::atomic<int64_t> st_push_full{0}, st_push_full_n{0}, st_push_delta{0}, st_push_delta_n{0}, st_push_none{0}, st_push_tpl{0};
 std::atomic<int64_t> st_set_new{0}, st_set_new_n{0}, st_set_tpl{0}, st_set_again{0};
 std::atomic<int64_t> st_sig_walks{0}, st_sig_hits{0}, st_sig_checked{0}, st_sig_bad{0};   // ((Triforce) desc_sig.h)
@@ -3866,8 +4432,9 @@ VkDescriptorBufferInfo kept_uniform(desc_keep::Prog* kp, size_t j, const NvnStat
     return bi;
 }
 /// A sampled texture's view (as texture_view_of gives it: null, the dummy is drawn) and Texture, and its sampler, through the
-/// per-binding reuse: descriptor j of kp (null: resolved, as before). A draw's (not compute's) new ASTC textures may wait a frame
-VkSampler kept_texture(desc_keep::Prog* kp, size_t j, uint32_t handle, VkImageViewType vt, bool compare, bool compute,
+/// per-binding reuse: descriptor j of kp (null: resolved, as before). A draw's (not compute's) new ASTC textures may wait a frame.
+/// scene: the draw renders the jittered scene (draw_in_scene), its sampler the one with the upscaler's texture LOD bias
+VkSampler kept_texture(desc_keep::Prog* kp, size_t j, uint32_t handle, VkImageViewType vt, bool compare, bool compute, bool scene,
                        VkImageView* view, Texture** tex) {
     using namespace desc_keep;
     Elem* e = kp && handle ? &kp->e[j] : nullptr;
@@ -3876,11 +4443,14 @@ VkSampler kept_texture(desc_keep::Prog* kp, size_t j, uint32_t handle, VkImageVi
     Stamps now;
     bool took = false;
     if (e) {   // (all read before the lookups below: a generation they move makes the next draw's look again)
-        in = handle | (uint64_t)vt << 32 | (uint64_t)compare << 40;
+        in = handle | (uint64_t)vt << 32 | (uint64_t)compare << 40 | (uint64_t)scene << 41;   // ((Triforce, S8) scene: its own sampler)
         version = texture_slot_version((int)(handle & 0xFFFFF));
         now.samp = sampler_registrations_generation(), now.destroy = texture_destroy_generation();
         now.dummy = texture_dummy_generation(), now.epoch = texture_epoch();
         took = take(*e, kTex, in, 0, version, now);
+        // ((Triforce, redrawn.h) a draw that may not leave textures for later takes no kept dummy of a registered slot, nor a kept
+        // texture that still owes bytes: it looks them up, and they are made and uploaded now)
+        if (took && !compute && !draw_may_defer && (!e->out[1] || texture_owes((const Texture*)(uintptr_t)e->out[2]))) took = false;
         if (took && desc_keep_mode() != 2) {
             count_add(st_dk_taken, 1);
             *view = (VkImageView)(uintptr_t)e->out[1], *tex = (Texture*)(uintptr_t)e->out[2];
@@ -3888,11 +4458,11 @@ VkSampler kept_texture(desc_keep::Prog* kp, size_t j, uint32_t handle, VkImageVi
             return (VkSampler)(uintptr_t)e->out[0];
         }
     }
-    upload_defer_ok = !compute;
+    upload_defer_ok = !compute && draw_may_defer;   // ((Triforce, redrawn.h) a draw into targets it did not draw in the frame before: now)
     *view = handle ? texture_view_of(handle, vt, ViewUse::Sample, VK_FORMAT_UNDEFINED, tex) : VK_NULL_HANDLE;
     upload_defer_ok = false;
     const bool known = view_slot_known;
-    const VkSampler smp = sampler_for((int)(handle >> 20), compare);
+    const VkSampler smp = sampler_for((int)(handle >> 20), compare, scene);
     if (e) {
         count_add(st_dk_resolved, 1);
         const uint64_t o0 = (uint64_t)(uintptr_t)smp, o1 = (uint64_t)(uintptr_t)*view, o2 = (uint64_t)(uintptr_t)*tex;
@@ -3904,7 +4474,9 @@ VkSampler kept_texture(desc_keep::Prog* kp, size_t j, uint32_t handle, VkImageVi
     return smp;
 }
 
-void build_descriptors(const NvnState& s, const Program& p, bool keep = false) {
+/// keep: a draw's build, through the per-binding reuse. scene: the draw renders the jittered scene (draw_in_scene), its
+/// textures sampled with the upscaler's LOD bias; a dispatch's never
+void build_descriptors(const NvnState& s, const Program& p, bool keep = false, bool scene = false) {
     dw().reset();
     dw().prog = &p;
     desc_fp().clear(), desc_fp_dummy = false;   // (RX_VK_DESC_SLOTGEN: the samplers' generation is read before the first handle,
@@ -4280,7 +4852,7 @@ void build_descriptors(const NvnState& s, const Program& p, bool keep = false) {
                 VkImageView view = VK_NULL_HANDLE;
                 // (texture_view_of and sampler_for, or what they gave this descriptor before: desc_keep.h)
                 const VkSampler smp = kept_texture(kp, jb + k, handle, vt, d.is_depth, st.vk_stage == VK_SHADER_STAGE_COMPUTE_BIT,
-                                                   &view, &tex);
+                                                   scene, &view, &tex);
                 if (pre_retarget_on && view && tex == pre_retarget.from) view = pre_retarget.to_view;   // (the engine's picture)
                 // (Triforce, texture detail: a texture with levels left out, at a binding the stage reads by texel
                 // position or asks the size of, is made whole: vk_texture.cpp texture_want_whole)
@@ -5307,6 +5879,7 @@ std::atomic<int64_t> st_dispatch_unbarred{0};   // (dispatches it left without t
 thread_local bool last_desc_valid = false;
 thread_local const Program* last_desc_prog = nullptr;
 thread_local uint64_t last_desc_bind = 0, last_desc_reg = 0, last_desc_ub = 0, last_desc_dgen = 0;
+thread_local bool last_desc_scene = false;   // ((Triforce, S8) whether they were built for the jittered scene: draw_in_scene)
 // (RX_VK_DESC_SLOTGEN: the versions of the slots the last build resolved, the samplers' generation it saw, and whether it
 // sampled an unregistered slot; the same draw keeps its descriptors while none of those moved)
 TLS_OBJECT(last_desc_fp, std::vector<uint64_t>)
@@ -5536,9 +6109,9 @@ bool dyn_same(const float* fp, int nf, const uint32_t* up, int nu, const uint8_t
         if (raw[i] != craw[i]) return false;
     return true;
 }
-/// (Triforce) The face a draw culls, NVN's: the game's, or with RX_VK_FOLIAGE_SHADOW_CULL a mesh program's draw into the sun's far
-/// shadow cascades with one face culled (foliage_shadow.h). dyn_pack keeps it, so a draw into another cascade layer with the same
-/// state is not taken for the same dynamic state
+/// (Triforce) The face a draw culls, NVN's: the game's, or with RX_VK_FOLIAGE_SHADOW_CULL (on from layer 1 unless it is off) a mesh
+/// program's draw into the sun's far shadow cascades with one face culled (foliage_shadow.h). dyn_pack keeps it, so a draw into
+/// another cascade layer with the same state is not taken for the same dynamic state
 uint32_t draw_cull(const NvnState& s, const Targets& at) {
     static_assert(foliage_shadow::kNone == NVN_FACE_NONE && foliage_shadow::kFront == NVN_FACE_FRONT &&
                   foliage_shadow::kBack == NVN_FACE_BACK);
@@ -5547,7 +6120,10 @@ uint32_t draw_cull(const NvnState& s, const Targets& at) {
         const foliage_shadow::Rule r = foliage_shadow::parse(e);
         if (r.from >= 0)
             logf("vk: RX_VK_FOLIAGE_SHADOW_CULL=%s: mesh draws into the sun's shadow cascades from layer %d on that cull neither face "
-                 "drawn with their %s faces culled (not the same picture: a switch to compare)", e, r.from, r.front ? "front" : "back");
+                 "drawn with their %s faces culled (=off: as the game draws them)", e && *e ? e : "(default)", r.from,
+                 r.front ? "front" : "back");
+        else
+            logf("vk: RX_VK_FOLIAGE_SHADOW_CULL=%s: the sun's shadow cascades' mesh draws cull as the game asks", e);
         return r;
     }();
     const uint32_t game = (uint32_t)s.poly.cull;
@@ -5561,6 +6137,29 @@ uint32_t draw_cull(const NvnState& s, const Targets& at) {
                  (unsigned long long)cur_program->key, at.depth_layer, at.width, at.height, c == foliage_shadow::kFront ? "front" : "back");
     }
     return (uint32_t)c;
+}
+/// ((Triforce) RX_VK_FOLIAGE_SHADOW_VRS, foliage_shadow.h) A draw through a pipeline with the shading rate dynamic (pipeline_rate)
+/// sets it: 2 x 2 for a mesh program's draw into a cascade from the switch's layer on that the game draws double-sided, 1 x 1 for
+/// any other. Set again whenever the pipeline was bound for this draw (a pipeline without the state, bound between, left it
+/// undefined), in another command buffer, or for the other size; else the command buffer has it
+thread_local VkCommandBuffer rate_cmd = VK_NULL_HANDLE;
+thread_local uint32_t rate_size = 0;
+void draw_rate(VkCommandBuffer cmd, const NvnState& s, const Targets& at, bool bound) {
+    static const int from = foliage_shadow::parse_rate(getenv("RX_VK_FOLIAGE_SHADOW_VRS"));
+    const uint32_t size = foliage_shadow::rate(from, (int)s.poly.cull, true, at.n, at.depth != nullptr, at.width, at.height,
+                                               at.depth_layer);
+    if (!bound && cmd == rate_cmd && size == rate_size) return;
+    const VkExtent2D fragment{size, size};
+    const VkFragmentShadingRateCombinerOpKHR keep[2] = {VK_FRAGMENT_SHADING_RATE_COMBINER_OP_KEEP_KHR,
+                                                        VK_FRAGMENT_SHADING_RATE_COMBINER_OP_KEEP_KHR};
+    vkCmdSetFragmentShadingRateKHR(cmd, &fragment, keep);
+    rate_cmd = cmd, rate_size = size;
+    if (size > 1) {
+        static std::atomic<int> told{0};
+        if (told.fetch_add(1, std::memory_order_relaxed) < 6)
+            logf("vk: foliage shadow 2 x 2: program %016llx's draw into the cascade layer %u (%ux%u) at one fragment per 2 x 2 pixels",
+                 (unsigned long long)(cur_program ? cur_program->key : 0), at.depth_layer, at.width, at.height);
+    }
 }
 constexpr int kDynF = 13, kDynU = 35;
 constexpr int kDynCull = 23;   // ((Triforce) the packed word draw_cull's face is in, which dynamic_state takes)
@@ -6101,7 +6700,7 @@ void draw_begin_recording(int slot, VkCommandBuffer cmd, uint64_t value) {
              (unsigned long long)(kStream >> 20), (unsigned long long)(stream_peak.load(std::memory_order_relaxed) >> 10),
              (unsigned long long)stream_grown.load(), (unsigned long long)(stream_extra.load() >> 20));
     r.used = 0, r.before = 0;
-    r.c1_at.clear();
+    r.c1_at.reset();   // (its array kept: emptied at every recording's start, it fills again to about the same size)
     cur = &r;
     pass() = Pass{};
     work_since_barrier = false;   // ((Triforce, P4) and its first dispatch not right after one: its begin cleared the marks, vk_work.h work_begun)
@@ -7550,20 +8149,32 @@ bool fallback_record(VkCommandBuffer cmd, Program& p, const DrawArgs& d) {
     fallback_records_address = f->records_address;
     const uint32_t capacity = Shader::Backend::SPIRV::MESH_FALLBACK_CAPACITY;
     end_pass(cmd);
+    // ((Triforce, 11-18, EstebanGGM) the barriers inside a fallback draw: only the stages that write and read the records (the
+    // header's update, the task and mesh compute, the indirect dispatch), not every stage as full_barrier has it. The one
+    // before the reset and the one after the mesh stage stay full: those order it against other draws)
+    const auto fb_barrier = [&](VkPipelineStageFlags2 src, VkPipelineStageFlags2 dst) {
+        VkMemoryBarrier2 b{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+        b.srcStageMask = src;
+        b.srcAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
+        b.dstStageMask = dst;
+        b.dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
+        VkDependencyInfo dep{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+        dep.memoryBarrierCount = 1, dep.pMemoryBarriers = &b;
+        vkCmdPipelineBarrier2(cmd, &dep);
+    };
     // (the shared pair: the last fallback draw on it, of any program of this thread, has read it before it is reset)
     full_barrier(cmd);
     const uint32_t groups{(uint32_t)std::clamp(d.groups[0], 0, (int)capacity)};
     // (the records' header: the draw's command with no vertices and one instance, the allocator at 0, and the mesh dispatch
     // with no workgroups, its y and z 1. The records past it need nothing: the draw reaches only those taken this time; nor
-    // the payload buffer: the mesh dispatch reads only the map entries and payloads its task wrote. Fills that do not overlap:
-    // two over the same bytes have no order between them without a barrier)
+    // the payload buffer: the mesh dispatch reads only the map entries and payloads its task wrote. (EstebanGGM) One 32-byte
+    // update, not four fills)
     static_assert(Shader::Backend::SPIRV::MESH_FALLBACK_DISPATCH_WORD == 5 && Shader::Backend::SPIRV::MESH_FALLBACK_HEADER_WORDS == 8);
-    vkCmdFillBuffer(cmd, f->records, 0, 4, 0);    // (vertexCount)
-    vkCmdFillBuffer(cmd, f->records, 4, 4, 1);    // (instanceCount)
-    vkCmdFillBuffer(cmd, f->records, 8, 16, 0);   // (firstVertex, firstInstance, the allocator, the dispatch's x)
-    vkCmdFillBuffer(cmd, f->records, 24, 8, 1);   // (the dispatch's y and z)
+    const uint32_t hdr[8] = {0u, 1u, 0u, 0u, 0u, 0u, 1u, 1u};   // (vertexCount, instanceCount, firstVertex, firstInstance, the
+                                                                // allocator, the dispatch's x, y, z)
+    vkCmdUpdateBuffer(cmd, f->records, 0, sizeof hdr, hdr);
     fallback_draw_records = f->records;
-    full_barrier(cmd);
+    fb_barrier(VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT);
     if (!bind_descriptors(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, p)) return false;
     push_constants(cmd, p, nullptr, d.first_task);
     size_t stages[2] = {p.stages.size(), p.stages.size()};
@@ -7598,7 +8209,7 @@ bool fallback_record(VkCommandBuffer cmd, Program& p, const DrawArgs& d) {
     };
     if (p.fallback_task) {
         if (!send(stages[0], false)) return false;
-        full_barrier(cmd);
+        fb_barrier(VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT);
         if (!send(stages[1], true)) return false;
     } else {
         if (!send(stages[0], true)) return false;
@@ -7623,6 +8234,25 @@ bool vertex_set_same(uint64_t stamp, const uint64_t* addr, const uint64_t* size,
         if (cached_addr[i] != addr[i] || cached_size[i] != sz || cached_stride[i] != stride[i]) return false;
     }
     return true;
+}
+/// (hookshot) The vertex bindings that differ from the ones last bound on this command buffer: first..first+count, count 0
+/// when none does. Only those are bound again: the driver takes every binding it is handed, and all 16 were handed to it
+/// whenever one stream changed, the unused ones with the zero buffer again (1.1 % of the replay thread on a Steam Deck,
+/// in the driver). Nothing bound on this command buffer yet (valid false): all 16
+void vertex_bind_range(const VkBuffer* b, const VkDeviceSize* o, const VkDeviceSize* z, const VkDeviceSize* s, const VkBuffer* lb,
+                       const VkDeviceSize* lo, const VkDeviceSize* lz, const VkDeviceSize* ls, bool valid, uint32_t* first,
+                       uint32_t* count) {
+    if (!valid) {
+        *first = 0, *count = 16;
+        return;
+    }
+    uint32_t a = 16, e = 0;
+    for (uint32_t i = 0; i < 16; i++)
+        if (b[i] != lb[i] || o[i] != lo[i] || z[i] != lz[i] || s[i] != ls[i]) {
+            if (a == 16) a = i;
+            e = i + 1;
+        }
+    *first = a == 16 ? 0 : a, *count = a == 16 ? 0 : e - a;
 }
 /// The index buffer already bound on this command buffer (a new recording is not)
 bool index_bind_same(uint64_t buffer, uint64_t offset, uint32_t type, uint64_t cached_buffer, uint64_t cached_offset,
@@ -7706,8 +8336,8 @@ static void target_types(const Targets& at, uint8_t types[8]) {
 static const char* skin_check(const NvnState& s, const Program& p, const DrawArgs& d, const Targets& at) {
     // (indexed or not: Link's legs and others are drawn as plain vertex arrays, and were left out when only indexed draws were taken)
     if (d.mesh || d.indirect || d.instances != 1 || !at.n || !at.color[0] || !at.depth ||
-        !temporal_scene_size(at.width, at.height) || !temporal_scene_format(at.color_format[0]) || !temporal_wanted())
-        return "not a plain draw into the scene";
+        !temporal_scene_size(at.width, at.height) || !temporal_scene_format(at.color_format[0]) || !temporal_motion_wanted())
+        return "not a plain draw into the scene";   // ((Triforce) AMD FSR 3.1's motion too: temporal_motion_wanted)
     if (s.nvattr < 7) return "fewer than 7 vertex attributes";
     const auto attr = [&](int i) { return *reinterpret_cast<const nvn_va_st*>(&s.vattr[i]); };
     const nvn_va_st pos = attr(0);
@@ -7827,6 +8457,7 @@ static bool fallback_list_held(uint64_t list) {
     return false;
 }
 
+static bool program_writes_memory(const Program& p);   // ((Triforce) writes_memory, kept per program: below draw())
 void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
     PROF_HOT(PROF_DRAW);
     FINE_N(FC_DRAWS, 1);
@@ -8114,6 +8745,57 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
     // in the same recording): the set it pushed or bound named that texture's old views, which go once the GPU is past the texture's
     // last use, a use the reused set no longer counted. The draws after it sampled freed memory, whatever the driver put there next:
     // plants and fences glowing white on a Legion Go S, which RX_VK_NO_DESC_REUSE=1 took away (issue 1126). RX_VK_DESC_REUSE_DGEN=0: as before
+    // ((Triforce, redrawn.h) whether this draw may leave a texture it samples for the next frame: only when every target it writes
+    // was written in the frame before too (the scene) and it writes no memory. A text box the game composes once into a target of
+    // its own and keeps had the dummy for the whole session when its frame was over the new-texture budget. And in a frame that
+    // left something for later, such a draw builds its own descriptors (strict): reused ones may hold a dummy or a texture still
+    // owed its bytes)
+    {   // ((Triforce, 11-19) RX_VK_REDRAWN=0: every draw may leave textures for later, as before v0.5.2: an A/B for 0.5.2's stutter)
+        // ((Triforce, 11-19) and only into small targets. The game finalizes many of its targets between frames (released), the
+        // scene's and its passes' among them (2560x1440, 960x540, 640x360, 480x270), so each was "not drawn before" every frame
+        // and every draw into one made and uploaded its new textures at once and skipped the descriptors' reuse: in the lab
+        // benchmark Lake Hylia's average 44.6 fps against 59.6, Castle Town's 40.5 against 45.5, first visits with 250-900 ms
+        // frames (#bug-tracker "Full Stuttering with last Update 0.5.2"). What the rule is for are small targets composed once:
+        // the text boxes (R8, 262x104 .. 656x113) and the title's and menus' labels (RGBA8, 90x34 .. 631x94; RX_VK_REDRAWN_LOG=1
+        // lists them). A target of RX_VK_REDRAWN_SMALL_PX (100000) pixels or more may always leave textures for later, as before)
+        static const bool redrawn_off = getenv("RX_VK_REDRAWN") && atoi(getenv("RX_VK_REDRAWN")) == 0;
+        static const uint64_t small_px = [] {
+            const char* e = getenv("RX_VK_REDRAWN_SMALL_PX");
+            const long long v = e && *e ? atoll(e) : -1;
+            return v >= 0 ? (uint64_t)v : 100000ull;
+        }();
+        const bool big = small_px > 0 && (uint64_t)at.width * at.height >= small_px;
+        bool may = redrawn_off || big || !program_writes_memory(p);
+        for (int i = 0; i < at.n && may && !redrawn_off && !big; i++) may = texture_redrawn(at.color[i]);
+        if (may && !redrawn_off && !big) may = texture_redrawn(at.depth);
+        draw_may_defer = may;
+    }
+    const bool strict = !draw_may_defer && texture_frame_left_any();
+    // ((Triforce, 11-19, lab) RX_VK_REDRAWN_LOG=1: the targets of draws that may not defer, each kind once (64 at most): size,
+    // format, whether the GPU wrote it, released, and the frames since its last and the write before)
+    if (!draw_may_defer && at.n > 0 && at.color[0]) {
+        static const bool rlog = getenv("RX_VK_REDRAWN_LOG") && atoi(getenv("RX_VK_REDRAWN_LOG")) != 0;
+        if (rlog) {
+            static std::mutex rlog_mu;
+            static std::set<uint64_t> seen;
+            const Texture* t0 = at.color[0];
+            const uint64_t k = (uint64_t)at.width << 40 | (uint64_t)at.height << 20 | (uint64_t)(uint32_t)at.color_format[0] << 2 |
+                               (t0->released ? 2u : 0u) | (t0->gpu_written ? 1u : 0u);
+            std::lock_guard<std::mutex> g(rlog_mu);
+            if (seen.size() < 64 && seen.insert(k).second)
+                logf("vk: redrawn: a draw that may not defer into %ux%u format %d (%d targets): gpu written %d, released %d, last %lld "
+                     "and before %lld frames ago (frame %llu), program %016llx%s", at.width, at.height, (int)at.color_format[0], at.n,
+                     (int)t0->gpu_written, (int)t0->released, (long long)(texture_frame_no() - t0->last_written),
+                     (long long)(t0->prev_written ? texture_frame_no() - t0->prev_written : -1), (unsigned long long)texture_frame_no(),
+                     (unsigned long long)p.key, program_writes_memory(p) ? ", the program writes memory" : "");
+        }
+    }
+    if (strict) {
+        const int64_t n = st_strict_builds.fetch_add(1, std::memory_order_relaxed) + 1;
+        if ((n & (n - 1)) == 0)   // (at 1, 2, 4, 8, ...)
+            logf("vk: draws into targets not drawn in the frame before, in frames that left textures for later: %lld, their "
+                 "textures made and uploaded at once (redrawn.h; RX_VK_CREATE_NEW_MS / RX_VK_UPLOAD_NEW_MS: the budget)", (long long)n);
+    }
     const uint64_t reg_gen = registrations_generation(), ub_gen = ub_generation();
     static const bool no_reuse = getenv("RX_VK_NO_DESC_REUSE") != nullptr;   // (A/B: every draw builds its own)
     static const bool dgen_off = getenv("RX_VK_DESC_REUSE_DGEN") && atoi(getenv("RX_VK_DESC_REUSE_DGEN")) == 0;
@@ -8123,7 +8805,11 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
     // with the fallback's layout, its task and mesh stages read another program's buffers, and descriptors the push left
     // as they were: stale addresses, like the one RADV faulted on in Hyrule Field (#792))
     const bool slotgen = desc_slotgen_on();
-    const bool same_gens = !no_reuse && last_desc_valid && last_desc_prog == &p && last_desc_bind == s.bind_gen &&
+    // ((Triforce, S8) the scene's draws sample with the upscaler's texture LOD bias, the others (a shadow cascade, a capture)
+    // without it: the descriptors the program's last draw built for the other kind of pass do not stand, nor their signature)
+    const bool scene = draw_in_scene(at);
+    if (last_desc_scene != scene) last_desc_valid = false;
+    const bool same_gens = !no_reuse && !strict && last_desc_valid && last_desc_prog == &p && last_desc_bind == s.bind_gen &&
                            last_desc_ub == ub_gen && last_desc_dgen == dgen &&
                            (slotgen ? desc_slots_kept(reg_gen) : last_desc_reg == reg_gen) &&
                            (!p.fallback || dw().prog == &p);
@@ -8136,7 +8822,7 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
     // from. Equal to that of the descriptors at the graphics bind point, which this program's last draw pushed in this command
     // buffer and nothing pushed over since (pushed()), and a build of theirs that kept every one: a build would take each of them
     // again and push nothing. RX_VK_DESC_SIG=0: built, as before)
-    const int sig_mode = !same_gens && !no_reuse ? desc_sig_mode() : 0;
+    const int sig_mode = !same_gens && !no_reuse && !strict ? desc_sig_mode() : 0;
     desc_sig::Sig& sig = sig_now();
     sig.prog = nullptr;
     const bool sig_walked = sig_mode && p.push && !dump_on() && !pre_retarget_on && desc_sig_walk(s, p, sig);
@@ -8150,7 +8836,7 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
         trace_tex_hit = nullptr, trace_tex_mask = 0;
         count_add(st_dk_builds, 1);
         const int64_t drops = desc_drops, dummies0 = desc_dummies, known0 = desc_dummies_known;
-        build_descriptors(s, p, true);   // (textures first used here are uploaded by the recording's upload command buffer)
+        build_descriptors(s, p, true, scene);   // (textures first used here are uploaded by the recording's upload command buffer)
         FINE_N(FC_WRITES, (int64_t)dw().writes.size());
         if (sig_walked) {   // ((Triforce) desc_sig.h: what it left besides the descriptors, for a draw that keeps them)
             sig_armed = desc_drops == drops;
@@ -8274,17 +8960,21 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
         if (slot >= 0) pass().sampled_targets |= (uint16_t)(1u << slot);
     }
     pass().written |= writes;
-    if (pl != last_pipeline) {
+    const bool bound = pl != last_pipeline;
+    if (bound) {
         FINE_SCOPE(FT_BINDPL);
         FINE_N(FC_BIND_PIPE, 1);
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pl), last_pipeline = pl;
     }
+    // ((Triforce) the pipeline has the shading rate dynamic: set right after its bind, before anything can leave the draw out, so
+    // that a later draw that finds it bound finds the rate set too; draw_rate)
+    if (pipeline_rate(p, at)) draw_rate(cmd, s, at, bound);
     if (!same_desc) {
         FINE_SCOPE(FT_BINDDESC);
         if (sig_hit) sig_check(cmd, p);   // ((Triforce) RX_VK_DESC_SIG=check: before the push changes what is pushed)
         if (!bind_descriptors(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, p)) SKIP_HERE();
         last_desc_valid = true, last_desc_prog = &p, last_desc_bind = s.bind_gen, last_desc_reg = reg_gen;
-        last_desc_ub = ub_gen, last_desc_dgen = dgen;
+        last_desc_ub = ub_gen, last_desc_dgen = dgen, last_desc_scene = scene;
         if (slotgen)   // (RX_VK_DESC_SLOTGEN: what its handles resolved; the next such draw may keep it through other slots' churn)
             last_desc_fp() = desc_fp(), last_desc_fp_dummy = desc_fp_dummy, last_desc_samp = desc_samp_seen,
             last_desc_destroy = desc_destroy_seen;
@@ -8540,10 +9230,16 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
             vbufs[b] = r.buffer, voffs[b] = r.offset, vsizes[b] = s.vbuf[b].size ? s.vbuf[b].size : VK_WHOLE_SIZE;
             vstrides[b] = s.vstream[b].stride;
         }
-        if (!last_vb_valid || std::memcmp(vbufs, last_vb.b, sizeof vbufs) || std::memcmp(voffs, last_vb.o, sizeof voffs) ||
-            std::memcmp(vsizes, last_vb.z, sizeof vsizes) || std::memcmp(vstrides, last_vb.s, sizeof vstrides)) {
+        // (hookshot: only the bindings that changed, vertex_bind_range; what is bound after it is the same 16. Every other
+        // graphics bind on a replay command buffer (masked clears, the temporal passes, a new recording) clears
+        // last_vb_valid, so the 16 remembered are what the command buffer has. RX_VK_VB_RANGE=0: all 16 at each change, as before)
+        static const bool vb_all = getenv("RX_VK_VB_RANGE") && atoi(getenv("RX_VK_VB_RANGE")) == 0;
+        uint32_t vb_first = 0, vb_count = 0;
+        vertex_bind_range(vbufs, voffs, vsizes, vstrides, last_vb.b, last_vb.o, last_vb.z, last_vb.s, last_vb_valid, &vb_first, &vb_count);
+        if (vb_count && vb_all) vb_first = 0, vb_count = 16;
+        if (vb_count) {
             FINE_N(FC_VBIND, 1);
-            vkCmdBindVertexBuffers2(cmd, 0, 16, vbufs, voffs, vsizes, vstrides);
+            vkCmdBindVertexBuffers2(cmd, vb_first, vb_count, vbufs + vb_first, voffs + vb_first, vsizes + vb_first, vstrides + vb_first);
             std::memcpy(last_vb.b, vbufs, sizeof vbufs), std::memcpy(last_vb.o, voffs, sizeof voffs);
             std::memcpy(last_vb.z, vsizes, sizeof vsizes), std::memcpy(last_vb.s, vstrides, sizeof vstrides);
             last_vb_valid = true;
@@ -8635,6 +9331,10 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
     st_draws++, pass().draws++;
     if (occ_live) occ_draw_issued();
 }
+// ((Triforce, redrawn.h) asked at every draw: a walk of the stages' few descriptor lists. Not kept in the Program: a field
+// there changes sizeof(Program), which the program cache's stamp holds (vk_shader.cpp disk_stamp), and every player's
+// program and pipeline caches would be thrown away at the update (272 -> 280 bytes did that, 11-18))
+static bool program_writes_memory(const Program& p) { return writes_memory(p); }
 
 /// A dispatch over 2 ms is logged, 60 times, and only while RX_VK_SLOW_DISPATCH is set. Off, the clock is not read.
 bool slow_dispatch_timing() {
@@ -8820,6 +9520,19 @@ bool upscale_stub(VkCommandBuffer cmd, const NvnState& s, uint64_t key) {
     // GPU without cooperative matrices they are left out): the temporal upscaler is offered it first, as temporal_stand_in
     // offers the networks that did translate. It takes only the scene into the picture; anything else goes on below
     if (temporal_wanted() && temporal_rejected_network(cmd, key, src, &in, dst, &out)) return true;
+    // ((Triforce, 11-18, EstebanGGM) and with FSR 3.1 picked (the Upscaler row, fsr3_wanted), FSR 3.1 takes such a rejected
+    // network's pass, as it takes those that translated, rather than the plain stretch below: an RX 580 has no cooperative
+    // matrices, so every one of its upscale networks is rejected. Only when FSR 3.1 is the upscaler (his had frame
+    // generation's inputs too, fsr3_inputs::wanted: those are left to their own path here)
+    if (fsr3_wanted()) {
+        VkImageView in_view = VK_NULL_HANDLE, out_view = VK_NULL_HANDLE;
+        {
+            ParLock lk;
+            in_view = texture_view(src, &in, nullptr, VK_IMAGE_VIEW_TYPE_2D, ViewUse::Sample);
+            out_view = texture_view(dst, &out, nullptr, VK_IMAGE_VIEW_TYPE_2D, ViewUse::Storage, nullptr, dst->format);
+        }
+        if (in_view && out_view && fsr3_upscale(cmd, key, false, src, in_view, dst, out_view, 0)) return true;
+    }
     // (Triforce: and from here to the end: the two textures' views and marks, and the helpers' own pipelines and history
     // images, typed_upscale's statics, which two workers recording such dispatches at once would both make)
     ParLock lk;
@@ -9054,9 +9767,24 @@ static bool typed_upscale(VkCommandBuffer cmd, VkImageView input_view, VkImageVi
     if (temporal) probe_image(cmd, out, level, 0, key, 't');
     return true;
 }
+/// ((Triforce, FG-2) A gameplay network's output whose dispatch goes on past fsr3_stand_in (the game's own network, or the
+/// TAAU or the Anti-aliasing row's pass in its place): taken as frame generation's picture without the HUD once it has run,
+/// hudless_after_dispatch. The recording thread's own: each worker records its dispatches whole)
+struct HudlessAfter {
+    Texture* out = nullptr;
+    uint32_t level = 0;
+    uint64_t key = 0;
+};
+thread_local HudlessAfter hudless_after;
+void hudless_after_dispatch(VkCommandBuffer cmd, uint64_t key) {
+    const HudlessAfter h = hudless_after;
+    hudless_after = {};
+    if (h.out && h.key == key) framegen_hudless_note(cmd, h.out, h.level);
+}
 /// (hookshot) AMD FSR 3.1 in place of the gameplay upscale network (vk_fsr3.cpp), and its frame interpolation's inputs from it
 /// (vk_fsr3_inputs.cpp): the same dispatches as temporal_stand_in below, found the same way. true: FSR 3.1 wrote the output
 bool fsr3_stand_in(VkCommandBuffer cmd, const NvnState& s, const Program& p) {
+    hudless_after = {};   // ((Triforce, FG-2) a dispatch's own: none left from one that was skipped)
     if (p.stages.empty() || !fsr3_inputs::wanted()) return false;
     const Stage& st = p.stages[0];
     if (!gameplay_network(p.key) && !(st.info.uses_cooperative_matrix && st.info.texture_descriptors.size() == 1 &&
@@ -9074,7 +9802,15 @@ bool fsr3_stand_in(VkCommandBuffer cmd, const NvnState& s, const Program& p) {
     uint32_t level = 0;
     const uint32_t out_handle = handle_of(s, st, od, 0);
     if (out_handle) texture_view_of(out_handle, VK_IMAGE_VIEW_TYPE_2D, ViewUse::Storage, image_format(od.format), &out, &level);
-    return fsr3_upscale(cmd, p.key, gameplay_network(p.key), in, dw().imgs[0].imageView, out, dw().imgs[ntex].imageView, level);
+    const bool done = fsr3_upscale(cmd, p.key, gameplay_network(p.key), in, dw().imgs[0].imageView, out, dw().imgs[ntex].imageView, level);
+    // ((Triforce, FSR3-03) the chain's redraws of what moves by itself may have drawn into FSR's motion with a pipeline,
+    // viewport and descriptors of their own (vk_temporal.cpp temporal_fsr3_motion): the next draw sets all of its again)
+    last_dyn_valid = false, last_desc_valid = false, last_vb_valid = false, last_pipeline = VK_NULL_HANDLE;
+    vertex_set.on = false, last_ib.on = false;
+    // ((Triforce, FG-2) the picture before the HUD: FSR 3.1's now, or the game's network's once its dispatch has run)
+    if (done && out) framegen_hudless_note(cmd, out, level);
+    else if (out && gameplay_network(p.key)) hudless_after = {out, level, p.key};
+    return done;
 }
 /// (hookshot) A temporal upscaler (NVIDIA DLSS, AMD FSR 4: vk_temporal.cpp) in place of the gameplay upscale network, when
 /// one is on and its inputs are as expected: the network's input as it samples it, its output's storage view
@@ -9104,6 +9840,11 @@ bool temporal_stand_in(VkCommandBuffer cmd, const NvnState& s, const Program& p)
     // (its actor motion may have drawn with a pipeline, viewport and descriptors of its own: the next draw sets all of its again)
     last_dyn_valid = false, last_desc_valid = false, last_vb_valid = false, last_pipeline = VK_NULL_HANDLE;
     vertex_set.on = false, last_ib.on = false;
+    // ((Triforce, FG-2) DLSS's or FSR 4's picture, or before the bloom the tone mapped one: the picture before the HUD)
+    if (done && out) {
+        hudless_after = {};
+        framegen_hudless_note(cmd, out, level);
+    }
     return done;
 }
 /// (hookshot) The same for an upscale network that did not translate on this GPU (upscale_stub found its input, the largest
@@ -9140,6 +9881,9 @@ static bool temporal_rejected_network(VkCommandBuffer cmd, uint64_t key, Texture
         ParLock lk;
         texture_written(dst);
     }
+    // ((Triforce, FG-2) the upscaler's picture of a network that does not translate here (the Render resolution's shares on
+    // RDNA 3): frame generation's picture before the HUD, as at a network that does)
+    framegen_hudless_note(cmd, dst, 0);
     static std::mutex mu;
     static std::unordered_set<uint64_t> seen;
     std::lock_guard seen_lk(mu);
@@ -9163,8 +9907,13 @@ bool taau_stand_in(VkCommandBuffer cmd, const NvnState& s, const Program& p) {
     texture_view_of(handle, VK_IMAGE_VIEW_TYPE_2D, ViewUse::Storage, image_format(od.format), &out, &level);
     if (!out || out->format != VK_FORMAT_B10G11R11_UFLOAT_PACK32) return false;
     const char* keys = getenv("RX_VK_TAAU_KEYS") ? getenv("RX_VK_TAAU_KEYS") : "fd029a317a9a4b94";
-    ParLock lk;   // (Triforce: typed_upscale's pipeline and history images are shared by every recording thread: upscale_stub)
-    return typed_upscale(cmd, dw().imgs[0].imageView, dw().imgs[ntex].imageView, out, level, p.key, keys, true);
+    bool done;
+    {
+        ParLock lk;   // (Triforce: typed_upscale's pipeline and history images are shared by every recording thread: upscale_stub)
+        done = typed_upscale(cmd, dw().imgs[0].imageView, dw().imgs[ntex].imageView, out, level, p.key, keys, true);
+    }
+    if (done) hudless_after_dispatch(cmd, p.key);   // ((Triforce, FG-2) the picture it wrote in the network's place, before the HUD)
+    return done;
 }
 /// (Triforce) The Insert menu's Anti-aliasing row (vk_aa.h) in place of the game's SMAA composition (its third pass,
 /// aa_rows.h kComposeKey): with Off, FXAA or SMAA Ultra in effect, the pass's two ends are looked for among what its
@@ -9400,7 +10149,17 @@ PrepareWhy prepare_check(const std::string& path, const std::string& seed, uint6
 /// to choose), with the stage libraries or without, and what warm_libraries builds of them (kWarmRecipe, to be counted up when that
 /// changes: vk_draw.cpp is not in the translator's stamp)
 constexpr uint32_t kWarmRecipe = 2;   // (2: the libraries are in our pipeline cache)
-uint64_t warmed_stamp(bool libraries) {
+// ((Triforce) Two words more, each only where it applies, so that every other device's stamp stays what it was and nothing is
+// made again there: kModulePatches where make_module hands the driver modules otherwise than they were translated (the NaN
+// selects of AMD's older compiler, spv_nan_select.h: those modules are new to every cache of the driver's), kRateRecipe in the
+// driver's part where warm_libraries also makes the shading rate's libraries (pipeline_rate). Counted up as kWarmRecipe is)
+constexpr uint32_t kModulePatches = 1, kRateRecipe = 1;
+uint32_t module_patches() {
+    static const bool nan_selects = spv_nan_select::on(getenv("RX_VK_NAN_SELECTS"));   // (as make_module reads it)
+    // ((Triforce, 11-19) and 2: the water's simplification, v0.5.2's RX 470 .. 590 port, which came without a new stamp: shader_water_mode)
+    return (dev.fixes.nan_bits && nan_selects ? 1u : 0u) | (shader_water_mode() ? 2u : 0u);
+}
+uint64_t warmed_stamp_of(bool libraries, uint32_t patches, bool rate) {
     uint64_t h = program_cache_stamp();
     const auto add = [&h](const void* d, size_t n) {
         for (size_t i = 0; i < n; i++) h = (h ^ ((const uint8_t*)d)[i]) * 1099511628211ull;
@@ -9409,7 +10168,41 @@ uint64_t warmed_stamp(bool libraries) {
     const uint32_t v[] = {dev.props.vendorID, dev.props.deviceID, dev.props.driverVersion,
                           libraries ? (gpl_libs_cached() ? 1u : 3u) : 0u, kWarmRecipe};
     add(v, sizeof v);
+    if (patches) {
+        const uint32_t p[] = {kModulePatches, patches};
+        add(p, sizeof p);
+    }
+    if (rate) add(&kRateRecipe, sizeof kRateRecipe);
     return h;
+}
+/// What the pipelines built for the driver's caches are good for (the light precompile's record, the predicted pipelines')
+uint64_t warmed_stamp(bool libraries) {
+    return warmed_stamp_of(libraries, module_patches(), false);
+}
+/// What the driver's part is good for (prepare_run, triforce_prepared.bin's second stamp): warmed_stamp's, and with the stage
+/// libraries on a device with dev.foliage_rate, the shading rate's libraries of the native mesh programs in it too (a folder
+/// warmed by a build that made none of them is warmed once more: the libraries it has come back from the cache)
+uint64_t libraries_stamp(bool libraries) {
+    return warmed_stamp_of(libraries, module_patches(), libraries && dev.foliage_rate);
+}
+/// ((Triforce) What a pipeline cache file of this session's own holds pipelines for (<file>.own, pcache_own_mark): prepare_run's
+/// driver part's stamp
+uint64_t pcache_own_stamp() { return libraries_stamp(gpl_wanted() && !getenv("RX_VK_NO_WARM")); }
+/// ((Triforce) The skip list of the driver's part is its stamp's (gpl_rules.h skip_read). Where the stamp changed by the two
+/// words above alone, it is the same driver with the same programs, and the variants it crashed on are left out still: carried
+/// over from the stamp it was, rather than met again in the driver's hands (one start lost to each)
+void warm_skip_carry(const std::string& skip, bool libraries, uint64_t now) {
+    if (!gpl_rules::skip_read(skip, now).empty()) return;
+    for (int k = 0; k < 4; k++) {
+        const uint64_t was = warmed_stamp_of(libraries, k & 1 ? module_patches() : 0u, libraries && (k & 2));
+        if (was == now) continue;
+        const std::vector<gpl_rules::Id> ids = gpl_rules::skip_read(skip, was);
+        if (ids.empty()) continue;
+        gpl_rules::skip_add(skip, now, ids);
+        logf("vk: the driver's part: %zu program variants an earlier start ended with in the driver's hands are left out still "
+             "(carried over to the part's new stamp)", ids.size());
+        return;
+    }
 }
 /// (hookshot) An update: every shader was prepared once here, for another translator. Each release changes the translator, and every
 /// update then held the game's start for the whole seed again (116k variants, minutes on most PCs: "shaders need to be prepared every
@@ -9441,6 +10234,92 @@ bool pcache_saved_now() {
     const auto size = std::filesystem::file_size(pcache_path, ec);
     return !ec && size >= before;
 }
+/// ((Triforce) A checkpoint's save (warm_checkpoint.h has why and the rules), on a thread of its own while the workers build:
+/// pipeline_cache_save's preparation save, whose rules all hold (the carried session's cap and its open history, the bound,
+/// the busy flag, file_writers::Writing, the .tmp written whole and put in place, .for and .base), but only when a copy of the
+/// data fits in the RAM available with 2 GB to spare, looked at now (memory_ram_fits_now; the save at the end does not ask),
+/// with the fetch's room for what the workers build meanwhile. As a checkpoint (pcache_checkpoint_now) the save fetches with
+/// that room, gives up once a stop is asked or with the disk short, and flushes the file before it is put in place.
+/// The bytes written (the main file and the play file), 0: nothing (not now, nothing new, or refused by its rules). It says
+/// nothing of the part being made: the prepare's record, lib_check's and the journal are not touched
+// ((Triforce) A checkpoint's save on this thread (pcache_checkpoint_save, warm_checkpoint.h): pipeline_cache_save and
+// pcache_play_save then fetch a cache that grows meanwhile with room for what is built, give up once a stop is asked, and put
+// the file on the disk before it takes the old one's place. A forced save runs on its caller's thread: the flag is that
+// checkpoint's alone
+thread_local bool pcache_checkpoint_now = false;
+size_t pcache_checkpoint_save() {
+    size_t n = 0, play = 0;
+    {
+        const auto use = pcache_use();
+        if (!use.cache || vkGetPipelineCacheData(dev.device, use.cache, &n, nullptr) != VK_SUCCESS || !n) return 0;
+    }
+    if (pcache_play_cache && vkGetPipelineCacheData(dev.device, pcache_play_cache, &play, nullptr) != VK_SUCCESS) play = 0;
+    // (the play file's data and the main file's are fetched one after the other, each with room for what is built meanwhile:
+    // the larger is what has to fit)
+    if (!memory_ram_fits_now(std::max(warm_checkpoint::room(n), play ? warm_checkpoint::room(play) : 0))) return 0;
+    const size_t main_was = pcache_saved_size.load(), play_was = pcache_play_saved.load();
+    struct Now {   // (pipeline_cache_save's checkpoint on this thread: pcache_checkpoint_now)
+        Now() { pcache_checkpoint_now = true; }
+        ~Now() { pcache_checkpoint_now = false; }
+    } now;
+    pipeline_cache_save(true);
+    const size_t main_now = pcache_saved_size.load(), play_now = pcache_play_saved.load();
+    return (main_now != main_was ? main_now : 0) + (play_now != play_was ? play_now : 0);
+}
+/// ((Triforce) The checkpoints of one long build of the preparation (warm_checkpoint.h): look(built) from its watch loop, each
+/// save on a thread of its own so that the loop goes on with the bar and the carry's look meanwhile, and end() once the
+/// workers are joined, before the build's own last save. A line only when something was written: Setup's silence watch
+/// (make_game.py PREPARE_SILENCE) must still see a part stuck in one build go silent, and a checkpoint is due only after
+/// kMinBuilt were built since the last one, and while the count moved in the last kQuietMs. A stop asked ends a checkpoint
+/// under way at its next look (pipeline_cache_save), so end() does not hold the stop for its write. what, unit: the line's words
+struct PcacheCheckpoints {
+    const char* what;
+    const char* unit;
+    const unsigned minutes = warm_checkpoint::minutes(getenv("RX_VK_WARM_SAVE_MIN"));
+    const bool card = warm_checkpoint::card_ok(dev.props.vendorID, getenv("RX_VK_PCACHE_PLAY_SAVE"));
+    const std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+    warm_checkpoint::Clock clock;   // (the saving thread's while busy, the loop's after)
+    warm_checkpoint::Moved moved;   // (when the count last moved: none in kQuietMs, the part is stuck and goes silent)
+    std::atomic<bool> busy{false};
+    std::thread saving;
+    PcacheCheckpoints(const char* what_, const char* unit_) : what(what_), unit(unit_) {}
+    PcacheCheckpoints(const PcacheCheckpoints&) = delete;
+    PcacheCheckpoints& operator=(const PcacheCheckpoints&) = delete;
+    ~PcacheCheckpoints() { end(); }
+    void look(size_t built) {
+        if (!minutes || !card) return;
+        const uint64_t now = (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+        moved.look(now, built);
+        if (busy.load() || !warm_checkpoint::due(minutes, card, clock, now, built, moved.at_ms)) return;
+        if (saving.joinable()) saving.join();
+        busy = true;
+        try {
+            saving = std::thread([this, now, built] {
+                const auto from = std::chrono::steady_clock::now();
+                size_t wrote = 0;
+                try {
+                    wrote = pcache_checkpoint_save();
+                } catch (const std::exception& e) {
+                    logf("vk: the pipeline cache's checkpoint save failed: %s", e.what());
+                }
+                if (wrote) {
+                    logf("vk: %s saved for a restart: %zu MB in %.1f s (%zu %s; RX_VK_WARM_SAVE_MIN=0: only at the end)", what,
+                         wrote >> 20, std::chrono::duration<double>(std::chrono::steady_clock::now() - from).count(), built, unit);
+                    clock = warm_checkpoint::saved(now, built);
+                } else {
+                    clock = warm_checkpoint::skipped(clock, minutes, now);
+                }
+                busy = false;
+            });
+        } catch (const std::exception&) {   // (no thread: asked again later)
+            clock = warm_checkpoint::skipped(clock, minutes, now);
+            busy = false;
+        }
+    }
+    void end() {
+        if (saving.joinable()) saving.join();
+    }
+};
 // (Triforce) The driver's part made safe to begin again (gpl_rules.h): its journal, <prepared>.warming, names what each worker
 // has in the driver's hands, and <prepared>.warming.skip the variants a start died with, which are left out from then on
 gpl_rules::Journal warm_journal;
@@ -9457,7 +10336,10 @@ bool warm_begin(const std::string& warming, uint64_t warmed) {
              "RX_VK_PREPARE_AGAIN=1 tries again)", left.tries);
         return false;
     }
-    if (left.found)
+    if (left.found && !left.began)   // ((Triforce, 11-18) it ended with no compile of the part under way: no try, gpl_rules.h)
+        logf("vk: the last start ended with no driver compile of the shaders' driver's part under way (before it, or in the "
+             "translation): no try used (start %u of %u at most)", left.tries + 1, gpl_rules::kTries);
+    else if (left.found)
         logf("vk: the last start did not finish the driver's part of the shaders, with %zu program variants in the driver's hands: "
              "those are left to their first draw from now on (%zu in all for this driver), and the part goes on (start %u of %u "
              "at most); what was compiled already comes back from the driver's cache", left.in_hand.size(), warm_skip.size(),
@@ -9474,10 +10356,22 @@ void warm_end(const std::string& warming) {
     warm_journal.close();
     remove(warming.c_str());
 }
+// ((Triforce) warm_libraries made the libraries, but the cache that holds them is over its file's bound and was not written: the
+// next start has them cold again whatever it does (lib_check_made)
+bool warm_unsaved = false;
+// ((Triforce) warm_libraries made the libraries into a cache over the bound that began from an older file: that file is not read
+// again, and the next start makes them anew (warm_libraries). Not a making that did not stay: lib_check_made is not told)
+bool warm_reset = false;
 bool warm_libraries(void (*progress)(size_t done, size_t total)) {
     const auto t0 = std::chrono::steady_clock::now();
     prepare_pass_now.store(1, std::memory_order_relaxed);
     pcache_init();   // (before the workers: the libraries are built into it, and the start that only warms has not made it yet)
+    // ((Triforce) a cache carried over a stamp change that is past what it may hold already (pcache_carry.h): nothing is built
+    // into it, the libraries are built into the fresh one that takes its place (pcache_carry_rebuild)
+    if (pcache_carry_check(false)) {
+        logf("vk: the stage libraries are left to the fresh pipeline cache: the carried one is past what it may hold");
+        return false;
+    }
     // (a state list's programs are in memory by now, state_list_prepare read them in for the precompile: those as they are)
     std::vector<Program*> loaded;
     std::vector<uint64_t> keys = program_cache_keys(&loaded);
@@ -9497,6 +10391,8 @@ bool warm_libraries(void (*progress)(size_t done, size_t total)) {
     // ((Triforce) the variants a start died with in the driver's hands, for this driver: left to their first draw)
     std::unordered_set<uint64_t> skip;
     for (const gpl_rules::Id& id : warm_skip) skip.insert(mix(id.key, id.variant));
+    // ((Triforce) the timing line: what each part took over the workers, and whether they were on a processor, PrepTimes)
+    PrepTimes times;
     const auto warm = [&](Program& p, int slot) {
         // (a fallback program's pipelines are never linked from libraries: graphics_pipeline)
         if (p.failed || p.compute || p.fallback || p.stages.empty()) return;
@@ -9507,43 +10403,121 @@ bool warm_libraries(void (*progress)(size_t done, size_t total)) {
         ensure_layout(p);
         Targets at{};
         // ((Triforce) named in the journal for as long as the driver has it: gpl_rules.h. A worker past the journal's slots
-        // has no line: its variant would not be blamed, the start's count still stands)
+        // has no line: its variant would not be blamed, the start's count still stands. The first of them makes the start a
+        // try: gpl_rules.h Journal::began)
+        warm_journal.began();
         warm_journal.mark(slot, {p.key, p.variant});
-        for (int part = 1; part <= 2; part++)
-            if (const VkPipeline lib = build_graphics(p, *blank, at, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, part)) {
-                vkDestroyPipeline(dev.device, lib, nullptr);
-                libs++;
+        // ((Triforce) and a native mesh program's depth-only libraries, with the shading rate (pipeline_rate, keyed apart in
+        // gpl_keys): its shadow draws' links ask for those, not for the others)
+        for (int rate = 0; rate < 2; rate++) {
+            if (rate) {
+                at = rate_targets();
+                if (!pipeline_rate(p, at)) break;
             }
+            for (int part = 1; part <= 2; part++) {
+                const auto built_from = std::chrono::steady_clock::now();
+                const VkPipeline lib = build_graphics(p, *blank, at, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, part);
+                times.add(rate ? 2 : part - 1, built_from);   // (0 pre-raster, 1 fragment, 2 the shading rate's two)
+                if (lib) {
+                    vkDestroyPipeline(dev.device, lib, nullptr);
+                    libs++;
+                }
+            }
+        }
         warm_journal.mark(slot, {});
         variants++;
     };
+    // ((Triforce) a carried cache's size as the workers begin: its projection counts its growth from there, over a sample of
+    // the whole order built first, every kSampleStride-th program (pcache_carry.h has why not the order's head, the notes'
+    // programs); the others wait for it (carry_sampled) so that the growth is the sample's alone. Not given (not carried, the
+    // projection off, Intel), none is made, the warm keeps its own order, and only past its limit is the cache dropped)
+    size_t carry_from = 0;
+    const bool carry_projected = pcache_carry_held(&carry_from);
+    const size_t carry_sample = carry_projected ? (size_t)pcache_carry::sample_count(total) : 0;
+    std::atomic<bool> carry_sampled{!carry_projected};
     const auto worker = [&](int slot) {
         ub_thread_off();   // (a background thread: see ub_thread_off)
-        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);   // (as prepare_run's)
+        SetThreadPriority(GetCurrentThread(), prepare_priority());   // (as prepare_run's)
+        PrepTimes::Worker timed(times);
         for (;;) {
-            if (prepare_stopped()) return;
-            const size_t i = next++;
-            if (i >= total) return;
+            // ((Triforce) and once a carried cache is past what it may hold: what is built into it from there is lost)
+            if (prepare_stopped() || pcache_carry_over.load(std::memory_order_relaxed)) return;
+            const size_t claim = next++;
+            if (claim >= total) return;
+            const size_t i = carry_projected ? (size_t)pcache_carry::sample_order(claim, total) : claim;
+            if (claim >= carry_sample && !carry_sampled.load()) {   // (past the sample: its projection first)
+                while (!carry_sampled.load() && !prepare_stopped() && !pcache_carry_over.load(std::memory_order_relaxed))
+                    Sleep(5);
+                if (prepare_stopped() || pcache_carry_over.load(std::memory_order_relaxed)) return;
+            }
             if (i < loaded.size()) warm(*loaded[i], slot);
             else
                 program_cache_borrow(keys[i - loaded.size()], [&](Program& p) {
                     if (!in_memory.count(mix(p.key, p.variant))) warm(p, slot);
                 });
             done++;
+            timed.tick();
         }
     };
     std::vector<std::thread> threads;
     const unsigned workers = prepare_workers();   // (Triforce: as prepare_run's, before the title)
     for (unsigned i = 0; i < workers; i++) threads.emplace_back(worker, (int)i);
-    while (done.load() < total && !prepare_stopped()) {
+    // ((Triforce) the timing line, every two minutes too, so that a start stopped from outside (Setup's Cancel) has it. Only
+    // when programs were done since the last one: the line goes to the same pipe as @@progress, and Setup's silence watch
+    // (make_game.py PREPARE_SILENCE) must still see a warm that stopped moving, one build the driver never returns, go silent)
+    const auto timing = [&](const char* when) {
+        const double s = us_since(times.t0) / 1e6;
+        logf("vk: the driver's part's timing%s: %zu stage libraries in %.0f s, %.1f a second; summed over the workers: %s, %s, %s; "
+             "%s", when, libs.load(), s, s > 0 ? libs.load() / s : 0.0, times.kind_text(0, "pre-raster").c_str(),
+             times.kind_text(1, "fragment").c_str(), times.kind_text(2, "shading rate").c_str(), times.cpu_text(workers).c_str());
+    };
+    auto timing_next = std::chrono::steady_clock::now() + std::chrono::seconds(120);
+    size_t timing_done = 0;   // (done at the last timing line: none without progress since)
+    // ((Triforce) a cache carried over a stamp change is looked at as it grows (pcache_carry.h): past what it may hold, the
+    // workers stop, and the libraries are built into a fresh cache (pcache_carry_rebuild) with little of this pass lost.
+    // First, once its sample is built, whether it would get there at the rate it grew over it, by the margin: the early
+    // drop, a few minutes in rather than when it gets there; then the others begin (pcache_carry.h)
+    auto looked = std::chrono::steady_clock::now();
+    // ((Triforce) and the cache saved every RX_VK_WARM_SAVE_MIN minutes while they build (warm_checkpoint.h): a restart, a
+    // crash or a kill in the part's two hours goes on from the last checkpoint, not from nothing. Not the part made: only the
+    // end below says that)
+    PcacheCheckpoints checkpoints("the driver's part so far", "stage libraries");
+    while (done.load() < total && !prepare_stopped() && !pcache_carry_over.load()) {
         if (progress) progress(done.load(), total);
         Sleep(100);
         if (next.load() >= total + threads.size()) break;
+        if (!carry_sampled.load() && done.load() >= carry_sample) {
+            pcache_carry_early(carry_from, done.load(), total, libs.load());
+            carry_sampled = true;
+        }
+        if (std::chrono::steady_clock::now() - looked >= std::chrono::milliseconds(pcache_carry::kCheckMs)) {
+            pcache_carry_check(true);
+            looked = std::chrono::steady_clock::now();
+        }
+        if (std::chrono::steady_clock::now() >= timing_next) {
+            const size_t now_done = done.load();
+            if (now_done != timing_done) {
+                timing(" so far");
+                timing_done = now_done;
+            }
+            timing_next += std::chrono::seconds(120);
+        }
+        checkpoints.look(libs.load());
     }
     for (std::thread& t : threads) t.join();
+    checkpoints.end();   // (a checkpoint under way, before the part's own end: its save, or a stop's)
+    timing("");
     if (prepare_stopped()) {   // (what was built is in the driver's cache: the next start goes through those quickly)
         logf("vk: the stage libraries stopped at %zu of %zu programs (the window was closed): the next start makes them again",
              done.load(), total);
+        return false;
+    }
+    // ((Triforce) the carried cache past what it may hold, seen now or while the workers built (before the bound's branch
+    // below, which would count the part as done with the old file on the disk): not saved, built again into a fresh cache.
+    // Dropped early, it is not past yet: the line above said that it would be)
+    if (pcache_carry_check(false)) {
+        logf("vk: the stage libraries stopped at %zu of %zu programs: the pipeline cache carried over the stamp change is past "
+             "what it may hold, or would be at this rate, and they are built into a fresh cache", done.load(), total);
         return false;
     }
     logf("vk: warmed %zu stage libraries of %zu kept shader program variants (%zu programs, the %zu the notes name first) in %.1f s",
@@ -9558,10 +10532,34 @@ bool warm_libraries(void (*progress)(size_t done, size_t total)) {
         size_t held = 0;
         if (pcache && vkGetPipelineCacheData(dev.device, pcache, &held, nullptr) == VK_SUCCESS &&
             !pcache_bound::within(held, pcache_bound_bytes)) {
+            // ((Triforce) A cache that began from the file may be over the bound only by what the file held that nothing asks
+            // for now: a file carried over an update (program_carry.h) whose modules differ on this device (the NaN selects,
+            // module_patches) or with a library recipe more (kRateRecipe) keeps the old pipelines beside the new ones, and the
+            // reset of 11-14 no longer drops them. Kept so, this device would compile its libraries at their first draw every
+            // session. So such a file is not read again (its .for goes; this session keeps the whole cache in memory), and the
+            // part is not counted as made: the next start makes it into a new file, with only these shaders' pipelines. A new
+            // file over the bound as well is the case below. Not with RX_VK_PCACHE_KEEP_OLD, which reads any file. ((Triforce)
+            // Nor for a file of this session's own kind (pcache_from_own: a checkpoint's of the part before a crash, or a part
+            // made fresh): it holds only these pipelines, and dropping it would make the whole part again for the case below)
+            if (pcache_from_file && !pcache_from_own && !getenv("RX_VK_PCACHE_KEEP_OLD") && remove((pcache_path + ".for").c_str()) == 0) {
+                logf("vk: the pipeline cache with the stage libraries holds %zu MB, over the bound of %llu MB, with what %s held "
+                     "before (pipelines it may no longer be asked for): not written, and the file is not read again; the next "
+                     "start makes the driver's part again into a new file, with only these shaders' pipelines "
+                     "(RX_VK_PCACHE_MAX_MB=<MB> sets the bound)", held >> 20, (unsigned long long)(pcache_bound_bytes >> 20),
+                     pcache_path.c_str());
+                // ((Triforce) and not carried either (pcache_carry.h): with no .for it would count as another stamp's file, which an
+                // update's preparation carries; .nocarry naming these shaders starts that one fresh as well
+                char nocarry[20];
+                snprintf(nocarry, sizeof nocarry, "%016llx", (unsigned long long)program_cache_stamp());
+                file_writers::write_whole(pcache_path + ".nocarry", nocarry, 16);
+                warm_reset = true;
+                return false;
+            }
             logf("vk: the pipeline cache with the stage libraries holds %zu MB, over the bound of %llu MB: it is not written, and "
                  "the libraries are compiled when a draw first needs them, as without the driver's part. "
                  "RX_VK_PCACHE_MAX_MB=<MB> raises the bound; with it, RX_VK_PREPARE_AGAIN=1 makes the part again", held >> 20,
                  (unsigned long long)(pcache_bound_bytes >> 20));
+            warm_unsaved = true;
             return true;
         }
         const auto t1 = std::chrono::steady_clock::now();
@@ -9572,6 +10570,183 @@ bool warm_libraries(void (*progress)(size_t done, size_t total)) {
              (unsigned long long)(ec ? 0 : size >> 20), std::chrono::duration<double>(std::chrono::steady_clock::now() - t1).count());
         if (!saved) return false;
     }
+    return true;
+}
+// ---- (Triforce, after NX2navi e10ef60) Whether the driver's part recorded as made is still in the pipeline cache: lib_check.h has
+// why, the rules and what a start does when it is not. Before the game, from prepare_run, on its thread ----
+/// The sample: lib_check::kSample kept program variants, each one's two shader libraries made exactly as warm_libraries makes them
+/// (no state, no target, a triangle list), asking the caches only where the device can, twice. *ms: what the sample took
+lib_check::Tally lib_check_sample(double* ms) {
+    const auto t0 = std::chrono::steady_clock::now();
+    std::vector<Program*> loaded;   // (variants in memory already: a state list's. The sample is of the program cache's records)
+    const std::vector<uint64_t> keys = program_cache_keys(&loaded);
+    auto blank = std::make_unique<NvnState>();
+    blank->nvattr = 16;
+    const bool ask = gpl_ask_only();
+    std::vector<lib_check::Probe> probes;
+    const uint64_t seed = (uint64_t)t0.time_since_epoch().count() / 1000;
+    for (const size_t i : lib_check::spots(keys.size(), lib_check::kLook, seed)) {
+        if ((int)probes.size() >= lib_check::kSample || prepare_stopped()) break;
+        bool taken = false;
+        program_cache_borrow(keys[i], [&](Program& p) {
+            // (the variants warm_libraries makes libraries of, and no other)
+            if (taken || p.failed || p.compute || p.fallback || p.stages.empty() || gpl_skipped(p)) return;
+            taken = true;
+            ensure_layout(p);
+            Targets at{};
+            lib_check::Probe pr;
+            pr.asked = ask, pr.made = true;
+            // ((Triforce) a native mesh program's shading rate libraries too, as warm_libraries makes them: lost or never made,
+            // its shadow draws would find them cold)
+            for (int rate = 0; rate < 2 && pr.made; rate++) {
+                if (rate) {
+                    at = rate_targets();
+                    if (!pipeline_rate(p, at)) break;
+                }
+                for (int part = 1; part <= 2; part++)
+                    for (int again = 0; again < 2 && pr.made; again++) {
+                        bool cold = false;
+                        const auto b0 = std::chrono::steady_clock::now();
+                        const VkPipeline lib = build_graphics(p, *blank, at, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, part, ask ? &cold : nullptr);
+                        (again ? pr.again_ms : pr.first_ms) +=
+                            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - b0).count();
+                        if (lib) vkDestroyPipeline(dev.device, lib, nullptr);
+                        else pr.answered_cold = cold, pr.made = false;   // (cold, or refused: neither says the cache has it)
+                    }
+            }
+            probes.push_back(pr);
+        });
+    }
+    *ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    return lib_check::tally(probes);
+}
+int lib_check_next = 0;   // (the strikes recorded once the part is made again: lib_check::decide, lib_check_made)
+/// prepare_run's, at a start whose record says the driver's part is made for this stamp (warmed) and with the stage libraries:
+/// true when a sample finds them cold and the part is to be made again now. RX_VK_LIB_CHECK=0: never looked at
+bool lib_check_cold(const std::string& prepared, uint64_t warmed) {
+    // (kept in the driver's own cache, RX_VK_GPL_NO_CACHE, a library asked of ours is always cold: nothing to tell)
+    if (!lib_check::on(getenv("RX_VK_LIB_CHECK")) || !gpl_libs_cached()) return false;
+    pcache_init();
+    if (!pcache) return false;
+    // (a file over its bound is not read, and one made again would not be written: cold whatever is done. pcache_init says so)
+    std::error_code ec;
+    const auto size = std::filesystem::file_size(pcache_path, ec);
+    if (!ec && !pcache_bound::within((uint64_t)size, pcache_bound_bytes)) return false;
+    const std::string state = prepared + ".check";
+    double ms = 0;
+    const lib_check::Tally t = lib_check_sample(&ms);
+    const lib_check::Verdict v = lib_check::verdict(t);
+    const lib_check::State had = lib_check::state_read(state);
+    const lib_check::Do d = lib_check::decide(v, had, warmed, &lib_check_next);
+    if (v == lib_check::Verdict::Unknown) {
+        logf("vk: stage libraries: %d kept program variants sampled, too few to tell whether the driver's part is still in the "
+             "pipeline cache (%.0f ms)", t.got, ms);
+    } else if (v == lib_check::Verdict::Warm) {
+        logf("vk: stage libraries: the driver's part is in the pipeline cache (%d of %d sampled variants cold; their libraries "
+             "%.2f ms, again %.2f ms, the median; %.0f ms in all; RX_VK_LIB_CHECK=0: not looked at)", t.cold, t.got, t.first_median,
+             t.again_median, ms);
+        if (had.found) remove(state.c_str());   // (kept this time: the count of starts that found them cold again begins anew)
+    } else if (d == lib_check::Do::Stop) {
+        logf("vk: stage libraries: cold again (%d of %d sampled variants, %d of them answered by the caches) right after the "
+             "driver's part was made again for them: this driver or this PC does not keep them, and they are compiled when a draw "
+             "first needs them, as before (remove %s to try again)", t.cold, t.got, t.answered, state.c_str());
+    } else {
+        logf("vk: stage libraries: %d of %d sampled variants cold (%d answered so by the caches; %.2f ms, again %.2f ms, the median), "
+             "in %.0f ms: the pipeline cache lost the driver's part (%s gone or refused, or the libraries built otherwise now). It "
+             "is made again now, before the game, as after a driver update; without it every new pipeline waits for a whole build "
+             "or its draws are left out (RX_VK_LIB_CHECK=0: not looked at)", t.cold, t.got, t.answered, t.first_median,
+             t.again_median, ms, pcache_path.c_str());
+    }
+    return d == lib_check::Do::Again;
+}
+/// prepare_run's, the part made again after lib_check_cold (made) or left out by warm_begin (not made): recorded, so that a start
+/// that finds it cold again right after leaves it to the draws (lib_check::decide). Left out, or made into a cache that could not
+/// be written: recorded as past every try at once
+void lib_check_made(const std::string& prepared, uint64_t warmed, bool made) {
+    const int strikes = !made || warm_unsaved ? lib_check::kStrikes : lib_check_next;
+    if (!lib_check::state_write(prepared + ".check", warmed, strikes)) logf("vk: %s.check cannot be written", prepared.c_str());
+}
+// ((Triforce) The carry's rebuild (pcache_carry.h, pcache_carry_rebuild): the compute programs whose pipelines prepare_run's warm
+// built into a carried cache (by key), and whether the next prepare_run is the one into the fresh cache, which builds them
+// again: seed_compute gives its made only the variants it keeps now, and every one is kept by then)
+std::mutex prepare_cs_mu;
+std::unordered_set<uint64_t> prepare_cs_keys;
+std::atomic<bool> prepare_cs_again{false};
+/// A compute program's pipeline, built into the main cache for the driver's caches and let go (prepare_run's warm, and the
+/// carry's rebuild: the same creation, so that play's finds it). True: built
+bool prepare_compute_pipeline(Program& p) {
+    ensure_layout(p);
+    VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+    ci.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    ci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    ci.stage.module = p.stages[0].module;
+    ci.stage.pName = "main";
+    pin_subgroup(ci.stage, p.workgroup[0]);
+    ci.layout = p.layout;
+    if (getenv("RX_VK_NOOPT")) ci.flags |= VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT;
+    VkPipeline pl = VK_NULL_HANDLE;
+    // (into the app's pipeline cache, saved to mkw_vk_pipelines.bin: without it the next start compiled them again in play
+    // where the driver's own cache missed them, AMD's 15 s culling compiles each time). (Triforce, 11-18) A start that
+    // dies while such a call is under way is a try of the driver's part; one that dies between them, in the translation
+    // they are spread over, uses none: gpl_rules.h Journal::Compiling. It was the sticky began(), written at the first
+    // compute warm, seconds into an update's 5-40 minute translation. (The carry's rebuild runs with no journal open:
+    // nothing is written then)
+    bool built;
+    {
+        const gpl_rules::Journal::Compiling compiling(warm_journal);
+        built = guarded_compute(pcache, &ci, &pl) == VK_SUCCESS && pl;
+    }
+    if (built) {
+        vkDestroyPipeline(dev.device, pl, nullptr);
+        pcache_built_since_save++;
+    }
+    if (p.layout) vkDestroyPipelineLayout(dev.device, p.layout, nullptr), p.layout = VK_NULL_HANDLE;
+    if (p.set_layout) vkDestroyDescriptorSetLayout(dev.device, p.set_layout, nullptr), p.set_layout = VK_NULL_HANDLE;
+    return built;
+}
+/// ((Triforce) The carry's rebuild, at the prepare_run into the fresh cache: the compute pipelines the carried run's warm built
+/// (prepare_cs_keys), every kept variant of each program, from the program cache, built into the fresh cache as that warm
+/// built them. Nothing is translated again. False: stopped (the window was closed)
+bool warm_kept_computes(void (*progress)(size_t done, size_t total)) {
+    const auto t0 = std::chrono::steady_clock::now();
+    pcache_init();
+    std::vector<uint64_t> keys;
+    {
+        std::lock_guard lk(prepare_cs_mu);
+        keys.assign(prepare_cs_keys.begin(), prepare_cs_keys.end());
+        prepare_cs_keys.clear();
+    }
+    std::sort(keys.begin(), keys.end());
+    std::atomic<size_t> next{0}, done{0}, built{0};
+    const auto worker = [&] {
+        ub_thread_off();   // (a background thread: see ub_thread_off)
+        SetThreadPriority(GetCurrentThread(), prepare_priority());   // (as prepare_run's)
+        for (;;) {
+            if (prepare_stopped()) return;
+            const size_t i = next++;
+            if (i >= keys.size()) return;
+            program_cache_borrow(keys[i], [&](Program& p) {
+                if (!p.failed && p.compute && !p.stages.empty() && prepare_compute_pipeline(p)) built++;
+            });
+            done++;
+        }
+    };
+    std::vector<std::thread> threads;
+    const unsigned workers = (unsigned)std::min<size_t>(prepare_workers(), std::max<size_t>(keys.size(), 1));
+    for (unsigned i = 0; i < workers; i++) threads.emplace_back(worker);
+    while (done.load() < keys.size() && !prepare_stopped()) {
+        if (progress) progress(done.load(), keys.size());
+        Sleep(100);
+        if (next.load() >= keys.size() + threads.size()) break;
+    }
+    for (std::thread& t : threads) t.join();
+    if (prepare_stopped()) {
+        logf("vk: the compute pipelines stopped at %zu of %zu programs (the window was closed)", done.load(), keys.size());
+        return false;
+    }
+    logf("vk: built %zu compute pipelines of %zu compute programs again into the fresh pipeline cache, from the program cache "
+         "(nothing translated), in %.1f s", built.load(), keys.size(),
+         std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
     return true;
 }
 /// Every shader of the game, before its first start (vk_shader.cpp, the seed): translated once for this translator, and the
@@ -9587,38 +10762,68 @@ bool prepare_run(void (*progress)(size_t done, size_t total), bool background) {
     double hash_ms = 0;
     const PrepareWhy why = prepare_check(path, seed_path(), program_cache_stamp(), &prepared_for, &hash_ms);
     const bool libraries = gpl_wanted() && !getenv("RX_VK_NO_WARM");
-    const uint64_t warmed = warmed_stamp(libraries);
+    const uint64_t warmed = libraries_stamp(libraries);
     const std::string warming = path + ".warming";
     // ((Triforce) the variants the driver's part leaves out for this driver, for play too: gpl_skipped, gpl_rules.h)
-    if (libraries && !background) gpl_skip_set(gpl_rules::skip_read(warming + ".skip", warmed));
+    if (libraries && !background) {
+        warm_skip_carry(warming + ".skip", libraries, warmed);
+        gpl_skip_set(gpl_rules::skip_read(warming + ".skip", warmed));
+    }
     if (hash_ms > 0)
         logf("vk: the shader list was hashed (%.0f MB in %.0f ms): written since the last check, or too close to it to go by its time",
              prepared_for.seed_size / 1048576.0, hash_ms);
+    // ((Triforce) the prepare_run into the fresh cache after a carried one went past what it may hold (pcache_carry_rebuild):
+    // the compute pipelines the carried run built, again, from the program cache. The record says the shaders are translated
+    // and their driver part is not made, so the stage libraries follow below, and nothing is translated again)
+    if (!background && prepare_cs_again.exchange(false) && !warm_kept_computes(progress)) return false;
     if (why == PrepareWhy::None && !getenv("RX_VK_PREPARE_AGAIN")) {
         // (perf push 11-11: a shipped state list the notes were not made from, in a folder prepared already: its pipelines are
         // noted now, for the precompile that follows, as a prepare would have. See state_shipped_id)
-        if (!background && state_shipped_new()) {
-            logf("vk: the shipped pipeline list is not the one this folder's notes were made from: its pipelines are noted now");
+        // ((Triforce) and a kept set of the shader caches put back whose notes are older than the player's own list: what was
+        // met while the other set was there is noted now too. cache_set.h kStatesPending)
+        const bool shipped_new = !background && state_shipped_new();
+        const bool put_back = !background && cache_set_states_pending();
+        if (shipped_new || put_back) {
+            if (shipped_new)
+                logf("vk: the shipped pipeline list is not the one this folder's notes were made from: its pipelines are noted now");
+            if (put_back)
+                logf("vk: the shader caches put back are older than the pipeline state list: its pipelines are noted now");
             if (seed_open()) {
                 state_list_prepare(nullptr);
                 seed_close();
             }
         }
         if (getenv("RX_VK_SEED_CHECK")) seed_open();
-        if (prepared_for.warmed == warmed || background) return false;
+        // ((Triforce, after NX2navi e10ef60) recorded as made for this stamp: a sample says whether the pipeline cache still has
+        // the stage libraries (lib_check.h). Cold, the part is made again below, as for another driver)
+        const bool cold = !background && libraries && prepared_for.warmed == warmed && lib_check_cold(path, warmed);
+        // ((Triforce) a cache carried over a stamp change (pcache_carry.h) at a start recorded as made: written now with these
+        // shaders' stamp, or the record would say the part is made while the file on the disk is the old stamp's, which the
+        // next start refuses and then makes the part again before the game. Made again below, the part's own save writes it
+        if (!cold && !background && pcache_carried && prepared_for.warmed == warmed) pcache_saved_now();
+        if (!cold && (prepared_for.warmed == warmed || background)) return false;
         // (translated, and the driver's part is another driver's, or of before the libraries were wanted: that part alone, no
         // shader translated. Without libraries it is predict_run's pipelines, which follow a prepare that prepared)
-        logf("vk: the shaders are prepared, but their driver's part was made for another driver or other settings: made again%s",
-             libraries ? "" : " (no stage libraries: the predicted pipelines alone)");
+        if (!cold)
+            logf("vk: the shaders are prepared, but their driver's part was made for another driver or other settings: made again%s",
+                 libraries ? "" : " (no stage libraries: the predicted pipelines alone)");
         if (libraries) {
             // ((Triforce) it was: a start that found the last one's marker left the part out, for good. warm_begin says what
             // a start does now with what the last one left)
-            if (warm_begin(warming, warmed)) {
+            const bool begun = warm_begin(warming, warmed);
+            if (begun) {
                 if (!warm_libraries(progress)) {
+                    // ((Triforce) not stopped: made, and the cache with them could not be written. Recorded as a making
+                    // that did not stay, so that the next start that finds them cold leaves them to the draws, and does not
+                    // hold every start for the whole part again. Not for a carried cache past what it may hold: that one is
+                    // built again into a fresh cache, pcache_carry_rebuild)
+                    // (nor for a cache over the bound only by an older file's pipelines: made again into a new file then)
+                    if (cold && !prepare_stopped() && !warm_reset && !pcache_carry_over.load()) lib_check_made(path, warmed, false);
                     warm_end(warming);
                     return false;
                 }
             }
+            if (cold) lib_check_made(path, warmed, begun);
             warm_end(warming);
         }
         prepared_for.warmed = warmed;
@@ -9670,31 +10875,21 @@ bool prepare_run(void (*progress)(size_t done, size_t total), bool background) {
     // them, seconds each for the culling programs (53caac5f: 6.5 s, 41 s inlined), which looked like a hang
     const auto warm_compute = [&](Program& p) {
         if (!warm_cs || taau_key(p.key)) return;
-        ensure_layout(p);
-        VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
-        ci.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-        ci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-        ci.stage.module = p.stages[0].module;
-        ci.stage.pName = "main";
-        pin_subgroup(ci.stage, p.workgroup[0]);
-        ci.layout = p.layout;
-        if (getenv("RX_VK_NOOPT")) ci.flags |= VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT;
-        VkPipeline pl = VK_NULL_HANDLE;
-        // (into the app's pipeline cache, saved to mkw_vk_pipelines.bin: without it the next start compiled them again in play
-        // where the driver's own cache missed them, AMD's 15 s culling compiles each time)
-        if (guarded_compute(pcache, &ci, &pl) == VK_SUCCESS && pl) {
-            vkDestroyPipeline(dev.device, pl, nullptr);
-            libs++;
-            pcache_built_since_save++;
+        // ((Triforce) named for the carry's rebuild, which builds it again into a fresh cache (warm_kept_computes); and not
+        // built into a carried cache past what it may hold: that one is let go, pcache_carry.h)
+        if (pcache_carried) {
+            std::lock_guard lk(prepare_cs_mu);
+            prepare_cs_keys.insert(p.key);
         }
-        if (p.layout) vkDestroyPipelineLayout(dev.device, p.layout, nullptr), p.layout = VK_NULL_HANDLE;
-        if (p.set_layout) vkDestroyDescriptorSetLayout(dev.device, p.set_layout, nullptr), p.set_layout = VK_NULL_HANDLE;
+        if (pcache_carry_over.load(std::memory_order_relaxed)) return;
+        if (prepare_compute_pipeline(p)) libs++;
     };
     const auto worker = [&] {
         ub_thread_off();   // (a background thread: see ub_thread_off)
         // (below normal: on all the CPUs at High the driver's compiles froze the whole PC. It was half the CPUs for that too;
-        // now prepare_workers decides, which keeps half only in a process started above normal priority)
-        SetThreadPriority(GetCurrentThread(), background ? THREAD_PRIORITY_IDLE : THREAD_PRIORITY_BELOW_NORMAL);
+        // now prepare_workers decides, which keeps half only in a process started above normal priority. (Triforce) Normal in
+        // a start that only prepares: prepare_priority)
+        SetThreadPriority(GetCurrentThread(), background ? THREAD_PRIORITY_IDLE : prepare_priority());
         for (;;) {
             if (prepare_stopped()) return;
             const size_t i = next++;
@@ -9732,16 +10927,27 @@ bool prepare_run(void (*progress)(size_t done, size_t total), bool background) {
     std::vector<std::thread> threads;
     const unsigned cpus = std::max(1u, std::thread::hardware_concurrency());
     // (in play: a quarter of the CPUs, two to four, the game's own threads before them. Before the title nothing of the game
-    // runs: prepare_workers, every processor where the PC's memory and the process's priority allow it)
-    const unsigned workers = background ? std::clamp(cpus / 4, 2u, 4u) : prepare_workers();
+    // runs: prepare_workers, every processor where the PC's memory and the process's priority allow it; (Triforce) fewer on
+    // AMD's driver for RDNA 1 and 2, prepare_translate_workers)
+    const unsigned workers = background ? std::clamp(cpus / 4, 2u, 4u) : prepare_translate_workers();
     for (unsigned i = 0; i < workers; i++) threads.emplace_back(worker);
+    auto looked = std::chrono::steady_clock::now();   // ((Triforce) a carried cache's size, as it grows: pcache_carry.h)
     while (done.load() < total && !prepare_stopped()) {
         if (progress) progress(done.load() / 3, programs);   // (in programs, as the log counts them, not programs times variants)
         Sleep(100);
         if (next.load() >= total + threads.size()) break;
+        if (!background && std::chrono::steady_clock::now() - looked >= std::chrono::milliseconds(pcache_carry::kCheckMs)) {
+            pcache_carry_check(true);
+            looked = std::chrono::steady_clock::now();
+        }
     }
     for (std::thread& t : threads) t.join();
-    if (!background) state_list_prepare(nullptr);   // (in play it is too late for the precompile: an update's is state_list_run, before)
+    if (!background) pcache_carry_check(false);   // ((Triforce) the workers joined: the size asked on any card, Intel's too)
+    // (in play it is too late for the precompile: an update's is state_list_run, before. (Triforce, 11-18) Stopped, not at
+    // all: after an update it translates thousands of the list's programs, minutes with no line, past the 10 s a closed
+    // window waits and the 30 s of the builder's Cancel, which then kill the run, and the stop loses its pipeline cache save.
+    // The next prepare goes through the list, as for a list not gone through)
+    if (!background && !prepare_stopped()) state_list_prepare(nullptr);
     if (!getenv("RX_VK_SEED_CHECK")) seed_close();
     if (prepare_stopped()) {   // (closed: what was made is in the program cache already, the rest is made at the next start)
         logf("vk: shader preparation stopped at %zu of %zu (the window was closed): the next start goes on from there", done.load(),
@@ -9777,6 +10983,56 @@ void state_list_run() {
     state_list_prepare(nullptr);
     if (!getenv("RX_VK_SEED_CHECK")) seed_close();
 }
+/// ((Triforce) vk_main.cpp's preparation (HOOKSHOT_PREPARE_ONLY), right after prepare_run: when this session carried the file
+/// over a stamp change and its cache went past what a carried one may hold (pcache_carry_past: at a save, or looked at while the
+/// preparation built), the merged cache is let go and a fresh one takes its place, and true: the caller runs prepare_run again.
+/// Its record is made to say "translated, the driver's part not made" (the stamp kept, warmed 0), so that run translates
+/// nothing: it builds the compute pipelines the carried run built (warm_kept_computes, from the program cache) and the stage
+/// libraries (warm_libraries) into the fresh cache, what the carried run compiled coming back from the driver's own cache, and
+/// the saves write it with a new base (pcache_carry.h). prepare_run's workers are joined by then, and nothing else builds yet
+/// (the precompile and the predicted pipelines' builder come after)
+bool pcache_carry_rebuild() {
+    if (!pcache_carry_over.load() || !pcache || pcache_door.closed() || prepare_stopped()) return false;
+    VkPipelineCacheCreateInfo ci{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
+    VkPipelineCache fresh = VK_NULL_HANDLE;
+    if (vkCreatePipelineCache(dev.device, &ci, nullptr, &fresh) != VK_SUCCESS || !fresh) {
+        logf("vk: the pipeline cache carried over a stamp change is past what it may hold and no fresh cache could be made: the "
+             "file stays as it was");
+        return false;
+    }
+    while (pcache_door.inside()) Sleep(1);   // (none expected: a creation that had the gate lets it go)
+    size_t held = 0;
+    if (vkGetPipelineCacheData(dev.device, pcache, &held, nullptr) != VK_SUCCESS) held = 0;
+    const VkPipelineCache merged = pcache;
+    pcache = fresh;
+    vkDestroyPipelineCache(dev.device, merged, nullptr);
+    pcache_saved_size = 0;
+    {
+        std::lock_guard lk(pcache_side_mu);
+        pcache_carried = false;
+        pcache_side = pcache_carry::session(pcache_carry::Start::Fresh, pcache_side);
+    }
+    pcache_from_file = false;   // (the fresh cache holds nothing a file had: warm_libraries)
+    pcache_from_own = false;
+    pcache_carry_over = false;
+    {   // (the compute programs the carried run built pipelines of: built again first, warm_kept_computes)
+        std::lock_guard lk(prepare_cs_mu);
+        prepare_cs_again = !prepare_cs_keys.empty();
+    }
+    // (the record: the shaders translated for this stamp, their driver part not made. The first run wrote this stamp before
+    // its driver part; it is kept, so the next run goes to the driver's part alone and translates nothing again)
+    const std::string path = prepared_path();
+    PreparedFor had;
+    if (prepared_read(path, &had)) {
+        had.warmed = 0;
+        prepared_write(path, had);
+    }
+    logf("vk: the pipeline cache carried over a stamp change (%zu MB) is not kept: a fresh cache takes its place and the "
+         "shaders' driver part is built again into it (from the driver's own cache, where this run compiled it)", held >> 20);
+    return true;
+}
+/// ((Triforce) vk_main.cpp's preparation, gone through to its end and saved: pcache_carry_close (the carry's part)
+void pcache_carry_done() { pcache_carry_close(); }
 void prepare_background() {
     std::thread([] {
         SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_IDLE);
@@ -9804,6 +11060,26 @@ void prepare_background() {
 // are the lesser evil there. RX_VK_PRECOMPILE_KEEP=1: every start builds and keeps all, as before; =0: this rule on any
 // PC; unset or auto: this rule under 20 GB of RAM ----
 constexpr uint64_t kBuiltComputes = 0xC04D50555445D001ull;   // (in the record: the compute programs' pipelines were built)
+// ((Triforce) The fog's froxels behind last frame's depth (spv_fog.h, make_module) hand the driver a compute module that no
+// cache of its has, while the record's stamp (warmed_stamp) stays what it was. With kBuiltComputes alone, a record written
+// before the patch said the compute programs were built, and the fog's first pass was compiled at its first dispatch in play,
+// entering a foggy place. So while the patch is on, the record's computes key has kFogPatch mixed in: such a record builds the
+// listed compute programs once more before the game (each but the fog's a cache hit), and nothing else changes: not the
+// stamp, not the notes' keys, not the predicted record. Their creation goes through cached_compute, so the fog's, compiled,
+// is in the play cache (or, with none, counted for the main file: pcache_main_built), which pipeline_cache_save writes
+// before built_write records the key; made straight in the main cache, it was on no file and the next start compiled it in
+// play all the same. RX_VK_FOG_CULL=1: kBuiltComputes, as before the patch. Keeping every
+// pipeline (precompile_keeps_all) builds the listed computes at every start, and a prepare makes its modules through
+// make_module: both compile the patched module before the game with no record to change)
+// (Triforce, 11-17) And which matcher wrote it: until af843c8 spv_fog::find matched none of Triforce's fog modules, so a
+// record written then (kBuiltComputes ^ kFogPatch) said built while the driver had been handed the fog's module unpatched,
+// and the next light precompile skipped the computes, leaving the patched one to its first dispatch. kFogPatch times the
+// matcher's version (spv_fog::kMatcher; kFogPatch is odd, so each version gives its own key, and version 1 the old one)
+constexpr uint64_t kFogPatch = 0xF06F205E0F7A1101ull;
+uint64_t built_computes_key() {
+    static const bool kept = spv_fog::cull_kept(getenv("RX_VK_FOG_CULL"));   // (as make_module reads it)
+    return kept ? kBuiltComputes : kBuiltComputes ^ (kFogPatch * spv_fog::kMatcher);
+}
 // (Triforce, 11-16) And by the RAM the game can have, not the PC's total: what is available at the precompile and what the
 // process holds already, 22 GB or more (mem_parts.h keep_all_pipelines, where v0.4.0-test9's figures are). That 32 GB PC
 // started with 18.4 GB free and kept everything (14,535 graphics and 1,033 compute pipelines, about 3.3 GB of its working
@@ -9831,12 +11107,17 @@ bool precompile_keeps_all() {
     if (GlobalMemoryStatusEx(&ms)) {
         uint64_t ws = 0, priv = 0;
         memory_process(&ws, &priv);
-        const bool keep = mem_parts::keep_all_pipelines(ms.ullTotalPhys, ms.ullAvailPhys, ws);
-        logf("vk: precompile: %s: %llu MB of RAM available and %llu MB held by the game already, of %llu MB in the PC (kept "
-             "from %llu MB of the first two on a PC of 20 GB or more; RX_VK_PRECOMPILE_KEEP=1: always kept, =0: never)",
+        // ((Triforce, 11-18) less what the pipeline cache's read added, but on AMD's driver: mem_parts.h own_for_keep)
+        const bool amd = dev.props.vendorID == 0x1002;
+        const uint64_t cache_read = pcache_read_ws.load(), own = mem_parts::own_for_keep(ws, cache_read, amd);
+        const bool keep = mem_parts::keep_all_pipelines(ms.ullTotalPhys, ms.ullAvailPhys, own);
+        logf("vk: precompile: %s: %llu MB of RAM available and %llu MB held by the game already (%llu MB in all, %llu MB of it "
+             "the pipeline cache's read, %s), of %llu MB in the PC (kept from %llu MB of the first two on a PC of 20 GB or more; "
+             "RX_VK_PRECOMPILE_KEEP=1: always kept, =0: never)",
              keep ? "the pipelines it builds are kept for the session" : "the pipelines it builds go to the caches and are not kept",
-             (unsigned long long)(ms.ullAvailPhys >> 20), (unsigned long long)(ws >> 20), (unsigned long long)(ms.ullTotalPhys >> 20),
-             (unsigned long long)(mem_parts::kKeepAllBytes >> 20));
+             (unsigned long long)(ms.ullAvailPhys >> 20), (unsigned long long)(own >> 20), (unsigned long long)(ws >> 20),
+             (unsigned long long)(cache_read >> 20), amd ? "counted: AMD's driver" : "not counted",
+             (unsigned long long)(ms.ullTotalPhys >> 20), (unsigned long long)(mem_parts::kKeepAllBytes >> 20));
         return keep;
     }
 #endif
@@ -9910,20 +11191,31 @@ void precompile_run(void (*progress)(size_t done, size_t total)) {
     if (light) warm_index_set(notes, note_at, computes_listed);
     std::vector<uint32_t>().swap(note_at);
     const uint64_t built_stamp = warmed_stamp(gpl_wanted());
+    const uint64_t computes_key = built_computes_key();   // ((Triforce) the fog's patch in it: see kFogPatch)
     std::unordered_set<uint64_t> built;
     const size_t noted_n = notes.size();
     bool computes_built = false;
+    // ((Triforce) RX_VK_FOLIAGE_SHADOW_VRS: a depth-only pipeline may have the shading rate dynamic now (pipeline_rate; whether its
+    // program is a native mesh one is not in the note), made otherwise than the one an earlier start built for the driver's
+    // cache. It is in the record under a key of its own, so each is built once more before the game, not compiled at its draw;
+    // once its program is read, one that is not a native mesh program's is left as it was, below)
+    const auto built_key = [](const PipeNote& n) {
+        return dev.foliage_rate && n.n == 0 && depth_aspect((VkFormat)n.depth_format) ? mix(n.key, kRateLibrary) : n.key;
+    };
     if (light) {
         built = built_read(built_stamp);
-        computes_built = built.count(kBuiltComputes) != 0;
-        std::erase_if(notes, [&](const std::unique_ptr<PipeNote>& n) { return built.count(n->key) != 0; });
+        computes_built = built.count(computes_key) != 0;
+        std::erase_if(notes, [&](const std::unique_ptr<PipeNote>& n) { return built.count(built_key(*n)) != 0; });
         logf("vk: precompile: RAM spared (RX_VK_PRECOMPILE_KEEP=1: as before): %zu of %zu noted pipelines were built by "
              "an earlier start and are left to their first draw%s", noted_n - notes.size(), noted_n,
              computes_built ? ", the compute programs' too" : "");
     }
     std::vector<uint64_t> building;   // (their keys, for the record once they are built)
     if (light)
-        for (const auto& n : notes) building.push_back(n->key);
+        for (const auto& n : notes) {
+            building.push_back(n->key);
+            if (built_key(*n) != n->key) building.push_back(built_key(*n));
+        }
     std::unordered_set<uint64_t> wanted;
     for (const auto& n : notes) wanted.insert(n->prog);
     // (the compute programs: those play dispatched (triforce_computes.bin), or every kept one when there is no list yet)
@@ -9939,6 +11231,20 @@ void precompile_run(void (*progress)(size_t done, size_t total)) {
     }, all_computes, true);
     logf("vk: precompile: compute programs: %s (%zu keys listed as dispatched in play)",
          all_computes ? "every kept one" : (which && !strcmp(which, "none")) ? "none" : "those play dispatched", used.size());
+    // ((Triforce) the depth-only notes kept above for the rate alone (built by an earlier start, not under built_key's key): with
+    // their programs read, those of a program that is not a native mesh one have the very pipeline that start built
+    // (pipeline_rate false). They are not built again, and the record takes their key all the same (building)
+    if (light && dev.foliage_rate) {
+        const size_t before = notes.size();
+        std::erase_if(notes, [&](const std::unique_ptr<PipeNote>& n) {
+            if (built_key(*n) == n->key || !built.count(n->key)) return false;
+            const Program* p = program_find(n->prog, n->variant);
+            return p && !pipeline_rate(*p, note_targets(*n));
+        });
+        if (notes.size() != before)
+            logf("vk: precompile: %zu depth-only pipelines of programs without the shading rate are as an earlier start built them",
+                 before - notes.size());
+    }
     const double read_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     const size_t total = notes.size() + computes.size() + fallbacks.size();
     // (the workers' state on the heap: a start whose last pipelines never finish (two of 4926 on an RX 5700 XT, "stuck at
@@ -9952,6 +11258,7 @@ void precompile_run(void (*progress)(size_t done, size_t total)) {
         std::atomic<bool> graphics_begun{false};
         bool abandoned = false;
         bool light = false;   // ((Triforce) the graphics pipelines built for the caches and let go: precompile_keeps_all)
+        PrepTimes times;   // ((Triforce) the timing line: 0 the compute pipelines, 1 the mesh fallbacks, 2 the graphics pipelines)
     };
     const size_t graphics_n = notes.size(), computes_n = computes.size(), fallbacks_n = fallbacks.size();
     Pre* pre = new Pre;
@@ -9961,6 +11268,7 @@ void precompile_run(void (*progress)(size_t done, size_t total)) {
     auto& done = pre->done;
     const auto worker = [pre, total] {
         ub_thread_off();   // (a background thread: see ub_thread_off)
+        PrepTimes::Worker timed(pre->times);
         auto& notes = pre->notes;
         auto& computes = pre->computes;
         auto& fallbacks = pre->fallbacks;
@@ -9978,7 +11286,14 @@ void precompile_run(void (*progress)(size_t done, size_t total)) {
                 pin_subgroup(ci.stage, p.workgroup[0]);
                 ci.layout = p.layout;
                 VkPipeline made = VK_NULL_HANDLE;
-                if (guarded_compute(pcache_use().cache, &ci, &made) != VK_SUCCESS) made = VK_NULL_HANDLE;
+                const auto built_from = std::chrono::steady_clock::now();
+                // ((Triforce) through the play cache as the dispatch's creation (cached_compute, pcache_play.h): one the main
+                // cache has comes back at once, one it lacks (the fog's patched first pass, after spv_fog.h) is compiled into the
+                // play cache, which the save before the record writes. Made straight in the main cache, that one was counted
+                // nowhere (pcache_main_built), the save wrote the play file alone, and the record said built: the next start
+                // left it to its first dispatch and compiled it in play)
+                if (cached_compute(pcache_use().cache, &ci, &made) != VK_SUCCESS) made = VK_NULL_HANDLE;
+                pre->times.add(0, built_from);
                 std::lock_guard lk(pre->mu);
                 if (!pre->abandoned) p.compute_pipeline = made;
                 else if (made) vkDestroyPipeline(dev.device, made, nullptr);   // (the game went on: it builds its own)
@@ -9987,7 +11302,9 @@ void precompile_run(void (*progress)(size_t done, size_t total)) {
                 Program& p = *fallbacks[i - computes.size()];
                 int none = 0;
                 if (p.compute_state.compare_exchange_strong(none, 1)) {
+                    const auto built_from = std::chrono::steady_clock::now();
                     fallback_compute_pipelines(p);
+                    pre->times.add(1, built_from);
                     p.compute_state.store(2, std::memory_order_release);
                 }
             } else {
@@ -10002,7 +11319,9 @@ void precompile_run(void (*progress)(size_t done, size_t total)) {
                         first.lock();
                         if (pre->graphics_begun.load()) first.unlock();
                     }
+                    const auto built_from = std::chrono::steady_clock::now();
                     const VkPipeline made = build_graphics(*p, n.s, note_targets(n), (VkPrimitiveTopology)n.topo);
+                    pre->times.add(2, built_from);
                     pre->graphics_begun = true;
                     if (first.owns_lock()) first.unlock();
                     if (pre->light) {   // ((Triforce) in the caches now: its first draw builds it from there)
@@ -10023,6 +11342,7 @@ void precompile_run(void (*progress)(size_t done, size_t total)) {
                 }
             }
             pre->done++;
+            timed.tick();
         }
     };
     std::vector<std::thread> threads;
@@ -10032,6 +11352,10 @@ void precompile_run(void (*progress)(size_t done, size_t total)) {
     size_t last_done = 0;
     auto last_change = std::chrono::steady_clock::now();
     bool gone_on = false;
+    // ((Triforce) the caches saved every RX_VK_WARM_SAVE_MIN minutes while it builds, as the driver's part's (warm_checkpoint.h):
+    // most precompiles end before the first, a cold one of thousands of pipelines does not. The record of what was built
+    // (built_write) is written after the end's save alone)
+    PcacheCheckpoints checkpoints("precompile: the pipelines so far", "pipelines");
     while (done.load() < total && !prepare_stopped()) {
         if (progress) progress(done.load(), total);
         Sleep(100);
@@ -10046,16 +11370,27 @@ void precompile_run(void (*progress)(size_t done, size_t total)) {
                  total, stall_s);
             break;
         }
+        checkpoints.look(done.load());
+    }
+    checkpoints.end();   // (a checkpoint under way, before the workers' state goes and before the end's save)
+    if (!gone_on)
+        for (std::thread& t : threads) t.join();
+    {   // ((Triforce) the timing line: PrepTimes. With the game gone on, the workers still at work count to their last item)
+        const PrepTimes& tm = pre->times;
+        const double s = us_since(tm.t0) / 1e6;
+        const size_t built_n = (size_t)(tm.kind_n[0].load() + tm.kind_n[1].load() + tm.kind_n[2].load());
+        logf("vk: precompile: timing: %zu built in %.1f s, %.1f a second; summed over the workers: %s, %s, %s; %s", built_n, s,
+             s > 0 ? built_n / s : 0.0, tm.kind_text(0, "compute").c_str(), tm.kind_text(1, "mesh fallback").c_str(),
+             tm.kind_text(2, "graphics").c_str(), tm.cpu_text((unsigned)threads.size()).c_str());
     }
     if (gone_on) {
         for (std::thread& t : threads) t.detach();
     } else {
-        for (std::thread& t : threads) t.join();
         delete pre;
         // (little RAM: what this start built is on disk before the record says so, and the next start leaves it out)
         if (light && !prepare_stopped() && (!building.empty() || !computes_built)) {
             built.insert(building.begin(), building.end());
-            built.insert(kBuiltComputes);
+            built.insert(computes_key);
             pipeline_cache_save(true);
             built_write(built_stamp, built);
         }
@@ -10175,7 +11510,7 @@ void predict_run(void (*progress)(size_t done, size_t total)) {
     std::atomic<bool> out_of_time{false};
     const auto worker = [&] {
         ub_thread_off();   // (a background thread: see ub_thread_off)
-        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);   // (as prepare_run's)
+        SetThreadPriority(GetCurrentThread(), prepare_priority());   // (as prepare_run's)
         driver_cache_only = true;
         for (;;) {
             if (prepare_stopped()) return;
@@ -10685,7 +12020,7 @@ void dispatch(VkCommandBuffer cmd, NvnState& s, uint32_t x, uint32_t y, uint32_t
     }
     if (fsr3_stand_in(cmd, s, p)) return void(st_dispatches++);
     if (temporal_stand_in(cmd, s, p)) return void(st_dispatches++);
-    if (taau_stand_in(cmd, s, p)) return void(st_dispatches++);
+    if (taau_stand_in(cmd, s, p)) return void(st_dispatches++);   // ((Triforce, FG-2) it takes the picture before the HUD itself)
     if (aa_stand_in(cmd, s, p)) return void(st_dispatches++);   // (Triforce: the Anti-aliasing row, vk_aa.h)
     if (!p.compute_pipeline) SKIP_HERE();
     dump_ssbos(cmd, p, "before");
@@ -10766,6 +12101,7 @@ void dispatch(VkCommandBuffer cmd, NvnState& s, uint32_t x, uint32_t y, uint32_t
         }
     }
     cw.dispatch_at = work_at(cw);   // ((Triforce, P4) RX_VK_DISPATCH_BARRIER: the command buffer's own count, cmd_work.h)
+    hudless_after_dispatch(cmd, p.key);   // ((Triforce, FG-2) the game's own network wrote the picture before the HUD)
     if (dump_on() && dump_ssbo_wanted(p.key)) dump_ssbos(cmd, p, "after");
     if (gprof_on()) {
         char label[96];
@@ -11041,6 +12377,28 @@ void gpl_retire_run() {
     }
 }
 
+/// A checkpoint's file on the disk before it is closed and put in place: a power cut right after the rename would otherwise
+/// leave the name on data still in the system's cache, and the last good checkpoint gone. False: it could not be
+bool pcache_file_flush(FILE* f) {
+    if (fflush(f) != 0) return false;
+#ifdef _WIN32
+    return FlushFileBuffers((HANDLE)_get_osfhandle(_fileno(f))) != 0;
+#else
+    return fsync(fileno(f)) == 0;
+#endif
+}
+/// Whether the pipeline cache's disk has room for a checkpoint of n bytes, the .tmp beside the old file
+/// (warm_checkpoint::disk_fits). Short: said once, and the checkpoint is asked again later
+bool pcache_disk_fits(uint64_t n) {
+    std::error_code ec;
+    const auto space = std::filesystem::space(std::filesystem::path(pcache_path).parent_path(), ec);
+    if (warm_checkpoint::disk_fits(!ec, ec ? 0 : (uint64_t)space.available, n)) return true;
+    static std::atomic<bool> told{false};
+    if (!told.exchange(true))
+        logf("vk: the pipeline cache's checkpoint waits: %llu MB free on its disk, %llu MB and 1 GB to spare needed (%s)",
+             (unsigned long long)(ec ? 0 : space.available >> 20), (unsigned long long)(n >> 20), pcache_path.c_str());
+    return false;
+}
 /// ((Triforce) pipeline_cache_save's, on its thread: the play file written when its cache's data changed (pcache_play.h
 /// save_what). True: the main file is to be saved as well (no play cache, or main_built pipelines compiled into the main cache
 /// since its last save)
@@ -11050,14 +12408,27 @@ bool pcache_play_save(int64_t main_built) {
     if (vkGetPipelineCacheData(dev.device, pcache_play_cache, &n, nullptr) != VK_SUCCESS) n = 0;
     const pcache_play::SaveWhat w = pcache_play::save_what(true, n, pcache_play_saved.load(), main_built);
     if (!w.play) return w.main;
+    // ((Triforce) a checkpoint's (warm_checkpoint.h): the precompile builds into this cache meanwhile, so it is fetched with room
+    // and asked again where it grew past that, and the file is on the disk before it takes the old one's place)
+    const bool checkpoint = pcache_checkpoint_now;
+    if (checkpoint) n = warm_checkpoint::room(n);
     std::vector<uint8_t> data(n);
-    if (vkGetPipelineCacheData(dev.device, pcache_play_cache, &n, data.data()) != VK_SUCCESS || !n) return w.main;
+    VkResult got = vkGetPipelineCacheData(dev.device, pcache_play_cache, &n, data.data());
+    for (int t = 1; checkpoint && got == VK_INCOMPLETE && t < warm_checkpoint::kFetchTries; t++) {
+        std::vector<uint8_t>().swap(data);
+        if (vkGetPipelineCacheData(dev.device, pcache_play_cache, &n, nullptr) != VK_SUCCESS || !n) return w.main;
+        n = warm_checkpoint::room(n);
+        data.resize(n);
+        got = vkGetPipelineCacheData(dev.device, pcache_play_cache, &n, data.data());
+    }
+    if (got != VK_SUCCESS || !n) return w.main;
     const std::string tmp = pcache_play_path + ".tmp";
     FILE* f = fopen(tmp.c_str(), "wb");
     if (!f) return w.main;
     bool ok = fwrite(data.data(), 1, n, f) == n;
+    if (checkpoint) ok = ok && pcache_file_flush(f);
     ok = fclose(f) == 0 && ok;
-    if (ok && MoveFileExA(tmp.c_str(), pcache_play_path.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+    if (ok && MoveFileExA(tmp.c_str(), pcache_play_path.c_str(), MOVEFILE_REPLACE_EXISTING | (checkpoint ? MOVEFILE_WRITE_THROUGH : 0))) {
         pcache_play_saved = n;
         {   // (the shaders it is for: pcache_play_open. (Triforce, handoff §8) whole or not at all: file_writers.h)
             char want[20];
@@ -11116,6 +12487,7 @@ void pipeline_cache_save(bool force) {
     }
     auto save = [force] {
         struct Done { ~Done() { busy = false; } } done;
+        const bool checkpoint = force && pcache_checkpoint_now;   // ((Triforce) warm_checkpoint.h: pcache_checkpoint_save's)
         // ((Triforce, handoff §8) the exit waits for this save (2 s at most: a cut one leaves the old files, .tmp and .part
         // are put in place whole), and none begins once it has begun: file_writers.h
         const file_writers::Writing writing;
@@ -11148,6 +12520,11 @@ void pipeline_cache_save(bool force) {
                     pcache_built_since_save += 32;   // (asked again at the next check)
                     return;
                 }
+                // ((Triforce) A session that carried the file over a stamp change writes it only up to its cap, or the bound
+                // where lower (pcache_carry.h): past it the merged data is not kept, and the preparation builds again into a
+                // fresh cache (pcache_carry_rebuild). Before the bound's own refusal, which would leave the old file and no
+                // rebuild
+                if (!pcache_carry_save_ok(n)) return;
                 // (Triforce) Data over the file's bound is not written (pcache_bound.h): the next start would refuse that
                 // file whole. The file keeps its last save, and what was built since is compiled again at the next start
                 if (!pcache_bound::within(n, pcache_bound_bytes)) {
@@ -11159,25 +12536,74 @@ void pipeline_cache_save(bool force) {
                              (unsigned long long)(pcache_bound_bytes >> 20));
                     return;
                 }
+                // ((Triforce) A checkpoint (warm_checkpoint.h): not once a stop is asked (the stop's own save writes the cache, and
+                // the stop must not wait for this one's 2 GB), nor with the disk short of room for the .tmp beside the old file.
+                // The workers build into the cache while it is fetched: with room for that, the driver saying what it wrote, and
+                // asked again where it grew past the room (VK_INCOMPLETE). The other saves fetch a cache nothing builds into)
+                if (checkpoint && (prepare_stopped() || !pcache_disk_fits(n))) return;
+                if (checkpoint) n = warm_checkpoint::room(n);
                 std::vector<uint8_t> data(n);
-                if (vkGetPipelineCacheData(dev.device, pcache, &n, data.data()) == VK_SUCCESS) {
+                VkResult got = vkGetPipelineCacheData(dev.device, pcache, &n, data.data());
+                for (int t = 1; checkpoint && got == VK_INCOMPLETE && t < warm_checkpoint::kFetchTries; t++) {
+                    std::vector<uint8_t>().swap(data);
+                    if (prepare_stopped() || vkGetPipelineCacheData(dev.device, pcache, &n, nullptr) != VK_SUCCESS || !n) return;
+                    if (!pcache_carry_save_ok(n) || !pcache_bound::within(n, pcache_bound_bytes)) return;
+                    n = warm_checkpoint::room(n);
+                    data.resize(n);
+                    got = vkGetPipelineCacheData(dev.device, pcache, &n, data.data());
+                }
+                if (checkpoint && got == VK_INCOMPLETE) {
+                    static std::atomic<bool> told{false};
+                    if (!told.exchange(true))
+                        logf("vk: the pipeline cache's checkpoint could not fetch it whole in %d tries while the workers built: "
+                             "asked again later", warm_checkpoint::kFetchTries);
+                }
+                // ((Triforce) the carry's cap and the bound once more on what was fetched: a checkpoint's may hold more than the
+                // size they were asked for)
+                if (got == VK_SUCCESS && pcache_carry_save_ok(n) && pcache_bound::within(n, pcache_bound_bytes)) {
                     const std::string tmp = pcache_path + ".tmp";
                     if (FILE* f = fopen(tmp.c_str(), "wb")) {
-                        bool ok = fwrite(data.data(), 1, n, f) == n;
+                        // ((Triforce) a checkpoint's in parts, giving up between them once a stop is asked, or once the
+                        // carried cache was dropped (pcache_carry_over: the file is not put in place, and the rebuild waits
+                        // for this thread in checkpoints.end(), so the rest of up to 2 GB and its flush are not written for it)
+                        bool ok = true;
+                        const size_t part = checkpoint ? warm_checkpoint::kChunk : n;
+                        for (size_t at = 0; ok && at < n; at += part) {
+                            const size_t len = std::min(part, n - at);
+                            ok = !(checkpoint && (prepare_stopped() || pcache_carry_over.load())) && fwrite(data.data() + at, 1, len, f) == len;
+                        }
+                        // ((Triforce) on the disk before it is put in place; not flushed for a drop)
+                        if (checkpoint) ok = ok && !pcache_carry_over.load() && pcache_file_flush(f);
                         ok = fclose(f) == 0 && ok;   // (its last bytes go to the disk at the close)
+                        if (checkpoint && prepare_stopped()) ok = false;
+                        // ((Triforce) and not once the carried cache was dropped while this one wrote (pcache_carry_early on the
+                        // watch loop's thread, pcache_carry_past on another save's): pcache_carry_save_ok said yes before the
+                        // write, and the rebuild's fresh cache is what the file holds next. The rebuild clears the flag only once
+                        // the part's checkpoints are joined, so this one never sees it cleared under it)
+                        if (checkpoint && pcache_carry_over.load()) ok = false;
+                        char want[20];
+                        snprintf(want, sizeof want, "%016llx", (unsigned long long)program_cache_stamp());
+                        const bool keep_old = getenv("RX_VK_PCACHE_KEEP_OLD") != nullptr;
+                        // ((Triforce) before the data takes the old file's place: a carried session's history (pcache_carry.h
+                        // begun; not written, the data is not put in place), and whether the file holds only this part's own)
+                        if (ok && !keep_old) ok = pcache_carry_saving(n, want);
+                        if (ok) pcache_own_mark();
                         // (only a file in place counts as saved: a failed write is tried again at the next save)
-                        if (ok && MoveFileExA(tmp.c_str(), pcache_path.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+                        if (ok && MoveFileExA(tmp.c_str(), pcache_path.c_str(),
+                                              MOVEFILE_REPLACE_EXISTING | (checkpoint ? MOVEFILE_WRITE_THROUGH : 0))) {
                             pcache_saved_size = n;
                             pcache_main_written(main_built);   // ((Triforce) pcache_play.h)
                             // (the shaders it is for, beside it: pcache_init reads the file only for these. Not when the old
                             // file was read whatever it was for, RX_VK_PCACHE_KEEP_OLD: that would name the old data as these')
                             // ((Triforce, handoff §8) whole or not at all: file_writers.h)
-                            if (!getenv("RX_VK_PCACHE_KEEP_OLD")) {
-                                char want[20];
-                                snprintf(want, sizeof want, "%016llx", (unsigned long long)program_cache_stamp());
+                            if (!keep_old) {
                                 file_writers::write_whole(pcache_path + ".for", want, 16);
+                                // ((Triforce) and its history, pcache_carry.h: a carried save names these shaders too)
+                                pcache_carry_saved(n, want);
                             }
                             logf("vk: pipeline cache saved (%zu KB)", n >> 10);
+                        } else {
+                            remove(tmp.c_str());   // ((Triforce) not left to fill the disk: written again whole at the next save)
                         }
                     }
                 }

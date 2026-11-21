@@ -9,6 +9,21 @@ namespace mkwvk::hangwatch {
 
 constexpr int kReports = 3;   // (at most this many a run: a game that stalls again and again says so three times)
 
+// ((Triforce) The stacks asked for from outside: a file of this name beside the report's, "triforce_hang.txt.now" in the game
+// folder, is looked for every second; the watch takes it away and writes where every thread is, into the log and the
+// report's file, whether or not a frame is shown. For a game that goes on showing frames and gets nowhere: the owner's
+// save that did not load on 2026-11-20 showed its loading screen at 240 frames a second for minutes, one game thread
+// (BaseProcCreateAndDeleteThread) at a whole core, and the stall's own report never came: frames were shown. Asked for
+// with a file because that needs nothing done to the game's process from outside. At most kAsked a run)
+constexpr const char* kAskSuffix = ".now";
+constexpr int kAsked = 16;
+/// Whether an ask found now is served: the first kAsked of a run (`served`: how many were, counted up here)
+inline bool ask(int& served) {
+    if (served >= kAsked) return false;
+    served++;
+    return true;
+}
+
 struct Watch {
     int64_t presents = -1;   // the presents counted at the last look
     int still = 0;           // judged seconds running without one

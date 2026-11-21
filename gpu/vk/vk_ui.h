@@ -27,21 +27,31 @@ inline ImU32 alpha(ImU32 c, float k) {
 }
 
 // ---- the palette ----
-// (Triforce: the game's menus, measured on its own Options screen: kInk its texts' white (255,253,227), kValue the near-black
-// panel a row's value sits on, kValueOn the orange plate of the value chosen (211,144,37) with its text in the same white,
-// kDim the other half of a toggle (95,93,81). kType: the game's text sizes as Dear ImGui's: its 54 units draw 65 high.
-// The old overlay's golds stay for the start-up screen's bar)
+// (Triforce: the game's menus, measured on its own Options screen: kInk its texts' white, kValue the near-black panel a
+// row's value sits on, kValueOn the orange plate of the value chosen (211,144,37) with its text in the same white, kDim the
+// other half of a toggle (95,93,81: the white at a third over the panel). kType: the game's text sizes as Dear ImGui's: its 54
+// units draw 65 high. The old overlay's golds stay for the start-up screen's bar. Where the game's layouts give a colour it is
+// theirs (vk_game_tex.h: a material's white colour, linear, here in sRGB): kInk PaOptionBtnL_00's T_Option_00 and
+// SystemOption_00's T_Caption_00 (1, 0.988, 0.776), kSeparator PaSlideListSeparator_00's three panes, kBgNoise SystemBG_00's
+// P_Noise_00. kValue and kValueOn are the plain plates' colours where the game's textures are missing: with them the plates
+// are vk_game_tex.h's value_plate and value_plate_on, the texture as the game colours it)
 constexpr float kType = 1.2f;
-constexpr ImU32 kInk = rgba(255, 253, 227), kInkBright = rgba(255, 253, 227), kSoft = rgba(226, 218, 190), kDim = rgba(104, 100, 86),
+constexpr ImU32 kInk = rgba(255, 254, 228), kInkBright = rgba(255, 254, 228), kSoft = rgba(226, 218, 190), kDim = rgba(104, 100, 86),
                 kGold = rgba(222, 152, 40), kGoldHi = rgba(238, 168, 52), kGoldInk = rgba(36, 24, 8), kAccent = rgba(214, 170, 96),
                 kEdge = rgba(150, 122, 74, 200), kCellDark = rgba(44, 32, 17, 240), kCellName = rgba(107, 80, 42, 255),
                 kCellNameSel = rgba(124, 93, 49, 255), kBronze = rgba(84, 64, 38), kColumn = rgba(44, 36, 26, 244),
                 kBannerTop = rgba(150, 122, 78, 255), kBanner = rgba(118, 94, 58, 255), kBannerInk = rgba(255, 251, 238),
                 kBannerEdge = rgba(40, 28, 14), kTabInset = rgba(60, 42, 22, 235), kBox = rgba(52, 38, 22, 250),
                 kBoxEdge = rgba(122, 98, 64, 220), kBar = rgba(10, 8, 5, 200), kListen = rgba(150, 120, 40),
-                kValue = rgba(24, 21, 14, 255), kValueOn = rgba(211, 144, 37, 255), kValueOnInk = rgba(255, 253, 227),
-                kCursor = rgba(255, 255, 255), kCursorGlow = rgba(150, 185, 255);
+                kValue = rgba(24, 21, 14, 255), kValueOn = rgba(211, 144, 37, 255), kValueOnInk = rgba(255, 254, 228),
+                kCursor = rgba(255, 255, 255), kCursorGlow = rgba(150, 185, 255), kSeparator = rgba(75, 57, 34),
+                kBgNoise = rgba(28, 13, 13);
 constexpr int kDimAlpha = 178;   // (the game behind the menu: the System screens darken it so)
+// (Triforce) SystemBG_00's shade (P_Bg_00: black, SystemBgSh_00's alpha, a rounded dark middle that leaves the scene at the
+// screen's edges) over its noise (P_Noise_00: kBgNoise, DecoNoise_00's alpha, 8 x 8 times across the screen as its texture's
+// scale is). Their strengths are the layout's three values of 1, 0.4 and 0.7 for its pictures in their order (capture,
+// noise, shade): 0.7 is the middle's darkness the screen was measured at (kDimAlpha, 178)
+constexpr int kNoiseAlpha = 102, kShadeAlpha = 179;
 
 /// The unit: pixels per point (a 720th of the window's height; 3 of the game's layout units). The game's menus have one
 /// size, so the menu has too; *margin: kept for the callers that lay out from an edge (the game's guides sit 20 points in)
@@ -60,6 +70,14 @@ struct Ctx {
     int confirm_dot = 3, back_dot = 1;   // (the face buttons that confirm and go back: vk_menu_keys.h dot, 3 the bottom, 1 the right)
     float pulse = 1;   // (the cursor's glow now, 0 to 1: the game's breathes)
     bool over_game = false;   // (Triforce: drawn over the game's own Options screen: the guides' band hides the game's guides)
+    // ((Triforce, 11-20) over_game: where the game's guides band ends at the right, in these pixels (game_grid.h
+    // guide_band_x1): past w on a picture wider than the grid; w or less, the plate ends at w as before)
+    float guides_x1 = 0;
+    // ((Triforce) the keys the menu takes for the tabs and for Back, as the player bound the Switch's L, R and B (vk_menu.cpp
+    // ui_ctx): the tab strip's ends and the guides name the same ones, as the game's own guides name its bindings)
+    const char* key_tab_l = "Q";
+    const char* key_tab_r = "E";
+    const char* key_back = "Esc";
 };
 
 /// A place of the game's layout (units from the screen's centre, y up) in pixels
@@ -184,51 +202,78 @@ inline void plate(Ctx& c, ImVec2 a, ImVec2 b, bool sel = false, bool btn = false
     c.d->AddRect(a, b, kEdge, 0, std::max(1.0f, lu(c, 3)));
 }
 /// A value's plate over a..b (what shows of it): the game's OptionBtnThinElement, near black under a row's value; on: the
-/// orange plate of the value chosen. Its texture's rim is 16 x 14 units outside what shows
+/// orange plate of the value chosen. Its texture's rim is 16 x 14 units outside what shows. (Triforce) The texture as
+/// PaOptionBtnL_00's W_Base_01 and W_CheckL_00 colour it (vk_game_tex.h value_plate, value_plate_on), drawn untinted: k its
+/// alpha. Before, the grey texture was tinted with the measured colour, so the orange's middle came out darker than the game's
 inline void value_plate(Ctx& c, ImVec2 a, ImVec2 b, bool on = false, float k = 1) {
-    const ImU32 col = alpha(on ? kValueOn : kValue, k);
     const ImVec2 m(lu(c, 16.5f), lu(c, 14));
-    if (const Art* t = art("OptionBtnThinElement_00")) nine(c, t, a - m, b + m, 200, 28, col);
-    else c.d->AddRectFilled(a, b, col, lu(c, 4));
+    if (const Art* t = art(on ? "value_plate_on" : "value_plate")) nine(c, t, a - m, b + m, 200, 28, alpha(IM_COL32_WHITE, k));
+    else if (const Art* g = art("OptionBtnThinElement_00")) nine(c, g, a - m, b + m, 200, 28, alpha(on ? kValueOn : kValue, k));
+    else c.d->AddRectFilled(a, b, alpha(on ? kValueOn : kValue, k), lu(c, 4));
 }
 /// The cursor: the game's white hand-drawn frame, its inner edge on a..b, and its blue-white glow outside, which breathes
 /// (vk_game_tex.h make_cursor, from OptionBtnThinCursorLine and OptionBtnThinCursorGlow: the layout draws the 640 x 173
-/// texture 960 x 260 units, the line's inner edge then a box of 809 x 114)
-inline void cursor(Ctx& c, ImVec2 a, ImVec2 b) {
+/// texture 960 x 260 units, the line's inner edge then a box of 809 x 114). (Triforce) k: how much of it shows, as the
+/// game's buttons fade their cursor in and out (focus_anim.h: N_Cursor_00's alpha, the line's and the glow's)
+inline void cursor(Ctx& c, ImVec2 a, ImVec2 b, float k = 1) {
+    if (k <= 0) return;
     const Art *line = art("cursor_line"), *glow = art("cursor_glow");
     const ImVec2 m(lu(c, 75.5f), lu(c, 73));
     if (line && glow) {
-        nine(c, glow, a - m, b + m, 150, 80, alpha(kCursorGlow, 0.50f + 0.35f * c.pulse));
-        nine(c, line, a - m, b + m, 150, 80, kCursor);
+        nine(c, glow, a - m, b + m, 150, 80, alpha(kCursorGlow, (0.50f + 0.35f * c.pulse) * k));
+        nine(c, line, a - m, b + m, 150, 80, alpha(kCursor, k));
         return;
     }
     const float t = lu(c, 13);
     for (int i = 4; i >= 1; i--)
-        c.d->AddRect(a - ImVec2(t + i * 1.2f * c.s, t + i * 1.2f * c.s), b + ImVec2(t + i * 1.2f * c.s, t + i * 1.2f * c.s), alpha(kCursorGlow, 0.08f + 0.05f * c.pulse),
+        c.d->AddRect(a - ImVec2(t + i * 1.2f * c.s, t + i * 1.2f * c.s), b + ImVec2(t + i * 1.2f * c.s, t + i * 1.2f * c.s), alpha(kCursorGlow, (0.08f + 0.05f * c.pulse) * k),
                      2 * c.s, 2.2f * c.s);
-    c.d->AddRect(a - ImVec2(t * 0.5f, t * 0.5f), b + ImVec2(t * 0.5f, t * 0.5f), kCursor, c.s, t);
+    c.d->AddRect(a - ImVec2(t * 0.5f, t * 0.5f), b + ImVec2(t * 0.5f, t * 0.5f), alpha(kCursor, k), c.s, t);
 }
 /// (the old name: the selection's outline)
 inline void glow(Ctx& c, ImVec2 a0, ImVec2 b0) { cursor(c, a0, b0); }
 /// The game's arrow at m, pointing left or right: on its Options screen a plain white triangle, 18 x 22 units
 inline void arrow(Ctx& c, ImVec2 m, bool right, ImU32 col = kInk) { triangle(c, m, lu(c, 28), right ? 1 : 0, col); }   // (28: its anti-aliased rim counted)
-/// The game's separator across x0..x1 at y: its mark in the middle, a fine line to either side (PaSlideListSeparator). col:
-/// the game's own tint on the options' column, a dim tan (71,53,32 over 50,36,23); (Triforce) the performance overlay asks
-/// for its own, the mark's and the lines' (line_col 0: col)
-inline void separator(Ctx& c, float x0, float x1, float y, ImU32 col = rgba(104, 80, 46), ImU32 line_col = 0) {
+/// The game's separator across x0..x1 at y: its mark in the middle, a fine line to either side (PaSlideListSeparator: P_DecoMark_00,
+/// OptionSeparateMark_00; P_DecoLine_01 and _02, SystemLine_03). col: the layout's tint on the options' column, a dim tan
+/// (kSeparator: measured 71,53,32 over 50,36,23; was 104,80,46); (Triforce) the performance overlay asks for its own, the
+/// mark's and the lines' (line_col 0: col). (Triforce, options_version 7) The line as NX2navi draws the
+/// same texture (its runtime/ui/menu_skin.cpp filigree_art): of its 240 x 43 texels the stroke, 38 to 217, stretched out from
+/// the mark, and its end dot, 217 to 232, at its own proportion at the OUTER end, on the rows 14 to 32; the right one as the
+/// texture is, the left one mirrored. Before, the whole texture was stretched, its dot smeared at the inner ends by the mark
+inline void separator(Ctx& c, float x0, float x1, float y, ImU32 col = kSeparator, ImU32 line_col = 0) {
     const float m = (x0 + x1) * 0.5f, mw = lu(c, 171), mh = lu(c, 60);
     if (!line_col) line_col = col;
     if (const Art* t = art("OptionSeparateMark_00")) image(c, t, ImVec2(m - mw, y - mh), ImVec2(m + mw, y + mh), col);
     else diamond(c, ImVec2(m, y), lu(c, 14), col);
     const Art* line = art("SystemLine_03");
-    const float gap = lu(c, 150), lh = lu(c, 32);
-    if (line) {
+    const float gap = lu(c, 145);   // (the mark's ink, 28 to 200 of its 228 texels, and a little room)
+    if (line && line->w > 232 && line->h > 32) {
+        const float tx = lu(c, 1.5f), top = y - 9 * tx, bot = y + 9 * tx, dot = 15 * tx;   // (a texel: 1.5 units)
+        const float u0 = 38 / line->w, u1 = 217 / line->w, u2 = 232 / line->w, v0 = 14 / line->h, v1 = 32 / line->h;
+        if (x1 - dot > m + gap) {
+            const auto t = line->tex->GetTexRef();
+            c.d->AddImage(t, ImVec2(m + gap, top), ImVec2(x1 - dot, bot), ImVec2(u0, v0), ImVec2(u1, v1), line_col);
+            c.d->AddImage(t, ImVec2(x1 - dot, top), ImVec2(x1, bot), ImVec2(u1, v0), ImVec2(u2, v1), line_col);
+            c.d->AddImage(t, ImVec2(x0 + dot, top), ImVec2(m - gap, bot), ImVec2(u1, v0), ImVec2(u0, v1), line_col);
+            c.d->AddImage(t, ImVec2(x0, top), ImVec2(x0 + dot, bot), ImVec2(u2, v0), ImVec2(u1, v1), line_col);
+        }
+    } else if (line) {   // (a texture of another shape: whole, as before)
+        const float lh = lu(c, 32);
         image(c, line, ImVec2(x0, y - lh), ImVec2(m - gap, y + lh), line_col, false);
         image(c, line, ImVec2(m + gap, y - lh), ImVec2(x1, y + lh), line_col, true);
     } else {
         c.d->AddLine(ImVec2(x0, y), ImVec2(m - gap, y), line_col, std::max(1.0f, lu(c, 3)));
         c.d->AddLine(ImVec2(m + gap, y), ImVec2(x1, y), line_col, std::max(1.0f, lu(c, 3)));
     }
+}
+/// (Triforce, options_version 7) A group's heading in a list of rows, a row's room a..b: the game's separator across its top
+/// part, as PaSlideListSeparator parts the game's lists, and the group's title under it, in gold at the rows' names' place
+/// (name_x), as the Debug tab's headings and NX2navi's opt_group: the filigree, then the title
+inline void heading(Ctx& c, ImVec2 a, ImVec2 b, float name_x, const char* title) {
+    const float h = b.y - a.y;
+    separator(c, a.x + lu(c, 40), b.x - lu(c, 40), a.y + h * 0.24f);
+    text_mid(c, c.f.heading, 20 * c.s, name_x, a.y + h * 0.80f, kGoldHi, title);
 }
 
 // ---- the button prompts: the game's own icons (its External font), or the keys' caps ----
@@ -286,11 +331,11 @@ inline float glyph(Ctx& c, float my, float x, const Prompt& pr, bool draw) {
             return 2 * hh + gap;
         }
         case kTabs: {
-            const float w = key(x, "Q");
-            return w + gap + key(x + w + gap, "E");
+            const float w = key(x, c.key_tab_l);
+            return w + gap + key(x + w + gap, c.key_tab_r);
         }
         case kConfirm: return key(x, "Enter");
-        default: return key(x, "Esc");
+        default: return key(x, c.key_back);
         }
     }
     // (the game's icons: PaGuideKey's T_Icon, the External font at 102 units)
@@ -334,10 +379,21 @@ inline float prompt_bar(Ctx& c, const Prompt* list, int n) {
     if (full > room) k.s = c.s * room / full;
     const float pw = prompts(k, 0, my, list, n, false);
     const float band0 = std::max(0.0f, right - pw - lu(c, 300)), top = prompt_bar_top(c);
+    // ((Triforce, 11-20) over the game's panes the plate goes on to where the game's own band ends (guides_x1: past the
+    // column's right edge on a picture wider than the grid). The lab's check 3 of 26670c0: "a plain strip of the game's
+    // footer band shows to the right of our guides", 75 px in the 1600 x 900 window, 155 px in fullscreen 3440 x 1440. Past
+    // the column the band's texture goes on as its right end is (its edge texels, not stretched): inside it, as it was)
+    const float x1 = c.over_game ? std::max(c.w, c.guides_x1) : c.w, past = c.w + lu(c, 4);
     if (c.over_game)   // (the game's own guides are under it: its band's dark, whole, from where they begin)
-        c.d->AddRectFilled(ImVec2(std::min(band0 + lu(c, 260), at(c, 1000, 0).x), top + lu(c, 26)), ImVec2(c.w, c.h), rgba(24, 22, 12));
-    if (const Art* t = art("SystemGuideBase_00")) image(c, t, ImVec2(band0, top), ImVec2(c.w + lu(c, 4), c.h), rgba(0, 0, 0, 215), true);
-    else c.d->AddRectFilledMultiColor(ImVec2(band0, top), ImVec2(c.w, c.h), alpha(kBar, 0), kBar, kBar, alpha(kBar, 0));
+        c.d->AddRectFilled(ImVec2(std::min(band0 + lu(c, 260), at(c, 1000, 0).x), top + lu(c, 26)), ImVec2(x1, c.h), rgba(24, 22, 12));
+    if (const Art* t = art("SystemGuideBase_00")) {
+        image(c, t, ImVec2(band0, top), ImVec2(past, c.h), rgba(0, 0, 0, 215), true);
+        const float u = 0.5f / std::max(1.0f, (float)t->w);   // (flipped: the texture's left edge is the band's right end)
+        if (x1 > past) c.d->AddImage(t->tex->GetTexRef(), ImVec2(past, top), ImVec2(x1, c.h), ImVec2(u, 0), ImVec2(u, 1), rgba(0, 0, 0, 215));
+    } else {
+        c.d->AddRectFilledMultiColor(ImVec2(band0, top), ImVec2(c.w, c.h), alpha(kBar, 0), kBar, kBar, alpha(kBar, 0));
+        if (x1 > c.w) c.d->AddRectFilled(ImVec2(c.w, top), ImVec2(x1, c.h), kBar);
+    }
     prompts(k, right - pw, my, list, n, true);
     return top;
 }
@@ -356,10 +412,49 @@ inline void banner(Ctx& c, float /*hh*/, const char* title = nullptr) {
 }
 /// The header's height as the pages lay out under it
 inline float banner_height(const Ctx& c) { return lu(c, 200); }
-/// The System screens' dark column from x0 to x1 (pixels), the whole height: SystemBg_05, its soft edges
-inline void column_bg(Ctx& c, float x0, float x1) {
-    if (const Art* t = art("SystemBg_05")) nine(c, t, ImVec2(x0, -lu(c, 160)), ImVec2(x1, c.h + lu(c, 160)), 80, 242);
-    else c.d->AddRectFilled(ImVec2(x0 + lu(c, 30), 0), ImVec2(x1 - lu(c, 30), c.h), kColumn);
+/// The System screens' dark column from x0 to x1 (pixels), the whole height: SystemBg_05, its soft edges. (Triforce) As
+/// SystemOption_00 draws it, P_OptionBg_00: the texture whole over 2240 x 5000 units, its middle 1240 up (so its foot, the
+/// soft edge, at 1260 down: just off the screen), seen through S_Scissor_00, 2200 wide about the same middle. Before it was
+/// nine parts over the window's height. inner (inside the game's own Options screen, whose column is the same, under it):
+/// only the texture's opaque middle, texels 60 to 1380 of its 1440 each way, which covers the game's own list under our rows
+/// and leaves its column's soft edges single, the game's own: drawn whole, those edges would be darkened twice
+inline void column_bg(Ctx& c, float x0, float x1, bool inner = false) {
+    const Art* t = art("SystemBg_05");
+    if (!t) {
+        c.d->AddRectFilled(ImVec2(x0 + lu(c, 30), 0), ImVec2(x1 - lu(c, 30), c.h), kColumn);
+        return;
+    }
+    const float top = at(c, 0, 1240 + 2500).y, bottom = at(c, 0, 1240 - 2500).y, cut = lu(c, 20);
+    ImVec2 clip0(x0 + cut, 0), clip1(x1 - cut, c.h);
+    if (inner) {
+        const float in0 = 60.0f / 1440, in1 = 1380.0f / 1440;
+        clip0.x = x0 + (x1 - x0) * in0, clip1.x = x0 + (x1 - x0) * in1;
+        clip1.y = std::min(c.h, top + (bottom - top) * in1);
+    }
+    c.d->PushClipRect(clip0, clip1, true);
+    image(c, t, ImVec2(x0, top), ImVec2(x1, bottom));
+    c.d->PopClipRect();
+    // (inner: the opaque middle ends a little above the screen's foot (texel 1380 is about 1420 of 1440 lines), and the game's
+    // own list goes on under it to the foot: its row there showed under every tab of ours, wherever the list was scrolled.
+    // The strip below is covered with the last opaque texels of the middle, stretched down: the column's own colour, once)
+    if (inner && clip1.y < c.h) {
+        c.d->PushClipRect(ImVec2(clip0.x, clip1.y), ImVec2(clip1.x, c.h), true);
+        c.d->AddImage(t->tex->GetTexRef(), ImVec2(x0, clip1.y), ImVec2(x1, c.h), ImVec2(0, 1370.0f / 1440), ImVec2(1, 1380.0f / 1440));
+        c.d->PopClipRect();
+    }
+}
+/// (Triforce) The System screens' background over the game, where the game draws none under the menu (the menu opened
+/// over play, not inside the game's Options screen): SystemBG_00's noise and its shade over the whole window (the noise's
+/// tiles as square as on a 16:9 screen). Its capture of the scene, blurred by the game's filter, is the game's own picture
+/// here, as it is. False without the two textures (an older romfs): the caller dims the window flat, as before
+inline bool system_bg(Ctx& c) {
+    const Art *shade = art("SystemBgSh_00"), *noise = art("DecoNoise_00");
+    if (!shade || !noise || c.w <= 0 || c.h <= 0) return false;
+    const float th = c.h / 8, tw = std::floor(c.h * 16.0f / 9.0f + 0.5f) / 8;
+    for (float y = 0; y < c.h; y += th)
+        for (float x = 0; x < c.w; x += tw) image(c, noise, ImVec2(x, y), ImVec2(x + tw, y + th), alpha(kBgNoise, kNoiseAlpha / 255.0f));
+    image(c, shade, ImVec2(0, 0), ImVec2(c.w, c.h), rgba(0, 0, 0, kShadeAlpha));
+    return true;
 }
 /// A box (the help, a question): the game's caption plate (SystemCaptionBg_00). (Triforce) opacity: under 1, the plate lets
 /// the rest of what is behind it through (the performance overlay's); the plain plate's edge line stays whole
@@ -374,10 +469,12 @@ inline void box(Ctx& c, ImVec2 a, ImVec2 b, float opacity = 1) {
 }
 /// A button as the game's own (PaCommonBtnThin: the plate with the curls at its corners, 672 x 144 units of it showing, its
 /// text 54 units, the cursor round it when chosen)
-inline void button(Ctx& c, ImVec2 a0, ImVec2 b0, const char* label, bool sel) {
+/// (Triforce) focus: how much of its cursor shows, 0 to 1, as the game's buttons fade it in and out (focus_anim.h Focus)
+inline void button(Ctx& c, ImVec2 a0, ImVec2 b0, const char* label, float focus) {
     plate(c, a0, b0, false, true);
     text_mid_centre(c, c.f.body, lu(c, 54 * kType), (a0.x + b0.x) * 0.5f, (a0.y + b0.y) * 0.5f - lu(c, 2), kInk, label);
-    if (sel) cursor(c, a0 + ImVec2(lu(c, 8), lu(c, 8)), b0 - ImVec2(lu(c, 8), lu(c, 8)));   // (the line on the plate's edge, as the game's)
+    if (focus > 0) cursor(c, a0 + ImVec2(lu(c, 8), lu(c, 8)), b0 - ImVec2(lu(c, 8), lu(c, 8)), focus);   // (the line on the plate's edge, as the game's)
 }
+inline void button(Ctx& c, ImVec2 a0, ImVec2 b0, const char* label, bool sel) { button(c, a0, b0, label, sel ? 1.0f : 0.0f); }
 
 } // namespace mkwvk::ui

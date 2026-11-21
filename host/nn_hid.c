@@ -148,6 +148,17 @@ static void mouse_look_tick(void) {
 static volatile LONG64 player_input_ns;
 int64_t hos_player_input_ns(void) { return InterlockedCompareExchange64(&player_input_ns, 0, 0); }
 static void player_used(void) { InterlockedExchange64(&player_input_ns, hos_now_ns()); }
+/* ((Triforce, 11-19) the device the player used last: 0 none yet, 1 the keys or the mouse (a bound key, a bound mouse
+   button or the captured mouse's motion), 2 a controller (a button, a stick past 12000), for host/prompts.c's Button prompts
+   Auto (the face of the next start) and the overlay's icons. read_input only stores it, and only when it changes; and counts
+   each device's uses (hos_input_uses: prompts.c tells a player using the keys from a key pressed once) */
+static volatile LONG input_last, input_uses[3];
+int hos_input_last(void) { return (int)input_last; }
+unsigned hos_input_uses(int device) { return device >= 1 && device <= 2 ? (unsigned)input_uses[device] : 0; }
+static void device_used(LONG device) {
+    InterlockedIncrement(&input_uses[device]);
+    if (input_last != device) InterlockedExchange(&input_last, device);
+}
 static volatile LONG drag_dx, drag_dy, drag_right;
 static double drag_x, drag_y;
 void hos_hid_drag(int dx, int dy, int right) {
@@ -823,8 +834,9 @@ static void pads_read(uint64_t *buttons, int32_t stick[4]) {
 }
 
 /* (Triforce) Whether XInput has a controller now, for the Button prompts row's Auto (host/prompts.c auto_face), which asks
-   once, at the game's start, and only when SDL names none: a controller read through XInput alone (HOS_NO_SDL=1, or no
-   SDL beside the game) keeps the game's own icons, and only a PC with no controller at all gets the keys' */
+   once, at the game's start, and only when SDL names none: a controller read through XInput alone (HOS_NO_SDL=1, no SDL
+   beside the game, or one SDL had not opened yet) gets the Xbox's icons ((11-19) the Switch's before), XInput reading
+   only pads of the Xbox's layout, and only a PC with no controller there gets the keys' or the last run's device's */
 int hos_xinput_connected(void) {
     XInputGetStateFn get = xinput_get;
 #ifdef _WIN32   /* (as pads_read: System32's) */
@@ -953,6 +965,11 @@ static void read_input(uint64_t *buttons, int32_t stick[4]) {
     memset(stick, 0, 4 * sizeof *stick);
     void hos_mouse_native_stick(int held);
     scripted_input(buttons, stick);
+    /* ((Triforce, 11-19) benchmark mode (host/hos_bench.c) drives the game itself: its presses and stick alone, with the window
+       in front or behind other windows; the player's devices do not count while it runs (a mouse or a pad would move the camera
+       it measures) */
+    int hos_bench_input_only(void);
+    if (hos_bench_input_only()) return;
     /* A scripted run (a test) takes no input from the player's devices until 5 s after its last press (a variable
        left set in a shell no longer leaves the game without controls), and otherwise the pads count only
        while the game's window is in front, like the keyboard: XInput is global, so a test run in the background
@@ -975,20 +992,39 @@ static void read_input(uint64_t *buttons, int32_t stick[4]) {
         static const char *env;
         static int looked;
         if (!looked) looked = 1, env = getenv("HOS_INPUT_BACKGROUND");
-        if (pads_in_background(env, rx_option(4, 0))) pads_read(buttons, stick);
+        /* ((Triforce, 11-18) while the Insert menu is open the pads are its own here too (it reads them in the background
+           now: gpu/vk/vk_menu.cpp pads_ok), as in front below; read all the same, so the menu's bits stay current) */
+        if (pads_in_background(env, rx_option(4, 0))) {
+            uint64_t pb = 0;
+            int32_t ps[4] = {0};
+            pads_read(&pb, ps);
+            if (!rx_option(1, 0)) {
+                *buttons |= pb;
+                stick_max(stick, ps);
+            }
+        }
         return;
     }
     {   /* (Triforce) The options' tabs inside the game's own Options screen (host/oot_menu.c, gpu/vk/vk_menu.cpp): one of
-           our tabs left with Back (the gamepad input B is bound to, Esc, or the mouse's right button) is the game's Back as well, as in its own
+           our tabs left with Back (the gamepad input B is bound to, Esc, a key bound to B, or the mouse's right button) is the game's Back as well, as in its own
            menus one Back leaves the screen from any tab. The press itself never reaches the game (below), so B is
            tapped for it. A tab left with L or R is the game's own tab: no tap */
         int hos_oot_options_front(void);
         static int was_open;
         const int open = rx_option(1, 0);
+        /* (and the keys bound to B, as the game's own tab has them: our tabs take a modifier there (Shift, B's default) as it is
+           let go (gpu/vk/vk_menu.cpp menu_tick, so that Shift+Tab still steps back a tab), so it is up by the time they close:
+           one seen down within the last 300 ms counts) */
+        static int64_t b_key_ns;
+        const int64_t now = hos_now_ns();
+        for (int k = 0; k < 2; k++) {
+            const int vk = hos_binding(HOS_BIND_KEY, HOS_SW_B, k);
+            if (vk >= 8 && (GetAsyncKeyState(vk) & 0x8000)) b_key_ns = now;
+        }
         if (was_open && !open && hos_oot_options_front()) {
             const int b = hos_binding(HOS_BIND_PAD, HOS_SW_B, 0);
             if ((b >= 0 && b < HOS_PAD_N && ((uint32_t)pad_raw_now >> b & 1)) || (GetAsyncKeyState(VK_ESCAPE) & 0x8000) ||
-                (GetAsyncKeyState(VK_RBUTTON) & 0x8000))
+                (GetAsyncKeyState(VK_RBUTTON) & 0x8000) || (b_key_ns && now - b_key_ns < 300000000LL))
                 hos_hid_tap("0:B/80");
         }
         was_open = open;
@@ -1007,12 +1043,12 @@ static void read_input(uint64_t *buttons, int32_t stick[4]) {
         }
         if (pb || ps[0] > 12000 || ps[0] < -12000 || ps[1] > 12000 || ps[1] < -12000 || ps[2] > 12000 || ps[2] < -12000 ||
             ps[3] > 12000 || ps[3] < -12000)
-            player_used();
+            player_used(), device_used(2);
     }
     binds_load();   /* (the keys: key_default's, or triforce_options.ini's; the mouse's buttons once its capture is known) */
     walk_vk = walk_key_code(rx_option(HOS_OPT_WALK_KEY, 0));   /* ((Triforce) before the keys are read: it is none of theirs) */
     for (int i = 0; i < HOS_SW_N; i++)
-        if (bound_down(i, 0)) *buttons |= 1ULL << i, player_used();
+        if (bound_down(i, 0)) *buttons |= 1ULL << i, player_used(), device_used(1);
     int32_t mouse[4] = {0};
     /* the mouse's motion: the camera itself (mouse_native.c) with the menu's Mouse camera on Native, else the right
        stick; also the stick while the game does not give the camera free control (a menu, a lock-on, the pause menu,
@@ -1040,13 +1076,16 @@ static void read_input(uint64_t *buttons, int32_t stick[4]) {
     mouse_buttons_arm(captured);
     if (captured)
         for (int i = 0; i < HOS_SW_N; i++)
-            if (bound_down(i, 1)) *buttons |= 1ULL << i;
+            if (bound_down(i, 1)) *buttons |= 1ULL << i, device_used(1);
+    /* ((Triforce) the captured mouse turning the camera: past an eighth of the stick's travel, not the mouse nudged) */
+    if (mouse[2] > 4096 || mouse[2] < -4096 || mouse[3] > 4096 || mouse[3] < -4096) device_used(1);
     /* (the left stick's and the camera's keys: WASD and the arrows or IJKL by default) */
     const int cx = bound_down(HOS_KEY_CAM_RIGHT, captured) - bound_down(HOS_KEY_CAM_LEFT, captured),
               cy = bound_down(HOS_KEY_CAM_UP, captured) - bound_down(HOS_KEY_CAM_DOWN, captured);
     int32_t keys[4] = {(bound_down(HOS_KEY_MOVE_RIGHT, captured) - bound_down(HOS_KEY_MOVE_LEFT, captured)) * 32767,
                        (bound_down(HOS_KEY_MOVE_UP, captured) - bound_down(HOS_KEY_MOVE_DOWN, captured)) * 32767,
                        cx * 32767, cy * 32767};
+    if (keys[0] || keys[1] || cx || cy) device_used(1);   /* ((Triforce) the movement and camera keys) */
     /* ((Triforce) the walk key held: the movement keys push the left stick a part of the way. The keys' alone: a
        controller's stick and the scripted presses are as they are) */
     if (walk_vk && key(walk_vk)) walk_keys(keys, rx_option(HOS_OPT_WALK_SCALE, 51));
@@ -1060,6 +1099,88 @@ static void vibration_send(uint64_t handle, uint64_t value);
 volatile int64_t hos_hid_last_read;
 
 volatile uint64_t hos_npad_buttons;   /* (Triforce) the buttons of the last state the game was given: host/mod_cheats.c */
+/* (Triforce) The Mods entry under a game list's last button (host/oot_menu.c, gpu/vk/vk_menu.cpp), from npad_states' read: while
+   the game's cursor is on that last button and our menu is shut, Down (the D-pad's, or the left stick held down) is the
+   entry's, not the game's: the renderer takes the cursor onto Mods at its first frame.
+   While the Mods entry or its screen has the cursor the game gets no input (a pad's is the menu's already, read_input, and the
+   keys' too, key()). What is left is a test's scripted presses (the script, the live input file): they go to the menu as a
+   pad's would (HOS_OPT_MODS_PRESS), not to the game. Buttons held as the cursor goes back to the game are not the game's until
+   let go (the Up that left Mods does not move the game's cursor too).
+   ((Triforce, 11-19) the lab's "a normal DOWN from Title Screen skips Mods to Quit": the Down that brought the cursor onto
+   Mods, still held at the next read, counted there as a new press of the entry's (the buttons before were taken as none
+   held), on to Quit; a 16 ms Down, gone by then, landed on Mods. A press is new against the buttons of the read before,
+   whichever side had them: those held as the cursor comes onto Mods, its Down among them, are held, not pressed. And the
+   directions held are told at each read (HOS_MODS_HELD_*), so the menu repeats a held one at its rate as it repeats a
+   pad's or a key's) */
+static void mods_input(uint64_t *buttons_io, int32_t stick[4]) {
+    int hos_oot_mods_down(void);
+    uint64_t buttons = *buttons_io;
+    const uint64_t raw = buttons;   /* (as the devices and the script gave them, before the entry takes its Down) */
+    /* ((Triforce) 11-17) the left stick pushed past half its travel, as the D-pad */
+    const int raw_dir = stick[1] > 16384 ? HOS_MODS_PRESS_UP : stick[1] < -16384 ? HOS_MODS_PRESS_DOWN
+                      : stick[0] < -16384 ? HOS_MODS_PRESS_LEFT : stick[0] > 16384 ? HOS_MODS_PRESS_RIGHT : 0;
+    static int was_down;
+    /* (a press only: the Down that brought the game's cursor onto the last button, still held, is not one.
+       ((Triforce, 11-19) the stick's Down where the menu's pad bits have it, past half its travel (HOS_PAD_LS_DOWN,
+       pads_read): at -16000 it came onto Mods a read before the menu saw the stick's Down, which it then took as a
+       Down of its own, on to Quit) */
+    const int down = (int)(buttons >> B_DOWN & 1) || stick[1] < -16384;
+    /* ((Triforce, 11-19) a Down held from higher up the list: the game's own repeat takes its cursor onto the last button,
+       and the Down, held from before, was no press there, so the cursor stayed on that button as long as it was held. A
+       held Down goes on onto Mods as a repeat, at the menu's held-direction rate (vk_menu.cpp menu_tick: after 0.35 s held,
+       then a step of 83 ms, 33 ms past 1.5 s): at its first step on the last button once the hold is past the first delay.
+       A Down pressed on the button above, which moves the game's cursor onto the last one, needs the first 0.35 s held as
+       any repeat does: a short press stays there. Its word is 5, a repeat's: the menu repeats on from Mods at the step) */
+    static int64_t down_ns, last_ns;   /* (when this Down was pressed; when it was first held on the last button, 0 none) */
+    static int repeated;               /* (its repeat onto Mods told: once a hold) */
+    const int64_t now = hos_now_ns();
+    if (down && !was_down) down_ns = now, repeated = 0;
+    if (!rx_option(1, 0) && hos_oot_mods_down() && down) {
+        buttons &= ~(1ULL << B_DOWN);
+        stick[1] = 0;
+        if (!was_down) {
+            rx_option_set(HOS_OPT_MODS_ENTER, 1), last_ns = 0;
+        } else if (!repeated) {
+            if (!last_ns) last_ns = now;
+            const int64_t held = now - down_ns, step = held > 1500000000LL ? 33000000LL : 83000000LL;
+            if (held >= 350000000LL && now - last_ns >= step) rx_option_set(HOS_OPT_MODS_ENTER, 5), repeated = 1, last_ns = 0;
+        }
+    } else {
+        last_ns = 0;
+    }
+    was_down = down;
+    static uint64_t prev, held_over;
+    static int sel_was, stick_over, stick_was;
+    const int sel = rx_option(HOS_OPT_MODS_SELECTED, 0) != 0;
+    if (sel) {
+        static const struct { int bit, press; } map[] = {{B_UP, HOS_MODS_PRESS_UP}, {B_DOWN, HOS_MODS_PRESS_DOWN},
+            {B_LEFT, HOS_MODS_PRESS_LEFT}, {B_RIGHT, HOS_MODS_PRESS_RIGHT}, {B_A, HOS_MODS_PRESS_A}, {B_B, HOS_MODS_PRESS_B},
+            {B_L, HOS_MODS_PRESS_L}, {B_R, HOS_MODS_PRESS_R}};
+        const uint64_t fresh = buttons & ~prev;
+        int bits = 0, held = raw_dir;
+        for (int i = 0; i < (int)(sizeof map / sizeof *map); i++) {
+            if (fresh >> map[i].bit & 1) bits |= map[i].press;
+            if (buttons >> map[i].bit & 1) held |= map[i].press;
+        }
+        if (raw_dir && raw_dir != stick_was) bits |= raw_dir;
+        stick_was = raw_dir;
+        /* (each read: the presses, and the directions held, which the menu repeats; the report bit says it is one) */
+        rx_option_set(HOS_OPT_MODS_PRESS, bits | (held & HOS_MODS_PRESS_DIRS) << HOS_MODS_HELD_SHIFT | HOS_MODS_REPORT);
+        prev = buttons;
+        buttons = 0;
+        memset(stick, 0, 4 * sizeof *stick);
+    } else {
+        if (sel_was) held_over = prev | buttons, stick_over = 1;   /* ((Triforce, 11-19) and the keys: the menu's while it was open) */
+        held_over &= buttons;
+        buttons &= ~held_over;
+        if (stick_over && stick[0] > -12000 && stick[0] < 12000 && stick[1] > -12000 && stick[1] < 12000) stick_over = 0;
+        if (stick_over) stick[0] = stick[1] = 0;
+        prev = raw, stick_was = raw_dir;   /* (held now: not pressed at the first read with Mods chosen) */
+    }
+    sel_was = sel;
+    *buttons_io = buttons;
+}
+
 /* GetNpadStates(State* out, int count, unsigned int const& npadId): the latest state first */
 static void npad_states(Ctx *c) {
     uint64_t out = ARG(0);
@@ -1091,55 +1212,7 @@ static void npad_states(Ctx *c) {
     }
     if (connected) {
         read_input(&buttons, stick);
-        {   /* (Triforce) the Mods entry under a game list's last button (host/oot_menu.c, gpu/vk/vk_menu.cpp): while the
-               game's cursor is on that last button and our menu is shut, Down (the D-pad's, or the left stick held down)
-               is the entry's, not the game's: the renderer takes the cursor onto Mods at its first frame */
-            int hos_oot_mods_down(void);
-            static int was_down;
-            /* (a press only: the Down that brought the game's cursor onto the last button, still held, is not one) */
-            const int down = (int)(buttons >> B_DOWN & 1) || stick[1] < -16000;
-            if (!rx_option(1, 0) && hos_oot_mods_down() && down) {
-                buttons &= ~(1ULL << B_DOWN);
-                stick[1] = 0;
-                if (!was_down) rx_option_set(HOS_OPT_MODS_ENTER, 1);
-            }
-            was_down = down;
-            /* While the Mods entry or its screen has the cursor the game gets no input (a pad's is the menu's already,
-               above, and the keys' too, key()). What is left is a test's scripted presses: they go to the menu as a pad's
-               would (HOS_OPT_MODS_PRESS), not to the game. Buttons held as the cursor goes back to the game are not the
-               game's until let go (the Up that left Mods does not move the game's cursor too) */
-            static uint64_t prev, held_over;
-            static int sel_was, stick_over;
-            const int sel = rx_option(HOS_OPT_MODS_SELECTED, 0) != 0;
-            if (sel) {
-                static const struct { int bit, press; } map[] = {{B_UP, HOS_MODS_PRESS_UP}, {B_DOWN, HOS_MODS_PRESS_DOWN},
-                    {B_LEFT, HOS_MODS_PRESS_LEFT}, {B_RIGHT, HOS_MODS_PRESS_RIGHT}, {B_A, HOS_MODS_PRESS_A}, {B_B, HOS_MODS_PRESS_B},
-                    {B_L, HOS_MODS_PRESS_L}, {B_R, HOS_MODS_PRESS_R}};
-                const uint64_t fresh = buttons & ~prev;
-                int bits = 0;
-                for (int i = 0; i < (int)(sizeof map / sizeof *map); i++)
-                    if (fresh >> map[i].bit & 1) bits |= map[i].press;
-                {   /* ((Triforce) 11-17) and the left stick pushed past half its travel, as the D-pad */
-                    static int stick_was;
-                    const int dir = stick[1] > 16384 ? HOS_MODS_PRESS_UP : stick[1] < -16384 ? HOS_MODS_PRESS_DOWN
-                                  : stick[0] < -16384 ? HOS_MODS_PRESS_LEFT : stick[0] > 16384 ? HOS_MODS_PRESS_RIGHT : 0;
-                    if (dir && dir != stick_was) bits |= dir;
-                    stick_was = dir;
-                }
-                if (bits) rx_option_set(HOS_OPT_MODS_PRESS, bits);
-                prev = buttons;
-                buttons = 0;
-                memset(stick, 0, 4 * sizeof *stick);
-            } else {
-                if (sel_was) held_over = prev, stick_over = 1;
-                held_over &= buttons;
-                buttons &= ~held_over;
-                if (stick_over && stick[0] > -12000 && stick[0] < 12000 && stick[1] > -12000 && stick[1] < 12000) stick_over = 0;
-                if (stick_over) stick[0] = stick[1] = 0;
-                prev = 0;
-            }
-            sel_was = sel;
-        }
+        mods_input(&buttons, stick);   /* (Triforce) the Mods entry's: below */
         {   /* (Triforce) the sprint button's press is its own while Link plays (host/oot_sprint.c) */
             void hos_oot_sprint_pad(uint64_t *buttons);
             hos_oot_sprint_pad(&buttons);

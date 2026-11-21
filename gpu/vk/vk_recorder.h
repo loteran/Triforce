@@ -85,7 +85,7 @@ extern std::atomic<bool> par_active;   // (vk_replay.cpp: a parallel replay's se
     V(vkCmdSetDepthCompareOp) V(vkCmdSetStencilTestEnable) V(vkCmdSetRasterizerDiscardEnable) V(vkCmdSetPolygonModeEXT)             \
     V(vkCmdSetDepthClampEnableEXT) V(vkCmdSetAlphaToCoverageEnableEXT)                                                             \
     A(vkCmdSetColorBlendEnableEXT) A(vkCmdSetColorBlendEquationEXT) A(vkCmdSetColorWriteMaskEXT)                                   \
-    V(vkCmdWriteBufferMarkerAMD) A(vkCmdSetCheckpointNV) V(vkCmdWriteTimestamp2) V(vkCmdResetQueryPool)
+    A(vkCmdSetFragmentShadingRateKHR) V(vkCmdWriteBufferMarkerAMD) A(vkCmdSetCheckpointNV) V(vkCmdWriteTimestamp2) V(vkCmdResetQueryPool)
 
 // (DEFER) The calls that drain the thread's held packets first (vk_work.h has a macro for each: the test checks the two lists agree,
 // and that every file making one of these calls includes vk_work.h or is on its list of known exceptions). K: a ::vkx function,
@@ -1157,6 +1157,16 @@ RX_REC_PACKER void pk_vkCmdSetColorWriteMaskEXT(VkCommandBuffer cb, uint32_t fir
            [&] { ::vkx::vkCmdSetColorWriteMaskEXT(cb, first, n, wm); });
 }
 inline constexpr auto& rx_vkCmdSetColorWriteMaskEXT = Route<::vkx::vkCmdSetColorWriteMaskEXT, pk_vkCmdSetColorWriteMaskEXT>::call;
+
+/// ((Triforce) foliage_shadow.h: the fragment size and the two combiner operations the driver reads)
+RX_REC_PACKER void pk_vkCmdSetFragmentShadingRateKHR(VkCommandBuffer cb, const VkExtent2D* size, const VkFragmentShadingRateCombinerOpKHR ops[2]) {
+    Enc e;
+    const VkExtent2D* s = e.dup(size, 1);
+    const VkFragmentShadingRateCombinerOpKHR* o = e.dup(ops, 2);
+    e.emit(OP_vkCmdSetFragmentShadingRateKHR, [=] { ::vkx::vkCmdSetFragmentShadingRateKHR(cb, s, o); },
+           [&] { ::vkx::vkCmdSetFragmentShadingRateKHR(cb, size, ops); });
+}
+inline constexpr auto& rx_vkCmdSetFragmentShadingRateKHR = Route<::vkx::vkCmdSetFragmentShadingRateKHR, pk_vkCmdSetFragmentShadingRateKHR>::call;
 
 /// (the marker is an opaque value the driver hands back, never read through: kept as the pointer value)
 RX_REC_PACKER void pk_vkCmdSetCheckpointNV(VkCommandBuffer cb, const void* marker) {

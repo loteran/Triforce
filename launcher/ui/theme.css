@@ -1,0 +1,84 @@
+/* Triforce's own theme over the new layout (v2, 11-19): the warm hall, parchment text, gold as the one accent, the crest as
+   the mark, serif titles, the three stones for state (style_tokens.md v3 values). Kept out: the halo, motes, letter-spaced
+   capitals and the painted crest as decoration. */
+:root {
+  --ink: #0a0908; --panel: rgba(18, 16, 12, .8); --line: rgba(var(--gold-rgb), .2); --line-soft: #2c2518;
+  --text: #f3ead5; --text2: #cdc2a8; --text3: #948a70;
+  --gold: rgb(var(--gold-rgb)); --gold-hi: rgb(var(--gold-hi-rgb)); --gold-ink: rgb(var(--gold-ink-rgb));
+  --emerald: #6be07f; --emerald-ink: #0a5a14; --sapphire: #8fc0ff; --ruby: #ff6b76; --amber: #f7dc8c;
+}
+/* the gold, as r, g, b: Settings > Launcher > Color scheme moves every one of them from the one chosen colour (app.js, gold
+   shades), and these are what Triforce gold gives back, so the default is the look as it was. lit / low / deep: the polished
+   bar's top, foot and the bars' dark end; edge: the hairlines cut into it; ink, ink2 and emboss: the text on gold and the light
+   under it (dark or light by the colour's luminance); glow and warm: the light under Play and over the title scene; w1-w4: the
+   wordmark. tint-*: how far the crest and the game's ornaments are turned to match (0deg, 1, 1 = as drawn). */
+:root {
+  --gold-rgb: 224, 178, 62; --gold-hi-rgb: 247, 220, 140; --gold-lit-rgb: 255, 244, 204; --gold-low-rgb: 168, 118, 28; --gold-deep-rgb: 154, 106, 24;
+  --gold-edge-rgb: 61, 42, 8; --gold-ink-rgb: 61, 42, 8; --gold-ink2-rgb: 36, 23, 0; --gold-emboss-rgb: 255, 244, 204;
+  --gold-glow-rgb: 247, 200, 110; --gold-warm-rgb: 255, 196, 92;
+  --gold-w1-rgb: 255, 241, 184; --gold-w2-rgb: 232, 184, 64; --gold-w3-rgb: 181, 126, 28; --gold-w4-rgb: 243, 207, 106;
+  --gold-lit: rgb(var(--gold-lit-rgb)); --gold-low: rgb(var(--gold-low-rgb)); --gold-deep: rgb(var(--gold-deep-rgb)); --gold-ink2: rgb(var(--gold-ink2-rgb));
+  --tint-h: 0deg; --tint-s: 1; --tint-b: 1;
+}
+/* the polished bars' own shades: the gold's, until a colour is chosen (app.js keeps them from going too light to shine) */
+:root {
+  --gold-bar-rgb: var(--gold-rgb); --gold-bar-hi-rgb: var(--gold-hi-rgb); --gold-bar-lit-rgb: var(--gold-lit-rgb); --gold-bar-low-rgb: var(--gold-low-rgb);
+  --gold-bar-deep-rgb: var(--gold-deep-rgb); --gold-bar-edge-rgb: var(--gold-edge-rgb);
+}
+.flair, h1, h2, .side h3, .slot p b, .found b { font-family: 'Cormorant Garamond', 'Palatino Linotype', Georgia, serif; font-variation-settings: normal; }
+h1 { font-weight: 700; font-size: 70px; letter-spacing: -.01em; line-height: .98; }
+h2 { font-weight: 700; font-size: 46px; letter-spacing: -.005em; }
+.side h3 { font-size: 22px; font-weight: 700; } .slot p b { font-size: 18px; font-weight: 700; } .found b { font-size: 21px; font-weight: 700; }
+
+/* the warm hall and the scrims over the save's picture */
+.bg { filter: blur(34px) saturate(1.15) brightness(.8) sepia(.18); }
+.scrim { background:
+  linear-gradient(90deg, rgba(10, 9, 8, .8) 0%, rgba(10, 9, 8, .38) 44%, rgba(10, 9, 8, .04) 78%),
+  linear-gradient(180deg, rgba(10, 9, 8, .5) 0%, rgba(10, 9, 8, 0) 24%, rgba(10, 9, 8, .12) 58%, rgba(10, 9, 8, .9) 100%); }
+.plain { background: radial-gradient(1100px 680px at 50% -18%, #221b10 0%, #110e0a 46%, var(--ink) 74%); }
+
+/* the mark: the crest itself, and the wordmark in engraved gold */
+.brand { gap: 12px; font-family: 'Cormorant Garamond', 'Palatino Linotype', Georgia, serif; font-size: 25px; font-weight: 700; letter-spacing: .01em; }
+.brand span { background: linear-gradient(180deg, rgb(var(--gold-w1-rgb)) 0%, rgb(var(--gold-w2-rgb)) 42%, rgb(var(--gold-w3-rgb)) 56%, rgb(var(--gold-w4-rgb)) 100%); -webkit-background-clip: text; background-clip: text; color: transparent; }
+.mark { width: 30px; height: 28px; background: url(img/crest.png) center / contain no-repeat; }
+.mark i { display: none; }
+.nav a { border-radius: 0; padding: 9px 4px; margin: 0 12px; color: var(--text3); }
+.nav a.on { background: none; color: var(--text); box-shadow: inset 0 -2px 0 var(--gold); }
+.state { background: rgba(10, 9, 8, .6); border-color: var(--line); color: var(--text2); }
+.dot { background: var(--emerald); } .dot.amber { background: var(--amber); } .dot.blue { background: var(--sapphire); }
+
+/* the eyebrow: gold, in sentence case, after a gold hairline */
+.over { color: var(--gold); font-weight: 600; } .over b { background: var(--gold); opacity: .8; height: 1px; width: 28px; }
+
+/* the one gold action, as the polished bar of the old Setup; everything else is quiet */
+.btn { background: rgba(243, 234, 213, .07); border-color: var(--line); color: var(--text); }
+.btn.go { color: var(--gold-ink); background: linear-gradient(180deg, rgb(var(--gold-bar-lit-rgb)) 0%, rgb(var(--gold-bar-hi-rgb)) 12%, rgb(var(--gold-bar-rgb)) 48%, rgb(var(--gold-bar-deep-rgb)) 100%);
+  box-shadow: 0 12px 30px rgba(0, 0, 0, .45), inset 0 1px 0 rgba(255, 255, 255, .55), inset 0 -2px 0 rgba(var(--gold-bar-edge-rgb), .35);
+  text-shadow: 0 1px 0 rgba(var(--gold-emboss-rgb), .45); }
+.btn.quiet { background: transparent; border-color: transparent; color: var(--text2); }
+.focus { outline-color: var(--gold-hi); }
+
+/* pictures framed with a gold hairline */
+.card::after, .slot { border-color: rgba(var(--gold-rgb), .32); }
+.card::after { border: 1px solid rgba(var(--gold-rgb), .38); }
+.thumbs div.on { outline-color: var(--gold); }
+.tag { background: rgba(10, 9, 8, .78); color: var(--text); }
+
+.news { border-top-color: var(--line); } .news h4 { color: var(--gold); } .news h4 em { color: var(--text3); }
+.news p b { color: var(--text); } .foot { color: var(--text3); } .key { border-color: var(--text3); color: var(--text2); }
+
+/* first run and the build: steps, fields, the progress line in gold */
+.steps .done i { background: var(--emerald-ink); border-color: var(--emerald); color: var(--emerald); }
+.steps .now { color: var(--text); } .steps .now i { background: var(--gold); border-color: var(--gold); color: var(--gold-ink); }
+.box, .slot { background: var(--panel); border-color: var(--line); }
+.file { background: rgba(var(--gold-rgb), .08); border-color: var(--line); color: var(--gold); }
+.field + .field { border-top-color: var(--line-soft); }
+.track { background: #262017; height: 6px; } .track i { background: linear-gradient(90deg, var(--gold-deep), var(--gold) 70%, var(--gold-lit)); }
+.list div + div { border-top-color: var(--line-soft); }
+.d .bul { background: var(--emerald-ink); border-color: var(--emerald); } .d .bul::after { border-color: var(--emerald); }
+.n .bul { border-color: var(--gold); } .n .bul::after { background: var(--gold); } .list .n span { color: var(--gold); }
+.ok { color: var(--emerald); }
+
+/* lining numerals: the serif's old-style 1 reads as a dotless i in '31 minutes' */
+.flair, h1, h2, .brand, .side h3, .slot p b, .found b { font-variant-numeric: lining-nums; font-feature-settings: 'lnum' 1; }
+.mark { width: 34px; height: 31px; }

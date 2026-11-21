@@ -51,10 +51,11 @@ def sources():
     down = down[:down.index("return 0;")]
     if "if (menu_open)" not in down or "else if (renderer && !mouse_captured) mouse_capture(w, 1);" not in down:
         raise SystemExit("display.c: a click with the menu open captures the mouse")
-    # ((Triforce) a toggle's halves: split where halves_cell draws them meeting, on both pages that draw them; a half picks)
+    # ((Triforce) a toggle's halves: split where halves_cell draws them meeting, on the tabs' rows (the Debug tab's among
+    # them since 11-17: one loop draws every tab); a half picks)
     if "float halves_meet(ImVec2 a, ImVec2 b)" not in menu or "const float xm = halves_meet(a, b);" not in menu:
         raise SystemExit("the menu's toggles are not split for the mouse where they are drawn to meet")
-    if len(re.findall(r"hits\.add\([^;]*menu_hit::kRow[^;]*, vm\);", menu)) != 2:
+    if len(re.findall(r"hits\.add\([^;]*menu_hit::kRow[^;]*, vm\);", menu)) != 1:
         raise SystemExit("a page of rows records its toggles without where their halves meet")
     if "if (*d.value != (hit.side < 0 ? d.hi : d.lo)) press[4] = true;" not in menu:
         raise SystemExit("a click on a toggle's half does not pick that value")
@@ -65,7 +66,7 @@ def sources():
         raise SystemExit("draw_game_tab does not record the tabs it draws over the game's header")
     embed = menu[menu.index("if (in_game_options && !open_now.load()) {"):]
     embed = embed[:embed.index("tab_left = tab_right = false;")]
-    for need in ("host->pointer(&gp)", "hits.at((float)(ix - (int)game_tab_ox), (float)iy)", "if (!game_tab_read) gp.pressed = 0",
+    for need in ("host->pointer(&gp)", "hits.at(game_tab_map.back_x((float)ix), game_tab_map.back_y((float)iy))", "if (!game_tab_read) gp.pressed = 0",
                  "clicked_tab = hover_tab", "cur_tab = clicked_tab >= 0 ? clicked_tab"):
         if need not in embed:
             raise SystemExit("the game's own tab does not take the mouse on our tabs: " + need)

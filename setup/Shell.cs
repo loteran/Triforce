@@ -609,36 +609,44 @@ sealed partial class Shell
                 // unpacking, is not fetched again)
                 await Task.Run(Tools.Sweep);
                 long Length(string file) { try { return File.Exists(file) ? new FileInfo(file).Length : 0; } catch (Exception) { return 0; } }
-                var whole = release.ToolsSize > 0 && Length(zip) == release.ToolsSize;
-                var unpacked = release.ToolsSize * ToolsUnpackedTimes;
-                if (release.ToolsSize > 0 && Space.Problem("the Triforce tools (a download of " + (release.ToolsSize >> 20) + " MB that unpacks to about " + (unpacked >> 20) + " MB)",
-                        (whole ? 0 : Math.Max(0, release.ToolsSize - Length(zip + ".part"))) + unpacked, Space.Free(cache), Space.Disk(cache)) is { } none)
-                    throw new NoRoomException(none);
-                FetchProgress(0, "");
-                if (!whole)
-                    await Download.ToFile(http, release.ToolsUrl, zip, release.ToolsSize, (f, got) => Ui(() =>
-                    {
-                        FetchProgress(f, (got >> 20) + " / " + (release.ToolsSize >> 20) + " MB");
-                        stage.Charge(Art.Ruby, f * 0.7);
-                    }), token);
-                else Program.Log("tools " + release.Tag + ": the zip is here already, whole (" + release.ToolsSize + " bytes)");
-                FetchStep.Text = "Unpacking the tools";
-                FetchCancel.IsEnabled = false;
-                FetchProgress(0, "");
-                try { await Task.Run(() => Tools.Unpack(zip, release.Tag, f => Ui(() => { FetchProgress(f, ""); stage.Charge(Art.Ruby, 0.7 + f * 0.3); }))); }
-                catch (Exception e) when (e is not NoRoomException && !Space.Full(e))
+                // ((Triforce, 11-18) the tools in parts (Tools.UnpackParts): tools that are there and a release that has its code
+                // and base apart fetch the code alone, and the base only when the one there is not the release's. Otherwise, or when
+                // the code part carries no base list, the whole zip, as before)
+                var parts = have != null && release.ToolsCodeUrl != null && release.ToolsBaseUrl != null &&
+                            await ToolsInParts(http, release, have, cache, token);
+                if (!parts)
                 {
-                    // (a zip that does not unpack is fetched again at the next try, not tried again; one there was no room for is kept)
-                    try { File.Delete(zip); } catch (Exception) { }
-                    throw;
+                    var whole = release.ToolsSize > 0 && Length(zip) == release.ToolsSize;
+                    var unpacked = release.ToolsSize * ToolsUnpackedTimes;
+                    if (release.ToolsSize > 0 && Space.Problem("the Triforce tools (a download of " + (release.ToolsSize >> 20) + " MB that unpacks to about " + (unpacked >> 20) + " MB)",
+                            (whole ? 0 : Math.Max(0, release.ToolsSize - Length(zip + ".part"))) + unpacked, Space.Free(cache), Space.Disk(cache)) is { } none)
+                        throw new NoRoomException(none);
+                    FetchProgress(0, "");
+                    if (!whole)
+                        await Download.ToFile(http, release.ToolsUrl, zip, release.ToolsSize, (f, got) => Ui(() =>
+                        {
+                            FetchProgress(f, (got >> 20) + " / " + (release.ToolsSize >> 20) + " MB");
+                            stage.Charge(Art.Ruby, f * 0.7);
+                        }), token);
+                    else Program.Log("tools " + release.Tag + ": the zip is here already, whole (" + release.ToolsSize + " bytes)");
+                    FetchStep.Text = "Unpacking the tools";
+                    FetchCancel.IsEnabled = false;
+                    FetchProgress(0, "");
+                    try { await Task.Run(() => Tools.Unpack(zip, release.Tag, f => Ui(() => { FetchProgress(f, ""); stage.Charge(Art.Ruby, 0.7 + f * 0.3); }))); }
+                    catch (Exception e) when (e is not NoRoomException && !Space.Full(e))
+                    {
+                        // (a zip that does not unpack is fetched again at the next try, not tried again; one there was no room for is kept)
+                        try { File.Delete(zip); } catch (Exception) { }
+                        throw;
+                    }
+                    FetchCancel.IsEnabled = true;
+                    // (the zip, and what downloads of other releases left there: parts nothing will go on from)
+                    string[] leavings = { };
+                    try { leavings = Directory.GetFiles(cache, "Triforce-Tools-*"); } catch (Exception) { }
+                    foreach (var f in leavings)
+                        try { File.Delete(f); } catch (Exception) { }
+                    Program.Log("tools " + release.Tag + " unpacked into " + Tools.Folder);
                 }
-                FetchCancel.IsEnabled = true;
-                // (the zip, and what downloads of other releases left there: parts nothing will go on from)
-                string[] leavings = { };
-                try { leavings = Directory.GetFiles(cache, "Triforce-Tools-*"); } catch (Exception) { }
-                foreach (var f in leavings)
-                    try { File.Delete(f); } catch (Exception) { }
-                Program.Log("tools " + release.Tag + " unpacked into " + Tools.Folder);
             }
             stage.Set(Art.Ruby, true);
             fetch = null;
@@ -669,6 +677,71 @@ sealed partial class Shell
     }
 
     void Ui(Action a) => Window.Dispatcher.BeginInvoke(a);
+
+    /// ((Triforce, 11-18) Merge's tools in parts: the release's code zip, then its base zip only when the tools here do not hold
+    /// its base (Tools.HasBase), and the tools folder made again from them (Tools.UnpackParts). False: the code zip names no base
+    /// (the whole zip is fetched instead, as before). Downloads through Guard.cs's Download, with the sizes the release lists
+    async Task<bool> ToolsInParts(HttpClient http, Release release, string have, string cache, CancellationToken token)
+    {
+        static long Length(string file) { try { return File.Exists(file) ? new FileInfo(file).Length : 0; } catch (Exception) { return 0; } }
+        var tag = string.Concat(release.Tag.Where(c => char.IsLetterOrDigit(c) || c == '.' || c == '-'));
+        var code = System.IO.Path.Combine(cache, "Triforce-Tools-code-" + tag + ".zip");
+        var baseZip = System.IO.Path.Combine(cache, "Triforce-Tools-base-" + tag + ".zip");
+        FetchState("Merging Triforce " + release.Tag,
+                   "Triforce " + release.Tag + " replaces " + have + ". Downloading its new code (" + Math.Max(1, release.ToolsCodeSize >> 20) + " MB); the compiler and Python you have are kept.",
+                   "Downloading the tools");
+        FetchProgress(0, "");
+        if (!(release.ToolsCodeSize > 0 && Length(code) == release.ToolsCodeSize))
+            await Download.ToFile(http, release.ToolsCodeUrl!, code, release.ToolsCodeSize, (f, got) => Ui(() =>
+            {
+                FetchProgress(f, (got >> 10) + " / " + (release.ToolsCodeSize >> 10) + " KB");
+                stage.Charge(Art.Ruby, f * 0.3);
+            }), token);
+        var b = await Task.Run(() => { try { return Tools.BaseListIn(code); } catch (Exception) { return null; } });
+        if (b == null)
+        {
+            Program.Log("tools " + release.Tag + ": the code part names no base: the whole zip instead");
+            try { File.Delete(code); } catch (Exception) { }
+            return false;
+        }
+        FetchStep.Text = "Checking the tools you have";
+        FetchProgress(0, "");
+        var keep = await Task.Run(() => { try { return Tools.HasBase(b, Tools.Folder, f => Ui(() => FetchProgress(f, ""))); } catch (Exception) { return false; } });
+        Program.Log("tools " + release.Tag + ": the base (" + b.Files.Count + " files) " + (keep ? "is the one here: kept" : "is not the one here: fetched"));
+        if (!keep)
+        {
+            FetchStep.Text = "Downloading the compiler and Python (" + (release.ToolsBaseSize >> 20) + " MB)";
+            var unpacked = release.ToolsBaseSize * ToolsUnpackedTimes;
+            if (release.ToolsBaseSize > 0 && Space.Problem("the Triforce tools (a download of " + (release.ToolsBaseSize >> 20) + " MB that unpacks to about " + (unpacked >> 20) + " MB)",
+                    Math.Max(0, release.ToolsBaseSize - Length(baseZip + ".part")) + unpacked, Space.Free(cache), Space.Disk(cache)) is { } none)
+                throw new NoRoomException(none);
+            FetchProgress(0, "");
+            if (!(release.ToolsBaseSize > 0 && Length(baseZip) == release.ToolsBaseSize))
+                await Download.ToFile(http, release.ToolsBaseUrl!, baseZip, release.ToolsBaseSize, (f, got) => Ui(() =>
+                {
+                    FetchProgress(f, (got >> 20) + " / " + (release.ToolsBaseSize >> 20) + " MB");
+                    stage.Charge(Art.Ruby, 0.3 + f * 0.4);
+                }), token);
+        }
+        FetchStep.Text = "Unpacking the tools";
+        FetchCancel.IsEnabled = false;
+        FetchProgress(0, "");
+        try { await Task.Run(() => Tools.UnpackParts(code, keep ? null : baseZip, b, release.Tag, f => Ui(() => { FetchProgress(f, ""); stage.Charge(Art.Ruby, 0.7 + f * 0.3); }))); }
+        catch (Exception e) when (e is not NoRoomException && !Space.Full(e))
+        {
+            // (parts that do not unpack are fetched again at the next try, not tried again)
+            try { File.Delete(code); } catch (Exception) { }
+            try { File.Delete(baseZip); } catch (Exception) { }
+            throw;
+        }
+        FetchCancel.IsEnabled = true;
+        string[] leavings = { };
+        try { leavings = Directory.GetFiles(cache, "Triforce-Tools-*"); } catch (Exception) { }
+        foreach (var f in leavings)
+            try { File.Delete(f); } catch (Exception) { }
+        Program.Log("tools " + release.Tag + " unpacked into " + Tools.Folder + " from its parts (" + (keep ? "the base kept" : "the base fetched") + ")");
+        return true;
+    }
 
     static string? BuiltVersion(string folder) =>
         ReadValue(System.IO.Path.Combine(folder, "triforce_version.txt"), "version") ?? ReadValue(System.IO.Path.Combine(folder, "hookshot_version.txt"), "version");
@@ -942,6 +1015,17 @@ sealed partial class Shell
         clock.Start();
         // (NVIDIA DLSS chosen: its SDK fetched first, only what is missing, and built in; a build and an update alike)
         var dlss = DlssChosen;
+        // ((Triforce, 11-18) #bug-tracker "Update & merge removes NVIDIA DLSS": an update keeps what the folder was built with, as
+        // it keeps FSR. A folder built with DLSS (its ngx\nvngx_dlss.dll) is updated with it whatever the stored choice says (a
+        // player's builds had DLSS, yet every Update & merge ran without it and the update took the folder's DLSS away), and the
+        // choice is stored again. The tick still decides for a new build)
+        var updated = args.IndexOf("--update") is var ui && ui >= 0 && ui + 1 < args.Count ? args[ui + 1].Trim('"') : null;
+        if (!dlss && updated != null && File.Exists(System.IO.Path.Combine(updated, "ngx", "nvngx_dlss.dll")))
+        {
+            dlss = true;
+            Install.Set("Dlss", "1");
+            Program.Log("update: the folder was built with NVIDIA DLSS (ngx\\nvngx_dlss.dll): updated with it");
+        }
         if (dlss && !args.Contains("--fetch-ngx-sdk")) args.AddRange(new[] { "--fetch-ngx-sdk", "--accept-nvidia-license" });
         // (11-15: AMD FSR 4 in every build: its code is built in and AMD's two signed libraries (MIT license) are fetched
         // from AMD's repository and put beside the game: nx2/make_game.py --fsr, scripts/fsr_sdk.py. The Upscaler row offers

@@ -171,7 +171,7 @@ def main():
     check(row and row.group(1).rstrip().endswith("hn_lazy_write_back, true, true"),
           "no Lazy write-back row on the Debug tab that applies after a restart and leaves the preset alone")
     if row:
-        check(menu.index('"Developer", nullptr') < row.start() < menu.index('{TAB_SYSTEM, "Restart"'),
+        check(menu.index('"Developer", nullptr') < row.start() < menu.index('constexpr int kRowsEnd'),   # ((Triforce, 11-19) the table's end)
               "the Lazy write-back row is not under the Debug tab's Developer heading")
     check("int lazy_write_back = 1;" in opts, "the Lazy write-back row is not on by default (options_version 5)")
     hint = re.search(r"MENU_HINTS\(hn_lazy_write_back, 0,(.*?)\)\n", menu, re.S)

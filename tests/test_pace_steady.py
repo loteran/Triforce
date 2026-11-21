@@ -546,16 +546,22 @@ def check_source():
     check("presenting = true;" in block(pace, "int frame_start() {") and "if (presenting && ns > 0)" in block(pace, "void steady_held(int64_t ns) {"),
           "a hold on the present thread is counted as the presenting thread's")
     menu = (ROOT / "gpu/vk/vk_menu.cpp").read_text(encoding="utf-8")
-    row = re.search(r'\{TAB_DISPLAY, "Steady frame rate", &opts\.steady_fps, 0, 2, 1, tx_steady_fps,(.*?)\n     nullptr, true, true\},', menu, re.S)
-    check(row is not None, "the Display tab has no Steady frame rate row (Off, Any rate, Refresh steps; read at the start)")
-    check(menu.index('"Game frame rate cap"') < menu.index('"Steady frame rate"') < menu.index('"Reflex frame limit"'),
-          "the Steady frame rate row is not beside the Game frame rate cap")
+    # ((Triforce, options_version 7) Steady frame rate is the Frame pacing row's two Steady values (merged_rows.h); its value keeps
+    # its key, steady_frame_rate, in a row no tab shows, and the Frame pacing row takes the restart for it)
+    row = re.search(r'\{TAB_HIDDEN, "Steady frame rate", &opts\.steady_fps, 0, 2, 1, tx_steady_fps, nullptr\},', menu)
+    check(row is not None, "the Steady frame rate's value is not kept under its key, 0 to 2")
+    pacing = re.search(r'\{TAB_GRAPHICS, "Frame pacing", &merged\.pacing, 0, 3, 1, tx_pacing,(.*?)\n     hn_pacing, true\},', menu, re.S)
+    check(pacing is not None, "the Graphics tab has no Frame pacing row of four values taking a restart")
+    check(menu.index('"Frame rate cap", &opts.fps_cap') < menu.index('"Frame pacing", &merged.pacing'),
+          "the Frame pacing row is not in the Frame rate cap's group")
+    check("if (r.value == &merged.pacing) return opts.steady_fps;" in block(menu, "int restart_value_of(const Row& r) {"),
+          "the Frame pacing row asks for a restart for more than its Steady values")
     check('return v == 1 ? "Any rate" : v == 2 ? "Refresh steps" : "Off";' in block(menu, "const char* tx_steady_fps(int v) {"),
           "the row's values are not Off, Any rate, Refresh steps")
     check("opts.steady_fps" not in block(menu, "const char* ini_key(const Row& r) {"), "the row's key is not its name's, steady_frame_rate")
     check("int steady_fps = 0;" in (ROOT / "gpu/vk/vk_menu.h").read_text(encoding="utf-8"), "the row is not off by default")
-    check("| Steady frame rate | Off, Any rate, Refresh steps" in (ROOT / "readme.md").read_text(encoding="utf-8"),
-          "readme.md's settings table has no Steady frame rate row")
+    check("| Frame pacing | Off, Even, Steady (any rate), Steady (refresh steps)" in (ROOT / "readme.md").read_text(encoding="utf-8"),
+          "readme.md's settings table has no Frame pacing row with Steady")
     guide = (ROOT / "docs/development.md").read_text(encoding="utf-8")
     check("| `steady_frame_rate` | 0 Off, 1 any rate" in guide and "| `HOS_FPS_STEADY=0`, `=1`, `=2` |" in guide,
           "docs/development.md has no rows for steady_frame_rate and HOS_FPS_STEADY")

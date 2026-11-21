@@ -15,6 +15,7 @@
 #include <map>
 #include <mutex>
 #include <string>
+#include <utility>
 #include <vector>
 
 #define CHECK(c) do { if (!(c)) { std::fprintf(stderr, "FAIL line %d: %s\n", __LINE__, #c); std::exit(1); } } while (0)
@@ -33,6 +34,9 @@ namespace dlssg { bool active() { return false; } }
 bool fine_mode = true;
 bool fine_vectors() { return fine_mode; }
 constexpr float kFineBias = 0.3f;
+struct PresentSourceRect { uint32_t x, y, w, h; };   // ((Triforce, FG-2) vk_present_rect.h's, which the state names)
+// ((Triforce, FG-5) the frames' format: RGBA8 here (HDR Native's 10-bit one is tests/test_framegen_amd.py's)
+VkFormat frames_format() { return VK_FORMAT_R8G8B8A8_UNORM; }
 /* ACTUAL_STRUCTS */
 int multiplier() { return opts.framegen; }
 int display_refresh_mhz() { return 60000; }

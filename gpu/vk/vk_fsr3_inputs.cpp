@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <functional>
@@ -19,7 +20,9 @@
 #include <unordered_map>
 #include <vector>
 
+#include "dlss_checks.h"     // ((Triforce) scene_size_fits: the scenes the gameplay upscale's output can come from)
 #include "dlss_math.h"
+#include "framegen_rows.h"   // ((Triforce) pose_of, camera_cut: a camera cut starts a new history)
 #include "vk_draw.h"   // (descriptors_disturbed)
 #include "vk_fsr3.h"
 #include "vk_fsr3fi.h"
@@ -32,6 +35,10 @@
 #include "shaders/fsr3_prep_comp_spv.h"
 #include "vk_work.h"   // (after the others: counts the commands that do GPU work, for full_barrier)
 
+namespace mkwvk {
+bool present_held_last();   // ((Triforce) vk_replay.cpp: the last present held its frame, the hold of the last picture)
+}
+
 namespace mkwvk::fsr3_inputs {
 namespace {
 
@@ -40,12 +47,16 @@ int env_switch(const char* name) {   // (-1: unset)
     return e && *e ? atoi(e) : -1;
 }
 
+/// ((Triforce) the frames FSR 3.1 may fail to draw in a row before the host's jitter stops: jitter_size)
+constexpr uint64_t kMissedFrames = 3;
+
 struct Image {
     VkImage image = VK_NULL_HANDLE;
     VmaAllocation memory = nullptr;
     VkImageView view = VK_NULL_HANDLE;
     VkFormat format = VK_FORMAT_UNDEFINED;
     uint32_t width = 0, height = 0;
+    VkImageUsageFlags usage = 0;
 };
 
 struct Camera {
@@ -85,19 +96,34 @@ struct State {
     bool have_frame = false;
     std::atomic<uint64_t> upscaled_frame{0};   // (the frame FSR's upscaler last drew: jitter_size, on the game's thread)
     std::atomic<uint32_t> jitter_w{0}, jitter_h{0}, jitter_phases{8};
+    // ((Triforce) the first frame of a run of FSR 3.1's failures since it last drew (missed), 0: none; jitter_size)
+    std::atomic<uint64_t> missed_from{0};
+    // ((Triforce) the gameplay upscale's output size, as last seen (note_output): which scenes keep a camera)
+    std::atomic<uint32_t> out_w{0}, out_h{0};
+    // ((Triforce) camera cuts: the pose of the frame before (framegen_rows.h pose_of), and how many were taken)
+    framegen_rows::Pose last_pose;
+    bool have_pose = false;
+    uint64_t cuts = 0;
+    uint64_t used_frame = 0;   // (the frame prepare last ran or wanted() last held: release_idle)
     struct Dead { uint64_t frame; std::function<void()> free; };
     std::vector<Dead> dead;   // (what work in flight may still use: freed a few frames on)
     const char* reason = nullptr;
     int reason_repeats = 0;
     bool told = false;
+    bool told_chain = false;   // ((Triforce, FG-4) chain_motion's first frame said)
 };
 State& st() {
     static State s;
     return s;
 }
 
-bool fail(const char* why) {   // (why, when it changes and every 600th time)
+constexpr const char* kNoCamera = "no scene camera this frame";
+
+/// Why, when it changes and every 600th time. Anything but a frame without the scene's camera (a menu, the pause screen: no
+/// scene drawn) is FSR 3.1 failing to draw a frame it was to draw: the host's jitter stops soon (missed)
+bool fail(const char* why) {
     State& s = st();
+    if (why != kNoCamera) missed();
     if (why != s.reason || ++s.reason_repeats % 600 == 0) logf("vk: fsr3 inputs: not made this frame (%s)", why);
     if (why != s.reason) s.reason = why, s.reason_repeats = 0;
     return false;
@@ -118,8 +144,11 @@ void free_dead() {
     }
 }
 
-bool make_image(VkCommandBuffer cmd, Image& im, VkFormat format, uint32_t w, uint32_t h) {
-    if (im.image && im.format == format && im.width == w && im.height == h) return true;
+/// extra: usage besides storage and sampling ((Triforce) the motion's: a colour attachment, which the chain's redraws of
+/// what moves by itself draw into, vk_temporal.cpp temporal_fsr3_motion)
+bool make_image(VkCommandBuffer cmd, Image& im, VkFormat format, uint32_t w, uint32_t h, VkImageUsageFlags extra = 0) {
+    const VkImageUsageFlags usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | extra;
+    if (im.image && im.format == format && im.width == w && im.height == h && im.usage == usage) return true;
     if (im.image) {
         const Image old = im;
         later([old] {
@@ -131,7 +160,7 @@ bool make_image(VkCommandBuffer cmd, Image& im, VkFormat format, uint32_t w, uin
     VkImageCreateInfo ic{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
     ic.imageType = VK_IMAGE_TYPE_2D, ic.format = format, ic.extent = {w, h, 1}, ic.mipLevels = 1, ic.arrayLayers = 1;
     ic.samples = VK_SAMPLE_COUNT_1_BIT, ic.tiling = VK_IMAGE_TILING_OPTIMAL;
-    ic.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    ic.usage = usage;
     if (!create_image(ic, im.image, im.memory)) return im = {}, false;
     VkImageViewCreateInfo vc{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
     vc.image = im.image, vc.viewType = VK_IMAGE_VIEW_TYPE_2D, vc.format = format;
@@ -140,7 +169,7 @@ bool make_image(VkCommandBuffer cmd, Image& im, VkFormat format, uint32_t w, uin
         destroy_image(im.image, im.memory);
         return im = {}, false;
     }
-    im.format = format, im.width = w, im.height = h;
+    im.format = format, im.width = w, im.height = h, im.usage = usage;
     VkImageMemoryBarrier2 b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};   // (UNDEFINED -> GENERAL, once)
     b.srcStageMask = VK_PIPELINE_STAGE_2_NONE, b.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
     b.dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
@@ -226,9 +255,26 @@ bool wanted() {
            fsr4fg::frames_wanted();
 }
 
+void note_output(uint32_t width, uint32_t height) {
+    State& s = st();
+    s.out_w.store(width, std::memory_order_relaxed), s.out_h.store(height, std::memory_order_relaxed);
+}
+
+bool scene_size(uint32_t width, uint32_t height) {
+    // ((Triforce) 640x360 at least, as before, or the chain's rule (vk_temporal.cpp temporal_scene_size) once the output is
+    // seen: 1 to 3 times smaller than it, so FSR's Ultra Performance in the handheld size (512x288 for 1536x864) has its
+    // camera. Either: an output whose height is no multiple of 3 (1600) draws 533 lines at a third, which the chain's rule
+    // alone would turn away. A smaller target with a camera (the pause screen's model views, a reflection) is still not the
+    // scene: the largest of the frame is, and the upscale's input must be it)
+    if (width >= 640 && height >= 360) return true;
+    const State& s = st();
+    const uint32_t ow = s.out_w.load(std::memory_order_relaxed), oh = s.out_h.load(std::memory_order_relaxed);
+    return dlss_checks::scene_size_fits(width, height, ow, oh);
+}
+
 void note_scene_draw(const Texture* color0, uint32_t width, uint32_t height, Texture* depth, uint64_t camera,
                      uint64_t camera_size) {
-    if (!color0 || !depth || !camera || camera_size < 0x230 || width < 640 || height < 360) return;
+    if (!color0 || !depth || !camera || camera_size < 0x230 || !scene_size(width, height)) return;
     // ((Triforce, 11-16: DLSS frame generation never made a frame for the owner, HDR Native with RenoDX) the scene's target in
     // the format this run draws it in, as vk_temporal.cpp's note takes it: B10G11R11, or RGBA16F where the run's scene is
     // (RenoDX's HDR, host/nn_vi.c hos_scene_rgba16f). With B10G11R11 alone no camera was kept in an RGBA16F run, so frame
@@ -253,6 +299,7 @@ void note_scene_draw(const Texture* color0, uint32_t width, uint32_t height, Tex
     k.jitter[0] = -c[0x78 / 4], k.jitter[1] = -c[0x88 / 4];
     k.width = width, k.height = height, k.depth = depth, k.depth_id = depth->id, k.noted = texture_destroyed_count(), k.frame = now;
     k.valid = true;
+    upscale_lod_scene(width, height);   // ((Triforce, S8) this frame's scene size for the texture LOD bias: vk_draw.cpp)
 }
 
 bool is_scene(const Texture* in) {
@@ -270,7 +317,7 @@ bool prepare(VkCommandBuffer cmd, Texture* in, VkImageView in_view, Frame& out, 
     s.cam.valid = false;   // (each frame's own camera)
     if (!in || !in_view) return fail("no input view");
     const uint64_t now = texture_frame_no();
-    if (!cam.valid || now - cam.frame > 1) return fail("no scene camera this frame");
+    if (!cam.valid || now - cam.frame > 1) return fail(kNoCamera);
     if (texture_destroyed_since(cam.depth_id, cam.noted)) return fail("the scene depth is gone");
     const uint32_t rw = in->width, rh = in->height;
     if (rw != cam.width || rh != cam.height) return fail("the input is not the scene's size");
@@ -289,11 +336,34 @@ bool prepare(VkCommandBuffer cmd, Texture* in, VkImageView in_view, Frame& out, 
     struct Disturbed {   // (from here commands are recorded: the program's descriptor pushes are pushed again after)
         ~Disturbed() { descriptors_disturbed(); }
     } disturbed;
+    // ((Triforce, FG-4) the motion a copy's destination too: the chain's, with what moves by itself, copied over it: chain_motion)
     if (!make_image(cmd, s.color, VK_FORMAT_R16G16B16A16_SFLOAT, rw, rh) || !make_image(cmd, s.depth, VK_FORMAT_R32_SFLOAT, rw, rh) ||
-        !make_image(cmd, s.motion, VK_FORMAT_R16G16_SFLOAT, rw, rh))
+        !make_image(cmd, s.motion, VK_FORMAT_R16G16_SFLOAT, rw, rh, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT))
         return fail("its images were not made");
 
-    const bool reset = !s.last_frame || now - s.last_frame > 2 || s.frame.width != rw || s.frame.height != rh;
+    // ((Triforce) a new history also after a present that held its frame, as vk_temporal.cpp's chain starts one: what was drawn
+    // while new textures were still owed (the dummy in their place) is not carried into the picture shown after the hold; and
+    // at a camera cut (framegen_rows.h kUpscalerCut: NX2navi's 2495391), the time measured since the frame before's camera
+    // (the CPU's, never taken under one 60th there: frames recorded back to back after a stall are no cut).
+    // Not at another render size: the game's dynamic resolution changes it, and the reprojection is in clip space, which
+    // does not depend on it (FSR's own history is kept across it: vk_fsr3.cpp)
+    const auto t = std::chrono::steady_clock::now();
+    const framegen_rows::Pose pose = framegen_rows::pose_of(cam.view);
+    const bool gap = !s.last_frame || now - s.last_frame > 2;
+    const bool held = !gap && present_held_last();
+    bool cut = false;
+    if (!gap && !held && s.have_pose && s.last_time.time_since_epoch().count()) {
+        const float dt = (float)std::chrono::duration<double, std::milli>(t - s.last_time).count();
+        cut = framegen_rows::camera_cut(s.last_pose, pose, dt, framegen_rows::kUpscalerCut);
+        if (cut && s.cuts++ < 24) {
+            float d2 = 0.0f;
+            for (int i = 0; i < 3; i++) d2 += (pose.pos[i] - s.last_pose.pos[i]) * (pose.pos[i] - s.last_pose.pos[i]);
+            logf("vk: fsr3 inputs: frame %llu: a camera cut (moved %.2f m in %.1f ms): a new history (%llu so far)",
+                 (unsigned long long)now, std::sqrt(d2), dt, (unsigned long long)s.cuts);
+        }
+    }
+    s.last_pose = pose, s.have_pose = true;
+    const bool reset = gap || held || cut;
     struct {
         float reproject[16];
         float jitter[2];
@@ -331,7 +401,6 @@ bool prepare(VkCommandBuffer cmd, Texture* in, VkImageView in_view, Frame& out, 
     }
     full_barrier(cmd);
 
-    const auto t = std::chrono::steady_clock::now();
     Frame f;
     f.color = s.color.view, f.depth = s.depth.view, f.motion = s.motion.view;
     f.width = rw, f.height = rh;
@@ -368,6 +437,18 @@ bool prepare(VkCommandBuffer cmd, Texture* in, VkImageView in_view, Frame& out, 
         if (!motion || !dlss_math::reprojection(current, previous, f.clip_to_prev))
             for (int i = 0; i < 16; i++) f.clip_to_prev[i] = i % 5 == 0 ? 1.0f : 0.0f;
     }
+    {   // ((Triforce, FSR3-03) the chain's redraws of what moves by itself: the camera as drawn, and the frame before's)
+        Frame::Own& o = f.own;
+        std::memcpy(o.current, cam.current, sizeof o.current);
+        std::memcpy(o.projection, cam.projection, sizeof o.projection);
+        o.jitter[0] = cam.jitter[0], o.jitter[1] = cam.jitter[1];
+        std::memcpy(o.before, previous, sizeof o.before);
+        o.jitter_before[0] = s.last_jitter[0], o.jitter_before[1] = s.last_jitter[1];
+        std::memcpy(o.reproject, pc.reproject, sizeof o.reproject);
+        o.depth = cam.depth;
+        o.last = s.last_frame;   // (before it is this frame's, below)
+        o.history = motion;
+    }
     f.frame_ms = s.last_time.time_since_epoch().count() && !reset
                      ? (float)std::min(250.0, std::chrono::duration<double, std::milli>(t - s.last_time).count())
                      : 16.667f;
@@ -391,6 +472,34 @@ bool prepare(VkCommandBuffer cmd, Texture* in, VkImageView in_view, Frame& out, 
     return true;
 }
 
+bool made_this_frame() {
+    State& s = st();
+    std::lock_guard lk(s.mu);
+    return s.have_frame && s.frame.frame == texture_frame_no();
+}
+
+bool chain_motion(VkCommandBuffer cmd, VkImage motion, uint32_t width, uint32_t height) {
+    // (RX_VK_FG_OWN_MOTION=0: the camera's motion alone, as before, for comparing)
+    static const bool off = env_switch("RX_VK_FG_OWN_MOTION") == 0;
+    State& s = st();
+    std::lock_guard lk(s.mu);
+    if (off || !cmd || !motion || !s.have_frame || s.frame.frame != texture_frame_no() || !s.motion.image ||
+        s.frame.width != width || s.frame.height != height || s.motion.width < width || s.motion.height < height)
+        return false;
+    full_barrier(cmd);   // (the chain's redraws into its motion, and prepare's pass into this one, before the copy)
+    const VkImageCopy c{{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0},
+                        {width, height, 1}};
+    vkCmdCopyImage(cmd, motion, VK_IMAGE_LAYOUT_GENERAL, s.motion.image, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
+    full_barrier(cmd);
+    s.frame.chain_motion = true;
+    if (!s.told_chain) {
+        s.told_chain = true;
+        logf("vk: fsr3 inputs: frame generation's motion is the upscaler chain's from frame %llu, what moves by itself in it "
+             "(%ux%u; RX_VK_FG_OWN_MOTION=0: the camera's alone)", (unsigned long long)s.frame.frame, width, height);
+    }
+    return true;
+}
+
 bool take(Frame& out) {
     State& s = st();
     std::lock_guard lk(s.mu);
@@ -402,18 +511,64 @@ bool take(Frame& out) {
 
 void upscaled(uint32_t rw, uint32_t rh, uint32_t dw, uint32_t dh) {
     State& s = st();
-    s.jitter_w = rw, s.jitter_h = rh, s.jitter_phases = (uint32_t)dlss_jitter_phases(rw, rh, dw, dh);
+    (void)dh;   // ((Triforce) AMD's rule is the width's: fsr3_math.h jitter_phases, 71 or 72 at Ultra Performance, not 64)
+    s.jitter_w = rw, s.jitter_h = rh, s.jitter_phases = fsr3_math::jitter_phases(rw, dw);
+    s.missed_from.store(0, std::memory_order_relaxed);
     s.upscaled_frame = texture_frame_no();
+}
+
+void missed() {
+    State& s = st();
+    uint64_t none = 0;
+    const uint64_t now = texture_frame_no();
+    s.missed_from.compare_exchange_strong(none, now ? now : 1, std::memory_order_relaxed);
 }
 
 uint32_t jitter_size(int axis) {
     // (RX_VK_FSR_JITTER=0: none. 0 too once FSR has not drawn for a while: the camera as the game has it)
     static const bool off = env_switch("RX_VK_FSR_JITTER") == 0;
     State& s = st();
-    const uint64_t last = s.upscaled_frame.load(std::memory_order_relaxed);
-    if (off || !last || texture_frame_no() - last > 30 || !fsr3_wanted()) return 0;
+    const uint64_t last = s.upscaled_frame.load(std::memory_order_relaxed), now = texture_frame_no();
+    if (off || !last || now - last > 30 || !fsr3_wanted()) return 0;
+    // ((Triforce) and once FSR 3.1 failed to draw the frames it was to draw for more than 3 in a row (not frames with no scene:
+    // the pause screen keeps the 30 above): the game's own upscale then takes the frames, which a jitter only makes wobble.
+    // A few frames, not one: this is asked on the game's thread, ahead of the replay that draws)
+    const uint64_t miss = s.missed_from.load(std::memory_order_relaxed);
+    if (miss && now >= miss && now - miss > kMissedFrames) return 0;
     if (axis == 2) return s.jitter_phases.load(std::memory_order_relaxed);
     return axis ? s.jitter_h.load(std::memory_order_relaxed) : s.jitter_w.load(std::memory_order_relaxed);
+}
+
+void release_idle() {
+    State& s = st();
+    const uint64_t now = texture_frame_no();
+    if (wanted()) {
+        s.used_frame = now;   // (asked for: kept, a frame may come at any time)
+        std::unique_lock lk(s.mu, std::try_to_lock);
+        if (lk.owns_lock() && !s.dead.empty()) free_dead();
+        return;
+    }
+    std::lock_guard lk(s.mu);
+    if (now - s.used_frame <= 120) return;   // (off for under 120 frames (2 s): kept, a row stepped through comes back at once)
+    if (s.color.image || s.depth.image || s.motion.image || !s.depth_views.empty()) {
+        logf("vk: fsr3 inputs: not asked for 120 frames: their images let go");
+        for (Image* im : {&s.color, &s.depth, &s.motion})
+            if (im->image) {
+                const Image old = *im;
+                later([old] {
+                    vkDestroyImageView(dev.device, old.view, nullptr);
+                    destroy_image(old.image, old.memory);
+                });
+                *im = {};
+            }
+        auto old = std::move(s.depth_views);
+        s.depth_views.clear();
+        later([old] {
+            for (const auto& [image, view] : old) vkDestroyImageView(dev.device, view, nullptr);
+        });
+        s.have_frame = false, s.last_frame = 0, s.have_pose = false, s.cam.valid = false;
+    }
+    free_dead();
 }
 
 } // namespace mkwvk::fsr3_inputs

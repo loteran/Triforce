@@ -86,12 +86,13 @@ def check_source(source):
     need("const bool sig_hit = sig_walked && last_desc_valid && last_desc_prog == &p && pushed()[0].cmd == cmd &&\n"
          "                         pushed()[0].layout == p.layout && desc_sig::hit(sig_bound(), sig, &p);" in draw,
          "a hit does not need the last draw's program and its push at the bind point", fails)
-    need("const int sig_mode = !same_gens && !no_reuse ? desc_sig_mode() : 0;" in draw, "the walk runs where the draw keeps them anyway",
+    need("const int sig_mode = !same_gens && !no_reuse && !strict ? desc_sig_mode() : 0;" in draw,
+         "the walk runs where the draw keeps them anyway (or a draw that may not defer in a frame that left textures: redrawn.h)",
          fails)
     need("const bool same_desc = same_gens || (sig_hit && sig_mode == 1);" in draw, "a checked hit is not built", fails)
     build = draw[draw.index("if (!same_desc) {"):]
-    before(build, "const int64_t drops = desc_drops", "build_descriptors(s, p, true);", "the drops are not read before the build", fails)
-    before(build, "build_descriptors(s, p, true);", "sig_armed = desc_drops == drops;", "the signature is armed before the build", fails)
+    before(build, "const int64_t drops = desc_drops", "build_descriptors(s, p, true, scene);", "the drops are not read before the build", fails)
+    before(build, "build_descriptors(s, p, true, scene);", "sig_armed = desc_drops == drops;", "the signature is armed before the build", fails)
     need("sig_armed &= b.buffer != VK_NULL_HANDLE;" in build, "a bank not made arms the signature", fails)
     need("sig.tex.assign(built_textures().begin(), built_textures().end());" in build, "the build's textures are not kept", fails)
     bind = draw[draw.index("FINE_SCOPE(FT_BINDDESC);"):]

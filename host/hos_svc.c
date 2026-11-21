@@ -16,6 +16,14 @@
 #define HOS_NX2_REGION_SIZE 0x2000000000ULL
 #define R_INVALID_ENUM 0xF001   /* svc::ResultInvalidEnumValue */
 
+/* ((Triforce) HOS_MEM_LIMIT, hos_mem.c: with the limit kept, what the game holds, never more than it is told it has; without,
+   the program and the heap, as before) */
+static uint64_t hos_mem_used_told(void) {
+    if (!hos_mem_limit()) return hos_program_size + hos_heap_size;
+    const uint64_t used = hos_mem_used();
+    return used < hos_total_memory ? used : hos_total_memory;
+}
+
 static uint64_t get_info(uint32_t id0, uint64_t id1, int *ok) {
     *ok = 1;
     switch (id0) {
@@ -26,7 +34,7 @@ static uint64_t get_info(uint32_t id0, uint64_t id1, int *ok) {
     case 4: return HOS_HEAP_BASE;                          /* HeapRegionAddress */
     case 5: return HOS_SPACE_END - HOS_HEAP_BASE;          /* HeapRegionSize */
     case 6: return hos_total_memory;                       /* TotalMemorySize */
-    case 7: return hos_program_size + hos_heap_size;       /* UsedMemorySize */
+    case 7: return hos_mem_used_told();                    /* UsedMemorySize */
     case 8: return 0;                                      /* DebuggerAttached */
     case 11: return 0x5A3C9E1F0B7D2468ULL ^ (id1 * 0x9E3779B97F4A7C15ULL);   /* RandomEntropy */
     case 12: return 0x08000000ULL;                         /* AslrRegionAddress */
@@ -42,7 +50,7 @@ static uint64_t get_info(uint32_t id0, uint64_t id1, int *ok) {
         return ctx_page;
     }
     case 21: return hos_total_memory;                      /* TotalNonSystemMemorySize */
-    case 22: return hos_program_size + hos_heap_size;      /* UsedNonSystemMemorySize */
+    case 22: return hos_mem_used_told();                   /* UsedNonSystemMemorySize */
     case 23: return 1;                                     /* IsApplication */
     /* the Switch 2 SDK's (ids from Eglantine's svc_types.h / svc_info.cpp) */
     case 24: return 256;                                   /* FreeThreadCount */
@@ -463,6 +471,10 @@ void a64_svc(Ctx *c, uint32_t imm) {
         return;
     }
     case 0x2C: { /* MapPhysicalMemory(address, size) */
+        if (!hos_mem_room(c->x[0], c->x[1])) {   /* ((Triforce) HOS_MEM_LIMIT, hos_mem.c: the console's own refusal) */
+            c->x[0] = 0x10801;   /* (svc::ResultLimitReached) */
+            return;
+        }
         const int committed = hos_commit(c->x[0], c->x[1]);
         if (hos_trace) hos_log("MapPhysicalMemory(%#llx, %#llx)", (unsigned long long)c->x[0], (unsigned long long)c->x[1]);
         if (committed > 0) hos_mem_note(HOS_MEM_MAPPED, c->x[0], c->x[1]);   /* (Triforce: the census, the game's physical maps) */

@@ -18,6 +18,8 @@ gamefile/
 
 # ---- build output and caches ----
 build/
+# (but launcher/Logic/Build/ is source: git on Windows ignores case, so build/ hid it and v0.5.2 was committed without it)
+!launcher/Logic/Build/
 __pycache__/
 *.pyc
 *.o

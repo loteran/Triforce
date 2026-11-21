@@ -62,7 +62,10 @@ struct Device {
          sparse_buffers = false, // (sparse-bound buffers on the queue: a pool imported as several dma-bufs)
          view_2d_of_3d = false, // (VK_EXT_image_2d_view_of_3d: a 3D texture a 2D sample instruction reads)
          coop_matrix = false,   // (VK_KHR_cooperative_matrix with its feature)
-         native_mma = false;    // (HMMA on it: the cooperative matrix test passed, vk_coopmat.cpp)
+         native_mma = false,    // (HMMA on it: the cooperative matrix test passed, vk_coopmat.cpp)
+         // ((Triforce) VK_KHR_fragment_shading_rate with pipelineFragmentShadingRate, native mesh shaders and
+         // RX_VK_FOLIAGE_SHADOW_VRS not off: the far cascades' foliage at 2 x 2, foliage_shadow.h)
+         foliage_rate = false;
     bool eds3_polygon = false, eds3_clamp = false, eds3_blend = false, eds3_a2c = false;
     bool swapchain_colorspace = false;   // (hookshot) VK_EXT_swapchain_colorspace: HDR10 surfaces are listed
     bool hdr = false;                    // (hookshot) the swapchain is HDR10 (ST 2084, Rec. 2020): framegen_hdr writes it
@@ -127,6 +130,7 @@ void memory_ram_watch(uint64_t presents);
 bool memory_ram_low();                       // (under 3 GB available, or a tenth of a PC of more than 30 GB)
 bool memory_ram_short();                     // (under 1.5 GB available at two looks in a row)
 bool memory_ram_fits(uint64_t bytes);        // (a copy of that many bytes fits in the RAM available, with 2 GB to spare)
+bool memory_ram_fits_now(uint64_t bytes);    // ((Triforce) the same with the RAM looked at now: the preparation's checkpoints)
 void memory_process(uint64_t* working_set, uint64_t* private_bytes);   // (the process's, asked now; 0 when not known)
 void pcache_let_go(uint64_t avail);          // (vk_draw.cpp: the pipeline cache let go for the RAM, once; pcache_gate.h)
 // (vk_draw.cpp) the cache as last read or saved (-1: let go), the graphics pipelines kept, the stage libraries kept, how many
@@ -180,6 +184,14 @@ void checkpoints_report();
 /// VK_AMD_buffer_marker's buffer, for RX_VK_CHECKPOINTS on a device without the NV checkpoints (vk_draw.cpp)
 void buffer_markers_init();
 void coopmat_init();   // vk_coopmat.cpp (once the device is made)
+/// ((Triforce) vk_cache_set.cpp, cache_set.h) The kept set of the shader caches: kept, put back or deleted for this start's
+/// stamp, once the device is made and before anything opens a cache (vk_main.cpp mkwvk_init)
+void cache_set_init();
+/// ((Triforce) cache_set.h kStatesPending) A kept set was put back while the player's pipeline state list had grown since it
+/// was kept: the prepare before the title goes through the state lists (vk_draw.cpp prepare_run). RX_VK_NO_STATE_LIST: false
+bool cache_set_states_pending();
+/// The lists were gone through (vk_draw.cpp state_list_prepare): the marker removed
+void cache_set_states_done();
 /// A marker of another kind of GPU work (m: mirror sync, b: write-back, u: texture upload, g: GPU unswizzle; key: its
 /// pool or texture), RX_VK_CHECKPOINTS. (Triforce) And the boundaries between them (checkpoint_kinds.h): w the write-back diff
 /// pass, r and z a recording begun and ended, v its uploads begun, p, M and P the present's blit begun, its menu, its end
@@ -197,12 +209,27 @@ extern std::atomic<bool> par_active;
 extern std::atomic<int64_t> par_lock_wait_ns, par_locks;   // (contention: the time threads waited for it)
 std::recursive_mutex& par_mutex();
 int64_t par_now_ns();
+/// RX_VK_PARLOCK_SPIN=<n> (default 4000, 0: off): ParLock spins this many times before it sleeps. The lock is held for
+/// microseconds at a time, and a recording thread put to sleep on it waited for the OS's wake-up (tens of microseconds) at
+/// every collision
+int par_spin();
+inline void par_pause() {
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__)
+    __builtin_ia32_pause();
+#elif defined(__aarch64__)
+    __asm__ __volatile__("yield");
+#endif
+}
 struct ParLock {
     bool on;
     explicit ParLock(bool want = true) : on(want && par_active.load(std::memory_order_relaxed)) {
         if (!on) return;
         par_locks.fetch_add(1, std::memory_order_relaxed);
         if (par_mutex().try_lock()) return;
+        for (int i = par_spin(); i > 0; i--) {
+            par_pause();
+            if (par_mutex().try_lock()) return;
+        }
         const int64_t t0 = par_now_ns();
         par_mutex().lock();
         par_lock_wait_ns.fetch_add(par_now_ns() - t0, std::memory_order_relaxed);
@@ -290,6 +317,14 @@ void memory_note_gpu_write(uint64_t gpu, uint64_t size);
 /// (vk_replay.cpp) The GPU's progress on the recordings' timeline, and a wait for it to reach v
 uint64_t vk_timeline_completed();
 void vk_timeline_wait(uint64_t v);
+// ((Triforce) RX_VK_LATE_QUEUE: the highest timeline value on the queue; a wait for a sent one (no flush; false: not reached in 1 s);
+// the late pages' fixes applied (dev.present_mu held; queue_flush_locked does it first); vk_memory.cpp's side
+uint64_t vk_timeline_signal_sent();
+bool vk_timeline_wait_sent(uint64_t v);
+void late_fix_flush_locked();
+void vk_late_queue_stats(int64_t* waits, int64_t* wait_ns, int64_t* timeouts);
+uint64_t memory_late_fix_pending();
+void memory_late_fix_apply(uint64_t done);
 /// ((Triforce, wp20) of this thread's last vk_timeline_wait, the part after the writer's recording was done (ns): wb_rec_wait.h)
 int64_t vk_timeline_wait_held_last();
 WriteGen memory_generation();
@@ -297,6 +332,8 @@ uintptr_t memory_stamp_who(uint64_t guest, WriteGen* gen, uintptr_t* anchor);   
 /// 1: a page of [guest, guest + size) was written after generation gen; 0: none was
 bool memory_written_since(uint64_t guest, uint64_t size, WriteGen gen);
 void memory_stamp(uint64_t guest, uint64_t size);   // a write the watch does not see (GPU writes, host writes)
+/// (RX_VK_CAP_ONLY_GPU) a present: the capture's per-frame counts logged every 10 s (vk_memory.cpp)
+void memory_cap_present();
 /// The page runs of [guest, guest + size) written after gen, as byte ranges from guest (appended to out)
 void memory_written_runs(uint64_t guest, uint64_t size, WriteGen gen, std::vector<std::pair<uint64_t, uint64_t>>& out, bool tex = false);
 uint64_t memory_pages_collected();                  // (statistics)
@@ -358,8 +395,12 @@ void memory_mirror_binds_flush();
 bool memory_mirror_bind_wait(VkSemaphoreSubmitInfo* wait);   // (and the wait a queue submission makes for those binds)
 /// (Triforce, vk_memory.cpp) The memory handling played on NVIDIA cards only (mirrors in pieces, compacted textures): on there,
 /// and on trial on a card of another make until triforce_memtrial.txt says it passed or failed. tick: at the 600th presents;
-/// device_lost: from device_lost()
+/// device_lost: from device_lost(). used: a part's first real use (a piece of a mirror bound, a texture made in the compacted
+/// pool): a session counts for the trial only once the handling runs in it, and passes once all of it has run for the trial's time
+enum MemoryTrialPart { MEMTRIAL_PIECES, MEMTRIAL_COMPACT, MEMTRIAL_PARTS };
 bool memory_trial_on();
+void memory_trial_used(MemoryTrialPart part);
+void memory_trial_refused(MemoryTrialPart part);   // (a part this card has could not be made: the trial does not wait for it)
 void memory_trial_tick();
 void memory_trial_device_lost();
 void memory_trial_orderly_end();   // (the menu's Restart and Exit: no verdict for a session ended on purpose)
@@ -383,6 +424,8 @@ bool replay_start();                          // vk_replay.cpp
 bool precompile_wanted();                     // vk_draw.cpp
 void precompile_run(void (*progress)(size_t done, size_t total));
 bool prepare_run(void (*progress)(size_t done, size_t total), bool background);
+bool pcache_carry_rebuild();   // ((Triforce) after prepare_run: the carried pipeline cache over its cap, a fresh one: pcache_carry.h)
+void pcache_carry_done();      // ((Triforce) the preparation gone through and saved: a carried history no longer open: pcache_carry.h)
 bool prepare_is_update();
 void prepare_background();
 void state_list_run();                        // (an update: the state list's pipelines noted before precompile_run)

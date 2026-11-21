@@ -49,6 +49,36 @@ inline uint64_t bytes(const char* env, uint64_t ram_bytes) {
 /// Whether a file or data of that size is within the bound (0: none)
 inline bool within(uint64_t size, uint64_t bound) { return !bound || size <= bound; }
 
+// ((Triforce, 11-18) The carry over an update. The rule of 11-14 left a file made for other shaders (an update that changed the
+// translation) unread: right for the growth, but on AMD's driver, which keeps no cache of its own for these, it meant every
+// pipeline and stage library compiled again after each such update: 87 minutes before the title on an RX 7900 XT (32 of them
+// the 14,467 noted pipelines, 53 the 88,742 stage libraries). What the update did not change still matches the old file: of
+// two caches a translator apart on the lab's PC, 39.6 % of the SPIR-V modules were the same (12.3 % of their bytes). So a file
+// for other shaders is read all the same when it is no larger than the carry limit: the driver finds again what it compiled for
+// the shaders that did not change, and the save writes old and new together for the new shaders. The limit stops the growth:
+// a fresh file is 650-860 MB, one carried and saved again is over 1536 MB, and the next update's start leaves it unread, as
+// before. RX_VK_PCACHE_CARRY_MB=<MB> sets the limit, 0: never carried (the rule of 11-14 alone))
+inline constexpr uint64_t kCarryMb = 1536;
+/// The carry limit in bytes (0: none carried). env: RX_VK_PCACHE_CARRY_MB (null or no number: the default)
+inline uint64_t carry_limit(const char* env) {
+    if (env && *env) {
+        char* end = nullptr;
+        const unsigned long long mb = strtoull(env, &end, 10);
+        if (end != env && !*end && env[0] != '-') return mb > (UINT64_MAX >> 20) ? kCarryMb << 20 : (uint64_t)mb << 20;
+    }
+    return kCarryMb << 20;
+}
+/// Whether a file for other shaders (not same) of size bytes is read all the same: carried over the update. And only when it
+/// leaves room under the bound (bound, 0: none) for as much again: the update's own pipelines go into the same file, and a save
+/// over the bound is not written, so a carried file that left no room would have them compiled again at every start
+/// And only on a PC with the RAM for it (ram_bytes, 0: not known, then never): the driver holds the carried data for the whole
+/// session, up to 1-1.5 GB more than a fresh file, and on 16 GB PCs that already run short of RAM (logs that say so dozens of
+/// times a session) that is paging and hitches in play. 31 GB and more: a 32 GB PC reports a little under 32
+inline constexpr uint64_t kCarryRamGb = 31;
+inline bool carried(bool same, uint64_t size, uint64_t limit, uint64_t bound, uint64_t ram_bytes) {
+    return !same && limit && size > 32 && size <= limit && (!bound || size <= bound / 2) && ram_bytes >= (kCarryRamGb << 30);
+}
+
 enum class Read {
     Ok,
     None,        // (no such file: a first start)

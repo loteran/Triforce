@@ -133,13 +133,20 @@ void check(uint32_t sw, uint32_t sh, const int* crop, uint32_t x, uint32_t y, ui
         fsr4_result = framegen_rows::SKIP;
         CHECK(framegen_record(nullptr, 1, sw, sh, crop) && fsr4_calls == 2 && fg.recorded->made == 0);
         CHECK(dispatches == 13 && copies == 5);
+        // ((Triforce, FG-2) no picture without the HUD, or HDR Native: the game's frame alone, never the shared interpolation's
+        // frame in place of AMD's; the present's source handed on for the picture without the HUD's cut)
+        shown();
+        fsr4_result = framegen_rows::GAME;
+        CHECK(framegen_record(nullptr, 1, sw, sh, crop) && fsr4_calls == 3 && fg.recorded->made == 0);
+        CHECK(dispatches == 15 && copies == 6);
+        CHECK(fg.src_w == sw && fg.src_h == sh && fg.source.x == x && fg.source.y == y && fg.source.w == w && fg.source.h == h);
         fsr4_result = framegen_rows::OWN;
-        CHECK(framegen_record(nullptr, 1, sw, sh, crop) && fsr4_calls == 3 && fg.recorded->made == 1);
-        CHECK(dispatches == 18 && copies == 6);
+        CHECK(framegen_record(nullptr, 1, sw, sh, crop) && fsr4_calls == 4 && fg.recorded->made == 1);
+        CHECK(dispatches == 20 && copies == 7);
         shown();
         fg.have_prev = false;   // (nothing before this frame: still handed over, as a frame with nothing to blend from)
-        CHECK(framegen_record(nullptr, 1, sw, sh, crop) && fsr4_calls == 4 && !fsr4_blend && fg.recorded->made == 0);
-        CHECK(dispatches == 20 && copies == 7);
+        CHECK(framegen_record(nullptr, 1, sw, sh, crop) && fsr4_calls == 5 && !fsr4_blend && fg.recorded->made == 0);
+        CHECK(dispatches == 22 && copies == 8);
         opts.framegen = 2;
         // ((Triforce) the fine vectors (vk_framegen.cpp fine_vectors), their pipelines made: a 2x frame is the copy, the
         // quarter- and half-size luma, the coarse vectors and their median, the fine vectors, two picks and one made frame)
@@ -147,7 +154,7 @@ void check(uint32_t sw, uint32_t sh, const int* crop, uint32_t x, uint32_t y, ui
         fg.have_prev = true;
         fg.half.pipe = fg.fine_flow.pipe = fg.fine_pick.pipe = fg.fine_synth.pipe = 1;
         CHECK(framegen_record(nullptr, 1, sw, sh, crop) && fg.recorded->made == 1);
-        CHECK(dispatches == 29 && copies == 8);
+        CHECK(dispatches == 31 && copies == 9);
         fg.half.pipe = fg.fine_flow.pipe = fg.fine_pick.pipe = fg.fine_synth.pipe = VK_NULL_HANDLE;
     } else {
         CHECK(dispatches == 0 && copies == 0 && !fg.recorded);

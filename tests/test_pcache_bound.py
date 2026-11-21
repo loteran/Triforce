@@ -69,6 +69,18 @@ int main(int, char** argv) {
     // (the answers the log names have words; the three that need no line have none)
     CHECK(*why(Read::OverBound) && *why(Read::Cut) && *why(Read::NoMemory) && *why(Read::Unsized) && *why(Read::Short));
     CHECK(!*why(Read::Ok) && !*why(Read::None));
+    // ((Triforce, 11-18) the carry: a file for other shaders read all the same up to the limit (1536 MB unset, 0: never), and only
+    // when it leaves room under the bound for as much again; one for these shaders is never "carried")
+    CHECK(carry_limit(nullptr) == 1536 * MB && carry_limit("") == 1536 * MB && carry_limit("x") == 1536 * MB && carry_limit("0") == 0);
+    CHECK(carry_limit("800") == 800 * MB);
+    const uint64_t R32 = 32 * GB - 300 * MB, R16 = 16 * GB - 200 * MB;   // (what such PCs report)
+    CHECK(carried(false, 860 * MB, 1536 * MB, 4096 * MB, R32) && carried(false, 1536 * MB, 1536 * MB, 4096 * MB, R32));
+    CHECK(!carried(false, 1537 * MB, 1536 * MB, 4096 * MB, R32));          // (over the limit: a file carried and saved again)
+    CHECK(!carried(false, 1100 * MB, 1536 * MB, 2048 * MB, R32) && carried(false, 1024 * MB, 1536 * MB, 2048 * MB, R32));   // (room for as much again)
+    CHECK(carried(false, 1400 * MB, 1536 * MB, 0, R32));                    // (no bound)
+    CHECK(!carried(false, 860 * MB, 1536 * MB, 4096 * MB, R16) && !carried(false, 860 * MB, 1536 * MB, 4096 * MB, 0));   // (16 GB, or RAM not known: never)
+    CHECK(carried(false, 860 * MB, 1536 * MB, 8192 * MB, 64 * GB));
+    CHECK(!carried(true, 860 * MB, 1536 * MB, 4096 * MB, R32) && !carried(false, 860 * MB, 0, 4096 * MB, R32) && !carried(false, 32, 1536 * MB, 4096 * MB, R32));
     return 0;
 }
 """
@@ -90,9 +102,14 @@ def check_source():
         raise SystemExit("pcache_init reads the cache's file past the bounded read")
     if "ci.initialDataSize = data.size();" not in init:
         raise SystemExit("the cache is not made from what the bounded read gave")
-    # (what is for other shaders is still not read at all, whatever its size)
-    if init.index("if (!pcache_same) {", init.index(setb)) > init.index(readb):
-        raise SystemExit("a file for other shaders is read")
+    # ((Triforce, 11-18) what is for other shaders is read only when carried: over the stamp change at an update's preparation
+    # (pcache_carry.h, tests/test_pcache_carry.py), or outside it by v0.5.2's size and RAM rule (pcache_bound::carried, with the
+    # bound, where pcache_carry::plain_carry lets it: not over the preparation's own carry); else not at all
+    carry = "pcache_bound::carried(pcache_same, (uint64_t)std::max<int64_t>(sz, 0), carry, pcache_bound_bytes, ram);"
+    if carry not in init or init.index(setb) > init.index(carry):
+        raise SystemExit("pcache_init does not decide the carry with the bound set, or not by pcache_bound::carried")
+    if init.index("if (!pcache_same && !pcache_carried && !carried) {", init.index(carry)) > init.index(readb):
+        raise SystemExit("a file for other shaders that is not carried is read")
     save = between(draw, "void pipeline_cache_save(bool force) {", "\n}\n")
     ask = "if (!pcache_bound::within(n, pcache_bound_bytes)) {"
     if ask not in save or save.index(ask) > save.index("std::vector<uint8_t> data(n);"):

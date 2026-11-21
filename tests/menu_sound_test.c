@@ -560,6 +560,24 @@ static void voices_and_mix(void) {
         CHECK(active() == 2 && voice_with(CURSOR) == 0 && voice_with(DECIDE) == 1);
         quiet();
     }
+    {   /* ((Triforce, 11-19) the system menu's: the mouse onto Mods or Quit and its click in one tick, or a stick's flick and
+           A, is their decide alone, as the options' tick and decision; 50 ms on they both play. Its ticks are not thinned
+           out by the 180 ms gap, as the game's System list does not thin out its own) */
+        install(SYS_CURSOR, 30000, 0.5f, 0.5f), install(SYS_DECIDE, 100, 1.0f, -1.0f);
+        t0 += 10000 * kMs;
+        hos_menu_sound_play(SYS_CURSOR, t0);
+        hos_menu_sound_play(SYS_DECIDE, t0);
+        CHECK(active() == 1 && voice_with(SYS_DECIDE) == 0 && voice_with(SYS_CURSOR) < 0 && voice_pos(0) == 0);
+        quiet();
+        hos_menu_sound_play(SYS_CURSOR, t0 + 1000 * kMs);
+        hos_menu_sound_play(SYS_CURSOR, t0 + 1100 * kMs);   /* (100 ms on: heard, restarted) */
+        CHECK(active() == 1 && voice_with(SYS_CURSOR) == 0 && voice_pos(0) == 0);
+        for (int k = 0; k < 10; k++) block(1.0f, 0.0f, 0.0f);
+        hos_menu_sound_play(SYS_DECIDE, t0 + 1150 * kMs);
+        CHECK(active() == 2 && voice_with(SYS_CURSOR) == 0 && voice_with(SYS_DECIDE) == 1);
+        quiet();
+        sounds[SYS_CURSOR] = sounds[SYS_DECIDE] = (Sound){0};
+    }
     {   /* a restart inside the mix, between its read of the voice's place and of its sound: the tick is 240 samples in when
            the decision, 100 samples long, takes its voice. The place is the tick's, the sound the decision's: nothing of
            it is mixed in this block (240 is past the decision's end, and its samples end where nothing can be read),

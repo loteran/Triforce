@@ -11,6 +11,7 @@
 #include "hos.h"
 #include "hos_paths.h"
 #include "hos_instance.h"   /* ((Triforce) one game at a time for a game folder) */
+#include "hos_bench.h"      /* ((Triforce, 11-19) benchmark mode: HOS_BENCHMARK */
 #include "../gpu/vk/vk_api.h"
 #include "../gpu/vk/oot_cheat_items.h"
 #include "../gpu/vk/oot_debug_link.h"   /* ((Triforce) the Game flags and Cutscenes pages' lines) */
@@ -267,7 +268,10 @@ static void call_guest(Ctx *c, uint64_t addr, uint64_t sp, const char *what) {
 
 void hos_update_check(void);   /* (host/hos_update.c) */
 #ifndef _WIN32
-/* (linux) Saves live in $XDG_DATA_HOME/hookshot (~/.local/share/hookshot), so a rebuilt game folder still finds them.
+/* (linux) Saves live in $XDG_DATA_HOME/triforce/user (~/.local/share/triforce/user), so a rebuilt game folder still finds
+   them. ((Triforce) 11-19: the folder builds before v0.5.3 used, $XDG_DATA_HOME/hookshot, is renamed to it the first time,
+   in one step (triforce/ itself may hold the builder already, so the saves get a folder of their own there); if that cannot
+   be done the saves stay in the old folder. The launcher looks in both, the new one first.)
    A user/ folder beside the executable from before is moved there the first time, entry by entry. Anything that
    cannot be moved keeps the old place. --user still wins. */
 static int is_dir(const char *p) {
@@ -333,7 +337,20 @@ static const char *saves_dir(const char *beside) {
         snprintf(dir, sizeof dir, "%s/.local/share", home);
     } else return beside;
     CreateDirectoryA(dir, NULL);
-    snprintf(dir + strlen(dir), sizeof dir - strlen(dir), "/hookshot");
+    {
+        char old[MAX_PATH];
+        snprintf(old, sizeof old, "%s/hookshot", dir);
+        snprintf(dir + strlen(dir), sizeof dir - strlen(dir), "/triforce");
+        CreateDirectoryA(dir, NULL);
+        snprintf(dir + strlen(dir), sizeof dir - strlen(dir), "/user");
+        if (is_dir(old) && GetFileAttributesA(dir) == INVALID_FILE_ATTRIBUTES) {   /* (the old folder, and no new one yet) */
+            if (MoveFileExA(old, dir, 0)) hos_log("saves: the save folder %s is now %s", old, dir);
+            else {
+                hos_log("saves: %s could not be renamed to %s (error %lu): the saves stay there", old, dir, (unsigned long)GetLastError());
+                snprintf(dir, sizeof dir, "%s", old);
+            }
+        }
+    }
     CreateDirectoryA(dir, NULL);
     if (GetFileAttributesA(dir) == INVALID_FILE_ATTRIBUTES) return beside;
     char pattern[MAX_PATH];
@@ -455,6 +472,7 @@ volatile int hos_oot_live_action;   /* (test runs) the live input file's "!cheat
 
 int hos_oot_hearts_enabled(void) {
     int rx_option(int id, int otherwise);
+    if (hos_bench_on()) return 1;   /* ((Triforce) benchmark mode: the hearts protected, whatever the Debug tab says) */
     const int menu = rx_option(HOS_OPT_CHEAT_HEARTS, -1);
     return menu < 0 ? hos_oot_protect_hearts : menu;
 }
@@ -710,6 +728,7 @@ static struct {
     int64_t requested_at, check_at;
     unsigned destination;
 } teleport;
+static uint64_t teleport_result;   /* ((Triforce) the last request's own result, oot_teleport: benchmark mode's retry */
 
 /* (Triforce, lab) The pipeline crawl's commands, from the live input file (host/nn_hid.c). "!banc <map> <entry> <event>
    [child|adult]" asks for a map change to any map by its names, as the game's own entrance actors do (the names are in the
@@ -839,6 +858,7 @@ static int oot_teleport(Ctx *c, uint64_t actor, unsigned index) {
         release_link(c);
     }
     *c = saved;
+    teleport_result = ok ? result : 0;   /* ((Triforce) benchmark mode: 0 = the event manager did not take it) */
     const int refused = crawl_banc && (!ok || !result);   /* (the crawl: asked again soon, not after the 8 s of a request under way) */
     teleport.requested_at = refused ? 0 : now;
     teleport.check_at = refused ? 0 : now + 1500000000LL;
@@ -1232,6 +1252,24 @@ static float oot_load_float(Ctx *c, uint64_t addr) {
     return value;
 }
 
+/* ((Triforce, 11-19) benchmark mode, host/hos_bench.c) its tour at Link's update: the map's state while it waits for play or for
+   an arrival (nothing is read of the game while a scene is measured), and the teleports it asks for, sent at once: its own
+   pace, not the 8 s a teleport from the menu keeps between two */
+static void oot_bench_tick(Ctx *c, uint64_t actor, int64_t now) {
+    if (!hos_bench_on() || !hos_bench_link_wants_state()) return;
+    char current[80];
+    int loading = 0;
+    oot_gamedata_string(c, 0x1d6189dau, current, sizeof current);   /* Sequence_CurrentBanc */
+    oot_gamedata_bool(c, 0xef2b60c2u, &loading);                    /* Sequence_IsLoadingBanc */
+    const uint64_t events = oot_singleton(c, OOT_EVENTMGR_SLOT);
+    const int event = events && recomp_load64(c, events + 104) ? 1 : 0;
+    const int want = hos_bench_link(now, actor, current, loading, event);
+    if (want < 0) return;
+    teleport.requested_at = 0;
+    teleport_result = 0;
+    const int sent = oot_teleport(c, actor, (unsigned)want);
+    hos_bench_teleport_sent(want, sent && teleport_result != 0);   /* (a request the event manager refused: asked again soon) */
+}
 static _Thread_local uint64_t flight_transform_controller;
 static _Thread_local uint64_t flight_pose_actor;
 static _Thread_local float flight_transform_yaw;
@@ -1251,6 +1289,7 @@ static void oot_update_player_cheats(Ctx *c, uint64_t actor, uint64_t components
     int action = rx_option(HOS_OPT_CHEAT_ACTION, 0);
     if (!action) action = __atomic_exchange_n(&hos_oot_live_action, 0, __ATOMIC_RELAXED);
     oot_teleport_followup(c);
+    oot_bench_tick(c, actor, now);   /* ((Triforce, 11-19) benchmark mode: its tour, host/hos_bench.c */
     oot_inventory_refresh(c, now);
     oot_link_tick(c, actor, now);   /* ((Triforce) the Game flags and Cutscenes pages) */
     if (action >= OOT_CHEAT_ITEM_ACTION && action < OOT_CHEAT_ITEM_ACTION + 256 * (int)OOT_ITEM_COUNT) {
@@ -1774,6 +1813,8 @@ static int game_main(int argc, char **argv) {
         const char *protect_hearts = getenv("HOS_OOT_PROTECT_HEARTS");
         hos_oot_protect_hearts = protect_hearts && !strcmp(protect_hearts, "1");
     }
+    hos_bench_init();   /* ((Triforce, 11-19) benchmark mode, HOS_BENCHMARK: host/hos_bench.c */
+    if (hos_bench_on()) hos_oot_protect_hearts = 1;
 #ifdef _WIN32
     {   // (the whole process, not only the window's thread: the renderer asks the window's size from its own, and on a 4K screen at 150%
         // Windows answered such a thread 2560 x 1440: the picture was that size, in the corner of the window. Hookshot issues 15, 18, 20)

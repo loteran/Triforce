@@ -138,7 +138,9 @@ int main(int argc, char** argv) {
     if prepare.count("warm_libraries(progress)") != 2:
         raise SystemExit("prepare_run: wanted warm_libraries after the translation and on the path with no translation")
     alone = prepare[:prepare.index("seed_open();\n    if (!programs)")]
-    if "warm_libraries(progress)" not in alone or "if (prepared_for.warmed == warmed || background) return false;" not in alone:
+    # ((Triforce) or when the stamp is the same and a sample finds the libraries gone from the cache: tests/test_lib_check.py)
+    if "warm_libraries(progress)" not in alone or \
+            "if (!cold && (prepared_for.warmed == warmed || background)) return false;" not in alone:
         raise SystemExit("prepare_run does not make the driver's part alone when only its stamp differs")
     at = 0
     for _ in range(2):   # (closed in the libraries: not written down as warmed)
@@ -150,10 +152,36 @@ int main(int argc, char** argv) {
     cleared = prepare.index("prepared_for.warmed = 0;\n")
     if prepare.index("prepared_write(path, prepared_for);", cleared) > prepare.index("if (!warm_libraries(progress)) {", cleared):
         raise SystemExit("prepare_run: the translation is not written down before the libraries are made")
-    stamp = block(draw, "uint64_t warmed_stamp(")
+    stamp = block(draw, "uint64_t warmed_stamp_of(")
     for part in ("program_cache_stamp()", "pipelineCacheUUID", "driverVersion", "libraries", "kWarmRecipe"):
         if part not in stamp:
             raise SystemExit("warmed_stamp leaves out " + part)
+    # ((Triforce) the words added where they apply alone: every other device's stamp is what it was, nothing made again there)
+    if "if (patches) {" not in stamp or "if (rate) add(&kRateRecipe, sizeof kRateRecipe);" not in stamp or \
+            stamp.index("add(v, sizeof v);") > stamp.index("if (patches) {"):
+        raise SystemExit("warmed_stamp_of: the module patches' and the rate's words are not added after the others, and only "
+                         "where they apply")
+    if "return warmed_stamp_of(libraries, module_patches(), false);" not in block(draw, "uint64_t warmed_stamp(") or \
+            "return warmed_stamp_of(libraries, module_patches(), libraries && dev.foliage_rate);" not in \
+            block(draw, "uint64_t libraries_stamp("):
+        raise SystemExit("warmed_stamp / libraries_stamp: wanted the modules' patches in both and the rate's libraries in the "
+                         "driver's part's alone")
+    # ((Triforce, 11-19) and bit 2, the water's simplification (shader_water_mode, the RX 470 .. 590 port that came without a
+    # new stamp): those cards warm their driver's part again once)
+    if "return (dev.fixes.nan_bits && nan_selects ? 1u : 0u) | (shader_water_mode() ? 2u : 0u);" not in block(draw, "uint32_t module_patches("):
+        raise SystemExit("module_patches is not the NaN selects' rewrite as make_module decides it, with the water's bit")
+    # ((Triforce) and the pipeline cache's <file>.own, which names it (pcache_own_stamp: what a file of the part's own holds,
+    # warm_checkpoint.h); nothing there says the part is made)
+    own = 'uint64_t pcache_own_stamp() { return libraries_stamp(gpl_wanted() && !getenv("RX_VK_NO_WARM")); }'
+    if "const uint64_t warmed = libraries_stamp(libraries);" not in prepare or "libraries_stamp(" in draw.replace(
+            "uint64_t libraries_stamp(", "").replace("const uint64_t warmed = libraries_stamp(libraries);", "").replace(own, ""):
+        raise SystemExit("the driver's part's stamp (libraries_stamp) is used past prepare_run, or prepare_run does not use it")
+    carry = prepare.index("warm_skip_carry(warming + \".skip\", libraries, warmed);")
+    if carry > prepare.index("gpl_skip_set(gpl_rules::skip_read(warming + \".skip\", warmed));"):
+        raise SystemExit("prepare_run reads the skip list before what the stamp it was carries over")
+    carried = block(draw, "void warm_skip_carry(")
+    if "if (!gpl_rules::skip_read(skip, now).empty()) return;" not in carried or "gpl_rules::skip_add(skip, now, ids);" not in carried:
+        raise SystemExit("warm_skip_carry does not carry the list over only where the new stamp has none")
     warm = block(draw, "bool warm_libraries(")
     for call in ("program_cache_keys(", "program_cache_borrow(", "pipe_notes_read()", "ub_thread_off();", "prepare_stopped()"):
         if call not in warm:

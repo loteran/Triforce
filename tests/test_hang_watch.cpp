@@ -50,6 +50,12 @@ int main() {
         }
         CHECK(told == kReports && w.reports == kReports);
     }
+    {   // ((Triforce) the stacks asked for from outside: served kAsked times a run, then no more)
+        int served = 0, yes = 0;
+        for (int i = 0; i < kAsked + 5; i++) yes += ask(served);
+        CHECK(yes == kAsked && served == kAsked && kAsked >= 4 && kAsked <= 64);
+        CHECK(kAskSuffix[0] == '.' && kAskSuffix[1] == 'n');
+    }
     std::puts("PASS: the hang watch reports a stall once, only while judged, and a few times a run");
     return 0;
 }

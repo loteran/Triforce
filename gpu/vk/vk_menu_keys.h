@@ -27,4 +27,23 @@ inline int dot(int position) {
     }
 }
 
+/// ((Triforce, 11-19) A key read two ways, its state (down: GetAsyncKeyState at each tick) and the host's queue of presses
+/// (queued: a press the window's thread noted since the last tick, a little after the state shows it), as one press: new
+/// when the key was not down at the last tick and is down now or was pressed between the ticks. taken: this tick's press is
+/// counted where both ways may give it (the Mods entries' game keys, vk_menu.cpp menu_tick); its queued press, still to
+/// come, is then not a press again within echo_ns (on that page or the next one). *echo: the queued press was that one
+struct KeyPress {
+    bool held = false;
+    long long echo_at = 0;   // (when a press was counted on the state alone: its queued press still to come; 0 none)
+};
+constexpr long long kEchoNs = 250000000LL;
+inline bool key_press(KeyPress& k, bool down, bool queued, bool taken, bool has_queue, long long now, bool* echo) {
+    *echo = queued && k.echo_at && now - k.echo_at < kEchoNs;
+    if (*echo) queued = false, k.echo_at = 0;
+    const bool went = !k.held && (down || queued);
+    k.held = down;
+    if (taken && went && !queued && has_queue) k.echo_at = now;
+    return went;
+}
+
 } // namespace mkwvk::menu_keys

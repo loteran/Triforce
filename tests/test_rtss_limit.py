@@ -140,9 +140,8 @@ def check_source():
     menu_h = (vk / "vk_menu.h").read_text(encoding="utf-8")
     check('"RivaTuner limit"' not in menu and "opts.rtss" not in menu and "int rtss" not in menu_h, "the RivaTuner limit row is still there")
     check('mine |= key == "rivatuner_limit";' in block(menu, "void save() {"), "an old rivatuner_limit= line is written back")
-    check("RivaTuner" in block(menu, "const char* hn_reflex_limit(int v, int variant) {") and
-          "Where RivaTuner Statistics Server is the game's limiter it holds the frames instead." in menu,
-          "the Reflex frame limit row does not say that RivaTuner wins")
+    # ((Triforce, options_version 7) no Reflex frame limit row: the Low latency row's line in the readme says RivaTuner wins)
+    check('"Reflex frame limit"' not in menu, "the Reflex frame limit row is still there")
     # ((Triforce) NX2navi's full overlay: its Frame limit row names who holds the frames, vk_pace.cpp's owner, after the rate)
     check("const int holder = mkwvk::pace::owner();" in menu and '" (RivaTuner)" : " (NVIDIA Reflex)"' in menu,
           "the overlay's Frame limit line does not say who holds the frames (vk_pace.cpp)")

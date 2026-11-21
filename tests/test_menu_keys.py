@@ -147,7 +147,7 @@ def main():
     need(tick, r'"PADS", "PADE", "PADW", "PADN".*?press\[5\] \|= p == pad_back, press\[7\] \|= p == pad_confirm',
          "RX_VK_MENU_SCRIPT's pad presses do not go through the same mapping")
     # (the page links on the tabs: confirm opens them)
-    need(tick, r"else if \(r\.cheat >= 0\) cheat_press\(r\.cheat, press, changed\)", "the debug tools' rows do not act on the Debug tab")
+    need(tick, r"if \(r\.cheat >= 0\) cheat_press\(r\.cheat, press, changed\)", "the debug tools' rows do not act on the Debug tab")
     need(tick, r"press\[7\] && is_motion_row\(r\)\) cur_tab = TAB_MOTION", "Motion does not open on confirm")
     need(tick, r"press\[7\] && !r\.value && can_bind\(\)\) page = 1", "Controls does not open on confirm")
     need(tick, r"press\[5\] && cur_tab == TAB_MOTION\) cur_tab = TAB_CONTROLS", "back does not leave the Motion page")
